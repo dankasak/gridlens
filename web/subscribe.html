@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Subscribe — Grid Lens</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .sub-page {
+      display: flex;
+      flex: 1;
+      padding: 2rem;
+      gap: 2rem;
+      max-width: 1200px;
+      margin: 0 auto;
+      width: 100%;
+      min-height: calc(100vh - 180px);
+    }
+    .sub-left  { flex: 0 0 40%; display: flex; flex-direction: column; gap: 1rem; }
+    .sub-right { flex: 1; display: flex; flex-direction: column; }
+
+    .screenshot {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      flex: 1;
+    }
+    .screenshot img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .screenshot-placeholder {
+      width: 100%; height: 100%; min-height: 380px;
+      background: #1a1a2e;
+      display: flex; align-items: center; justify-content: center;
+      color: #666; font-size: 0.85rem;
+    }
+
+    .info-panel {
+      border: 3px solid var(--purple);
+      border-radius: 8px;
+      padding: 1.75rem 2rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+      height: 100%;
+    }
+    .info-panel h1 { font-size: 1.3rem; line-height: 1.45; }
+    .info-panel ul { list-style: disc; padding-left: 1.25rem; display: flex; flex-direction: column; gap: 0.6rem; }
+    .info-panel ul li { font-size: 0.88rem; line-height: 1.55; color: #222; }
+    .info-panel ul li strong { font-weight: 700; }
+    .info-panel ul li em { font-style: italic; font-weight: 600; }
+
+    .cta-section {
+      margin-top: auto;
+      padding-top: 1.25rem;
+      border-top: 1px solid #e8e0f5;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    .cta-note { font-size: 0.85rem; color: var(--muted); }
+
+    .cta-buttons { display: flex; align-items: center; gap: 1.25rem; flex-wrap: wrap; }
+
+    .btn-skip {
+      background: none;
+      border: none;
+      color: var(--purple);
+      font-size: 0.9rem;
+      cursor: pointer;
+      text-decoration: underline;
+      padding: 0;
+    }
+    .btn-skip:hover { color: #4c1d95; }
+
+    .ha-only { display: none; }
+    .ha-context .ha-only { display: block; }
+    .ha-context .standalone-only { display: none; }
+
+    @media (max-width: 768px) {
+      .sub-page { flex-direction: column; }
+      .sub-left { flex: none; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="sub-page">
+
+  <!-- Left column -->
+  <div class="sub-left">
+    <div style="display:flex; align-items:center; gap:0.75rem;">
+      <svg style="width:56px;height:56px" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="28" cy="28" r="22" stroke="#0bb8b2" stroke-width="4"/>
+        <circle cx="28" cy="28" r="14" stroke="#0bb8b2" stroke-width="2.5" stroke-dasharray="4 3"/>
+        <path d="M31 16 L23 30 H29 L25 42 L37 26 H31 Z" fill="#f59e0b"/>
+        <line x1="44" y1="44" x2="54" y2="54" stroke="#0bb8b2" stroke-width="5" stroke-linecap="round"/>
+      </svg>
+      <div>
+        <div style="font-size:1.5rem;font-weight:700;color:#0bb8b2;letter-spacing:-0.3px">Grid Lens</div>
+        <div style="font-size:0.9rem;color:var(--muted)">API Subscription – $1 / month</div>
+      </div>
+    </div>
+
+    <div class="screenshot">
+      <img src="img/dashboard-screenshot.png" alt="Grid Lens dashboard showing plan comparison"
+           onerror="this.style.display='none'; this.nextElementSibling.style.display='flex'">
+      <div class="screenshot-placeholder" style="display:none">Dashboard screenshot coming soon</div>
+    </div>
+  </div>
+
+  <!-- Right column -->
+  <div class="sub-right">
+    <div class="info-panel">
+      <h1>Grid Lens is a Home Assistant app to help you choose the best energy plan.
+        While there are other comparison services, Grid Lens aims to be
+        privacy-focused and neutral. Here's how it works.</h1>
+
+      <ul>
+        <li>Grid Lens collects your energy generation &amp; usage patterns, by hooking into your
+          existing <a href="https://www.home-assistant.io/dashboards/energy/" target="_blank">energy dashboard</a>'s sensors.</li>
+
+        <li>Up-to-date retail energy plans are fetched via the Grid Lens API.</li>
+
+        <li>For each energy plan, an LP Optimizer is run – <em>locally</em> – passing it your data,
+          solar &amp; battery details (if applicable), and each of the retail energy plans.
+          Your data never leaves your Home Assistant instance.</li>
+
+        <li>A custom Home Assistant dashboard displays each plan's optimal usage (including
+          your deferrable loads, solar production, energy purchasing and selling, cost and
+          profit, and battery state-of-charge) and a bill estimate for the selected date range.</li>
+
+        <li>Grid Lens supports "deferrable loads" — electricity usage you can shift to optimal times,
+          e.g. a hot water heater or EV charger.</li>
+
+        <li>An API Subscription plan gives you access to <strong>all</strong> retail energy plans
+          supported in your region, updated constantly by our team of energy analysts.
+          We've kept the subscription cost to an absolute minimum.</li>
+
+        <li>Grid Lens doesn't have any business relationship with any energy retailers or
+          wholesalers. There are no referral links or kickbacks. We just model
+          <strong>all</strong> available plans accurately.</li>
+
+        <li>The only data we store is your email, Home Assistant Installation UUID, and Stripe
+          billing metadata. We don't sell data.</li>
+      </ul>
+
+      <div class="cta-section">
+        <p class="cta-note ha-only">
+          After payment you'll be returned automatically to Home Assistant to complete setup.
+        </p>
+        <p class="cta-note standalone-only">
+          Subscribe to compare all available plans in your state for just $1/month.
+          Cancel anytime.
+        </p>
+        <div class="cta-buttons">
+          <button class="btn btn-primary btn-lg" id="btn-subscribe">Subscribe – $1 / month</button>
+          <button class="btn-skip ha-only" id="btn-skip">Continue with free plan →</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script src="nav.js"></script>
+<script>
+  const params           = new URLSearchParams(window.location.search);
+  const flowId           = params.get('flow_id');
+  const callbackUrl      = params.get('callback_url');
+  const email            = params.get('email') || '';
+  const haInstallationId = params.get('ha_installation_id') || '';
+
+  if (flowId && callbackUrl) document.body.classList.add('ha-context');
+
+  document.getElementById('btn-subscribe').addEventListener('click', () => {
+    const url = new URL('https://api.gridlens.au/billing/checkout');
+    url.searchParams.set('email', email);
+    if (haInstallationId) url.searchParams.set('ha_installation_id', haInstallationId);
+    if (flowId)           url.searchParams.set('flow_id', flowId);
+    if (callbackUrl)      url.searchParams.set('callback_url', callbackUrl);
+    url.searchParams.set('cancel_url', window.location.href);
+    window.location.href = url.toString();
+  });
+
+  document.getElementById('btn-skip').addEventListener('click', () => {
+    if (callbackUrl && flowId) {
+      const r = new URL(callbackUrl);
+      r.searchParams.set('flow_id', flowId);
+      window.location.href = r.toString();
+    }
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pricing — Grid Lens</title>
+  <meta name="description" content="Grid Lens is free to use with your current plan. Subscribe for $1/month to compare all available plans.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<section class="hero" style="padding-bottom: 2rem">
+  <div class="container">
+    <div class="section-label">Pricing</div>
+    <h1>Simple, honest pricing</h1>
+    <p>Start free. Upgrade only if you want to compare all available plans.</p>
+  </div>
+</section>
+
+<section style="padding-top: 1rem">
+  <div class="container">
+    <div class="pricing-grid">
+
+      <div class="pricing-card">
+        <div class="price-tag">$0 <span>/ month</span></div>
+        <div class="tagline">No account required</div>
+        <ul>
+          <li>Compare your <strong>current plan</strong></li>
+          <li>Full local LP optimizer</li>
+          <li>Solar &amp; battery modelling</li>
+          <li>Deferrable load support</li>
+          <li>Custom HA dashboard</li>
+          <li class="no">All plans in your state</li>
+          <li class="no">Automatic plan updates</li>
+        </ul>
+        <div class="card-cta">
+          <a href="/docs.html" class="btn btn-outline" style="width:100%; text-align:center; display:block">Read setup guide</a>
+        </div>
+      </div>
+
+      <div class="pricing-card featured">
+        <span class="badge">Pro</span>
+        <div class="price-tag">$1 <span>/ month</span></div>
+        <div class="tagline">Everything in free, plus:</div>
+        <ul>
+          <li>Compare your current plan</li>
+          <li>Full local LP optimizer</li>
+          <li>Solar &amp; battery modelling</li>
+          <li>Deferrable load support</li>
+          <li>Custom HA dashboard</li>
+          <li><strong>All plans in your state</strong></li>
+          <li><strong>Automatic plan updates</strong></li>
+        </ul>
+        <div class="card-cta">
+          <a href="/subscribe.html" class="btn btn-primary" style="width:100%; text-align:center; display:block">Subscribe – $1 / month</a>
+        </div>
+      </div>
+
+    </div>
+
+    <table class="compare-table" style="margin-top: 4rem">
+      <thead>
+        <tr>
+          <th style="width:55%">Feature</th>
+          <th>Free</th>
+          <th class="col-pro">Pro – $1/mo</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>LP optimizer (runs locally)</td><td class="check">✓</td><td class="check">✓</td></tr>
+        <tr><td>Current plan comparison</td><td class="check">✓</td><td class="check">✓</td></tr>
+        <tr><td>Solar &amp; feed-in tariff modelling</td><td class="check">✓</td><td class="check">✓</td></tr>
+        <tr><td>Battery storage modelling</td><td class="check">✓</td><td class="check">✓</td></tr>
+        <tr><td>EV / deferrable load shifting</td><td class="check">✓</td><td class="check">✓</td></tr>
+        <tr><td>Custom HA dashboard</td><td class="check">✓</td><td class="check">✓</td></tr>
+        <tr><td>Your energy data leaves HA</td><td class="cross">Never</td><td class="cross">Never</td></tr>
+        <tr><td>All plans in your state</td><td class="cross">–</td><td class="check">✓</td></tr>
+        <tr><td>Continuous plan updates</td><td class="cross">–</td><td class="check">✓</td></tr>
+        <tr><td>New plans as they launch</td><td class="cross">–</td><td class="check">✓</td></tr>
+      </tbody>
+    </table>
+
+    <div style="margin-top: 3.5rem; max-width: 640px; margin-left: auto; margin-right: auto;">
+      <h2 style="text-align:center; margin-bottom: 2rem">FAQ</h2>
+
+      <h3>Why does it cost anything?</h3>
+      <p style="margin-top:0.5rem; margin-bottom:1.5rem; font-size:0.9rem; color:var(--muted)">
+        Maintaining accurate, up-to-date models for every retailer's plan structure requires ongoing work from a team of energy analysts. $1/month covers infrastructure and that effort — just barely. We've deliberately kept it at the lowest amount we can sustain.
+      </p>
+
+      <h3>What data do you store?</h3>
+      <p style="margin-top:0.5rem; margin-bottom:1.5rem; font-size:0.9rem; color:var(--muted)">
+        Only your email address, Home Assistant installation UUID, and Stripe billing metadata. Your energy usage data never reaches our servers — the optimizer runs entirely on your HA instance.
+      </p>
+
+      <h3>Can I cancel?</h3>
+      <p style="margin-top:0.5rem; margin-bottom:1.5rem; font-size:0.9rem; color:var(--muted)">
+        Yes, at any time from your Stripe billing portal. You'll revert to the free plan (current plan only) automatically.
+      </p>
+
+      <h3>Which states are supported?</h3>
+      <p style="margin-top:0.5rem; margin-bottom:1.5rem; font-size:0.9rem; color:var(--muted)">
+        Currently focusing on Australian NEM states (NSW, VIC, QLD, SA, ACT). More regions coming.
+      </p>
+    </div>
+  </div>
+</section>
+
+<div class="cta-banner">
+  <div class="container">
+    <h2>Try it free first</h2>
+    <p>Install Grid Lens and compare your current plan at no cost. Upgrade when you're ready to see everything.</p>
+    <a href="/docs.html" class="btn btn-white btn-lg">Get started →</a>
+  </div>
+</div>
+
+<script src="nav.js"></script>
+</body>
+</html>

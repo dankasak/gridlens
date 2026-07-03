@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Docs — Grid Lens</title>
+  <meta name="description" content="How to install and configure Grid Lens in Home Assistant.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<section style="padding: 3rem 0 1rem">
+  <div class="container">
+    <div class="docs-layout">
+
+      <!-- Sidebar -->
+      <nav class="docs-nav">
+        <div class="section-title">Getting started</div>
+        <ul>
+          <li><a href="#prerequisites">Prerequisites</a></li>
+          <li><a href="#install">Install the App</a></li>
+          <li><a href="#configure">Configure</a></li>
+          <li><a href="#dashboard">View the dashboard</a></li>
+        </ul>
+        <div class="section-title">Reference</div>
+        <ul>
+          <li><a href="#sensors">Required sensors</a></li>
+          <li><a href="#deferrable">Deferrable loads</a></li>
+          <li><a href="#api-key">API key</a></li>
+          <li><a href="#troubleshoot">Troubleshooting</a></li>
+        </ul>
+      </nav>
+
+      <!-- Content -->
+      <div class="docs-content">
+
+        <h2 id="prerequisites">Prerequisites</h2>
+        <p>Grid Lens requires Home Assistant 2024.1 or later with the following already working:</p>
+        <ul>
+          <li>The <a href="https://www.home-assistant.io/dashboards/energy/" target="_blank">Energy dashboard</a> configured with at least grid consumption sensors</li>
+          <li>Your electricity retailer and current plan details (tariff rates, peak/off-peak times)</li>
+        </ul>
+        <p>Solar, battery, and EV sensors are optional but unlock more accurate modelling.</p>
+        <div class="note">
+          <strong>Note:</strong> Grid Lens works with any HA-compatible energy sensor. You don't need a specific inverter or meter brand.
+        </div>
+
+        <h2 id="install">Install the App</h2>
+        <h3>Via HACS (recommended)</h3>
+        <p>Add the Grid Lens repository to HACS as a custom repository:</p>
+        <ol style="margin: 0.75rem 0 1rem 1.5rem; font-size: 0.93rem; color: #333;">
+          <li style="margin-bottom: 0.5rem">Open HACS → Integrations → ⋮ menu → Custom repositories</li>
+          <li style="margin-bottom: 0.5rem">Add <code>https://github.com/dankasak/gridlens</code> with category <strong>Integration</strong></li>
+          <li style="margin-bottom: 0.5rem">Search for "Grid Lens" and install</li>
+          <li>Restart Home Assistant</li>
+        </ol>
+
+        <h3>Manual install</h3>
+        <p>Copy the <code>custom_components/grid_lens</code> folder from the <a href="https://github.com/dankasak/gridlens" target="_blank">GitHub repo</a> into your HA <code>config/custom_components/</code> directory, then restart.</p>
+
+        <h2 id="configure">Configure</h2>
+        <p>After restarting, go to <strong>Settings → Devices &amp; Services → Add Integration</strong> and search for <strong>Grid Lens</strong>.</p>
+        <p>The setup wizard will ask you to:</p>
+        <ol style="margin: 0.75rem 0 1rem 1.5rem; font-size: 0.93rem; color: #333;">
+          <li style="margin-bottom: 0.5rem">Select your energy sensors (grid import, grid export, solar production, battery)</li>
+          <li style="margin-bottom: 0.5rem">Enter your current electricity plan details</li>
+          <li style="margin-bottom: 0.5rem">Optionally subscribe for access to all plans</li>
+        </ol>
+        <div class="note">
+          <strong>Free plan:</strong> You can skip the subscription step and model your current plan at no cost.
+        </div>
+
+        <h2 id="dashboard">View the dashboard</h2>
+        <p>Grid Lens adds a <strong>Grid Lens</strong> dashboard to your Home Assistant sidebar automatically. It shows:</p>
+        <ul>
+          <li>Cost comparison across all modelled plans for a selected date range</li>
+          <li>Hour-by-hour optimal usage profile for each plan</li>
+          <li>Battery state-of-charge curves</li>
+          <li>Deferrable load scheduling recommendations</li>
+          <li>Estimated bill for the period</li>
+        </ul>
+
+        <h2 id="sensors">Required sensors</h2>
+        <p>Grid Lens needs at least one of the following entity types, already configured in your Energy dashboard:</p>
+        <table class="compare-table">
+          <thead><tr><th>Sensor type</th><th>Required?</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>Grid consumption (kWh)</td><td class="check">Required</td><td>Total energy drawn from grid</td></tr>
+            <tr><td>Grid export (kWh)</td><td>Optional</td><td>Needed for feed-in tariff modelling</td></tr>
+            <tr><td>Solar production (kWh)</td><td>Optional</td><td>Enables solar self-consumption analysis</td></tr>
+            <tr><td>Battery charge / discharge (kWh)</td><td>Optional</td><td>Enables battery optimisation</td></tr>
+            <tr><td>EV / deferrable load (kWh)</td><td>Optional</td><td>Enables load-shifting recommendations</td></tr>
+          </tbody>
+        </table>
+
+        <h2 id="deferrable">Deferrable loads</h2>
+        <p>A deferrable load is electricity usage you can shift to a cheaper time of day — for example an EV charger, pool pump, or hot water system.</p>
+        <p>To include a deferrable load in the optimisation, you need a sensor that measures its consumption. Grid Lens will model what each plan would cost if you shifted that load to its cheapest window.</p>
+        <p>Configure deferrable loads under <strong>Settings → Devices &amp; Services → Grid Lens → Configure</strong> after setup.</p>
+
+        <h2 id="api-key">API key</h2>
+        <p>The free plan requires no API key — Grid Lens registers your installation automatically and grants access to model your current plan.</p>
+        <p>A Pro subscription ($1/month) gives you an API key that unlocks all available plans. If you subscribe outside of the HA setup flow, enter your key under <strong>Grid Lens → Configure → Update API Key</strong>.</p>
+
+        <h2 id="troubleshoot">Troubleshooting</h2>
+        <h3>Integration not appearing after install</h3>
+        <p>Ensure you fully restarted Home Assistant (not just reloaded). Custom integrations require a full restart to register.</p>
+
+        <h3>Sensor not found during setup</h3>
+        <p>Make sure your energy sensors appear in the <a href="https://www.home-assistant.io/dashboards/energy/" target="_blank">Energy dashboard</a> first. Grid Lens reads from the same sensor list.</p>
+
+        <h3>Optimiser returns no results</h3>
+        <p>Grid Lens needs at least 24 hours of sensor history to run the LP optimiser. If you've just set it up, check back the following day.</p>
+
+        <h3>Enable debug logging</h3>
+        <p>Add to your <code>configuration.yaml</code>:</p>
+        <pre><code>logger:
+  logs:
+    custom_components.grid_lens: debug</code></pre>
+        <p>Then check <strong>Settings → System → Logs</strong> for <code>grid_lens</code> entries.</p>
+
+        <p style="margin-top: 2rem">Still stuck? Email <a href="mailto:support@gridlens.au">support@gridlens.au</a>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script src="nav.js"></script>
+</body>
+</html>
