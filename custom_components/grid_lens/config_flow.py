@@ -30,6 +30,7 @@ from .const import (
     CONF_BATTERY_EFFICIENCY,
     CONF_BATTERY_SOC_SENSOR,
     CONF_BATTERY_CHARGE_POWER_SENSOR,
+    CONF_BATTERY_DISCHARGE_POWER_SENSOR,
     CONF_BATTERY_MIN_SOC,
     CONF_BATTERY_MAX_SOC,
     CONF_DEFERRABLE_LOAD_SENSORS,
@@ -506,6 +507,11 @@ def _battery_schema(defaults: dict) -> vol.Schema:
         schema_dict[vol.Optional(CONF_BATTERY_CHARGE_POWER_SENSOR, default=defaults[CONF_BATTERY_CHARGE_POWER_SENSOR])] = entity_sel()
     else:
         schema_dict[vol.Optional(CONF_BATTERY_CHARGE_POWER_SENSOR)] = entity_sel()
+
+    if defaults.get(CONF_BATTERY_DISCHARGE_POWER_SENSOR):
+        schema_dict[vol.Optional(CONF_BATTERY_DISCHARGE_POWER_SENSOR, default=defaults[CONF_BATTERY_DISCHARGE_POWER_SENSOR])] = entity_sel()
+    else:
+        schema_dict[vol.Optional(CONF_BATTERY_DISCHARGE_POWER_SENSOR)] = entity_sel()
 
     return vol.Schema(schema_dict)
 

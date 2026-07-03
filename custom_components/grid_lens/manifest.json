@@ -4,7 +4,7 @@
   "codeowners": [],
   "config_flow": true,
   "dependencies": ["recorder"],
-  "documentation": "https://github.com/yourusername/electricity-plan-comparison",
+  "documentation": "https://github.com/dankasak/gridlens",
   "integration_type": "service",
   "iot_class": "cloud_polling",
   "requirements": ["requests>=2.31.0", "pulp>=2.7.0", "highspy>=1.7.0"],
