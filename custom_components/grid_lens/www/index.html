@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Grid Lens</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #111827;
+      color: #f3f4f6;
+      min-height: 100vh;
+      padding: 16px;
+    }
+
+    h1 { font-size: 22px; font-weight: 600; margin-bottom: 4px; }
+    .subtitle { font-size: 13px; color: #9ca3af; margin-bottom: 14px; }
+
+    /* ── Date filter ─────────────────────────────────────────────────── */
+    .date-filter {
+      background: #1f2937;
+      border: 1px solid #374151;
+      border-radius: 10px;
+      padding: 12px 16px;
+      margin-bottom: 20px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: flex-end;
+    }
+    .date-filter-group { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+    .date-label {
+      display: flex; flex-direction: column; gap: 4px;
+      font-size: 11px; color: #9ca3af; font-weight: 500;
+    }
+    .date-label input[type="date"] {
+      background: #374151;
+      border: 1px solid #4b5563;
+      border-radius: 6px;
+      color: #f3f4f6;
+      padding: 7px 10px;
+      font-size: 13px;
+      font-family: inherit;
+      cursor: pointer;
+      outline: none;
+    }
+    .date-label input[type="date"]:focus { border-color: #3b82f6; }
+    .date-label input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.7); cursor: pointer; }
+    .btn {
+      padding: 8px 16px; border: none; border-radius: 6px;
+      font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit;
+    }
+    .btn-primary { background: #3b82f6; color: #fff; }
+    .btn-primary:hover { background: #2563eb; }
+    .btn-primary:disabled { background: #1e40af; opacity: 0.6; cursor: not-allowed; }
+    .btn-secondary { background: #374151; color: #d1d5db; font-weight: 400; }
+    .btn-secondary:hover { background: #4b5563; }
+    .quick-btns { display: flex; gap: 6px; flex-wrap: wrap; align-items: flex-end; }
+    .quick-btns .btn { padding: 6px 12px; font-size: 12px; }
+    .divider {
+      width: 1px; background: #374151; margin: 0 4px; align-self: stretch;
+      display: none;
+    }
+    @media (min-width: 600px) { .divider { display: block; } }
+    .calc-status { font-size: 12px; color: #9ca3af; align-self: center; }
+
+    /* ── Plan grid ───────────────────────────────────────────────────── */
+    .plan-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 16px;
+    }
+
+    .plan-card {
+      background: #1f2937;
+      border-radius: 10px;
+      padding: 16px;
+      border: 1px solid #374151;
+    }
+    .plan-card.current {
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 1px #3b82f6;
+    }
+
+    .badge {
+      display: inline-block;
+      background: #3b82f6;
+      color: #fff;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 99px;
+      margin-bottom: 6px;
+      letter-spacing: 0.5px;
+    }
+
+    .plan-name { font-size: 15px; font-weight: 600; margin-bottom: 10px; }
+
+    .cost-box {
+      background: #3b82f6;
+      border-radius: 8px;
+      padding: 14px;
+      text-align: center;
+      margin-bottom: 12px;
+    }
+    .cost-box.cheaper { background: #059669; }
+    .cost-box.costlier { background: #dc2626; }
+    .cost-amount { font-size: 30px; font-weight: 700; }
+    .cost-label { font-size: 11px; opacity: 0.9; margin-top: 3px; }
+
+    /* ── Bill breakdown ──────────────────────────────────────────────── */
+    .breakdown { font-size: 12px; color: #d1d5db; margin-bottom: 12px; }
+    .breakdown-row {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      padding: 5px 0;
+      border-bottom: 1px solid #374151;
+    }
+    .breakdown-row:last-child { border-bottom: none; }
+    .breakdown-label { color: #9ca3af; flex: 1; }
+    .breakdown-value { text-align: right; white-space: nowrap; margin-left: 8px; }
+    .bill-section-head {
+      font-size: 10px; font-weight: 700; letter-spacing: 0.8px;
+      text-transform: uppercase; color: #6b7280; padding: 8px 0 2px;
+    }
+    .bill-total-row {
+      display: flex; justify-content: space-between;
+      padding: 8px 0 4px; border-top: 2px solid #4b5563;
+      font-size: 13px; font-weight: 700; color: #f9fafb;
+    }
+    .bill-gst-row {
+      display: flex; justify-content: space-between;
+      padding: 2px 0; font-size: 11px; color: #6b7280;
+    }
+    .bill-fit { color: #10b981; }
+    .bill-note { font-size: 10px; color: #f59e0b; font-style: italic; padding: 4px 0; }
+
+    /* ── Charts ──────────────────────────────────────────────────────── */
+    .chart-label { font-size: 11px; color: #9ca3af; margin-bottom: 3px; margin-top: 10px; }
+    .chart-wrap { background: #111827; border-radius: 6px; padding: 6px 4px 2px; margin-bottom: 2px; }
+    svg.chart { display: block; width: 100%; overflow: visible; }
+
+    .hour-labels {
+      display: flex; justify-content: space-between;
+      font-size: 9px; color: #6b7280; margin-top: 2px;
+    }
+
+    .loading, .error {
+      text-align: center; padding: 60px; color: #9ca3af; font-size: 14px;
+    }
+    .error { color: #f87171; }
+
+    .legend { display: flex; gap: 14px; font-size: 11px; color: #9ca3af; margin-bottom: 4px; }
+    .legend span { display: flex; align-items: center; gap: 4px; }
+    .dot { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+  </style>
+</head>
+<body>
+
+<h1>Grid Lens</h1>
+<div class="subtitle" id="subtitle">Loading…</div>
+
+<div class="date-filter">
+  <div class="date-filter-group">
+    <label class="date-label">
+      From
+      <input type="date" id="start-date">
+    </label>
+    <label class="date-label">
+      To
+      <input type="date" id="end-date">
+    </label>
+    <button class="btn btn-primary" id="apply-btn" onclick="applyDates()">Calculate</button>
+  </div>
+  <div class="divider"></div>
+  <div class="quick-btns">
+    <button class="btn btn-secondary" onclick="quickRange(7)">Last 7 days</button>
+    <button class="btn btn-secondary" onclick="quickRange(30)">Last 30 days</button>
+    <button class="btn btn-secondary" onclick="quickRange(60)">Last 60 days</button>
+    <button class="btn btn-secondary" onclick="quickRange(90)">Last 90 days</button>
+  </div>
+  <span class="calc-status" id="calc-status"></span>
+</div>
+
+<div id="app"><div class="loading">Fetching plan data…</div></div>
+
+<script>
+const API = '/api/grid_lens/plan_data';
+
+// Track the currently-displayed params so auto-refresh uses the same range
+let currentParams = '';
+let refreshTimer = null;
+
+function fmt(n) { return '$' + (n || 0).toFixed(2); }
+
+function dateStr(d) {
+  // Returns YYYY-MM-DD in local time
+  return d.toLocaleDateString('sv-SE'); // sv-SE locale gives ISO date format
+}
+
+function initDates() {
+  const today = new Date();
+  const thirtyAgo = new Date(today);
+  thirtyAgo.setDate(thirtyAgo.getDate() - 30);
+  document.getElementById('end-date').value = dateStr(today);
+  document.getElementById('start-date').value = dateStr(thirtyAgo);
+}
+
+function quickRange(days) {
+  const today = new Date();
+  const from = new Date(today);
+  from.setDate(from.getDate() - days);
+  document.getElementById('end-date').value = dateStr(today);
+  document.getElementById('start-date').value = dateStr(from);
+  applyDates();
+}
+
+async function applyDates() {
+  const start = document.getElementById('start-date').value;
+  const end = document.getElementById('end-date').value;
+  if (!start || !end) return;
+  if (start > end) {
+    alert('Start date must be before end date.');
+    return;
+  }
+  const params = 'start_date=' + start + 'T00%3A00%3A00&end_date=' + end + 'T23%3A59%3A59';
+  await load(params);
+}
+
+function setCalcState(busy, msg) {
+  const btn = document.getElementById('apply-btn');
+  const status = document.getElementById('calc-status');
+  btn.disabled = busy;
+  btn.textContent = busy ? 'Calculating…' : 'Calculate';
+  status.textContent = msg || '';
+}
+
+// ── Charts ────────────────────────────────────────────────────────────
+
+function divergingChart(profile, upKey, downKey, upColor, downColor) {
+  const W = 288, H = 72, BAR = 11, GAP = 1, MID = 34;
+  const maxV = Math.max(...profile.map(s => Math.max(s[upKey] || 0, s[downKey] || 0)), 0.001);
+  const sc = (MID - 3) / maxV;
+  let bars = '';
+  profile.forEach((slot, i) => {
+    const x = i * (BAR + GAP);
+    const uh = Math.min(Math.max((slot[upKey] || 0) * sc, 0), MID - 3);
+    const dh = Math.min(Math.max((slot[downKey] || 0) * sc, 0), H - MID - 3);
+    if (uh > 0.3) bars += `<rect x="${x}" y="${MID - uh}" width="${BAR}" height="${uh}" fill="${upColor}" opacity="0.85"><title>${slot.hour}:00  ${(slot[upKey]||0).toFixed(4)}</title></rect>`;
+    if (dh > 0.3) bars += `<rect x="${x}" y="${MID}" width="${BAR}" height="${dh}" fill="${downColor}" opacity="0.85"><title>${slot.hour}:00  ${(slot[downKey]||0).toFixed(4)}</title></rect>`;
+  });
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" height="${H}">
+    <line x1="0" y1="${MID}" x2="${W}" y2="${MID}" stroke="#374151" stroke-width="0.8"/>
+    ${bars}
+  </svg>`;
+}
+
+function hourLabels() {
+  return `<div class="hour-labels">
+    <span>12am</span><span>3am</span><span>6am</span><span>9am</span><span>noon</span><span>3pm</span><span>6pm</span><span>9pm</span><span>11pm</span>
+  </div>`;
+}
+
+function socLineChart(profile) {
+  const W = 288, H = 60, PAD = 4;
+  const vals = profile.map(s => s.soc_percent || 0);
+  const hasData = vals.some(v => v > 0);
+  if (!hasData) return '<svg class="chart" viewBox="0 0 288 60" height="60"><text x="10" y="30" fill="#6b7280" font-size="10">No SOC data</text></svg>';
+  const BAR = 11, GAP = 1;
+  const sc = (H - PAD * 2) / 100;
+  let bars = '';
+  profile.forEach((slot, i) => {
+    const x = i * (BAR + GAP);
+    const h = Math.max((slot.soc_percent || 0) * sc, 0.5);
+    const y = H - PAD - h;
+    bars += `<rect x="${x}" y="${y}" width="${BAR}" height="${h}" fill="#a78bfa" opacity="0.8"><title>${slot.hour}:00  SOC: ${(slot.soc_percent||0).toFixed(1)}%</title></rect>`;
+  });
+  // 20% and 80% reference lines
+  const y80 = H - PAD - 80 * sc;
+  const y20 = H - PAD - 20 * sc;
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" height="${H}">
+    <line x1="0" y1="${y80}" x2="${W}" y2="${y80}" stroke="#374151" stroke-width="0.6" stroke-dasharray="3,2"/>
+    <line x1="0" y1="${y20}" x2="${W}" y2="${y20}" stroke="#374151" stroke-width="0.6" stroke-dasharray="3,2"/>
+    <text x="2" y="${y80 - 2}" fill="#6b7280" font-size="7">80%</text>
+    <text x="2" y="${y20 - 2}" fill="#6b7280" font-size="7">20%</text>
+    ${bars}
+  </svg>`;
+}
+
+// ── Bill breakdown ────────────────────────────────────────────────────
+
+function renderBreakdown(bd, days) {
+  const bi = bd.bill_items;
+  if (!bi) {
+    // Fallback: old format without bill_items
+    let rows = '';
+    if (bd.energy_cost !== undefined)
+      rows += `<div class="breakdown-row"><span class="breakdown-label">Energy cost</span><span class="breakdown-value">${fmt(bd.energy_cost)}</span></div>`;
+    if (bd.supply_charge)
+      rows += `<div class="breakdown-row"><span class="breakdown-label">Supply charge</span><span class="breakdown-value">${fmt(bd.supply_charge)}</span></div>`;
+    rows += `<div class="bill-total-row"><span>Total (${days} days)</span><span>${fmt(bd.total)}</span></div>`;
+    if (bd.note) rows += `<div class="bill-note">${bd.note}</div>`;
+    return `<div class="breakdown">${rows}</div>`;
+  }
+
+  let html = '<div class="breakdown">';
+
+  // Energy charges
+  html += '<div class="bill-section-head">Energy charges</div>';
+  bi.energy_lines.forEach(line => {
+    html += `<div class="breakdown-row">
+      <span class="breakdown-label">${line.label}<br>
+        <small>${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh</small>
+      </span>
+      <span class="breakdown-value">${fmt(line.amount)}</span>
+    </div>`;
+  });
+
+  // Daily supply charge
+  const s = bi.supply;
+  html += '<div class="bill-section-head">Daily supply charge</div>';
+  html += `<div class="breakdown-row">
+    <span class="breakdown-label">Supply charge<br>
+      <small>${(s.rate_per_day * 100).toFixed(2)}&thinsp;c/day &times; ${s.days}&thinsp;days</small>
+    </span>
+    <span class="breakdown-value">${fmt(s.amount)}</span>
+  </div>`;
+
+  // Feed-in credit
+  const f = bi.fit;
+  if (f.kwh > 0) {
+    html += '<div class="bill-section-head bill-fit">Feed-in credit</div>';
+    html += `<div class="breakdown-row bill-fit">
+      <span class="breakdown-label" style="color:#10b981">Feed-in tariff<br>
+        <small>${f.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${f.kwh.toFixed(1)}&thinsp;kWh</small>
+      </span>
+      <span class="breakdown-value">&minus;${fmt(f.credit)}</span>
+    </div>`;
+  }
+
+  // PEA (Price Efficiency Adjustment — Flow Power)
+  if (bi.pea_credit || bi.pea_breakdown) {
+    const pb = bi.pea_breakdown;
+    html += '<div class="bill-section-head bill-fit">Other credits</div>';
+    if (pb) {
+      const creditSign = bi.pea_credit >= 0 ? '&minus;' : '+';
+      const creditAbs = Math.abs(bi.pea_credit);
+      html += `<div class="breakdown-row bill-fit">
+        <span class="breakdown-label" style="color:#10b981">Price Efficiency Adjustment<br>
+          <small>
+            LWAP ${pb.lwap_c.toFixed(3)}c &minus; TWAP ${pb.twap_c.toFixed(3)}c
+            = CPEA ${pb.cpea_c.toFixed(3)}c<br>
+            PEA = CPEA &minus; BPEA ${pb.bpea_c.toFixed(1)}c
+            = <strong>${pb.pea_c.toFixed(3)}c/kWh</strong>
+            &times; ${pb.total_kwh.toFixed(1)}&thinsp;kWh
+          </small>
+        </span>
+        <span class="breakdown-value">${creditSign}${fmt(creditAbs)}</span>
+      </div>`;
+    } else {
+      html += `<div class="breakdown-row bill-fit">
+        <span class="breakdown-label" style="color:#10b981">Price Efficiency Adjustment<br>
+          <small>Estimated — actual amount varies</small>
+        </span>
+        <span class="breakdown-value">&minus;${fmt(bi.pea_credit)}</span>
+      </div>`;
+    }
+  }
+
+  // Total + GST
+  html += `<div class="bill-total-row">
+    <span>Total (inc. GST)</span><span>${fmt(bi.total)}</span>
+  </div>`;
+  html += `<div class="bill-gst-row">
+    <span>GST included (1/11)</span><span>${fmt(bi.gst_included)}</span>
+  </div>`;
+
+  if (bi.optimisation_note) {
+    html += `<div class="bill-note">${bi.optimisation_note}</div>`;
+  }
+
+  html += '</div>';
+  return html;
+}
+
+// ── Main load ─────────────────────────────────────────────────────────
+
+async function load(params) {
+  // params is an optional query string; when omitted use the last-used params
+  if (params !== undefined) currentParams = params;
+
+  const isFresh = params !== undefined; // user-triggered, not auto-refresh
+  if (isFresh) {
+    setCalcState(true, '');
+    document.getElementById('app').innerHTML =
+      '<div class="loading">Calculating — this takes a few seconds…</div>';
+  }
+
+  try {
+    const url = currentParams ? API + '?' + currentParams : API;
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('API returned ' + resp.status);
+    const data = await resp.json();
+
+    const currentName = data.current_plan_name;
+    const amberTotal = data.amber_total || 0;
+    const days = data.usage_days || 30;
+    const start = data.start_date ? data.start_date.slice(0, 10) : '';
+    const end = data.end_date ? data.end_date.slice(0, 10) : '';
+
+    document.getElementById('subtitle').textContent =
+      `${days}-day period · ${start} → ${end} · current plan: ${currentName || 'unknown'}`;
+
+    if (isFresh) setCalcState(false, 'Updated ' + new Date().toLocaleTimeString());
+
+    const plans = Object.entries(data.plan_details || {});
+    plans.sort(([nA, dA], [nB, dB]) => {
+      if (nA === currentName) return -1;
+      if (nB === currentName) return 1;
+      return (dA.breakdown?.total || 0) - (dB.breakdown?.total || 0);
+    });
+
+    let html = '<div class="plan-grid">';
+    plans.forEach(([name, details]) => {
+      const bd = details.breakdown || {};
+      const isCurrent = name === currentName;
+      const savings = (bd.total || 0) - amberTotal;
+      const cheaper = savings < -0.05;
+      const boxClass = isCurrent ? '' : cheaper ? ' cheaper' : ' costlier';
+      const label = isCurrent ? 'YOUR CURRENT PLAN'
+        : cheaper ? `SAVE ${fmt(Math.abs(savings))} over ${days} days`
+        : `COSTS ${fmt(savings)} more over ${days} days`;
+
+      const profile = details.hourly_profile || [];
+      let charts = '';
+      if (profile.length === 24) {
+        const maxK = Math.max(...profile.map(s => Math.max(s.import_kwh||0, s.export_kwh||0)), 0.001);
+        const maxC = Math.max(...profile.map(s => Math.max(s.import_cost||0, s.export_income||0)), 0.0001);
+        charts = `
+          <div class="legend">
+            <span><i class="dot" style="background:#3b82f6"></i> buying ↑</span>
+            <span><i class="dot" style="background:#10b981"></i> selling ↓</span>
+          </div>
+          <div class="chart-label">Average hourly energy (kWh)</div>
+          <div class="chart-wrap">${divergingChart(profile, 'import_kwh', 'export_kwh', '#3b82f6', '#10b981')}</div>
+          <div class="legend" style="margin-top:8px">
+            <span><i class="dot" style="background:#ef4444"></i> spend ↑</span>
+            <span><i class="dot" style="background:#14b8a6"></i> income ↓</span>
+          </div>
+          <div class="chart-label">Average hourly cost ($)</div>
+          <div class="chart-wrap">${divergingChart(profile, 'import_cost', 'export_income', '#ef4444', '#14b8a6')}</div>
+          <div class="legend" style="margin-top:8px">
+            <span><i class="dot" style="background:#f59e0b"></i> charge ↑</span>
+            <span><i class="dot" style="background:#f97316"></i> discharge ↓</span>
+          </div>
+          <div class="chart-label">Battery charge / discharge (kWh)</div>
+          <div class="chart-wrap">${divergingChart(profile, 'charge_kwh', 'discharge_kwh', '#f59e0b', '#f97316')}</div>
+          <div class="legend" style="margin-top:8px">
+            <span><i class="dot" style="background:#a78bfa"></i> battery SOC%</span>
+            <span style="color:#6b7280;font-size:10px">-- 20% / 80% limits</span>
+          </div>
+          <div class="chart-label">Battery state of charge (%)</div>
+          <div class="chart-wrap">${socLineChart(profile)}</div>
+          ${hourLabels()}`;
+      }
+
+      html += `<div class="plan-card${isCurrent ? ' current' : ''}">
+        ${isCurrent ? '<div class="badge">YOUR CURRENT PLAN</div>' : ''}
+        <div class="plan-name">${name}</div>
+        <div class="cost-box${boxClass}">
+          <div class="cost-amount">${fmt(bd.total)}</div>
+          <div class="cost-label">${label}</div>
+        </div>
+        ${renderBreakdown(bd, days)}
+        ${charts}
+      </div>`;
+    });
+    html += '</div>';
+    document.getElementById('app').innerHTML = html;
+
+  } catch (e) {
+    if (isFresh) setCalcState(false, '');
+    document.getElementById('app').innerHTML = `<div class="error">Error: ${e.message}</div>`;
+  }
+}
+
+// ── Init ──────────────────────────────────────────────────────────────
+
+initDates();
+load();
+
+// Auto-refresh every 5 minutes using whatever date range is currently shown
+setInterval(() => load(), 5 * 60 * 1000);
+</script>
+</body>
+</html>

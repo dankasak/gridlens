@@ -1,0 +1,10 @@
+build_from:
+  amd64: ghcr.io/home-assistant/amd64-base-python:3.12
+  aarch64: ghcr.io/home-assistant/aarch64-base-python:3.12
+  armv7: ghcr.io/home-assistant/armv7-base-python:3.12
+
+labels:
+  org.opencontainers.image.title: "Grid Lens"
+  org.opencontainers.image.description: "Electricity plan comparison and battery optimisation"
+  org.opencontainers.image.source: "https://github.com/yourusername/gridlens-addon"
+  org.opencontainers.image.licenses: "MIT"

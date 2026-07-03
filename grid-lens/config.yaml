@@ -1,0 +1,40 @@
+name: Grid Lens
+slug: grid_lens
+version: "1.0.0"
+description: "Real-time electricity plan comparison and battery optimisation for Australian households"
+url: https://github.com/yourusername/gridlens-addon
+arch:
+  - amd64
+  - aarch64
+  - armv7
+startup: application
+boot: auto
+init: false
+
+# Use the HA MariaDB add-on for storage (user must have it installed)
+services:
+  - mysql
+
+ports:
+  8000/tcp: 8000
+ports_description:
+  8000/tcp: "Grid Lens API"
+
+options:
+  admin_token: ""
+  stripe_secret_key: ""
+  stripe_webhook_secret: ""
+  stripe_price_id: ""
+  timescaledb_url: ""
+  log_level: "info"
+
+schema:
+  admin_token: str
+  stripe_secret_key: str
+  stripe_webhook_secret: str
+  stripe_price_id: str
+  timescaledb_url: str
+  log_level: list(debug|info|warning|error)
+
+# Pre-built image from GitHub Container Registry (set on release)
+image: ghcr.io/yourusername/gridlens-addon/grid-lens-{arch}

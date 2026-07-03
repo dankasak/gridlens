@@ -1,0 +1,18 @@
+calculate_period:
+  name: Calculate Plan Data for Period
+  description: Calculate and populate all plan sensors for a specified date range. This will run optimization for each plan and create hourly data you can graph.
+  fields:
+    start_date:
+      name: Start Date
+      description: Beginning of calculation period (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)
+      required: true
+      example: "2026-01-01"
+      selector:
+        text:
+    end_date:
+      name: End Date
+      description: End of calculation period (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)
+      required: true
+      example: "2026-01-31"
+      selector:
+        text:

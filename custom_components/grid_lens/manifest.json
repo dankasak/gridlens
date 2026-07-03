@@ -1,0 +1,12 @@
+{
+  "domain": "grid_lens",
+  "name": "Grid Lens",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["recorder"],
+  "documentation": "https://github.com/yourusername/electricity-plan-comparison",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "requirements": ["requests>=2.31.0", "pulp>=2.7.0", "highspy>=1.7.0"],
+  "version": "3.0.2"
+}
