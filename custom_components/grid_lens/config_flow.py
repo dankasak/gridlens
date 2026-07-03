@@ -441,7 +441,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     resp = await session.get(
                         f"{self._api_url}/plans/meta",
                         params={"state": self._state},
-                        headers={"X-API-Key": api_key},
+                        headers={"X-API-Key": api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
                         timeout=aiohttp.ClientTimeout(total=10),
                     )
                     if resp.status == 200:
@@ -654,12 +654,26 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
 
     async def async_step_current_plan(self, user_input=None):
         """Choose which plan the user is currently on."""
-        from .retailer_plans import get_all_plans
-        plan_options = [
-            {"value": f"{p.retailer} - {p.plan_name}", "label": f"{p.retailer} - {p.plan_name}"}
-            for p in get_all_plans()
-        ]
+        import aiohttp
         entry_data = self._config_entry.data
+        api_url = entry_data.get(CONF_GRIDLENS_API_URL, GRIDLENS_DEFAULT_API_URL)
+        state = entry_data.get(CONF_STATE, "NSW")
+        plan_options = []
+        try:
+            async with aiohttp.ClientSession() as _s:
+                async with _s.get(
+                    f"{api_url}/plans/list",
+                    params={"state": state},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as _r:
+                    if _r.status == 200:
+                        plan_meta = await _r.json()
+                        plan_options = [
+                            {"value": p["id"], "label": f"{p['retailer']} - {p['name']}"}
+                            for p in plan_meta
+                        ]
+        except Exception:
+            pass
 
         if user_input is not None:
             self._sensor_data = {**self._sensor_data, **user_input}
@@ -696,7 +710,7 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                         resp = await session.get(
                             f"{api_url}/plans/meta",
                             params={"state": entry_data.get(CONF_STATE)},
-                            headers={"X-API-Key": new_key},
+                            headers={"X-API-Key": new_key, "User-Agent": "GridLens-HA-Integration/1.0"},
                             timeout=aiohttp.ClientTimeout(total=10),
                         )
                         if resp.status != 200:

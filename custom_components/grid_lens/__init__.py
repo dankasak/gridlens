@@ -6,7 +6,9 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+import aiohttp
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import DOMAIN, PLAN_ID_TO_KEY
 
@@ -236,15 +238,15 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                         status=400
                     )
 
-            domain_data = self.hass.data.get(DOMAIN, {})
-            if not domain_data:
+            entries = self.hass.config_entries.async_entries(DOMAIN)
+            if not entries:
                 return web.Response(
                     text=json.dumps({'error': 'Integration not loaded'}),
                     content_type='application/json',
                     status=404
                 )
 
-            coordinator = next(iter(domain_data.values()), None)
+            coordinator = self.hass.data.get(DOMAIN, {}).get(entries[0].entry_id)
             if not coordinator:
                 return web.Response(
                     text=json.dumps({'error': 'No coordinator'}),
@@ -254,11 +256,29 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
             # Custom date range: recalculate on-the-fly and return directly.
             if start_date or end_date:
+                import aiohttp as _aiohttp
                 from .plan_calculator import PlanCalculator
+                from .const import CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL, CONF_STATE
                 from homeassistant.helpers.storage import Store
-                entry_id = next(iter(domain_data.keys()))
-                entry_obj = self.hass.config_entries.async_get_entry(entry_id)
+                entries = self.hass.config_entries.async_entries(DOMAIN)
+                entry_obj = entries[0] if entries else None
+                if not entry_obj:
+                    return web.Response(text=json.dumps({'error': 'No entry'}), content_type='application/json', status=404)
+                _api_key = entry_obj.data.get(CONF_GRIDLENS_API_KEY, "")
+                _api_url = entry_obj.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
+                _state   = entry_obj.data.get(CONF_STATE, "NSW")
+                _plan_data: dict = {}
+                try:
+                    _sess = async_get_clientsession(self.hass)
+                    async with _sess.get(f"{_api_url}/plans", params={"state": _state},
+                                         headers={"X-API-Key": _api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
+                                         timeout=_aiohttp.ClientTimeout(total=15)) as _r:
+                        if _r.status == 200:
+                            _plan_data = (await _r.json()).get("plans", {})
+                except Exception as _exc:
+                    _LOGGER.warning("plan-rates: could not fetch plan data: %s", _exc)
                 calculator = PlanCalculator(self.hass, entry_obj)
+                calculator.plan_data = _plan_data
 
                 # Derive which plan the user was actually on at start_date from change history.
                 if start_date:
@@ -403,8 +423,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             import io, json, zipfile
             from datetime import datetime as _dt
 
-            domain_data = self.hass.data.get(DOMAIN, {})
-            coordinator = next(iter(domain_data.values()), None) if domain_data else None
+            entries = self.hass.config_entries.async_entries(DOMAIN)
+            coordinator = self.hass.data.get(DOMAIN, {}).get(entries[0].entry_id) if entries else None
 
             if not coordinator:
                 return web.Response(
@@ -469,10 +489,11 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 }
                 zf.writestr('config.json', json.dumps(config, indent=2, default=str))
 
-                # All plan rate structures
-                from .retailer_plans import get_all_plans as _get_all_plans
-                plan_rates = [p.get_plan_info() for p in _get_all_plans()]
-                zf.writestr('plan_rates.json', json.dumps(plan_rates, indent=2, default=str))
+                # All plan rate structures (from cached coordinator data, if available)
+                coordinator_data = self.hass.data.get(DOMAIN, {}).get(entry_obj.entry_id)
+                if coordinator_data and hasattr(coordinator_data, 'data') and coordinator_data.data:
+                    plan_rates = coordinator_data.data.get('plan_data', {})
+                    zf.writestr('plan_rates.json', json.dumps(plan_rates, indent=2, default=str))
 
                 # Per-plan costs and savings
                 summary = {
@@ -552,15 +573,14 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             start_date = _parse_date(request.query.get('start_date'))
             end_date   = _parse_date(request.query.get('end_date'))
 
-            domain_data = self.hass.data.get(DOMAIN, {})
-            if not domain_data:
+            entries = self.hass.config_entries.async_entries(DOMAIN)
+            if not entries:
                 return web.Response(
                     text=json.dumps({'error': 'Integration not loaded'}),
                     content_type='application/json', status=404,
                 )
 
-            entry_id  = next(iter(domain_data.keys()))
-            entry_obj = self.hass.config_entries.async_get_entry(entry_id)
+            entry_obj = entries[0]
 
             # Set up SSE stream
             resp = web.StreamResponse(headers={
@@ -578,8 +598,34 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 except Exception:
                     pass  # client disconnected
 
-            from .retailer_plans import get_all_plans as _get_all_plans
-            plans_total = len(list(_get_all_plans()))
+            from .const import CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL, CONF_STATE
+
+            api_key = entry_obj.data.get(CONF_GRIDLENS_API_KEY, "")
+            api_url = entry_obj.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
+            state   = entry_obj.data.get(CONF_STATE, "NSW")
+
+            # Fetch plan data from API — enforces tier (free → locked plan only).
+            _LOGGER.info("Fetching plans from API (state=%s)", state)
+            plan_data: dict = {}
+            try:
+                _session = async_get_clientsession(self.hass)
+                async with _session.get(
+                    f"{api_url}/plans",
+                    params={"state": state},
+                    headers={"X-API-Key": api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as _r:
+                    if _r.status == 200:
+                        _resp = await _r.json()
+                        plan_data = _resp.get("plans", {})
+                        _LOGGER.info("Loaded %d plan(s) from API (tier=%s)", len(plan_data), _resp.get("tier"))
+                    else:
+                        _body = await _r.text()
+                        _LOGGER.warning("API /plans returned %s: %s", _r.status, _body[:200])
+            except Exception as _exc:
+                _LOGGER.warning("Could not fetch plan data from API: %s", _exc)
+
+            plans_total = len(plan_data) or 1
             plans_done  = 0
 
             await send('status', {
@@ -589,18 +635,17 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             })
 
             # Apply plan-history override if available
+            from .plan_calculator import PlanCalculator
+            calculator = PlanCalculator(self.hass, entry_obj)
+            calculator.plan_data = plan_data
+
             if start_date:
                 from homeassistant.helpers.storage import Store
                 hist_store = Store(self.hass, _HISTORY_STORAGE_VERSION, _HISTORY_STORAGE_KEY)
                 hist_data  = await hist_store.async_load() or {"entries": []}
                 hist_plan  = _plan_from_history(hist_data["entries"], start_date)
-                from .plan_calculator import PlanCalculator
-                calculator = PlanCalculator(self.hass, entry_obj)
                 if hist_plan:
                     calculator.current_plan_override = hist_plan
-            else:
-                from .plan_calculator import PlanCalculator
-                calculator = PlanCalculator(self.hass, entry_obj)
 
             async def on_plan_ready(plan_key, detail, meta):
                 nonlocal plans_done
@@ -731,9 +776,34 @@ class GridLensCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self):
         """Fetch data from energy sensors and calculate plan comparisons."""
+        import aiohttp
         from .plan_calculator import PlanCalculator
+        from .const import CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL, CONF_STATE
+
+        api_key = self.entry.data.get(CONF_GRIDLENS_API_KEY, "")
+        api_url = self.entry.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
+        state   = self.entry.data.get(CONF_STATE, "NSW")
+
+        plan_data: dict = {}
+        try:
+            import aiohttp as _aiohttp
+            _session = async_get_clientsession(self.hass)
+            async with _session.get(
+                f"{api_url}/plans",
+                params={"state": state},
+                headers={"X-API-Key": api_key},
+                timeout=_aiohttp.ClientTimeout(total=15),
+            ) as _r:
+                if _r.status == 200:
+                    _resp = await _r.json()
+                    plan_data = _resp.get("plans", {})
+                else:
+                    _LOGGER.warning("Coordinator: API /plans returned %s", _r.status)
+        except Exception as _exc:
+            _LOGGER.warning("Coordinator: could not fetch plan data: %s", _exc)
 
         self.calculator = PlanCalculator(self.hass, self.entry)
+        self.calculator.plan_data = plan_data
         result = await self.calculator.calculate_plan_costs()
         _LOGGER.info(f"Plan calculation complete: {result.get('usage_days', 0)} days")
 

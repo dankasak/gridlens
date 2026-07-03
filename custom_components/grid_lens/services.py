@@ -28,7 +28,6 @@ from .const import (
     METRIC_OPTIMIZATION_NOTES,
 )
 from .plan_calculator import PlanCalculator
-from .retailer_plans import AmberPlan, OVOEVPlan, EnergyAustraliaEVPlan, AGLNightSaverPlan
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -114,24 +113,8 @@ async def _calculate_and_populate_sensors(
     
     _LOGGER.warning(f"Loaded {len(usage_data)} usage records, {len(solar_data)} solar records, {len(export_data)} export records")
     
-    # Initialize plan instances
-    plan_instances = {
-        PLAN_AMBER: AmberPlan(),
-        PLAN_OVO: OVOEVPlan(),
-        PLAN_EA: EnergyAustraliaEVPlan(),
-        PLAN_AGL: AGLNightSaverPlan(),
-    }
-    
-    # Process each plan
-    for plan_id, plan in plan_instances.items():
-        _LOGGER.warning(f"Processing plan: {plan_id}")
-        
-        if plan_id == PLAN_AMBER:
-            # Amber uses actual data
-            await _populate_amber_actual(hass, calculator, plan_id, start_date, end_date, usage_data, solar_data, export_data)
-        else:
-            # Other plans use optimization
-            await _populate_plan_optimized(hass, calculator, plan_id, plan, start_date, end_date, usage_data, solar_data, export_data)
+    _LOGGER.warning("calculate_period service is deprecated — use the Grid Lens dashboard instead")
+    raise HomeAssistantError("calculate_period service is deprecated. Use the Grid Lens dashboard for plan comparisons.")
 
 
 async def _populate_amber_actual(
@@ -186,9 +169,8 @@ async def _populate_amber_actual(
                 hourly_data[hour]["battery_charge"] += record["charge_kwh"]
                 hourly_data[hour]["battery_discharge"] += record["discharge_kwh"]
     
-    # Get actual Amber prices (TODO: implement price matching)
-    # For now, use estimated average rates
-    amber_plan = AmberPlan()
+    # Legacy: estimate prices based on time of day
+    from datetime import datetime as _dt
     
     # Update sensors for each hour
     for hour, data in sorted(hourly_data.items()):

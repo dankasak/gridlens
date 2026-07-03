@@ -11,7 +11,7 @@ from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import statistics_during_period
 
 from .battery_optimizer import BatteryOptimizer
-from .retailer_plans import get_all_plans, create_plan, RetailerPlan
+from .retailer_plans import plans_from_api_data, RetailerPlan
 from .const import (
     CONF_ENERGY_SENSOR,
     CONF_SOLAR_SENSOR,
@@ -48,6 +48,10 @@ class PlanCalculator:
         self.import_price_sensor = entry.data.get(CONF_IMPORT_PRICE_SENSOR)
         self.export_price_sensor = entry.data.get(CONF_EXPORT_PRICE_SENSOR)
         
+        # Plan data fetched from API (plan_id → plan_data dict).
+        # Set by the SSE handler before calling calculate_plan_costs.
+        self.plan_data: dict | None = None
+
         # Battery configuration
         self.has_battery = entry.data.get(CONF_HAS_BATTERY, False)
         self.battery_capacity = entry.data.get(CONF_BATTERY_CAPACITY, 13.5)
@@ -75,6 +79,13 @@ class PlanCalculator:
                 max_soc_percent=self.battery_max_soc,
             )
             _LOGGER.info(f"Battery optimizer initialized: {self.battery_capacity}kWh battery")
+
+    def _get_plans(self) -> list[RetailerPlan]:
+        """Return plan objects from API data. Tier filtering is enforced by the API."""
+        if not self.plan_data:
+            _LOGGER.warning("No plan data loaded from API; calculation will have no plans.")
+            return []
+        return plans_from_api_data(self.plan_data)
 
     async def calculate_plan_costs(
         self,
@@ -222,7 +233,7 @@ class PlanCalculator:
         # PEA calculation for Flow Power (and any future plan with aemo_price_sensor).
         # Fetch AEMO dispatch prices once; compute PEA from actual grid import vs market prices.
         pea_results: dict = {}  # plan_key → pea_result dict
-        for _pea_plan in get_all_plans():
+        for _pea_plan in self._get_plans():
             aemo_sensor = getattr(_pea_plan, 'aemo_price_sensor', None)
             bpea = getattr(_pea_plan, 'bpea', 0.017)
             if not aemo_sensor:
@@ -279,7 +290,7 @@ class PlanCalculator:
         _LOGGER.warning(f"Battery check: has_battery={self.has_battery}, optimizer={bool(self.battery_optimizer)}, solar_data={len(solar_data) if solar_data else 0} records")
 
         all_plans_ordered = sorted(
-            get_all_plans(),
+            self._get_plans(),
             key=lambda p: 0 if f"{p.retailer} - {p.plan_name}" == current_plan_name else 1,
         )
 
@@ -425,7 +436,7 @@ class PlanCalculator:
 
         # Final current-plan total (fallback if current plan not in plan_costs).
         current_supply = (
-            next((p.daily_supply_charge for p in get_all_plans()
+            next((p.daily_supply_charge for p in self._get_plans()
                   if f"{p.retailer} - {p.plan_name}" == current_plan_name), 1.342)
             * actual_days
         )
@@ -446,8 +457,8 @@ class PlanCalculator:
         return {
             "amber_actual_cost": amber_cost,
             "amber_monthly_fee": next(
-                (getattr(p, 'monthly_subscription_fee', 0.0) for p in get_all_plans() if p.retailer == "Amber Electric"),
-                25.0,
+                (p.monthly_subscription_fee for p in self._get_plans() if p.retailer == "Amber Electric"),
+                0.0,
             ),
             "amber_total": amber_total,
             "current_plan_name": current_plan_name,
@@ -1214,11 +1225,14 @@ class PlanCalculator:
 
     def _detect_current_plan(self, days: int) -> tuple:
         """Return (supply_charge, plan_key) for the current plan."""
+        plans = self._get_plans()
+
         # User-configured plan takes priority over auto-detection.
+        # current_plan_override may be a slug ID or a "Retailer - Plan Name" string.
         if self.current_plan_override:
-            for plan in get_all_plans():
+            for plan in plans:
                 plan_key = f"{plan.retailer} - {plan.plan_name}"
-                if plan_key == self.current_plan_override:
+                if plan_key == self.current_plan_override or getattr(plan, 'plan_id', None) == self.current_plan_override:
                     supply = plan.daily_supply_charge * days
                     _LOGGER.info("Current plan (configured): %s (supply $%.2f)", plan_key, supply)
                     return supply, plan_key
@@ -1228,7 +1242,7 @@ class PlanCalculator:
             return 25.00, None
 
         sensor = self.import_price_sensor.lower()
-        for plan in get_all_plans():
+        for plan in plans:
             retailer_slug = plan.retailer.lower().replace(" ", "_")
             if retailer_slug in sensor or plan.retailer.lower().split()[0] in sensor:
                 supply = plan.daily_supply_charge * days
