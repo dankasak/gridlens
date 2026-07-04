@@ -270,7 +270,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 _plan_data: dict = {}
                 try:
                     _sess = async_get_clientsession(self.hass)
-                    async with _sess.get(f"{_api_url}/plans", params={"state": _state},
+                    _current_plan = entry_obj.data.get("current_plan", "")
+                    async with _sess.get(f"{_api_url}/plans",
+                                         params={"state": _state, "current_plan": _current_plan},
                                          headers={"X-API-Key": _api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
                                          timeout=_aiohttp.ClientTimeout(total=15)) as _r:
                         if _r.status == 200:
@@ -611,7 +613,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 _session = async_get_clientsession(self.hass)
                 async with _session.get(
                     f"{api_url}/plans",
-                    params={"state": state},
+                    params={"state": state, "current_plan": entry_obj.data.get("current_plan", "")},
                     headers={"X-API-Key": api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as _r:
@@ -619,6 +621,16 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                         _resp = await _r.json()
                         plan_data = _resp.get("plans", {})
                         _LOGGER.info("Loaded %d plan(s) from API (tier=%s)", len(plan_data), _resp.get("tier"))
+                    elif _r.status == 402:
+                        _body = await _r.text()
+                        _LOGGER.warning("API /plans returned %s: %s", _r.status, _body[:200])
+                        self.hass.components.persistent_notification.async_create(
+                            "Your Grid Lens subscription has ended and the dashboard cannot show plan data. "
+                            "Please resubscribe at **gridlens.au/pricing** or reconfigure the integration "
+                            "to restore your original plan.",
+                            title="Grid Lens: Subscription Ended",
+                            notification_id="grid_lens_subscription_ended",
+                        )
                     else:
                         _body = await _r.text()
                         _LOGGER.warning("API /plans returned %s: %s", _r.status, _body[:200])
@@ -790,13 +802,22 @@ class GridLensCoordinator(DataUpdateCoordinator):
             _session = async_get_clientsession(self.hass)
             async with _session.get(
                 f"{api_url}/plans",
-                params={"state": state},
-                headers={"X-API-Key": api_key},
+                params={"state": state, "current_plan": self.entry.data.get("current_plan", "")},
+                headers={"X-API-Key": api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
                 timeout=_aiohttp.ClientTimeout(total=15),
             ) as _r:
                 if _r.status == 200:
                     _resp = await _r.json()
                     plan_data = _resp.get("plans", {})
+                elif _r.status == 402:
+                    _LOGGER.warning("Coordinator: API /plans returned 402 (subscription ended)")
+                    self.hass.components.persistent_notification.async_create(
+                        "Your Grid Lens subscription has ended and the dashboard cannot show plan data. "
+                        "Please resubscribe at **gridlens.au/pricing** or reconfigure the integration "
+                        "to restore your original plan.",
+                        title="Grid Lens: Subscription Ended",
+                        notification_id="grid_lens_subscription_ended",
+                    )
                 else:
                     _LOGGER.warning("Coordinator: API /plans returned %s", _r.status)
         except Exception as _exc:
