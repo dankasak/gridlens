@@ -11,7 +11,7 @@
   const nav = document.createElement('nav');
   nav.innerHTML = `
     <a class="nav-logo" href="/index.html">
-      <img src="/img/grid_lens.jpg" alt="Grid Lens" style="height:44px;width:auto;">
+      <img src="/img/grid_lens.jpg" alt="Grid Lens" style="height:72px;width:auto;">
     </a>
     <ul class="nav-links">
       ${navLink('/index.html', 'Home')}

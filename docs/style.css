@@ -22,7 +22,7 @@ a { color: var(--teal); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
 /* ── Nav ── */
-nav {
+body > nav {
   display: flex;
   align-items: center;
   justify-content: space-between;
