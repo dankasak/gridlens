@@ -11,7 +11,7 @@
   const nav = document.createElement('nav');
   nav.innerHTML = `
     <a class="nav-logo" href="/index.html">
-      <img src="/img/grid_lens.jpg" alt="Grid Lens" style="height:72px;width:auto;">
+      <span class="brand">Grid Lens</span>
     </a>
     <ul class="nav-links">
       ${navLink('/index.html', 'Home')}
@@ -20,6 +20,11 @@
       <li><a href="/subscribe.html" class="btn btn-primary">Subscribe</a></li>
     </ul>`;
   document.body.insertBefore(nav, document.body.firstChild);
+
+  const banner = document.createElement('div');
+  banner.className = 'site-banner';
+  banner.innerHTML = `<img src="/img/grid_lens_banner.jpg" alt="Grid Lens">`;
+  document.body.insertBefore(banner, nav.nextSibling);
 
   const footer = document.createElement('footer');
   footer.innerHTML = `Grid Lens &copy; ${new Date().getFullYear()}
