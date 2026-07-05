@@ -13,11 +13,7 @@
         "title": "Select Your Network Distributor",
         "description": "Choose your electricity network distributor. Grid Lens currently has plan data for **Ausgrid** (Sydney, Central Coast, Newcastle, Hunter). Support for Endeavour Energy and Essential Energy is coming soon.",
         "data": {
-          "distributor": "Distributor",
-          "has_demand_tariff": "I'm on a demand tariff"
-        },
-        "data_description": {
-          "has_demand_tariff": "Tick this if your network bills a demand (peak kW) charge. It's set by your distributor based on your meter — check your bill for a 'demand' line in $/kW. When on, plans that include a demand charge will have it added to the estimate."
+          "distributor": "Distributor"
         }
       },
       "sensors": {
@@ -102,7 +98,11 @@
         "title": "Your Current Plan",
         "description": "Select the electricity plan you are currently on.\n\nThis creates your **free Grid Lens account**, which compares your current plan against itself so you can see your cost breakdown.\n\n[Upgrade at gridlens.au/pricing](https://gridlens.au/pricing) to compare against all available plans in your state and find out if you could be paying less.",
         "data": {
-          "current_plan": "Current plan"
+          "current_plan": "Current plan",
+          "has_demand_tariff": "I'm on a demand tariff"
+        },
+        "data_description": {
+          "has_demand_tariff": "Tick this if your network bills a demand (peak kW) charge. It's set by your distributor based on your meter — check your bill for a 'demand' line in $/kW. When on, plans that include a demand charge have it added to the estimate, and the battery optimiser shaves your peak to reduce it."
         }
       },
       "subscribe": {
@@ -201,7 +201,11 @@
         "title": "Your Current Plan",
         "description": "Select the electricity plan you are currently on.",
         "data": {
-          "current_plan": "Current plan"
+          "current_plan": "Current plan",
+          "has_demand_tariff": "I'm on a demand tariff"
+        },
+        "data_description": {
+          "has_demand_tariff": "Tick this if your network bills a demand (peak kW) charge. It's set by your distributor based on your meter — check your bill for a 'demand' line in $/kW. When on, plans that include a demand charge have it added to the estimate, and the battery optimiser shaves your peak to reduce it."
         }
       },
       "api_key": {

@@ -135,7 +135,6 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._state: str | None = None
         self._postcode: str | None = None
         self._distributor: str | None = None
-        self._has_demand_tariff: bool = False
         self._discovered: dict = {}
         self._device_options: list = []
         self._sensor_data: dict = {}
@@ -179,7 +178,6 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.FlowResult:
         if user_input is not None:
             self._distributor = user_input[CONF_DISTRIBUTOR]
-            self._has_demand_tariff = user_input.get(CONF_HAS_DEMAND_TARIFF, False)
             return await self.async_step_sensors()
 
         distributors = DISTRIBUTORS.get(self._state, [])
@@ -189,7 +187,6 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_DISTRIBUTOR): selector.SelectSelector(
                     selector.SelectSelectorConfig(options=distributors, mode=selector.SelectSelectorMode.DROPDOWN)
                 ),
-                vol.Optional(CONF_HAS_DEMAND_TARIFF, default=False): selector.BooleanSelector(),
             }),
         )
 
@@ -223,7 +220,6 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_STATE: self._state,
                     CONF_POSTCODE: self._postcode,
                     CONF_DISTRIBUTOR: self._distributor,
-                    CONF_HAS_DEMAND_TARIFF: self._has_demand_tariff,
                     CONF_ENERGY_SENSOR: user_input.get(CONF_ENERGY_SENSOR),
                     CONF_SOLAR_SENSOR: user_input.get(CONF_SOLAR_SENSOR),
                     CONF_GRID_EXPORT_SENSOR: user_input.get(CONF_GRID_EXPORT_SENSOR),
@@ -364,6 +360,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None and not errors:
             plan_id = user_input[CONF_CURRENT_PLAN]
+            has_demand_tariff = user_input.get(CONF_HAS_DEMAND_TARIFF, False)
             try:
                 ha_uuid = str(uuid.UUID(await instance_id.async_get(self.hass)))
                 self._ha_uuid = ha_uuid
@@ -383,6 +380,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         self._api_key = data["api_key"]
                         self._sensor_data.update({
                             CONF_CURRENT_PLAN: plan_id,
+                            CONF_HAS_DEMAND_TARIFF: has_demand_tariff,
                             CONF_GRIDLENS_EMAIL: self._email,
                             CONF_GRIDLENS_API_URL: self._api_url,
                             CONF_GRIDLENS_API_KEY: self._api_key,
@@ -390,6 +388,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         return await self.async_step_subscribe()
                     elif resp.status == 409:
                         self._sensor_data[CONF_CURRENT_PLAN] = plan_id
+                        self._sensor_data[CONF_HAS_DEMAND_TARIFF] = has_demand_tariff
                         return await self.async_step_manual_key()
                     else:
                         errors["base"] = "cannot_connect"
@@ -410,6 +409,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         mode=selector.SelectSelectorMode.DROPDOWN,
                     )
                 ),
+                vol.Optional(CONF_HAS_DEMAND_TARIFF, default=False): selector.BooleanSelector(),
             }),
             errors=errors,
         )
@@ -736,6 +736,10 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                     mode=selector.SelectSelectorMode.DROPDOWN,
                 )
             ),
+            vol.Optional(
+                CONF_HAS_DEMAND_TARIFF,
+                default=entry_data.get(CONF_HAS_DEMAND_TARIFF, False),
+            ): selector.BooleanSelector(),
         })
 
         return self.async_show_form(
