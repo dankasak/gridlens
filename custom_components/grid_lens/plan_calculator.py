@@ -636,9 +636,15 @@ class PlanCalculator:
         # actual metered import. LP schedule slots have no weekday, so the day
         # filter is applied only on the actual-usage path.
         lp_schedule = opt_result.get('schedule', []) if opt_result else []
+        opt_peak = opt_result.get('demand_peak_kw') if opt_result else None
         peak_kw = 0.0
         source = 'usage'
-        if not prefer_actual and lp_schedule:
+        if not prefer_actual and opt_peak is not None:
+            # The LP solved the peak directly (weekday-aware window), so bill the
+            # exact value it optimised against rather than re-scanning the schedule.
+            peak_kw = opt_peak
+            source = 'optimised-lp'
+        elif not prefer_actual and lp_schedule:
             source = 'optimised'
             for step in lp_schedule:
                 h = step.get('hour', 0) % 24
@@ -1844,14 +1850,41 @@ class PlanCalculator:
             from backports.zoneinfo import ZoneInfo
         tz = ZoneInfo("Australia/Sydney")
 
+        # Demand-charge peak-shaving inputs (only when the user is on a demand
+        # tariff and this plan carries one). Build a per-LP-hour window mask so
+        # the optimiser lowers the peak grid import inside the metered window.
+        demand_rate = 0.0
+        demand_predicate = None
+        if (self.has_demand_tariff
+                and getattr(plan, 'demand_charge_active', False)
+                and getattr(plan, 'demand_charge_per_kw_per_day', 0.0) > 0):
+            demand_rate = plan.demand_charge_per_kw_per_day
+            window = getattr(plan, 'demand_window', None) or {}
+            whours = window.get('hours', DEFAULT_DEMAND_WINDOW_HOURS)
+            days_spec = window.get('days', 'weekdays')
+
+            def demand_predicate(local_dt):
+                h_ok = True if whours == 'all' else (local_dt.hour in whours)
+                wd = local_dt.weekday()
+                if days_spec == 'all':
+                    d_ok = True
+                elif days_spec == 'weekends':
+                    d_ok = wd >= 5
+                else:
+                    d_ok = wd < 5  # weekdays (default)
+                return h_ok and d_ok
+
         hourly_import_rates = []
         hourly_export_rates = []
         local_hods = []  # local hour-of-day per LP hour, for availability masks
+        demand_window_mask = [] if demand_predicate else None
         for hour_idx in range(T):
             local_dt = (start_time + timedelta(hours=hour_idx)).astimezone(tz)
             hourly_import_rates.append(plan.get_import_rate(local_dt))
             hourly_export_rates.append(plan.get_export_rate(local_dt))
             local_hods.append(local_dt.hour)
+            if demand_predicate:
+                demand_window_mask.append(1 if demand_predicate(local_dt) else 0)
 
         # Translate each device's allowed local hours into a per-LP-hour mask so
         # the optimizer only schedules it when it is actually available (e.g. an
@@ -1876,6 +1909,8 @@ class PlanCalculator:
                 import_rates=hourly_import_rates,
                 export_rates=hourly_export_rates,
                 deferrable_loads=lp_deferrable_loads,
+                demand_rate=demand_rate,
+                demand_window_mask=demand_window_mask,
             )
         )
         _LOGGER.warning(

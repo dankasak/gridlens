@@ -76,6 +76,8 @@ class BatteryOptimizer:
         export_rates: List[float],
         initial_soc_percent: float = 50.0,
         deferrable_loads: List[Dict] = None,
+        demand_rate: float = 0.0,
+        demand_window_mask: List[int] = None,
     ) -> Dict:
         """Return an optimal hourly schedule minimising net energy cost.
 
@@ -89,6 +91,13 @@ class BatteryOptimizer:
         Each device gets its own LP variable with its own power cap, so a
         1.8 kW EV charger and a 4.7 kW hot water system are scheduled
         independently and cannot exceed their rated power in any single hour.
+
+        demand_rate ($/kW/day) and demand_window_mask (list[int] length T,
+        1 = hour is inside the network's demand window) enable peak-demand
+        shaving: when set, the LP adds a peak-kW variable to the objective so it
+        actively lowers the highest in-window grid import (e.g. by discharging
+        the battery or shifting deferrable loads out of the window). Left at the
+        default (rate 0 / mask None) the model behaves exactly as before.
 
         Tries LP first; falls back to greedy if scipy is unavailable or infeasible.
         """
@@ -105,9 +114,11 @@ class BatteryOptimizer:
         r_imp = import_rates[:T]
         r_exp = export_rates[:T]
         E0    = initial_soc_percent / 100.0 * self.capacity_kwh
+        dmask = demand_window_mask[:T] if demand_window_mask else None
 
         try:
-            return self._lp_optimize(solar, load, r_imp, r_exp, E0, T, deferrable_loads)
+            return self._lp_optimize(solar, load, r_imp, r_exp, E0, T, deferrable_loads,
+                                     demand_rate=demand_rate, demand_window_mask=dmask)
         except ImportError:
             _LOGGER.warning(
                 "PuLP not yet installed — using greedy fallback. "
@@ -148,17 +159,25 @@ class BatteryOptimizer:
     # MILP implementation — tries HiGHS, scipy, PuLP/CBC in order
     # ------------------------------------------------------------------
 
-    def _lp_optimize(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads):
+    def _lp_optimize(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads,
+                     demand_rate=0.0, demand_window_mask=None):
         """Build and solve the LP. Raises on failure so caller can fall back."""
-        try:
-            return self._lp_highspy(solar, load, r_imp, r_exp, E0, T, deferrable_loads)
-        except ImportError:
-            pass  # highspy not installed — try scipy
-        except Exception as exc:
-            _LOGGER.warning("HiGHS MILP failed (%s) — trying scipy", exc)
+        # HiGHS/PuLP paths don't model the peak-demand term; only the scipy path
+        # (the complete, production path) does. When a demand charge is active we
+        # skip straight to scipy so peak-shaving isn't silently dropped.
+        demand_active = demand_rate > 0 and demand_window_mask and any(demand_window_mask)
+        if not demand_active:
+            try:
+                return self._lp_highspy(solar, load, r_imp, r_exp, E0, T, deferrable_loads)
+            except ImportError:
+                pass  # highspy not installed — try scipy
+            except Exception as exc:
+                _LOGGER.warning("HiGHS MILP failed (%s) — trying scipy", exc)
 
         try:
-            return self._lp_scipy(solar, load, r_imp, r_exp, E0, T, deferrable_loads)
+            return self._lp_scipy(solar, load, r_imp, r_exp, E0, T, deferrable_loads,
+                                  demand_rate=demand_rate,
+                                  demand_window_mask=demand_window_mask)
         except ImportError:
             pass  # scipy not available — try PuLP
         except Exception as exc:
@@ -178,7 +197,8 @@ class BatteryOptimizer:
     # import at a physical grid limit (M), then post-process to net any
     # simultaneous import/export to a single direction.
 
-    def _lp_scipy(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads):
+    def _lp_scipy(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads,
+                  demand_rate=0.0, demand_window_mask=None):
         import numpy as np
         from scipy.optimize import linprog
         from scipy.sparse import lil_matrix
@@ -187,16 +207,28 @@ class BatteryOptimizer:
         M = (self.max_charge_rate_kw + self.max_discharge_rate_kw) * 2.0
         N = len(deferrable_loads)       # number of individual deferrable devices
         hours_per_day = 24
+        n_days = math.ceil(T / hours_per_day)
+
+        # Peak-demand shaving: add one auxiliary variable P (peak kW), constrained
+        # to be ≥ grid import in every demand-window hour and priced at the demand
+        # charge over the horizon (rate $/kW/day × days). Minimising P drives the
+        # LP to flatten the highest in-window import — by discharging the battery
+        # or shifting deferrable loads out of the window. Off by default.
+        demand_active = demand_rate > 0 and demand_window_mask and any(demand_window_mask)
 
         # Variable layout:
-        #   [imp(T) | exp(T) | cha(T) | dis(T) | soc(T) | def_0(T) | def_1(T) | ... | def_{N-1}(T)]
+        #   [imp(T) | exp(T) | cha(T) | dis(T) | soc(T) | def_0(T) | ... | def_{N-1}(T) | P?]
         # Each device i has its own block of T variables starting at (5+i)*T.
+        # P (peak kW) is a single trailing scalar, present only when demand_active.
         I, X, C, D, S = 0, T, 2*T, 3*T, 4*T
-        n = (5 + N) * T
+        P_idx = (5 + N) * T
+        n = (5 + N) * T + (1 if demand_active else 0)
 
         c_obj = np.zeros(n)
         c_obj[I:I+T] = r_imp
         c_obj[X:X+T] = [-r for r in r_exp]
+        if demand_active:
+            c_obj[P_idx] = demand_rate * n_days
         # def_i has NO direct cost in the objective.  Its cost is implicit:
         # when solar is sufficient, def_i reduces exp → opportunity cost = r_exp[t];
         # when solar is insufficient, def_i increases imp → cost = r_imp[t].
@@ -220,7 +252,6 @@ class BatteryOptimizer:
                 ub[(5+i)*T:(5+i)*T+T] = dev['max_kw']
 
         # Equality constraints: T (energy balance) + T (SOC update) + N*n_days (per-device daily totals)
-        n_days = math.ceil(T / hours_per_day)
         n_eq = 2*T + N * n_days
         A_eq = lil_matrix((n_eq, n))
         b_eq = np.zeros(n_eq)
@@ -274,9 +305,16 @@ class BatteryOptimizer:
         # the SOC bounds in case the reported initial SOC lies outside them.
         # linprog uses A_ub x ≤ b_ub, so encode soc[T-1] ≥ E_end as -soc[T-1] ≤ -E_end.
         E_end = min(max(E0, self.min_soc_kwh), self.max_soc_kwh)
-        A_ub = lil_matrix((1, n))
+        # Row 0 is the terminal-SOC bound. When a demand charge is active, add one
+        # row per demand-window hour: import[t] - P ≤ 0  (P ≥ every in-window import).
+        demand_hours = [t for t in range(T) if demand_window_mask[t]] if demand_active else []
+        A_ub = lil_matrix((1 + len(demand_hours), n))
+        b_ub = np.zeros(1 + len(demand_hours))
         A_ub[0, S+T-1] = -1.0
-        b_ub = np.array([-E_end])
+        b_ub[0] = -E_end
+        for r, t in enumerate(demand_hours, start=1):
+            A_ub[r, I+t]   =  1.0
+            A_ub[r, P_idx] = -1.0
 
         result = linprog(c_obj, A_ub=A_ub.tocsr(), b_ub=b_ub,
                          A_eq=A_eq.tocsr(), b_eq=b_eq,
@@ -336,6 +374,7 @@ class BatteryOptimizer:
             'total_export_credit': total_export_credit,
             'net_cost':            total_import_cost - total_export_credit,
             'final_soc_percent':   max(0.0, soc_vals[T-1]) / self.capacity_kwh * 100.0,
+            'demand_peak_kw':      (max(0.0, x[P_idx]) if demand_active else None),
             'solver':              'lp/scipy',
         }
 
