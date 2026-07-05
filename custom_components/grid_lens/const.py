@@ -132,6 +132,42 @@ CONF_BATTERY_MAX_SOC = "battery_max_soc"
 # Deferrable loads
 CONF_DEFERRABLE_LOAD_SENSORS = "deferrable_load_sensors"  # list of sensor IDs
 CONF_DEFERRABLE_LOAD_MAX_KW = "deferrable_load_max_kw"    # list of max kW, parallel to sensors
+CONF_DEFERRABLE_LOAD_HOURS = "deferrable_load_hours"      # list of hour specs, parallel to sensors
+
+
+def parse_hours_spec(spec: str | None) -> set[int] | None:
+    """Parse a deferrable-load availability spec into a set of local hours (0-23).
+
+    Returns None for "all"/blank, meaning the device can run at any hour.
+    Accepts comma-separated hours and ranges; ranges are end-exclusive clock
+    times and may wrap midnight: "18-08" → {18..23, 0..7}, "0-6,12" → {0..5, 12}.
+    Raises ValueError on malformed input.
+    """
+    if spec is None:
+        return None
+    spec = spec.strip().lower()
+    if spec in ("", "all"):
+        return None
+    hours: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            start_s, end_s = part.split("-", 1)
+            start, end = int(start_s), int(end_s)
+            if not (0 <= start <= 23 and 0 <= end <= 24):
+                raise ValueError(f"hour out of range in '{part}'")
+            if start == end:
+                raise ValueError(f"empty range '{part}'")
+            h = start
+            while h != end % 24:
+                hours.add(h)
+                h = (h + 1) % 24
+        else:
+            h = int(part)
+            if not 0 <= h <= 23:
+                raise ValueError(f"hour out of range in '{part}'")
+            hours.add(h)
+    return hours or None
 
 # Current plan (user's active retail plan)
 CONF_CURRENT_PLAN = "current_plan"

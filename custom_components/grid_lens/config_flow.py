@@ -35,7 +35,9 @@ from .const import (
     CONF_BATTERY_MAX_SOC,
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
+    CONF_DEFERRABLE_LOAD_HOURS,
     CONF_CURRENT_PLAN,
+    parse_hours_spec,
     CONF_GRIDLENS_EMAIL,
     CONF_GRIDLENS_API_URL,
     CONF_GRIDLENS_API_KEY,
@@ -290,15 +292,27 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_device_power(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.FlowResult:
-        """Capture max power draw for each selected deferrable load."""
+        """Capture max power draw and availability hours for each selected deferrable load."""
         selected = self._sensor_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
         if not selected:
             return await self.async_step_current_plan()
 
+        errors: dict[str, str] = {}
         if user_input is not None:
-            max_kw_list = [float(user_input.get(f"max_kw_{i}", 3.5)) for i in range(len(selected))]
-            self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
-            return await self.async_step_current_plan()
+            hours_list = [
+                str(user_input.get(f"hours_{i}", "all")).strip() or "all"
+                for i in range(len(selected))
+            ]
+            try:
+                for spec in hours_list:
+                    parse_hours_spec(spec)
+            except ValueError:
+                errors["base"] = "invalid_hours"
+            if not errors:
+                max_kw_list = [float(user_input.get(f"max_kw_{i}", 3.5)) for i in range(len(selected))]
+                self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
+                self._sensor_data[CONF_DEFERRABLE_LOAD_HOURS] = hours_list
+                return await self.async_step_current_plan()
 
         schema_dict = {}
         device_lines = []
@@ -313,11 +327,13 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     mode=selector.NumberSelectorMode.BOX,
                 )
             )
+            schema_dict[vol.Optional(f"hours_{i}", default="all")] = selector.TextSelector()
 
         return self.async_show_form(
             step_id="device_power",
             data_schema=vol.Schema(schema_dict),
             description_placeholders={"devices": "\n".join(device_lines)},
+            errors=errors,
         )
 
     async def async_step_current_plan(
@@ -624,18 +640,36 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         )
 
     async def async_step_device_power(self, user_input=None):
-        """Capture max power draw for each selected deferrable load."""
+        """Capture max power draw and availability hours for each selected deferrable load."""
         entry_data = self._config_entry.data
         selected = self._sensor_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
         if not selected:
             return await self.async_step_current_plan()
 
         existing_max_kw = entry_data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
+        existing_hours = entry_data.get(CONF_DEFERRABLE_LOAD_HOURS, [])
+        # Existing lists are keyed by position in the previously saved sensor
+        # list; map by sensor_id so reordering/removing devices keeps defaults.
+        prev_sensors = entry_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
+        prev_kw = {s: existing_max_kw[i] for i, s in enumerate(prev_sensors) if i < len(existing_max_kw)}
+        prev_hours = {s: existing_hours[i] for i, s in enumerate(prev_sensors) if i < len(existing_hours)}
 
+        errors: dict[str, str] = {}
         if user_input is not None:
-            max_kw_list = [float(user_input.get(f"max_kw_{i}", 3.5)) for i in range(len(selected))]
-            self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
-            return await self.async_step_current_plan()
+            hours_list = [
+                str(user_input.get(f"hours_{i}", "all")).strip() or "all"
+                for i in range(len(selected))
+            ]
+            try:
+                for spec in hours_list:
+                    parse_hours_spec(spec)
+            except ValueError:
+                errors["base"] = "invalid_hours"
+            if not errors:
+                max_kw_list = [float(user_input.get(f"max_kw_{i}", 3.5)) for i in range(len(selected))]
+                self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
+                self._sensor_data[CONF_DEFERRABLE_LOAD_HOURS] = hours_list
+                return await self.async_step_current_plan()
 
         schema_dict = {}
         device_lines = []
@@ -643,7 +677,7 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             state = self.hass.states.get(sensor_id)
             name = state.attributes.get("friendly_name", sensor_id) if state else sensor_id
             device_lines.append(f"{i + 1}. {name}")
-            default_kw = existing_max_kw[i] if i < len(existing_max_kw) else 3.5
+            default_kw = prev_kw.get(sensor_id, 3.5)
             schema_dict[vol.Optional(f"max_kw_{i}", default=default_kw)] = selector.NumberSelector(
                 selector.NumberSelectorConfig(
                     min=0.1, max=100.0, step=0.1,
@@ -651,11 +685,15 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                     mode=selector.NumberSelectorMode.BOX,
                 )
             )
+            schema_dict[vol.Optional(f"hours_{i}", default=prev_hours.get(sensor_id, "all"))] = (
+                selector.TextSelector()
+            )
 
         return self.async_show_form(
             step_id="device_power",
             data_schema=vol.Schema(schema_dict),
             description_placeholders={"devices": "\n".join(device_lines)},
+            errors=errors,
         )
 
     async def async_step_current_plan(self, user_input=None):

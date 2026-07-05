@@ -13,7 +13,12 @@ LP formulation (per hour t):
     SOC update     : E_bat[t] = E_bat[t-1] + η·P_cha[t] − P_dis[t]/η
     SOC bounds     : E_min ≤ E_bat[t] ≤ E_max
     Power limits   : P_cha[t] ≤ max_charge,  P_dis[t] ≤ max_discharge
-    Daily totals   : Σ_{t in day d} def_i[t] = daily_kwh_i  (per device per day)
+    Terminal SOC   : E_bat[T-1] ≥ E0  (battery must end no emptier than it started,
+                     otherwise the initial charge is free energy that suppresses
+                     grid import and hides differences between plans)
+    Availability   : def_i[t] = 0 outside the device's allowed hours (hour_mask)
+    Daily totals   : Σ_{t in day d} def_i[t] = daily_kwh_i  (per device per day,
+                     capped at what the availability window can physically deliver)
 
 Including def_i in the energy balance lets the LP correctly price deferrable load
 scheduling: during solar surplus, def_i reduces P_exp (opportunity cost = rate_exp);
@@ -77,6 +82,9 @@ class BatteryOptimizer:
         deferrable_loads is a list of per-device dicts, each with:
           'daily_kwh': float  — energy the device must consume per day
           'max_kw':    float  — maximum power draw per hour for that device
+          'hour_mask': optional list[int] of length T (1 = device available at
+                       that LP hour, 0 = unavailable).  Missing/None = always
+                       available.  Built by the caller from local hour-of-day.
 
         Each device gets its own LP variable with its own power cap, so a
         1.8 kW EV charger and a 4.7 kW hot water system are scheduled
@@ -202,8 +210,14 @@ class BatteryOptimizer:
         lb[S:S+T] = self.min_soc_kwh
         ub[S:S+T] = self.max_soc_kwh
         for i, dev in enumerate(deferrable_loads):
-            # Each device's per-hour draw is capped at its own rated max kW.
-            ub[(5+i)*T:(5+i)*T+T] = dev['max_kw']
+            # Each device's per-hour draw is capped at its own rated max kW,
+            # and forced to 0 in hours the device is unavailable (hour_mask).
+            mask = dev.get('hour_mask')
+            if mask:
+                for t in range(T):
+                    ub[(5+i)*T+t] = dev['max_kw'] if mask[t] else 0.0
+            else:
+                ub[(5+i)*T:(5+i)*T+T] = dev['max_kw']
 
         # Equality constraints: T (energy balance) + T (SOC update) + N*n_days (per-device daily totals)
         n_days = math.ceil(T / hours_per_day)
@@ -238,17 +252,34 @@ class BatteryOptimizer:
                 b_eq[row] = E0
 
         # Per-device, per-day energy total constraints.
-        # Device i on day d must consume exactly dev['daily_kwh'] (prorated for partial days).
+        # Device i on day d must consume exactly dev['daily_kwh'] (prorated for
+        # partial days), capped at what its availability window can physically
+        # deliver in that chunk so a narrow window cannot make the LP infeasible.
         for i, dev in enumerate(deferrable_loads):
+            mask = dev.get('hour_mask')
             for d in range(n_days):
                 t0 = d * hours_per_day
                 t1 = min(t0 + hours_per_day, T)
                 row = 2*T + i * n_days + d
                 for t in range(t0, t1):
                     A_eq[row, (5+i)*T+t] = 1.0
-                b_eq[row] = dev['daily_kwh'] * (t1 - t0) / hours_per_day
+                avail_hours = (
+                    sum(1 for t in range(t0, t1) if mask[t]) if mask else (t1 - t0)
+                )
+                target = dev['daily_kwh'] * (t1 - t0) / hours_per_day
+                b_eq[row] = min(target, avail_hours * dev['max_kw'])
 
-        result = linprog(c_obj, A_eq=A_eq.tocsr(), b_eq=b_eq,
+        # Terminal SOC: the battery must end the window at least as full as it
+        # started, so its initial charge is a loan, not free energy.  Clamped to
+        # the SOC bounds in case the reported initial SOC lies outside them.
+        # linprog uses A_ub x ≤ b_ub, so encode soc[T-1] ≥ E_end as -soc[T-1] ≤ -E_end.
+        E_end = min(max(E0, self.min_soc_kwh), self.max_soc_kwh)
+        A_ub = lil_matrix((1, n))
+        A_ub[0, S+T-1] = -1.0
+        b_ub = np.array([-E_end])
+
+        result = linprog(c_obj, A_ub=A_ub.tocsr(), b_ub=b_ub,
+                         A_eq=A_eq.tocsr(), b_eq=b_eq,
                          bounds=list(zip(lb.tolist(), ub.tolist())),
                          method='highs', options={'time_limit': 30.0})
 
@@ -376,6 +407,10 @@ class BatteryOptimizer:
             # exp[t] <= M * (1 - z[t])  →  exp[t] + M*z[t] <= M
             h.addRow(-INF, M, 2, [X+t, Z+t], [1.0, M])
 
+        # Terminal SOC: battery must end no emptier than it started.
+        E_end = min(max(E0, self.min_soc_kwh), self.max_soc_kwh)
+        h.addRow(E_end, INF, 1, [S+T-1], [1.0])
+
         h.run()
 
         status_str = str(h.getModelStatus())
@@ -420,6 +455,9 @@ class BatteryOptimizer:
             # Mutual exclusivity: import and export cannot both be non-zero
             prob += P_imp[t] <= M * z[t]
             prob += P_exp[t] <= M * (1 - z[t])
+
+        # Terminal SOC: battery must end no emptier than it started.
+        prob += E_bat[T-1] >= min(max(E0, self.min_soc_kwh), self.max_soc_kwh)
 
         status = prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=120))
         if pulp.LpStatus[status] not in ("Optimal", "Feasible"):

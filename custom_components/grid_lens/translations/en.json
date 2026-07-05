@@ -69,19 +69,29 @@
         }
       },
       "device_power": {
-        "title": "Deferrable Load Power Limits",
-        "description": "Enter the maximum rated power (kW) for each selected deferrable device. This caps how much power the optimizer can assign to these loads in any given hour — without this, it can pile everything into one cheap hour which isn't physically realistic.\n\n{devices}",
+        "title": "Deferrable Load Power Limits & Availability",
+        "description": "For each device, enter its maximum rated power (kW) and the hours it is **available to run**. Power caps how much the optimizer can assign in any hour; availability stops it scheduling a device when it can't run (e.g. an EV that is only plugged in overnight).\n\nHours format: `all`, or clock ranges like `18-08` (6pm–8am, wraps midnight) or `0-6,12-14`. End hour is exclusive.\n\n{devices}",
         "data": {
           "max_kw_0": "Device 1 — max power",
+          "hours_0": "Device 1 — available hours",
           "max_kw_1": "Device 2 — max power",
+          "hours_1": "Device 2 — available hours",
           "max_kw_2": "Device 3 — max power",
+          "hours_2": "Device 3 — available hours",
           "max_kw_3": "Device 4 — max power",
+          "hours_3": "Device 4 — available hours",
           "max_kw_4": "Device 5 — max power",
+          "hours_4": "Device 5 — available hours",
           "max_kw_5": "Device 6 — max power",
+          "hours_5": "Device 6 — available hours",
           "max_kw_6": "Device 7 — max power",
+          "hours_6": "Device 7 — available hours",
           "max_kw_7": "Device 8 — max power",
+          "hours_7": "Device 8 — available hours",
           "max_kw_8": "Device 9 — max power",
-          "max_kw_9": "Device 10 — max power"
+          "hours_8": "Device 9 — available hours",
+          "max_kw_9": "Device 10 — max power",
+          "hours_9": "Device 10 — available hours"
         }
       },
       "current_plan": {
@@ -107,7 +117,8 @@
       "wrong_unit_power": "This sensor measures power (W/kW), not energy. You need a cumulative energy sensor (kWh/MWh).",
       "wrong_unit": "Wrong unit of measurement — must be kWh or MWh.",
       "wrong_state_class": "This sensor does not have state_class: total_increasing. It may not be a cumulative energy sensor.",
-      "invalid_capacity": "Battery capacity must be greater than 0 kWh."
+      "invalid_capacity": "Battery capacity must be greater than 0 kWh.",
+      "invalid_hours": "Invalid availability hours — use 'all' or ranges like '18-08' or '0-6,12-14'."
     },
     "abort": {
       "already_configured": "Grid Lens is already configured."
@@ -157,19 +168,29 @@
         }
       },
       "device_power": {
-        "title": "Deferrable Load Power Limits",
-        "description": "Enter the maximum rated power (kW) for each selected deferrable device.\n\n{devices}",
+        "title": "Deferrable Load Power Limits & Availability",
+        "description": "For each device, enter its maximum rated power (kW) and the hours it is available to run.\n\nHours format: `all`, or clock ranges like `18-08` (6pm–8am, wraps midnight) or `0-6,12-14`. End hour is exclusive.\n\n{devices}",
         "data": {
           "max_kw_0": "Device 1 — max power",
+          "hours_0": "Device 1 — available hours",
           "max_kw_1": "Device 2 — max power",
+          "hours_1": "Device 2 — available hours",
           "max_kw_2": "Device 3 — max power",
+          "hours_2": "Device 3 — available hours",
           "max_kw_3": "Device 4 — max power",
+          "hours_3": "Device 4 — available hours",
           "max_kw_4": "Device 5 — max power",
+          "hours_4": "Device 5 — available hours",
           "max_kw_5": "Device 6 — max power",
+          "hours_5": "Device 6 — available hours",
           "max_kw_6": "Device 7 — max power",
+          "hours_6": "Device 7 — available hours",
           "max_kw_7": "Device 8 — max power",
+          "hours_7": "Device 8 — available hours",
           "max_kw_8": "Device 9 — max power",
-          "max_kw_9": "Device 10 — max power"
+          "hours_8": "Device 9 — available hours",
+          "max_kw_9": "Device 10 — max power",
+          "hours_9": "Device 10 — available hours"
         }
       },
       "current_plan": {
@@ -195,6 +216,7 @@
       "wrong_unit": "Wrong unit — must be kWh or MWh.",
       "wrong_state_class": "Not a cumulative energy sensor (state_class: total_increasing required).",
       "invalid_capacity": "Battery capacity must be greater than 0 kWh.",
+      "invalid_hours": "Invalid availability hours — use 'all' or ranges like '18-08' or '0-6,12-14'.",
       "invalid_api_key": "Invalid API key — check the key and try again.",
       "cannot_connect": "Could not connect to the Grid Lens API. Check your internet connection."
     }

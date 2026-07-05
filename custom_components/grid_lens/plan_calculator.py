@@ -29,7 +29,9 @@ from .const import (
     CONF_BATTERY_MAX_SOC,
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
+    CONF_DEFERRABLE_LOAD_HOURS,
     POPULAR_EV_PLANS,
+    parse_hours_spec,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -65,6 +67,7 @@ class PlanCalculator:
 
         self.deferrable_load_sensors: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
         self.deferrable_load_max_kw: list[float] = entry.data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
+        self.deferrable_load_hours: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_HOURS, [])
         self.current_plan_override: str | None = entry.data.get("current_plan")
         
         # Initialize battery optimizer if battery is configured
@@ -929,15 +932,44 @@ class PlanCalculator:
                 if i < len(self.deferrable_load_max_kw)
                 else 3.5
             )
+
+            # Availability window (local hours the device can run, e.g. an EV
+            # that is only plugged in overnight).  None = any hour.
+            hours_spec = (
+                self.deferrable_load_hours[i]
+                if i < len(self.deferrable_load_hours)
+                else None
+            )
+            try:
+                allowed_hours = parse_hours_spec(hours_spec)
+            except ValueError as err:
+                _LOGGER.warning(
+                    "Invalid availability hours %r for %s (%s) — treating as 'all'",
+                    hours_spec, sensor_id, err,
+                )
+                allowed_hours = None
+
+            daily_kwh = sensor_total / days
+            window_capacity = len(allowed_hours or range(24)) * max_kw
+            if daily_kwh > window_capacity:
+                _LOGGER.warning(
+                    "Deferrable %s needs %.1f kWh/day but its availability window "
+                    "can only deliver %.1f kWh/day — the optimizer will schedule "
+                    "the maximum the window allows",
+                    sensor_id, daily_kwh, window_capacity,
+                )
+
             deferrable_loads.append({
                 'sensor_id': sensor_id,
                 'name': name,
-                'daily_kwh': sensor_total / days,
+                'daily_kwh': daily_kwh,
                 'max_kw': max_kw,
+                'allowed_hours': allowed_hours,
             })
             _LOGGER.warning(
-                "Deferrable sensor %s (%s): %.2f kWh/day, max %.1f kW",
-                sensor_id, name, sensor_total / days, max_kw,
+                "Deferrable sensor %s (%s): %.2f kWh/day, max %.1f kW, hours %s",
+                sensor_id, name, daily_kwh, max_kw,
+                "all" if allowed_hours is None else sorted(allowed_hours),
             )
 
         combined_list = [
@@ -1674,8 +1706,23 @@ class PlanCalculator:
         # battery dispatch under each plan?"  The LP then decides WHEN to import/export
         # rather than trying to re-derive the full household consumption (which is
         # entangled with the existing battery behaviour under the current plan).
-        hourly_solar = self._build_hourly_profile(solar_data)
-        hourly_load  = self._build_hourly_profile(load_data)   # historical grid import
+
+        # Build load profile first — it spans the full window including nighttime.
+        hourly_load = self._build_hourly_profile(load_data)
+
+        # Build solar aligned to load's timestamp range, defaulting to 0 for missing
+        # hours (nighttime). Solar statistics have no records during dark hours, so a
+        # naive min(len(solar), len(load)) would truncate the LP to daytime only,
+        # preventing the optimizer from scheduling any loads to overnight windows.
+        load_hour_keys = sorted(set(
+            d['timestamp'].replace(minute=0, second=0, microsecond=0)
+            for d in load_data
+        ))
+        solar_by_hour: dict = {}
+        for d in solar_data:
+            hk = d['timestamp'].replace(minute=0, second=0, microsecond=0)
+            solar_by_hour[hk] = solar_by_hour.get(hk, 0.0) + d['value']
+        hourly_solar = [solar_by_hour.get(hk, 0.0) for hk in load_hour_keys]
 
         T = min(len(hourly_solar), len(hourly_load))
         hourly_solar = hourly_solar[:T]
@@ -1687,11 +1734,13 @@ class PlanCalculator:
             len(hourly_load),  sum(hourly_load),
         )
 
-        # Build per-hour tariff rates aligned to actual timestamps
-        if solar_data:
+        # Derive start_time from load data so the rate array covers the full window.
+        if load_data:
+            start_time = min(d['timestamp'] for d in load_data)
+        elif solar_data:
             start_time = min(d['timestamp'] for d in solar_data)
         else:
-            start_time = datetime.now(timezone.utc) - timedelta(days=30)
+            start_time = datetime.now(timezone.utc) - timedelta(days=2)
 
         try:
             from zoneinfo import ZoneInfo
@@ -1701,10 +1750,25 @@ class PlanCalculator:
 
         hourly_import_rates = []
         hourly_export_rates = []
+        local_hods = []  # local hour-of-day per LP hour, for availability masks
         for hour_idx in range(T):
             local_dt = (start_time + timedelta(hours=hour_idx)).astimezone(tz)
             hourly_import_rates.append(plan.get_import_rate(local_dt))
             hourly_export_rates.append(plan.get_export_rate(local_dt))
+            local_hods.append(local_dt.hour)
+
+        # Translate each device's allowed local hours into a per-LP-hour mask so
+        # the optimizer only schedules it when it is actually available (e.g. an
+        # EV that is plugged in overnight cannot soak up midday solar).
+        lp_deferrable_loads = []
+        for dev in (deferrable_loads or []):
+            allowed = dev.get('allowed_hours')
+            lp_dev = dict(dev)
+            lp_dev['hour_mask'] = (
+                None if allowed is None
+                else [1 if hod in allowed else 0 for hod in local_hods]
+            )
+            lp_deferrable_loads.append(lp_dev)
 
         # Run LP optimiser in a thread pool so the event loop stays responsive.
         import functools
@@ -1715,7 +1779,7 @@ class PlanCalculator:
                 load_profile=hourly_load,
                 import_rates=hourly_import_rates,
                 export_rates=hourly_export_rates,
-                deferrable_loads=deferrable_loads or [],
+                deferrable_loads=lp_deferrable_loads,
             )
         )
         _LOGGER.warning(
