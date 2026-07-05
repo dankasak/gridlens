@@ -117,6 +117,17 @@ CONF_DISTRIBUTOR = "distributor"
 CONF_STATE = "state"
 CONF_POSTCODE = "postcode"
 
+# Whether the customer is on a network demand tariff (peak-kW charges).
+# This is set by the DNSP based on the customer's NMI/meter, not by the retail
+# plan, so we can't infer it — the user tells us. When True, plans that carry a
+# demand charge (charges.demand_charge_per_kw_per_day) have it billed.
+CONF_HAS_DEMAND_TARIFF = "has_demand_tariff"
+
+# Default demand window when a plan defines a demand charge but no explicit
+# window. NSW residential demand tariffs (e.g. Ausgrid) typically meter peak
+# demand on weekday afternoons/evenings; 15:00–21:00 is the common band.
+DEFAULT_DEMAND_WINDOW_HOURS = [15, 16, 17, 18, 19, 20]
+
 # Battery configuration
 CONF_HAS_BATTERY = "has_battery"
 CONF_BATTERY_CAPACITY = "battery_capacity"

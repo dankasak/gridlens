@@ -13,7 +13,11 @@
         "title": "Select Your Network Distributor",
         "description": "Choose your electricity network distributor. Grid Lens currently has plan data for **Ausgrid** (Sydney, Central Coast, Newcastle, Hunter). Support for Endeavour Energy and Essential Energy is coming soon.",
         "data": {
-          "distributor": "Distributor"
+          "distributor": "Distributor",
+          "has_demand_tariff": "I'm on a demand tariff"
+        },
+        "data_description": {
+          "has_demand_tariff": "Tick this if your network bills a demand (peak kW) charge. It's set by your distributor based on your meter — check your bill for a 'demand' line in $/kW. When on, plans that include a demand charge will have it added to the estimate."
         }
       },
       "sensors": {

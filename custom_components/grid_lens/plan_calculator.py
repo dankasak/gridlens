@@ -30,6 +30,8 @@ from .const import (
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_HOURS,
+    CONF_HAS_DEMAND_TARIFF,
+    DEFAULT_DEMAND_WINDOW_HOURS,
     POPULAR_EV_PLANS,
     parse_hours_spec,
 )
@@ -49,7 +51,10 @@ class PlanCalculator:
         self.grid_export_sensor = entry.data.get(CONF_GRID_EXPORT_SENSOR)
         self.import_price_sensor = entry.data.get(CONF_IMPORT_PRICE_SENSOR)
         self.export_price_sensor = entry.data.get(CONF_EXPORT_PRICE_SENSOR)
-        
+        # Whether the customer is on a network demand tariff. Only when True do
+        # plans carrying a demand charge have it billed (see _compute_demand_charge).
+        self.has_demand_tariff = entry.data.get(CONF_HAS_DEMAND_TARIFF, False)
+
         # Plan data fetched from API (plan_id → plan_data dict).
         # Set by the SSE handler before calling calculate_plan_costs.
         self.plan_data: dict | None = None
@@ -579,6 +584,86 @@ class PlanCalculator:
 
         return import_cost, export_credit
 
+    def _compute_demand_charge(
+        self,
+        plan,
+        usage_data: list[dict],
+        opt_result: dict | None,
+        actual_days: int,
+        tz,
+        prefer_actual: bool = False,
+    ) -> dict | None:
+        """Return the demand-charge bill line, or None if it doesn't apply.
+
+        Demand charges are billed on peak *kW*, not kWh: the highest average
+        demand within the network's demand window over the billing period,
+        charged at $/kW/day × days. Grid Lens works with hourly energy data, so
+        peak kW is approximated as the maximum hourly grid-import kWh in the
+        window (1 kWh over 1 h = 1 kW average). Sub-hourly spikes are averaged
+        out, so this is a lower bound on the true metered demand.
+
+        Only applies when the customer is on a demand tariff (config toggle) and
+        the plan actually carries a demand charge.
+        """
+        if not self.has_demand_tariff:
+            return None
+        rate = getattr(plan, 'demand_charge_per_kw_per_day', 0.0) or 0.0
+        if rate <= 0 or not getattr(plan, 'demand_charge_active', False):
+            return None
+
+        window = getattr(plan, 'demand_window', None) or {}
+        hours = window.get('hours', DEFAULT_DEMAND_WINDOW_HOURS)
+        if hours == 'all':
+            def hour_ok(_h):
+                return True
+        else:
+            hset = set(hours)
+
+            def hour_ok(h):
+                return h in hset
+
+        days_spec = window.get('days', 'weekdays')
+
+        def day_ok(weekday: int) -> bool:  # 0=Mon .. 6=Sun
+            if days_spec == 'all':
+                return True
+            if days_spec == 'weekends':
+                return weekday >= 5
+            return weekday < 5  # 'weekdays' (default)
+
+        # Peak kW within the window. For optimised alternatives the LP dispatch
+        # already reflects battery peak-shaving; for the current plan we use the
+        # actual metered import. LP schedule slots have no weekday, so the day
+        # filter is applied only on the actual-usage path.
+        lp_schedule = opt_result.get('schedule', []) if opt_result else []
+        peak_kw = 0.0
+        source = 'usage'
+        if not prefer_actual and lp_schedule:
+            source = 'optimised'
+            for step in lp_schedule:
+                h = step.get('hour', 0) % 24
+                if hour_ok(h):
+                    peak_kw = max(peak_kw, step.get('import_kwh', 0.0))
+        else:
+            for d in (usage_data or []):
+                local_dt = d['timestamp'].astimezone(tz)
+                if hour_ok(local_dt.hour) and day_ok(local_dt.weekday()):
+                    peak_kw = max(peak_kw, d['value'])
+
+        if peak_kw <= 0:
+            return None
+
+        return {
+            'label': window.get('label') or 'Demand charge',
+            'peak_kw': round(peak_kw, 3),
+            'rate_per_kw_per_day': round(rate, 5),
+            'days': actual_days,
+            'amount': round(peak_kw * rate * actual_days, 2),
+            'window_hours': hours,
+            'source': source,
+            'approximate': True,
+        }
+
     def _compute_bill_items(
         self,
         plan,
@@ -760,8 +845,18 @@ class PlanCalculator:
         fit_eligible_kwh = round(fit_eligible_kwh, 2)
         fit_rate_c = round(fit_credit / fit_eligible_kwh * 100, 2) if fit_eligible_kwh > 0 else 0.0
 
+        # Demand charge (peak-kW), only when the customer is on a demand tariff and
+        # the plan carries one. Uses actual metered usage for the current plan and
+        # the LP dispatch (battery peak-shaving) for optimised alternatives.
+        demand = self._compute_demand_charge(
+            plan, usage_data, opt_result, actual_days, tz,
+            prefer_actual=import_cost_actual is not None,
+        )
+        demand_amount = demand['amount'] if demand else 0.0
+
         energy_charges = round(sum(line['amount'] for line in energy_lines), 2)
-        gross_charges = round(energy_charges + supply_amount + subscription_amount, 2)
+        gross_charges = round(
+            energy_charges + supply_amount + subscription_amount + demand_amount, 2)
 
         # Price Efficiency Adjustment (Flow Power).
         # Use computed PEA from AEMO spot prices when available; no fallback estimate.
@@ -790,6 +885,7 @@ class PlanCalculator:
                 'months': round(actual_days / 30.44, 2),
                 'amount': subscription_amount,
             } if subscription_amount else None,
+            'demand': demand,
             'fit': {
                 'rate_c': fit_rate_c,
                 'kwh': fit_eligible_kwh,

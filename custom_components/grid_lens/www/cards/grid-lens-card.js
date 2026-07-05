@@ -700,6 +700,18 @@ class GridLensCard extends HTMLElement {
             </div>`;
           }
 
+          // Demand charge (peak-kW), only present when on a demand tariff
+          if (bi.demand) {
+            const dm = bi.demand;
+            rows += '<div class="bill-section-head">Demand charge</div>';
+            rows += `<div class="breakdown-row">
+              <div class="breakdown-label">${dm.label}<br>
+                <span style="font-size:11px;opacity:0.7">${dm.peak_kw.toFixed(2)}&thinsp;kW peak &times; ${(dm.rate_per_kw_per_day * 100).toFixed(2)}&thinsp;c/kW/day &times; ${dm.days}&thinsp;days</span>
+              </div>
+              <div class="breakdown-value">$${dm.amount.toFixed(2)}</div>
+            </div>`;
+          }
+
           // VPP participation credit
           if (bi.vpp_credit) {
             rows += '<div class="bill-section-head bill-fit">VPP credit</div>';

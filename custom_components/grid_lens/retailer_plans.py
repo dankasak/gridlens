@@ -74,10 +74,17 @@ class PlanFromData(RetailerPlan):
         charges = plan_data.get("charges", {})
         self.daily_supply_charge    = charges.get("daily_supply_charge", 0.0)
         self.monthly_subscription_fee = charges.get("monthly_subscription", 0.0)
+        self.demand_charge_per_kw_per_day = charges.get("demand_charge_per_kw_per_day", 0.0)
 
         flags = plan_data.get("flags", {})
         self.is_market_linked    = flags.get("is_market_linked", False)
         self.spot_export_pricing = flags.get("spot_export_pricing", False)
+        self.demand_charge_active = flags.get("demand_charge_active", False)
+
+        # Optional demand-charge metering window. {"hours": [15,...] | "all",
+        # "days": "all" | "weekdays" | "weekends", "label": "..."}. When absent,
+        # the calculator falls back to DEFAULT_DEMAND_WINDOW_HOURS.
+        self.demand_window = plan_data.get("demand_window") or None
 
         vpp = plan_data.get("vpp") or {}
         mc = vpp.get("monthly_credit", 0.0)

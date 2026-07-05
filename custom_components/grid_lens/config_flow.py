@@ -21,6 +21,7 @@ from .const import (
     CONF_IMPORT_PRICE_SENSOR,
     CONF_EXPORT_PRICE_SENSOR,
     CONF_DISTRIBUTOR,
+    CONF_HAS_DEMAND_TARIFF,
     CONF_STATE,
     CONF_POSTCODE,
     CONF_HAS_BATTERY,
@@ -134,6 +135,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._state: str | None = None
         self._postcode: str | None = None
         self._distributor: str | None = None
+        self._has_demand_tariff: bool = False
         self._discovered: dict = {}
         self._device_options: list = []
         self._sensor_data: dict = {}
@@ -177,6 +179,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.FlowResult:
         if user_input is not None:
             self._distributor = user_input[CONF_DISTRIBUTOR]
+            self._has_demand_tariff = user_input.get(CONF_HAS_DEMAND_TARIFF, False)
             return await self.async_step_sensors()
 
         distributors = DISTRIBUTORS.get(self._state, [])
@@ -186,6 +189,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_DISTRIBUTOR): selector.SelectSelector(
                     selector.SelectSelectorConfig(options=distributors, mode=selector.SelectSelectorMode.DROPDOWN)
                 ),
+                vol.Optional(CONF_HAS_DEMAND_TARIFF, default=False): selector.BooleanSelector(),
             }),
         )
 
@@ -219,6 +223,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_STATE: self._state,
                     CONF_POSTCODE: self._postcode,
                     CONF_DISTRIBUTOR: self._distributor,
+                    CONF_HAS_DEMAND_TARIFF: self._has_demand_tariff,
                     CONF_ENERGY_SENSOR: user_input.get(CONF_ENERGY_SENSOR),
                     CONF_SOLAR_SENSOR: user_input.get(CONF_SOLAR_SENSOR),
                     CONF_GRID_EXPORT_SENSOR: user_input.get(CONF_GRID_EXPORT_SENSOR),
