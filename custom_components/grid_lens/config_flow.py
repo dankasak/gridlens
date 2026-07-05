@@ -331,7 +331,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 async with aiohttp.ClientSession() as session:
                     resp = await session.get(
                         f"{self._api_url}/plans/list",
-                        params={"state": self._state},
+                        params={"state": self._state, "network": self._distributor},
                         timeout=aiohttp.ClientTimeout(total=10),
                     )
                     if resp.status == 200:

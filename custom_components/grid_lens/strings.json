@@ -17,7 +17,7 @@
       },
       "distributor": {
         "title": "Select Your Network Distributor",
-        "description": "Choose your electricity network distributor.",
+        "description": "Choose your electricity network distributor. Grid Lens currently has plan data for **Ausgrid** (Sydney, Central Coast, Newcastle, Hunter). Support for Endeavour Energy and Essential Energy is coming soon.",
         "data": {
           "distributor": "Distributor"
         }

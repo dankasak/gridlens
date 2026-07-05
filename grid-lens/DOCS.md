@@ -29,3 +29,14 @@ in the integration settings.
 
 Install the **Grid Lens** integration via HACS to add plan-comparison sensors
 to your Home Assistant dashboards.
+
+## Coverage
+
+Grid Lens is currently in **proof-of-concept phase** with plan data for:
+
+| State | Network | Region |
+|-------|---------|--------|
+| NSW | Ausgrid | Sydney, Central Coast, Newcastle, Hunter |
+
+Support for Endeavour Energy (Western Sydney, Illawarra), Essential Energy
+(regional NSW), and other states is being added rapidly.

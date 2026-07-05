@@ -10,7 +10,7 @@ import aiohttp
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import DOMAIN, PLAN_ID_TO_KEY
+from .const import DOMAIN, PLAN_ID_TO_KEY, CONF_DISTRIBUTOR
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -267,12 +267,13 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 _api_key = entry_obj.data.get(CONF_GRIDLENS_API_KEY, "")
                 _api_url = entry_obj.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
                 _state   = entry_obj.data.get(CONF_STATE, "NSW")
+                _network = entry_obj.data.get(CONF_DISTRIBUTOR, "")
                 _plan_data: dict = {}
                 try:
                     _sess = async_get_clientsession(self.hass)
                     _current_plan = entry_obj.data.get("current_plan", "")
                     async with _sess.get(f"{_api_url}/plans",
-                                         params={"state": _state, "current_plan": _current_plan},
+                                         params={"state": _state, "current_plan": _current_plan, "network": _network},
                                          headers={"X-API-Key": _api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
                                          timeout=_aiohttp.ClientTimeout(total=15)) as _r:
                         if _r.status == 200:
@@ -605,15 +606,16 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             api_key = entry_obj.data.get(CONF_GRIDLENS_API_KEY, "")
             api_url = entry_obj.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
             state   = entry_obj.data.get(CONF_STATE, "NSW")
+            network = entry_obj.data.get(CONF_DISTRIBUTOR, "")
 
             # Fetch plan data from API — enforces tier (free → locked plan only).
-            _LOGGER.info("Fetching plans from API (state=%s)", state)
+            _LOGGER.info("Fetching plans from API (state=%s, network=%s)", state, network)
             plan_data: dict = {}
             try:
                 _session = async_get_clientsession(self.hass)
                 async with _session.get(
                     f"{api_url}/plans",
-                    params={"state": state, "current_plan": entry_obj.data.get("current_plan", "")},
+                    params={"state": state, "current_plan": entry_obj.data.get("current_plan", ""), "network": network},
                     headers={"X-API-Key": api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as _r:
@@ -795,6 +797,7 @@ class GridLensCoordinator(DataUpdateCoordinator):
         api_key = self.entry.data.get(CONF_GRIDLENS_API_KEY, "")
         api_url = self.entry.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
         state   = self.entry.data.get(CONF_STATE, "NSW")
+        network = self.entry.data.get(CONF_DISTRIBUTOR, "")
 
         plan_data: dict = {}
         try:
@@ -802,7 +805,7 @@ class GridLensCoordinator(DataUpdateCoordinator):
             _session = async_get_clientsession(self.hass)
             async with _session.get(
                 f"{api_url}/plans",
-                params={"state": state, "current_plan": self.entry.data.get("current_plan", "")},
+                params={"state": state, "current_plan": self.entry.data.get("current_plan", ""), "network": network},
                 headers={"X-API-Key": api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
                 timeout=_aiohttp.ClientTimeout(total=15),
             ) as _r:
