@@ -656,9 +656,9 @@ class PlanCalculator:
                 if hour_ok(local_dt.hour) and day_ok(local_dt.weekday()):
                     peak_kw = max(peak_kw, d['value'])
 
-        if peak_kw <= 0:
-            return None
-
+        # Always emit the line for a demand-charge plan the user qualifies for —
+        # even at a $0 peak — so a battery that fully shaves the peak is visibly
+        # doing its job rather than silently dropping the whole line.
         return {
             'label': window.get('label') or 'Demand charge',
             'peak_kw': round(peak_kw, 3),

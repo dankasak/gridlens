@@ -327,6 +327,18 @@ function renderBreakdown(bd, days) {
     <span class="breakdown-value">${fmt(s.amount)}</span>
   </div>`;
 
+  // Demand charge (peak-kW) — only present when on a demand tariff
+  if (bi.demand) {
+    const dm = bi.demand;
+    html += '<div class="bill-section-head">Demand charge</div>';
+    html += `<div class="breakdown-row">
+      <span class="breakdown-label">${dm.label}<br>
+        <small>${dm.peak_kw.toFixed(2)}&thinsp;kW peak &times; ${(dm.rate_per_kw_per_day * 100).toFixed(2)}&thinsp;c/kW/day &times; ${dm.days}&thinsp;days</small>
+      </span>
+      <span class="breakdown-value">${fmt(dm.amount)}</span>
+    </div>`;
+  }
+
   // Feed-in credit
   const f = bi.fit;
   if (f.kwh > 0) {
