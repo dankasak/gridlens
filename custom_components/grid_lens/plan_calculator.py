@@ -59,6 +59,10 @@ class PlanCalculator:
         # Set by the SSE handler before calling calculate_plan_costs.
         self.plan_data: dict | None = None
 
+        # Network operator definitions fetched from API (operator_key → operator_data dict).
+        # Set by the SSE handler before calling calculate_plan_costs.
+        self.network_operators: dict = {}
+
         # Battery configuration
         self.has_battery = entry.data.get(CONF_HAS_BATTERY, False)
         self.battery_capacity = entry.data.get(CONF_BATTERY_CAPACITY, 13.5)
@@ -93,7 +97,7 @@ class PlanCalculator:
         if not self.plan_data:
             _LOGGER.warning("No plan data loaded from API; calculation will have no plans.")
             return []
-        return plans_from_api_data(self.plan_data)
+        return plans_from_api_data(self.plan_data, self.network_operators)
 
     async def calculate_plan_costs(
         self,

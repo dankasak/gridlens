@@ -226,11 +226,16 @@ class PlanFromData(RetailerPlan):
         return result
 
 
-def plans_from_api_data(plan_dict: dict) -> list[RetailerPlan]:
+def plans_from_api_data(plan_dict: dict, network_operators: dict | None = None) -> list[RetailerPlan]:
     """Create RetailerPlan objects from the /plans API response dict.
 
     plan_dict is the 'plans' value from the API response:
         {plan_id: plan_data, ...}
+
+    network_operators is the 'network_operators' value from the API response:
+        {operator_key: operator_data, ...}
+
+    For plans with demand_charge_active=true, merges demand data from the network operator registry.
 
     Tier enforcement is done by the API — free tier returns only the locked plan,
     paid tier returns all plans.
@@ -239,5 +244,18 @@ def plans_from_api_data(plan_dict: dict) -> list[RetailerPlan]:
     for plan_id, plan_data in plan_dict.items():
         data = dict(plan_data)
         data.setdefault("id", plan_id)
+
+        # Merge network operator demand data if retailer passes it through
+        if network_operators and data.get("flags", {}).get("demand_charge_active"):
+            network_key = data.get("network", "").lower()
+            operator = network_operators.get(network_key) or {}
+            if operator:
+                data.setdefault("charges", {})
+                # Only inject operator data if not already in the plan JSON
+                if "demand_charge_per_kw_per_day" not in data["charges"]:
+                    data["charges"]["demand_charge_per_kw_per_day"] = operator.get("demand_charge_per_kw_per_day", 0.0)
+                if "demand_window" not in data:
+                    data["demand_window"] = operator.get("demand_window")
+
         result.append(PlanFromData(data))
     return result

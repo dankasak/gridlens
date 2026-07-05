@@ -269,6 +269,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 _state   = entry_obj.data.get(CONF_STATE, "NSW")
                 _network = entry_obj.data.get(CONF_DISTRIBUTOR, "")
                 _plan_data: dict = {}
+                _network_operators: dict = {}
                 try:
                     _sess = async_get_clientsession(self.hass)
                     _current_plan = entry_obj.data.get("current_plan", "")
@@ -277,11 +278,14 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                                          headers={"X-API-Key": _api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
                                          timeout=_aiohttp.ClientTimeout(total=15)) as _r:
                         if _r.status == 200:
-                            _plan_data = (await _r.json()).get("plans", {})
+                            _resp_data = await _r.json()
+                            _plan_data = _resp_data.get("plans", {})
+                            _network_operators = _resp_data.get("network_operators", {})
                 except Exception as _exc:
                     _LOGGER.warning("plan-rates: could not fetch plan data: %s", _exc)
                 calculator = PlanCalculator(self.hass, entry_obj)
                 calculator.plan_data = _plan_data
+                calculator.network_operators = _network_operators
 
                 # Derive which plan the user was actually on at start_date from change history.
                 if start_date:
@@ -611,6 +615,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             # Fetch plan data from API — enforces tier (free → locked plan only).
             _LOGGER.info("Fetching plans from API (state=%s, network=%s)", state, network)
             plan_data: dict = {}
+            network_operators: dict = {}
             try:
                 _session = async_get_clientsession(self.hass)
                 async with _session.get(
@@ -622,6 +627,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     if _r.status == 200:
                         _resp = await _r.json()
                         plan_data = _resp.get("plans", {})
+                        network_operators = _resp.get("network_operators", {})
                         _LOGGER.info("Loaded %d plan(s) from API (tier=%s)", len(plan_data), _resp.get("tier"))
                     elif _r.status == 402:
                         _body = await _r.text()
@@ -652,6 +658,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             from .plan_calculator import PlanCalculator
             calculator = PlanCalculator(self.hass, entry_obj)
             calculator.plan_data = plan_data
+            calculator.network_operators = network_operators
 
             if start_date:
                 from homeassistant.helpers.storage import Store
@@ -800,6 +807,7 @@ class GridLensCoordinator(DataUpdateCoordinator):
         network = self.entry.data.get(CONF_DISTRIBUTOR, "")
 
         plan_data: dict = {}
+        network_operators: dict = {}
         try:
             import aiohttp as _aiohttp
             _session = async_get_clientsession(self.hass)
@@ -812,6 +820,7 @@ class GridLensCoordinator(DataUpdateCoordinator):
                 if _r.status == 200:
                     _resp = await _r.json()
                     plan_data = _resp.get("plans", {})
+                    network_operators = _resp.get("network_operators", {})
                 elif _r.status == 402:
                     _LOGGER.warning("Coordinator: API /plans returned 402 (subscription ended)")
                     self.hass.components.persistent_notification.async_create(
@@ -828,6 +837,7 @@ class GridLensCoordinator(DataUpdateCoordinator):
 
         self.calculator = PlanCalculator(self.hass, self.entry)
         self.calculator.plan_data = plan_data
+        self.calculator.network_operators = network_operators
         result = await self.calculator.calculate_plan_costs()
         _LOGGER.info(f"Plan calculation complete: {result.get('usage_days', 0)} days")
 
