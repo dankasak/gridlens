@@ -192,7 +192,7 @@ class BatteryOptimizer:
     # Pure LP (no integer variables) so it solves in milliseconds even for
     # 700+ hour windows.  The LP has no mutual-exclusivity constraint between
     # import and export, so for plans where FiT > import rate in some hours
-    # (OVO free period, Glowbird overnight) the solver may simultaneously
+    # (OVO free period, GloBird overnight) the solver may simultaneously
     # import and export.  We prevent the problem becoming unbounded by capping
     # import at a physical grid limit (M), then post-process to net any
     # simultaneous import/export to a single direction.
