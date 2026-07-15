@@ -14,7 +14,7 @@ from .const import DOMAIN, PLAN_ID_TO_KEY, CONF_DISTRIBUTOR
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.SWITCH]
 
 _HISTORY_STORAGE_KEY = "grid_lens_plan_history"
 _HISTORY_STORAGE_VERSION = 1
@@ -760,23 +760,64 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = GridLensCoordinator(hass, entry)
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
+    # Advisory mode (forecast-fed planning, read-only). Independent coordinator so it
+    # never disturbs the manual plan-comparison flow. Best-effort — failures don't block.
+    try:
+        from .advisory.coordinator import AdvisoryCoordinator
+        _adv = AdvisoryCoordinator(hass, entry)
+        # Seed the last persisted plan BEFORE the sensor platform is set up, so the card
+        # renders the previous plan instantly on restart instead of sitting blank until
+        # live SOC/forecast arrive (Sigen Modbus SOC can take minutes to appear).
+        await _adv.async_load_cached()
+        hass.data[DOMAIN][f"{entry.entry_id}_advisory"] = _adv
+    except Exception as _adv_err:  # noqa: BLE001
+        _LOGGER.warning("Advisory mode setup failed: %s", _adv_err)
+
+    # Battery control manager (actuation). Created but INERT until the master switch is
+    # turned on — no battery writes on setup. Deadman restores native EMS on disable/stop.
+    if entry.data.get("has_battery", False):
+        try:
+            from .control.manager import ControlManager
+            hass.data[DOMAIN][f"{entry.entry_id}_control"] = ControlManager(hass, entry)
+        except Exception as _ctl_err:  # noqa: BLE001
+            _LOGGER.warning("Battery control setup failed: %s", _ctl_err)
+
     # Register services
     from .services import async_setup_services
     await async_setup_services(hass, entry)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # Pre-calculate in the background so the card has data immediately on load.
-    hass.async_create_task(coordinator.async_refresh())
+    # Pre-calculate in the background so the card has data immediately on load. The
+    # advisory refresh is chained AFTER the main one (awaited), because it reads the
+    # main coordinator's plan_data — running them concurrently races and leaves the
+    # advisory sensor stuck "waiting" until its next 10-min tick.
+    async def _startup_refresh():
+        await coordinator.async_refresh()
+        _advisory = hass.data[DOMAIN].get(f"{entry.entry_id}_advisory")
+        if _advisory is not None:
+            await _advisory.async_refresh()
+
+    hass.async_create_task(_startup_refresh())
 
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    # Deadman: if control is active, restore native EMS before tearing down.
+    _mgr = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_control")
+    if _mgr is not None:
+        try:
+            await _mgr.disable()
+        except Exception:  # noqa: BLE001
+            pass
+
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         hass.data[DOMAIN].pop(entry.entry_id)
-    
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_advisory", None)
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_control", None)
+
     return unload_ok
 
 

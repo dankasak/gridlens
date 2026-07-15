@@ -153,11 +153,21 @@ class PlanCalculator:
         # Only fall back to load-minus-solar if there is no export sensor (i.e. the
         # energy_sensor is a total-load sensor, not a grid-import sensor).
         grid_export_data = []
+        export_fine_data = []
         if self.grid_export_sensor:
             grid_export_data = await self._get_usage_data(start_date, end_date, self.grid_export_sensor)
             _LOGGER.warning(
                 f"Using direct sensors — import: {sum(d['value'] for d in usage_data):.2f} kWh, "
                 f"export: {sum(d['value'] for d in grid_export_data):.2f} kWh"
+            )
+            # 5-minute export series for FiT-window attribution in bill items.
+            # Hourly buckets cannot resolve sub-hourly FiT windows (e.g. Flow Power's
+            # 17:30-19:30: the 17:00 bucket's start timestamp falls outside the window,
+            # but most of its export can be inside it). Short-term statistics may only
+            # cover part of the period — _compute_bill_items falls back to pro-rated
+            # hourly buckets for uncovered hours.
+            export_fine_data = await self._get_usage_data(
+                start_date, end_date, self.grid_export_sensor, period="5minute"
             )
         elif self.solar_sensor and solar_data:
             # No dedicated export sensor: derive import/export from (total load) − solar
@@ -420,6 +430,7 @@ class PlanCalculator:
                     comparison_total=plan_costs.get(plan_key),
                     opt_result=opt_result,
                     pea_result=pea_results.get(plan_key),
+                    export_fine_data=export_fine_data,
                 )
 
             # Sync breakdown.total with bill_items.total for the current plan.
@@ -685,6 +696,7 @@ class PlanCalculator:
         comparison_total: float = None,
         opt_result: dict = None,
         pea_result: dict = None,
+        export_fine_data: list[dict] = None,
     ) -> dict:
         """Return itemised bill breakdown matching Australian electricity bill format.
 
@@ -845,12 +857,35 @@ class PlanCalculator:
                     fit_eligible_kwh += exp
         else:
             # Current plan with fixed FiT (e.g. Flow Power): apply plan rate to actual export_data.
-            for d in export_data:
+            #
+            # Prefer 5-minute short-term statistics: FiT windows sit on half-hour
+            # boundaries (Flow Power 17:30-19:30), and matching an hourly bucket's
+            # start timestamp against such a window misattributes up to an hour of
+            # export at each edge (real case: 121 kWh of 17:30-18:00 export dropped
+            # because the 17:00 bucket "starts" outside the window). 5-minute buckets
+            # attribute export to the window it actually occurred in.
+            fine = export_fine_data or []
+            covered_hours = set()
+            for d in fine:
                 local_dt = d['timestamp'].astimezone(tz)
+                covered_hours.add(local_dt.replace(minute=0, second=0, microsecond=0))
                 rate = plan.get_export_rate(local_dt)
                 if rate > 0:
                     fit_credit += d['value'] * rate
                     fit_eligible_kwh += d['value']
+            # Hourly fallback for hours outside short-term retention: pro-rate each
+            # bucket across its two half-hours (windows never split finer than :30),
+            # assuming export is spread evenly within the bucket.
+            for d in export_data:
+                local_dt = d['timestamp'].astimezone(tz)
+                if local_dt.replace(minute=0, second=0, microsecond=0) in covered_hours:
+                    continue
+                r0 = plan.get_export_rate(local_dt)
+                r30 = plan.get_export_rate(local_dt + timedelta(minutes=30))
+                halves = [r for r in (r0, r30) if r > 0]
+                if halves:
+                    fit_credit += d['value'] / 2 * sum(halves)
+                    fit_eligible_kwh += d['value'] / 2 * len(halves)
         fit_credit = round(fit_credit, 2)
         fit_eligible_kwh = round(fit_eligible_kwh, 2)
         fit_rate_c = round(fit_credit / fit_eligible_kwh * 100, 2) if fit_eligible_kwh > 0 else 0.0
@@ -1391,9 +1426,15 @@ class PlanCalculator:
         return 25.00, None  # Fallback
 
     async def _get_usage_data(
-        self, start_time: datetime, end_time: datetime, sensor_id: str = None
+        self, start_time: datetime, end_time: datetime, sensor_id: str = None,
+        period: str = "hour",
     ) -> list[dict]:
-        """Get historical usage data from HA long-term statistics (hourly change values)."""
+        """Get historical usage data from HA statistics (change values per period).
+
+        period="hour" reads long-term statistics; period="5minute" reads short-term
+        statistics, which only exist within the recorder's retention window — callers
+        using 5minute must tolerate partial or empty coverage.
+        """
         sensor = sensor_id or self.energy_sensor
         if not sensor:
             return []
@@ -1405,13 +1446,16 @@ class PlanCalculator:
                 start_time,
                 end_time,
                 {sensor},
-                "hour",
+                period,
                 None,
                 {"change"},
             )
 
             if not stats or sensor not in stats:
-                _LOGGER.warning(f"No long-term statistics for {sensor}")
+                if period == "hour":
+                    _LOGGER.warning(f"No long-term statistics for {sensor}")
+                else:
+                    _LOGGER.info(f"No {period} short-term statistics for {sensor}")
                 return []
 
             usage_data = []

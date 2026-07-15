@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Tests for the solar-vs-grid charge-source split (Issue 2, the 10 kW import-spike bug).
+
+The optimizer plan distinguishes total battery ``charge_kwh`` from grid ``buy_kwh``. A
+solar-charge slot charges the battery entirely from PV surplus (grid import only covers
+house + deferrable load). Executing such a slot with a Sigenergy PV-first *force_charge*
+setpoint makes the inverter import from the grid whenever instantaneous PV surplus falls
+below the setpoint — real grid-import spikes where the plan predicted ~0 import.
+
+The fix threads a ``grid_charge_w`` intent through ``DispatchInterval``:
+  * solar-only charge (``grid_charge_w <= eps``)  -> self-consumption (never imports)
+  * genuine grid charge (``grid_charge_w > eps``)  -> force_charge at the *grid* watts
+
+These tests exercise the REAL executor and planner logic. Home Assistant and scipy are
+not importable in this container, so their modules are stubbed and the target source
+files are loaded directly by path (pure control/plan logic — no HA runtime needed).
+
+Run:  python3 test_charge_source_split.py
+"""
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+import os
+import sys
+import types
+from datetime import datetime, timedelta, timezone
+
+# --------------------------------------------------------------------------- paths
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_COMPONENT = os.path.dirname(_HERE)  # .../custom_components/grid_lens
+_FIXED_NOW = datetime(2026, 7, 14, 11, 0, 0, tzinfo=timezone.utc)
+
+
+# ----------------------------------------------------------------- HA / dep stubs
+def _install_stubs() -> None:
+    """Minimal stand-ins so executor.py / planner.py import without HA or scipy."""
+
+    def _mod(name: str) -> types.ModuleType:
+        m = types.ModuleType(name)
+        sys.modules[name] = m
+        return m
+
+    # homeassistant.core.HomeAssistant
+    ha = _mod("homeassistant")
+    core = _mod("homeassistant.core")
+    core.HomeAssistant = type("HomeAssistant", (), {})
+
+    def _callback(fn):  # decorator no-op
+        return fn
+
+    core.callback = _callback
+    ha.core = core
+
+    # homeassistant.helpers.event.async_track_time_change / async_call_later
+    helpers = _mod("homeassistant.helpers")
+    event = _mod("homeassistant.helpers.event")
+    event.async_track_time_change = lambda *a, **k: (lambda: None)
+    event.async_call_later = lambda *a, **k: (lambda: None)
+    helpers.event = event
+    ha.helpers = helpers
+
+    # homeassistant.util.dt.now()
+    util = _mod("homeassistant.util")
+    dt = _mod("homeassistant.util.dt")
+    dt.now = lambda: _FIXED_NOW
+    util.dt = dt
+    ha.util = util
+
+
+def _load(path: str, fqname: str, package: str | None = None) -> types.ModuleType:
+    """Load a source file as ``fqname`` (with ``package`` for relative imports)."""
+    spec = importlib.util.spec_from_file_location(fqname, path)
+    module = importlib.util.module_from_spec(spec)
+    if package is not None:
+        module.__package__ = package
+    sys.modules[fqname] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _bootstrap():
+    """Load real base.py / executor.py / planner.py under a synthetic ``gl`` package."""
+    _install_stubs()
+
+    # Synthetic package tree so relative imports (``..inverters.base`` etc.) resolve.
+    for pkg in ("gl", "gl.inverters", "gl.control", "gl.advisory"):
+        m = types.ModuleType(pkg)
+        m.__path__ = []  # mark as package
+        sys.modules[pkg] = m
+
+    # Real base.py (stdlib-only) — gives us the genuine BatteryAction enum.
+    base = _load(os.path.join(_COMPONENT, "inverters", "base.py"), "gl.inverters.base",
+                 package="gl.inverters")
+
+    # Stub battery_controller module (executor only needs the *name* at import time;
+    # the tests inject a fake controller instance).
+    bc_stub = types.ModuleType("gl.control.battery_controller")
+    bc_stub.BatteryController = type("BatteryController", (), {})
+    sys.modules["gl.control.battery_controller"] = bc_stub
+
+    executor = _load(os.path.join(_COMPONENT, "control", "executor.py"),
+                     "gl.control.executor", package="gl.control")
+
+    # Stub planner deps that pull in scipy / models we don't need for _classify.
+    opt_stub = types.ModuleType("gl.battery_optimizer")
+    opt_stub.BatteryOptimizer = type("BatteryOptimizer", (), {})
+    sys.modules["gl.battery_optimizer"] = opt_stub
+    models_stub = types.ModuleType("gl.advisory.models")
+    models_stub.AdvisoryResult = type("AdvisoryResult", (), {})
+    models_stub.ForecastBundle = type("ForecastBundle", (), {})
+    sys.modules["gl.advisory.models"] = models_stub
+
+    planner = _load(os.path.join(_COMPONENT, "advisory", "planner.py"),
+                    "gl.advisory.planner", package="gl.advisory")
+
+    return base, executor, planner
+
+
+BASE, EXECUTOR, PLANNER = _bootstrap()
+BatteryAction = BASE.BatteryAction
+DispatchInterval = EXECUTOR.DispatchInterval
+ScheduleExecutor = EXECUTOR.ScheduleExecutor
+AdvisoryPlanner = PLANNER.AdvisoryPlanner
+
+
+# ----------------------------------------------------------------- fake controller
+class FakeBatteryController:
+    """Records every command the executor issues so tests can assert on them."""
+
+    supports_battery_control = True
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    async def force_charge(self, power_w, duration=None):
+        self.calls.append(("force_charge", power_w, duration))
+        return True
+
+    async def force_discharge(self, power_w, duration=None):
+        self.calls.append(("force_discharge", power_w, duration))
+        return True
+
+    async def set_idle(self, duration=None):
+        self.calls.append(("set_idle", duration))
+        return True
+
+    async def set_self_consumption_mode(self):
+        self.calls.append(("set_self_consumption_mode",))
+        return True
+
+    async def restore_normal(self):
+        self.calls.append(("restore_normal",))
+        return True
+
+    # convenience
+    def names(self) -> list[str]:
+        return [c[0] for c in self.calls]
+
+
+def _make_executor() -> tuple[ScheduleExecutor, FakeBatteryController]:
+    bc = FakeBatteryController()
+    ex = ScheduleExecutor(hass=object(), battery_controller=bc, interval_minutes=5)
+    return ex, bc
+
+
+def _tick(ex: ScheduleExecutor, at: datetime) -> None:
+    asyncio.run(ex._tick(at))
+
+
+# --------------------------------------------------------------------------- tests
+def test_solar_charge_slot_never_grid_force_charges():
+    """A solar-source charge slot (grid_charge_w == 0) must NOT issue force_charge;
+    it must be executed as self-consumption so the inverter never imports to charge."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.CHARGE,
+        power_w=10_000.0, grid_charge_w=0.0,  # 10 kW charge, all from solar surplus
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+
+    assert "force_charge" not in bc.names(), (
+        f"solar charge slot issued a grid force_charge: {bc.calls}")
+    assert bc.names() == ["set_self_consumption_mode"], bc.calls
+
+
+def test_grid_charge_slot_force_charges_with_grid_watts():
+    """A genuine grid-charge slot must issue force_charge with the GRID watts as the
+    rate cap (not the full charge rate, and not self-consumption)."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.CHARGE,
+        power_w=10_000.0, grid_charge_w=6_000.0,  # 10 kW charge, 6 kW of it from grid
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+
+    assert bc.names() == ["force_charge"], bc.calls
+    _name, power_w, _dur = bc.calls[0]
+    assert power_w == 6_000.0, f"expected grid watts (6000), got {power_w}"
+    assert "set_self_consumption_mode" not in bc.names()
+
+
+def test_solar_charge_transition_economy_no_respam():
+    """Consecutive solar-charge ticks (resolved to self-use) must not re-spam
+    self-consumption every tick (transition economy preserved)."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.CHARGE,
+        power_w=8_000.0, grid_charge_w=0.0,
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    _tick(ex, _FIXED_NOW + timedelta(minutes=5))  # same slot, next tick
+
+    assert bc.names().count("set_self_consumption_mode") == 1, bc.calls
+
+
+def test_grid_charge_below_eps_is_solar():
+    """Float-noise grid contributions (<= 1 W) are treated as solar-only."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.CHARGE,
+        power_w=5_000.0, grid_charge_w=0.5,
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    assert "force_charge" not in bc.names(), bc.calls
+    assert bc.names() == ["set_self_consumption_mode"], bc.calls
+
+
+def test_discharge_slot_unchanged():
+    """Non-charge actions are unaffected by the split."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.DISCHARGE, power_w=7_000.0,
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    assert bc.names() == ["force_discharge"], bc.calls
+    assert bc.calls[0][1] == 7_000.0
+
+
+def test_stale_plan_hands_back_to_native():
+    """Watchdog: a stale plan reverts to native EMS exactly once (deadman preserved)."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(start=_FIXED_NOW, action=BatteryAction.CHARGE,
+                            power_w=5_000.0, grid_charge_w=5_000.0)
+    ex.set_plan([slot], updated_at=_FIXED_NOW - timedelta(hours=2))  # older than max age
+    _tick(ex, _FIXED_NOW)
+    assert bc.names() == ["restore_normal"], bc.calls
+
+
+# --------------------------------------------- planner split-math (real _classify)
+def _planner() -> AdvisoryPlanner:
+    return AdvisoryPlanner(optimizer=None)
+
+
+def test_planner_solar_slot_grid_charge_zero():
+    """import only covers load+deferrable -> grid_charge_w == 0 (solar-only charge)."""
+    p = _planner()
+    step = {
+        "charge_kwh": 5.0,      # 10 kW over a 0.5 h slot
+        "discharge_kwh": 0.0,
+        "import_kwh": 1.0,      # <= load+deferrable, so none feeds the battery
+        "load_kwh": 0.6,
+        "deferrable_kwh": 0.4,
+    }
+    action, power_w, grid_w = p._classify(step, dt_h=0.5)
+    assert action == BatteryAction.CHARGE
+    assert round(power_w, 1) == 10_000.0
+    assert grid_w == 0.0, grid_w
+
+
+def test_planner_grid_slot_computes_grid_watts():
+    """import beyond load+deferrable feeds the battery -> grid_charge_w = that, in W."""
+    p = _planner()
+    step = {
+        "charge_kwh": 5.0,      # 10 kW total charge over 0.5 h
+        "discharge_kwh": 0.0,
+        "import_kwh": 4.0,      # 4 kWh import; 1 kWh covers load+deferrable
+        "load_kwh": 0.7,
+        "deferrable_kwh": 0.3,  # -> grid-to-battery = 3 kWh over 0.5 h = 6 kW
+    }
+    action, power_w, grid_w = p._classify(step, dt_h=0.5)
+    assert action == BatteryAction.CHARGE
+    assert round(grid_w, 1) == 6_000.0, grid_w
+    assert grid_w < power_w  # grid portion never exceeds the full charge rate
+
+
+def test_planner_grid_charge_capped_at_total_charge():
+    """grid-to-battery can never exceed the slot's total charge energy."""
+    p = _planner()
+    step = {
+        "charge_kwh": 2.0,      # only 2 kWh charged this slot
+        "discharge_kwh": 0.0,
+        "import_kwh": 10.0,     # large import (also feeding big loads)
+        "load_kwh": 1.0,
+        "deferrable_kwh": 1.0,  # grid-to-battery raw = 8 kWh, but capped at charge=2 kWh
+    }
+    _action, power_w, grid_w = p._classify(step, dt_h=0.5)
+    assert round(grid_w, 1) == round(power_w, 1) == 4_000.0, (grid_w, power_w)
+
+
+def test_planner_discharge_has_zero_grid_charge():
+    p = _planner()
+    step = {"charge_kwh": 0.0, "discharge_kwh": 4.0, "import_kwh": 0.0,
+            "load_kwh": 0.0, "deferrable_kwh": 0.0}
+    action, _power, grid_w = p._classify(step, dt_h=0.5)
+    assert action == BatteryAction.DISCHARGE
+    assert grid_w == 0.0
+
+
+# ------------------------------------------ soft terminal-SOC valuation (Defect 2)
+class _Bundle:
+    def __init__(self, export_rate):
+        self.export_rate = export_rate
+
+
+def test_terminal_soc_value_is_mean_export_rate():
+    """Terminal energy is valued at the horizon's mean export rate — a conservative
+    'you could have sold it' price that softens the hard terminal-SOC floor."""
+    # 0.45 in the 2h window, 0.05 otherwise, over a short horizon.
+    exp = [0.05, 0.05, 0.45, 0.45, 0.05, 0.05]
+    v = AdvisoryPlanner._terminal_soc_value(_Bundle(exp))
+    assert abs(v - sum(exp) / len(exp)) < 1e-12
+    # Must sit well below the grid-charge break-even (~import/eta ~ 0.35) so it can
+    # never make buying grid to bank terminal energy worthwhile.
+    assert v < 0.34
+
+
+def test_terminal_soc_value_empty_is_zero():
+    assert AdvisoryPlanner._terminal_soc_value(_Bundle([])) == 0.0
+
+
+def test_terminal_soc_value_ignores_negative_rates():
+    """Negative export rates (curtailment) are floored at 0 before averaging."""
+    v = AdvisoryPlanner._terminal_soc_value(_Bundle([-0.1, 0.2, 0.2]))
+    assert abs(v - (0.0 + 0.2 + 0.2) / 3) < 1e-12
+
+
+# --------------------------------------------------------------------------- runner
+def _run() -> int:
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    failed = 0
+    for t in tests:
+        try:
+            t()
+            print(f"PASS {t.__name__}")
+        except Exception as err:  # noqa: BLE001
+            failed += 1
+            print(f"FAIL {t.__name__}: {err}")
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(_run())

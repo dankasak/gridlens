@@ -78,6 +78,11 @@ class BatteryOptimizer:
         deferrable_loads: List[Dict] = None,
         demand_rate: float = 0.0,
         demand_window_mask: List[int] = None,
+        timestep_hours: float = 1.0,
+        soc_reward: float = 0.0,
+        export_penalty: float = 0.0,
+        no_grid_charge: bool = False,
+        terminal_soc_value: float = None,
     ) -> Dict:
         """Return an optimal hourly schedule minimising net energy cost.
 
@@ -91,6 +96,16 @@ class BatteryOptimizer:
         Each device gets its own LP variable with its own power cap, so a
         1.8 kW EV charger and a 4.7 kW hot water system are scheduled
         independently and cannot exceed their rated power in any single hour.
+
+        terminal_soc_value ($/kWh, optional) softens the terminal-SOC constraint for
+        rolling-horizon (advisory/control) use. Left None (the default), the LP enforces
+        the hard floor soc[T-1] >= E0 — correct and required for PLAN COMPARISON, where a
+        battery must not drain to empty for free energy. Set to a non-negative $/kWh, the
+        hard floor is dropped and end-of-horizon stored energy is instead VALUED in the
+        objective at that rate, so the LP neither buys grid at the horizon tail to force a
+        refill (Bug 2 artifact) nor treats an empty battery as free. Use a conservative
+        value (e.g. the export/FiT rate, well below import/eta) so it can never make
+        grid-charging worthwhile.
 
         demand_rate ($/kW/day) and demand_window_mask (list[int] length T,
         1 = hour is inside the network's demand window) enable peak-demand
@@ -118,16 +133,22 @@ class BatteryOptimizer:
 
         try:
             return self._lp_optimize(solar, load, r_imp, r_exp, E0, T, deferrable_loads,
-                                     demand_rate=demand_rate, demand_window_mask=dmask)
+                                     demand_rate=demand_rate, demand_window_mask=dmask,
+                                     timestep_hours=timestep_hours,
+                                     soc_reward=soc_reward, export_penalty=export_penalty,
+                                     no_grid_charge=no_grid_charge,
+                                     terminal_soc_value=terminal_soc_value)
         except ImportError:
             _LOGGER.warning(
                 "PuLP not yet installed — using greedy fallback. "
                 "Restart HA again after the first boot to enable LP optimisation."
             )
-            return self._greedy_optimize(solar, load, r_imp, r_exp, E0, T)
+            return self._greedy_optimize(solar, load, r_imp, r_exp, E0, T,
+                                         timestep_hours=timestep_hours)
         except Exception as exc:
             _LOGGER.warning("LP optimisation failed (%s) — using greedy fallback.", exc)
-            return self._greedy_optimize(solar, load, r_imp, r_exp, E0, T)
+            return self._greedy_optimize(solar, load, r_imp, r_exp, E0, T,
+                                         timestep_hours=timestep_hours)
 
     def calculate_no_battery_cost(
         self,
@@ -160,13 +181,17 @@ class BatteryOptimizer:
     # ------------------------------------------------------------------
 
     def _lp_optimize(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads,
-                     demand_rate=0.0, demand_window_mask=None):
+                     demand_rate=0.0, demand_window_mask=None, timestep_hours=1.0,
+                     soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
+                     terminal_soc_value=None):
         """Build and solve the LP. Raises on failure so caller can fall back."""
-        # HiGHS/PuLP paths don't model the peak-demand term; only the scipy path
-        # (the complete, production path) does. When a demand charge is active we
-        # skip straight to scipy so peak-shaving isn't silently dropped.
+        # HiGHS/PuLP paths model none of the extras below; only the scipy path (the
+        # complete, production path) does. Skip straight to scipy for any of them.
+        # (terminal_soc_value softens the terminal-SOC constraint — scipy-only.)
         demand_active = demand_rate > 0 and demand_window_mask and any(demand_window_mask)
-        if not demand_active:
+        if (not demand_active and timestep_hours == 1.0
+                and soc_reward == 0.0 and export_penalty == 0.0 and not no_grid_charge
+                and terminal_soc_value is None):
             try:
                 return self._lp_highspy(solar, load, r_imp, r_exp, E0, T, deferrable_loads)
             except ImportError:
@@ -177,7 +202,11 @@ class BatteryOptimizer:
         try:
             return self._lp_scipy(solar, load, r_imp, r_exp, E0, T, deferrable_loads,
                                   demand_rate=demand_rate,
-                                  demand_window_mask=demand_window_mask)
+                                  demand_window_mask=demand_window_mask,
+                                  timestep_hours=timestep_hours,
+                                  soc_reward=soc_reward, export_penalty=export_penalty,
+                                  no_grid_charge=no_grid_charge,
+                                  terminal_soc_value=terminal_soc_value)
         except ImportError:
             pass  # scipy not available — try PuLP
         except Exception as exc:
@@ -198,16 +227,19 @@ class BatteryOptimizer:
     # simultaneous import/export to a single direction.
 
     def _lp_scipy(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads,
-                  demand_rate=0.0, demand_window_mask=None):
+                  demand_rate=0.0, demand_window_mask=None, timestep_hours=1.0,
+                  soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
+                  terminal_soc_value=None):
         import numpy as np
         from scipy.optimize import linprog
         from scipy.sparse import lil_matrix
 
         eta = self.eta
-        M = (self.max_charge_rate_kw + self.max_discharge_rate_kw) * 2.0
+        dt = timestep_hours  # slot length in hours; variables are ENERGY (kWh) per slot
+        M = (self.max_charge_rate_kw + self.max_discharge_rate_kw) * 2.0 * dt
         N = len(deferrable_loads)       # number of individual deferrable devices
-        hours_per_day = 24
-        n_days = math.ceil(T / hours_per_day)
+        slots_per_day = int(round(24 / dt))
+        n_days = math.ceil(T / slots_per_day)
 
         # Peak-demand shaving: add one auxiliary variable P (peak kW), constrained
         # to be ≥ grid import in every demand-window hour and priced at the demand
@@ -229,6 +261,26 @@ class BatteryOptimizer:
         c_obj[X:X+T] = [-r for r in r_exp]
         if demand_active:
             c_obj[P_idx] = demand_rate * n_days
+        # Degeneracy regularizers (tiny, << the price signal). export_penalty makes a
+        # $0-value export cost a hair, so the LP prefers to CHARGE surplus solar rather
+        # than dump it. soc_reward gives stored energy a tiny intrinsic value, so the LP
+        # holds charge (imports to cover pre-peak load instead of self-consuming) and
+        # keeps the battery full for the paid export window. Both must stay far below the
+        # real spread so the peak export still dominates.
+        if export_penalty:
+            c_obj[X:X+T] += export_penalty
+        if soc_reward:
+            c_obj[S:S+T] -= soc_reward
+        # Soft terminal-SOC valuation (Bug 2 fix, rolling-horizon use only). When set, the
+        # hard terminal floor (soc[T-1] >= E0) is dropped below and end-of-horizon stored
+        # energy is instead valued here at terminal_soc_value $/kWh — so the LP is not forced
+        # to buy grid at the tail to refill, but empty-at-end still costs its intrinsic value.
+        # This is ADDITIVE with soc_reward on the final slot (soc_reward stays the tiny
+        # per-slot tie-breaker; terminal_soc_value is the boundary valuation) and is deliberately
+        # kept far below import_rate/eta so it can never make grid-charging profitable.
+        soft_terminal = terminal_soc_value is not None
+        if soft_terminal:
+            c_obj[S+T-1] -= max(0.0, terminal_soc_value)
         # def_i has NO direct cost in the objective.  Its cost is implicit:
         # when solar is sufficient, def_i reduces exp → opportunity cost = r_exp[t];
         # when solar is insufficient, def_i increases imp → cost = r_imp[t].
@@ -237,19 +289,20 @@ class BatteryOptimizer:
         lb = np.zeros(n)
         ub = np.full(n, np.inf)
         ub[I:I+T] = M
-        ub[C:C+T] = self.max_charge_rate_kw
-        ub[D:D+T] = self.max_discharge_rate_kw
+        # Per-slot energy caps = rated power × slot length (kWh).
+        ub[C:C+T] = self.max_charge_rate_kw * dt
+        ub[D:D+T] = self.max_discharge_rate_kw * dt
         lb[S:S+T] = self.min_soc_kwh
         ub[S:S+T] = self.max_soc_kwh
         for i, dev in enumerate(deferrable_loads):
-            # Each device's per-hour draw is capped at its own rated max kW,
-            # and forced to 0 in hours the device is unavailable (hour_mask).
+            # Each device's per-slot draw is capped at its own rated max energy
+            # (max_kw × dt), and forced to 0 in slots the device is unavailable.
             mask = dev.get('hour_mask')
             if mask:
                 for t in range(T):
-                    ub[(5+i)*T+t] = dev['max_kw'] if mask[t] else 0.0
+                    ub[(5+i)*T+t] = dev['max_kw'] * dt if mask[t] else 0.0
             else:
-                ub[(5+i)*T:(5+i)*T+T] = dev['max_kw']
+                ub[(5+i)*T:(5+i)*T+T] = dev['max_kw'] * dt
 
         # Equality constraints: T (energy balance) + T (SOC update) + N*n_days (per-device daily totals)
         n_eq = 2*T + N * n_days
@@ -289,34 +342,57 @@ class BatteryOptimizer:
         for i, dev in enumerate(deferrable_loads):
             mask = dev.get('hour_mask')
             for d in range(n_days):
-                t0 = d * hours_per_day
-                t1 = min(t0 + hours_per_day, T)
+                t0 = d * slots_per_day
+                t1 = min(t0 + slots_per_day, T)
                 row = 2*T + i * n_days + d
                 for t in range(t0, t1):
                     A_eq[row, (5+i)*T+t] = 1.0
-                avail_hours = (
+                avail_slots = (
                     sum(1 for t in range(t0, t1) if mask[t]) if mask else (t1 - t0)
                 )
-                target = dev['daily_kwh'] * (t1 - t0) / hours_per_day
-                b_eq[row] = min(target, avail_hours * dev['max_kw'])
+                target = dev['daily_kwh'] * (t1 - t0) / slots_per_day
+                b_eq[row] = min(target, avail_slots * dev['max_kw'] * dt)
 
         # Terminal SOC: the battery must end the window at least as full as it
         # started, so its initial charge is a loan, not free energy.  Clamped to
         # the SOC bounds in case the reported initial SOC lies outside them.
         # linprog uses A_ub x ≤ b_ub, so encode soc[T-1] ≥ E_end as -soc[T-1] ≤ -E_end.
+        # This HARD floor is used for plan comparison; in soft-terminal mode it is dropped
+        # entirely (the SOC lower bound lb[S:S+T]=min_soc_kwh still keeps soc[T-1] ≥ min_soc)
+        # and terminal energy is valued in the objective instead (see soft_terminal above).
         E_end = min(max(E0, self.min_soc_kwh), self.max_soc_kwh)
-        # Row 0 is the terminal-SOC bound. When a demand charge is active, add one
-        # row per demand-window hour: import[t] - P ≤ 0  (P ≥ every in-window import).
+        term_rows = 0 if soft_terminal else 1
+        # Row 0 (when present) is the terminal-SOC bound. When a demand charge is active, add
+        # one row per demand-window hour: import[t] - P ≤ 0  (P ≥ every in-window import).
         demand_hours = [t for t in range(T) if demand_window_mask[t]] if demand_active else []
-        A_ub = lil_matrix((1 + len(demand_hours), n))
-        b_ub = np.zeros(1 + len(demand_hours))
-        A_ub[0, S+T-1] = -1.0
-        b_ub[0] = -E_end
-        for r, t in enumerate(demand_hours, start=1):
-            A_ub[r, I+t]   =  1.0
+        # no_grid_charge adds T rows forbidding grid import from charging the battery:
+        # imp[t] - Σ def_i[t] ≤ load[t]  ⇒  grid may cover house load + deferrable devices,
+        # but any battery charge must come from solar surplus only.
+        ngc_rows = T if no_grid_charge else 0
+        n_ub = term_rows + len(demand_hours) + ngc_rows
+        A_ub = lil_matrix((n_ub, n)) if n_ub else None
+        b_ub = np.zeros(n_ub) if n_ub else None
+        r = 0
+        if not soft_terminal:
+            A_ub[0, S+T-1] = -1.0
+            b_ub[0] = -E_end
+            r = 1
+        for t in demand_hours:
+            # P is peak kW; import[t] is energy per slot → power = energy / dt.
+            A_ub[r, I+t]   =  1.0 / dt
             A_ub[r, P_idx] = -1.0
+            r += 1
+        if no_grid_charge:
+            for t in range(T):
+                A_ub[r, I+t] = 1.0
+                for i in range(N):
+                    A_ub[r, (5 + i) * T + t] = -1.0
+                b_ub[r] = load[t]
+                r += 1
 
-        result = linprog(c_obj, A_ub=A_ub.tocsr(), b_ub=b_ub,
+        result = linprog(c_obj,
+                         A_ub=(A_ub.tocsr() if A_ub is not None else None),
+                         b_ub=b_ub,
                          A_eq=A_eq.tocsr(), b_eq=b_eq,
                          bounds=list(zip(lb.tolist(), ub.tolist())),
                          method='highs', options={'time_limit': 30.0})
@@ -553,10 +629,13 @@ class BatteryOptimizer:
     # Greedy fallback
     # ------------------------------------------------------------------
 
-    def _greedy_optimize(self, solar, load, r_imp, r_exp, E0, T):
+    def _greedy_optimize(self, solar, load, r_imp, r_exp, E0, T, timestep_hours=1.0):
         avg_imp = sum(r_imp) / T if T else 0.15
         avg_exp = sum(r_exp) / T if T else 0.05
         eta = self.eta
+        dt = timestep_hours  # per-slot energy caps = rated power × dt
+        max_cha = self.max_charge_rate_kw * dt
+        max_dis = self.max_discharge_rate_kw * dt
 
         soc_kwh = E0
         schedule = []
@@ -571,7 +650,7 @@ class BatteryOptimizer:
 
             if fit_profitable:
                 # Profitable FiT window: discharge battery to maximise export.
-                can_dis = min(self.max_discharge_rate_kw,
+                can_dis = min(max_dis,
                               (soc_kwh - self.min_soc_kwh) * eta)
                 dis = max(0.0, can_dis)
                 available = net + dis          # solar surplus + battery
@@ -582,7 +661,7 @@ class BatteryOptimizer:
                     exp = 0.0
             elif net >= 0:
                 if r_exp[t] < avg_exp * 0.9:
-                    can_charge = min(net, self.max_charge_rate_kw,
+                    can_charge = min(net, max_cha,
                                      (self.max_soc_kwh - soc_kwh) / eta)
                     cha = max(0.0, can_charge)
                     exp = net - cha
@@ -591,7 +670,7 @@ class BatteryOptimizer:
             else:
                 deficit = -net
                 if r_imp[t] > avg_imp * 1.1:
-                    can_dis = min(deficit, self.max_discharge_rate_kw,
+                    can_dis = min(deficit, max_dis,
                                   (soc_kwh - self.min_soc_kwh) * eta)
                     dis = max(0.0, can_dis)
                     imp = deficit - dis

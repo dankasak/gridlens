@@ -114,13 +114,39 @@ class PlanFromData(RetailerPlan):
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _time_to_min(value) -> int:
+        """'HH:MM'[:SS] → minutes since midnight. '24:00' → 1440."""
+        parts = str(value).split(":")
+        return int(parts[0]) * 60 + (int(parts[1]) if len(parts) > 1 else 0)
+
+    @classmethod
+    def _in_time_range(cls, start, end, minute_of_day: int) -> bool:
+        """End-exclusive minute-of-day membership; wraps midnight when end <= start."""
+        s = cls._time_to_min(start)
+        e = cls._time_to_min(end)
+        if e <= s:  # wraps past midnight, e.g. 22:00 → 06:00
+            return minute_of_day >= s or minute_of_day < e
+        return s <= minute_of_day < e
+
     def _in_window(self, window: dict, dt: datetime) -> bool:
+        # Sub-hour time range (from the DB's true TIME range) takes precedence.
+        start, end = window.get("start"), window.get("end")
+        if start is not None and end is not None:
+            return self._in_time_range(start, end, dt.hour * 60 + dt.minute)
         hours = window.get("hours", "all")
         if hours == "all":
             return True
         return dt.hour in hours
 
     def _in_window_hour(self, window: dict, hour: int) -> bool:
+        # For hour-granular display/labels: a time-range window counts for an hour if
+        # it overlaps any part of that hour.
+        start, end = window.get("start"), window.get("end")
+        if start is not None and end is not None:
+            return any(
+                self._in_time_range(start, end, hour * 60 + m) for m in (0, 30, 59)
+            )
         hours = window.get("hours", "all")
         if hours == "all":
             return True

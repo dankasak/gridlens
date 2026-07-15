@@ -39,6 +39,15 @@ async def async_setup_entry(
     
     _LOGGER.warning(f"Setting up {len(sensors)} sensors (3 comparison + {len(PLANS) * len(METRICS)} plan metrics)")
 
+    # Advisory-mode dispatch sensor (independent coordinator; read-only).
+    advisory = hass.data[DOMAIN].get(f"{entry.entry_id}_advisory")
+    if advisory is not None:
+        try:
+            from .advisory.dispatch_sensor import build_advisory_sensors
+            sensors.extend(build_advisory_sensors(advisory, entry))
+        except Exception as _adv_err:  # noqa: BLE001
+            _LOGGER.warning("Advisory sensor setup skipped: %s", _adv_err)
+
     async_add_entities(sensors)
 
 
