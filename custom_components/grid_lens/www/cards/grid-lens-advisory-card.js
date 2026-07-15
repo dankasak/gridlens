@@ -655,31 +655,76 @@ class GridLensAdvisoryCard extends HTMLElement {
       const frac = Math.max(0, Math.min(1,
         ((ev.clientX - r.left) / r.width * GW - GML) / (GW - GML - GMR)));
       const ms = t0 + frac * (t1 - t0);
-      // nearest slot
-      let best = this._traj[0], bd = Infinity;
-      for (const s of this._traj) { const d = Math.abs(new Date(s.start).getTime() - ms); if (d < bd) { bd = d; best = s; } }
-      const bestMs = new Date(best.start).getTime();
+      // Check if hovering over historical time (before forecast starts)
+      const trajStart = new Date(this._traj[0].start).getTime();
+      const isHistory = ms < trajStart;
+
+      let bestMs, best = null;
+      if (!isHistory) {
+        // Hovering over forecast: find nearest trajectory slot
+        best = this._traj[0];
+        let bd = Infinity;
+        for (const s of this._traj) { const d = Math.abs(new Date(s.start).getTime() - ms); if (d < bd) { bd = d; best = s; } }
+        bestMs = new Date(best.start).getTime();
+      } else {
+        // Hovering over history: show data for the hovered time, not nearest forecast
+        bestMs = ms;
+      }
+
       const bx = this._xOf(bestMs);
       // move every chart's crosshair to the same time-column
       xhairs.forEach(l => { l.setAttribute('x1', bx); l.setAttribute('x2', bx); l.setAttribute('opacity', '1'); });
-      // measured SOC only for past slots
-      let av = null;
-      if (bestMs <= Date.now() && this._actual && this._actual.length) {
+
+      // Get measured data for this time
+      let av = null, actualSolar = null, actualLoad = null, actualBuy = null, actualSell = null;
+      if (this._actual && this._actual.length) {
         let d2 = Infinity;
         for (const p of this._actual) { const d = Math.abs(p.t.getTime() - bestMs); if (d < d2) { d2 = d; av = (d < 5400000) ? p.v : null; } }
       }
-      tip.innerHTML =
-        `<b>${fmtHour(bestMs)}</b>` +
-        `<div><span class="k" style="color:var(--predicted)">SOC plan</span> ${fmtPct(best.soc_percent)}` +
-        (av != null ? ` · <span class="k" style="color:var(--actual)">actual</span> ${fmtPct(av)}` : '') + `</div>` +
-        `<div><b>${actionLabel(best.action)}</b>${best.power_w ? ' · ' + Math.round(best.power_w) + ' W' : ''}</div>` +
-        `<div><span class="k" style="color:var(--solar)">sun</span> ${((+best.solar_kwh || 0) * kwScale).toFixed(2)} · <span class="k" style="color:var(--load)">load</span> ${((+best.load_kwh || 0) * kwScale).toFixed(2)} kW</div>` +
-        `<div><span class="k" style="color:var(--buy)">buy</span> ${((+best.buy_kwh || 0) * kwScale).toFixed(2)} · <span class="k" style="color:var(--sell)">sell</span> ${((+best.sell_kwh || 0) * kwScale).toFixed(2)} kW</div>` +
-        (this._deferNames || []).map((nm, i) => {
-          const v = (+best['defer_' + i] || 0) * kwScale;
-          return v > 0.01 ? `<div><span class="k" style="color:var(--defer${(i % 4) + 1})">${esc(nm)}</span> ${v.toFixed(2)} kW</div>` : '';
-        }).join('') +
-        `<div><span class="k">rate</span> ${fmtC(best.import_rate)} in / ${fmtC(best.export_rate)} out</div>`;
+      // Get actual energy data for this time if available
+      if (this._actualEnergy.solar && this._actualEnergy.solar.length) {
+        let d2 = Infinity;
+        for (const p of this._actualEnergy.solar) { const d = Math.abs(p.t.getTime() - bestMs); if (d < d2) { d2 = d; actualSolar = (d < 5400000) ? p.v : null; } }
+      }
+      if (this._actualEnergy.load && this._actualEnergy.load.length) {
+        let d2 = Infinity;
+        for (const p of this._actualEnergy.load) { const d = Math.abs(p.t.getTime() - bestMs); if (d < d2) { d2 = d; actualLoad = (d < 5400000) ? p.v : null; } }
+      }
+      if (this._actualEnergy.buy && this._actualEnergy.buy.length) {
+        let d2 = Infinity;
+        for (const p of this._actualEnergy.buy) { const d = Math.abs(p.t.getTime() - bestMs); if (d < d2) { d2 = d; actualBuy = (d < 5400000) ? p.v : null; } }
+      }
+      if (this._actualEnergy.sell && this._actualEnergy.sell.length) {
+        let d2 = Infinity;
+        for (const p of this._actualEnergy.sell) { const d = Math.abs(p.t.getTime() - bestMs); if (d < d2) { d2 = d; actualSell = (d < 5400000) ? p.v : null; } }
+      }
+
+      // Build tooltip content
+      if (isHistory && !best) {
+        // Historical data only
+        tip.innerHTML = `<b>${fmtHour(bestMs)}</b>` +
+          (av != null ? `<div><span class="k" style="color:var(--actual)">SOC</span> ${fmtPct(av)}</div>` : '') +
+          (actualSolar != null || actualLoad != null ? `<div><span class="k" style="color:var(--solar)">sun</span> ${(actualSolar || 0).toFixed(2)} · <span class="k" style="color:var(--load)">load</span> ${(actualLoad || 0).toFixed(2)} kW</div>` : '') +
+          (actualBuy != null || actualSell != null ? `<div><span class="k" style="color:var(--buy)">buy</span> ${(actualBuy || 0).toFixed(2)} · <span class="k" style="color:var(--sell)">sell</span> ${(actualSell || 0).toFixed(2)} kW</div>` : '') +
+          `<div style="font-size:10px;color:var(--muted);margin-top:4px">Historical data only (no forecast)</div>`;
+      } else if (best) {
+        // Forecast data with actual overlay
+        tip.innerHTML =
+          `<b>${fmtHour(bestMs)}</b>` +
+          `<div><span class="k" style="color:var(--predicted)">SOC plan</span> ${fmtPct(best.soc_percent)}` +
+          (av != null ? ` · <span class="k" style="color:var(--actual)">actual</span> ${fmtPct(av)}` : '') + `</div>` +
+          `<div><b>${actionLabel(best.action)}</b>${best.power_w ? ' · ' + Math.round(best.power_w) + ' W' : ''}</div>` +
+          `<div><span class="k" style="color:var(--solar)">sun</span> ${((actualSolar != null ? actualSolar : (+best.solar_kwh || 0) * kwScale)).toFixed(2)} · <span class="k" style="color:var(--load)">load</span> ${((actualLoad != null ? actualLoad : (+best.load_kwh || 0) * kwScale)).toFixed(2)} kW</div>` +
+          `<div><span class="k" style="color:var(--buy)">buy</span> ${((actualBuy != null ? actualBuy : (+best.buy_kwh || 0) * kwScale)).toFixed(2)} · <span class="k" style="color:var(--sell)">sell</span> ${((actualSell != null ? actualSell : (+best.sell_kwh || 0) * kwScale)).toFixed(2)} kW</div>` +
+          (this._deferNames || []).map((nm, i) => {
+            const v = (+best['defer_' + i] || 0) * kwScale;
+            return v > 0.01 ? `<div><span class="k" style="color:var(--defer${(i % 4) + 1})">${esc(nm)}</span> ${v.toFixed(2)} kW</div>` : '';
+          }).join('') +
+          `<div><span class="k">rate</span> ${fmtC(best.import_rate)} in / ${fmtC(best.export_rate)} out</div>`;
+      } else {
+        // No data at all
+        tip.innerHTML = `<b>${fmtHour(bestMs)}</b><div style="font-size:11px;color:var(--muted)">No data available</div>`;
+      }
       const cr = charts.getBoundingClientRect();
       const flip = (ev.clientX - cr.left) > cr.width * 0.62;
       tip.style.left = (ev.clientX - cr.left) + 'px';
