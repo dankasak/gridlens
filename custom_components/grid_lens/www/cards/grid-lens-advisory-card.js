@@ -26,8 +26,6 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._actualEnergy = { solar: [], load: [], buy: [], sell: [] };
     this._deferNames = [];    // deferrable device names, one series each
     this._viewMode = 'today'; // 'today' = today only; 'horizon' = full 36h
-    this._chartSvgs = [];     // track SVG elements for cleanup
-    this._moveHandler = null; // stored move handler for cleanup
   }
 
   setConfig(config) {
@@ -649,16 +647,10 @@ class GridLensAdvisoryCard extends HTMLElement {
     const tip = this.shadowRoot.querySelector('.xtip');
     if (!svgs.length || !tip) return;
 
-    // Clean up old move handlers to avoid duplicates when switching views
-    if (this._moveHandler && this._chartSvgs.length) {
-      this._chartSvgs.forEach(svg => svg.removeEventListener('mousemove', this._moveHandler));
-      charts.removeEventListener('mouseleave', this._moveLeavedHandler);
-    }
-
-    const { t0, t1, step } = this._timeScale();
-    const kwScale = 3600000 / step;   // kWh-per-interval → average kW
-
     const move = (ev) => {
+      // Get time scale dynamically so view mode changes are reflected
+      const { t0, t1, step } = this._timeScale();
+      const kwScale = 3600000 / step;
       const r = ev.currentTarget.getBoundingClientRect();
       const frac = Math.max(0, Math.min(1,
         ((ev.clientX - r.left) / r.width * GW - GML) / (GW - GML - GMR)));
@@ -695,17 +687,13 @@ class GridLensAdvisoryCard extends HTMLElement {
       tip.style.transform = flip ? 'translate(calc(-100% - 14px), -50%)' : 'translate(14px, -50%)';
       tip.style.opacity = '1';
     };
-
-    // Store handlers for cleanup on view mode change
-    this._moveHandler = move;
-    this._chartSvgs = svgs;
-    this._moveLeavedHandler = () => {
+    const leave = () => {
       xhairs.forEach(l => l.setAttribute('opacity', '0'));
       tip.style.opacity = '0';
     };
 
     svgs.forEach(svg => svg.addEventListener('mousemove', move));
-    charts.addEventListener('mouseleave', this._moveLeavedHandler);
+    charts.addEventListener('mouseleave', leave);
   }
 }
 
