@@ -25,6 +25,7 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._gc = 0;             // gradient-id counter (unique per render)
     this._actualEnergy = { solar: [], load: [], buy: [], sell: [] };
     this._deferNames = [];    // deferrable device names, one series each
+    this._viewMode = 'today'; // 'today' = today only; 'horizon' = full 36h
   }
 
   setConfig(config) {
@@ -206,6 +207,9 @@ class GridLensAdvisoryCard extends HTMLElement {
         .modeline .m { font-weight:550; }
         .note { font-size:11px; color:var(--muted); margin-top:8px; line-height:1.4; }
         .waiting { padding:26px 8px; text-align:center; color:var(--ink2); font-size:13px; }
+        .view-btn { transition:all 0.15s ease; font-weight:600; cursor:pointer; }
+        .view-btn:hover { background:rgba(255,255,255,0.08); }
+        .view-btn.active { background:var(--surface); color:var(--good); }
       </style>
       <div class="card"><div class="body"></div></div>
     `;
@@ -224,7 +228,13 @@ class GridLensAdvisoryCard extends HTMLElement {
           <div class="title">Battery Plan &amp; SOC Forecast</div>
           <div class="sub">${s.plan_name ? esc(s.plan_name) : 'Grid Lens advisory'}${s.solver ? ' · ' + esc(s.solver) : ''}${s.generated_at ? ' · ' + fmtTime(s.generated_at) : ''}</div>
         </div>
-        <div class="badge ${s.restored ? 'stale' : (s.status === 'ok' ? 'ok' : '')}">${s.restored ? 'LAST PLAN' : esc((s.status || 'unknown').toUpperCase())}</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <div style="display:flex;gap:4px;padding:2px;background:var(--plane);border:1px solid var(--border);border-radius:6px">
+            <button id="toggle-today" class="view-btn ${this._viewMode === 'today' ? 'active' : ''}" style="padding:4px 10px;border:none;background:transparent;color:var(--ink);cursor:pointer;font-size:11px;border-radius:4px">Today</button>
+            <button id="toggle-horizon" class="view-btn ${this._viewMode === 'horizon' ? 'active' : ''}" style="padding:4px 10px;border:none;background:transparent;color:var(--ink);cursor:pointer;font-size:11px;border-radius:4px">Full horizon</button>
+          </div>
+          <div class="badge ${s.restored ? 'stale' : (s.status === 'ok' ? 'ok' : '')}">${s.restored ? 'LAST PLAN' : esc((s.status || 'unknown').toUpperCase())}</div>
+        </div>
       </div>`;
 
     if (!this._traj || s.status !== 'ok') {
@@ -321,6 +331,23 @@ class GridLensAdvisoryCard extends HTMLElement {
       <div class="note">Advisory only — the battery follows its native EMS, so actual SOC won't track the plan until control is enabled. What's validated now is the solar/load/price forecasting. All series are the forecast for the current plan (${s.plan_name ? esc(s.plan_name) : '—'}).</div>`;
 
     this._wireCrosshair();
+    this._wireViewToggle();
+  }
+
+  _wireViewToggle() {
+    const todayBtn = this.shadowRoot.querySelector('#toggle-today');
+    const horizonBtn = this.shadowRoot.querySelector('#toggle-horizon');
+    if (!todayBtn || !horizonBtn) return;
+    todayBtn.addEventListener('click', () => {
+      this._viewMode = 'today';
+      this._sig = '';  // force re-render
+      this._paint();
+    });
+    horizonBtn.addEventListener('click', () => {
+      this._viewMode = 'horizon';
+      this._sig = '';  // force re-render
+      this._paint();
+    });
   }
 
   _geom() {
@@ -331,9 +358,21 @@ class GridLensAdvisoryCard extends HTMLElement {
     const t = this._traj;
     const planStart = new Date(t[0].start).getTime();
     const step = t.length > 1 ? (new Date(t[1].start).getTime() - planStart) : 1800000;
-    const t1 = new Date(t[t.length - 1].start).getTime() + step;
-    // Left edge is 2h before the plan starts, so "now" sits inset with history to its left.
-    const t0 = planStart - VIEW_BACK_MS;
+    let t1 = new Date(t[t.length - 1].start).getTime() + step;
+
+    let t0;
+    if (this._viewMode === 'today') {
+      // Show from midnight (today's start) to end of today
+      const now = new Date();
+      const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+      t0 = midnight;
+      // Clamp t1 to end of today (11:59:59 PM)
+      const endOfDay = midnight + 24 * 3600000;
+      t1 = Math.min(t1, endOfDay);
+    } else {
+      // Full horizon mode: 2h of history + full plan ahead
+      t0 = planStart - VIEW_BACK_MS;
+    }
     return { t0, t1, step, planStart };
   }
 
