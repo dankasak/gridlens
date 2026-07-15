@@ -99,7 +99,16 @@ class GridLensAdvisoryCard extends HTMLElement {
   async _fetchActual(hass, curSoc) {
     try {
       if (!this._traj || !this._traj.length) return;
-      const start = new Date(new Date(this._traj[0].start).getTime() - VIEW_BACK_MS);
+      // Fetch history from the appropriate start time based on view mode
+      let start;
+      if (this._viewMode === 'today') {
+        // In today mode, fetch from midnight (start of today)
+        const now = new Date();
+        start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      } else {
+        // In horizon mode, fetch from 2h before plan start
+        start = new Date(new Date(this._traj[0].start).getTime() - VIEW_BACK_MS);
+      }
       const end = new Date();
       const c = this._config;
       const eids = [c.soc_entity, c.solar_power_entity, c.load_power_entity, c.grid_power_entity]
@@ -339,14 +348,26 @@ class GridLensAdvisoryCard extends HTMLElement {
     const horizonBtn = this.shadowRoot.querySelector('#toggle-horizon');
     if (!todayBtn || !horizonBtn) return;
     todayBtn.addEventListener('click', () => {
-      this._viewMode = 'today';
-      this._sig = '';  // force re-render
-      this._paint();
+      if (this._viewMode !== 'today') {
+        this._viewMode = 'today';
+        this._lastFetch = 0;  // force history re-fetch with new time range
+        this._sig = '';  // force re-render
+        if (this._hass) {
+          this._fetchActual(this._hass, parseFloat(this._hass.states[this._config.soc_entity]?.state || 'NaN')).catch(() => {});
+        }
+        this._paint();
+      }
     });
     horizonBtn.addEventListener('click', () => {
-      this._viewMode = 'horizon';
-      this._sig = '';  // force re-render
-      this._paint();
+      if (this._viewMode !== 'horizon') {
+        this._viewMode = 'horizon';
+        this._lastFetch = 0;  // force history re-fetch with new time range
+        this._sig = '';  // force re-render
+        if (this._hass) {
+          this._fetchActual(this._hass, parseFloat(this._hass.states[this._config.soc_entity]?.state || 'NaN')).catch(() => {});
+        }
+        this._paint();
+      }
     });
   }
 
