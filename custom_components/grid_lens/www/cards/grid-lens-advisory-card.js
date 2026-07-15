@@ -26,6 +26,8 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._actualEnergy = { solar: [], load: [], buy: [], sell: [] };
     this._deferNames = [];    // deferrable device names, one series each
     this._viewMode = 'today'; // 'today' = today only; 'horizon' = full 36h
+    this._chartSvgs = [];     // track SVG elements for cleanup
+    this._moveHandler = null; // stored move handler for cleanup
   }
 
   setConfig(config) {
@@ -646,6 +648,13 @@ class GridLensAdvisoryCard extends HTMLElement {
     const xhairs = [...this.shadowRoot.querySelectorAll('.xhair')];
     const tip = this.shadowRoot.querySelector('.xtip');
     if (!svgs.length || !tip) return;
+
+    // Clean up old move handlers to avoid duplicates when switching views
+    if (this._moveHandler && this._chartSvgs.length) {
+      this._chartSvgs.forEach(svg => svg.removeEventListener('mousemove', this._moveHandler));
+      charts.removeEventListener('mouseleave', this._moveLeavedHandler);
+    }
+
     const { t0, t1, step } = this._timeScale();
     const kwScale = 3600000 / step;   // kWh-per-interval → average kW
 
@@ -686,11 +695,17 @@ class GridLensAdvisoryCard extends HTMLElement {
       tip.style.transform = flip ? 'translate(calc(-100% - 14px), -50%)' : 'translate(14px, -50%)';
       tip.style.opacity = '1';
     };
-    svgs.forEach(svg => svg.addEventListener('mousemove', move));
-    charts.addEventListener('mouseleave', () => {
+
+    // Store handlers for cleanup on view mode change
+    this._moveHandler = move;
+    this._chartSvgs = svgs;
+    this._moveLeavedHandler = () => {
       xhairs.forEach(l => l.setAttribute('opacity', '0'));
       tip.style.opacity = '0';
-    });
+    };
+
+    svgs.forEach(svg => svg.addEventListener('mousemove', move));
+    charts.addEventListener('mouseleave', this._moveLeavedHandler);
   }
 }
 
