@@ -140,6 +140,10 @@ CONF_BATTERY_DISCHARGE_POWER_SENSOR = "battery_discharge_power_sensor"
 CONF_BATTERY_MIN_SOC = "battery_min_soc"
 CONF_BATTERY_MAX_SOC = "battery_max_soc"
 
+# Which inverter driver ControlManager dispatches battery commands to (inverters/__init__.py).
+CONF_INVERTER_BRAND = "inverter_brand"
+CONF_INVERTER_TRANSPORT = "inverter_transport"
+
 # Deferrable loads
 CONF_DEFERRABLE_LOAD_SENSORS = "deferrable_load_sensors"  # list of sensor IDs
 CONF_DEFERRABLE_LOAD_MAX_KW = "deferrable_load_max_kw"    # list of max kW, parallel to sensors

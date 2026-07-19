@@ -12,11 +12,16 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 
-from ..inverters.sigenergy_mqtt import SigenergyMqttController
+from ..const import CONF_INVERTER_BRAND, CONF_INVERTER_TRANSPORT
+from ..inverters import get_inverter_controller
 from .battery_controller import BatteryController, GuardrailConfig
 from .executor import ScheduleExecutor
 
 _LOGGER = logging.getLogger(__name__)
+
+# Fallback for entries created before the inverter-selection config_flow step existed.
+_DEFAULT_BRAND = "sigenergy"
+_DEFAULT_TRANSPORT = "mqtt"
 
 
 class ControlManager:
@@ -25,8 +30,11 @@ class ControlManager:
         self.entry = entry
         d = entry.data
 
-        # Entity-proxy driver over sigenergy2mqtt (no second Modbus master).
-        driver = SigenergyMqttController(hass)
+        brand = d.get(CONF_INVERTER_BRAND, _DEFAULT_BRAND)
+        transport = d.get(CONF_INVERTER_TRANSPORT, _DEFAULT_TRANSPORT)
+        driver = get_inverter_controller(hass, brand, transport)
+        if driver is None:
+            raise RuntimeError(f"No inverter driver for brand={brand!r} transport={transport!r}")
         cfg = GuardrailConfig(
             min_soc_pct=float(d.get("battery_min_soc", 10.0)),
             charge_cutoff_pct=float(d.get("battery_max_soc", 100.0)),

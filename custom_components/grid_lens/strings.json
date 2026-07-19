@@ -67,6 +67,13 @@
           "battery_discharge_power_sensor": "Discharge power sensor if separate from the charge sensor. Leave blank if your charge sensor is signed (negative when discharging)."
         }
       },
+      "inverter": {
+        "title": "Inverter / Battery Control",
+        "description": "{detected}\n\nGrid Lens can actively manage your battery (charge/discharge) to follow the cheapest schedule. Select which inverter integration it should send commands to.",
+        "data": {
+          "inverter_select": "Inverter"
+        }
+      },
       "devices": {
         "title": "Deferrable Loads",
         "description": "These appliances were found in your Energy Dashboard. Select any that can be **rescheduled to cheaper hours** — the optimizer will find the best time to run them under each plan.\n\nTypical deferrable loads: EV charger, pool pump, dishwasher, washing machine, water heater.",
@@ -170,6 +177,13 @@
           "battery_soc_sensor": "State of charge sensor (optional)",
           "battery_charge_power_sensor": "Charge power sensor (optional)",
           "battery_discharge_power_sensor": "Discharge power sensor (optional)"
+        }
+      },
+      "inverter": {
+        "title": "Inverter / Battery Control",
+        "description": "{detected}\n\nUpdate which inverter integration Grid Lens sends battery commands to.",
+        "data": {
+          "inverter_select": "Inverter"
         }
       },
       "devices": {

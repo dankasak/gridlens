@@ -34,6 +34,8 @@ from .const import (
     CONF_BATTERY_DISCHARGE_POWER_SENSOR,
     CONF_BATTERY_MIN_SOC,
     CONF_BATTERY_MAX_SOC,
+    CONF_INVERTER_BRAND,
+    CONF_INVERTER_TRANSPORT,
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_HOURS,
@@ -46,8 +48,13 @@ from .const import (
     STATES,
     DISTRIBUTORS,
 )
+from .inverters import INVERTER_BRANDS, detect_inverter_brand
 
 _LOGGER = logging.getLogger(__name__)
+
+# Transient form field for the brand:transport dropdown — split into
+# CONF_INVERTER_BRAND / CONF_INVERTER_TRANSPORT on submit, not persisted as-is.
+_FIELD_INVERTER_SELECT = "inverter_select"
 
 
 async def _discover_dashboard_devices(hass: HomeAssistant) -> list[dict]:
@@ -255,12 +262,41 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
             if not errors:
                 self._sensor_data = {**self._sensor_data, **user_input}
+                if has_battery:
+                    return await self.async_step_inverter()
                 return await self.async_step_devices()
 
         return self.async_show_form(
             step_id="battery",
             data_schema=_battery_schema({}),
             errors=errors,
+        )
+
+    async def async_step_inverter(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.FlowResult:
+        """Pick which inverter brand/transport ControlManager should dispatch to."""
+        if user_input is not None:
+            brand, _, transport = user_input[_FIELD_INVERTER_SELECT].partition(":")
+            self._sensor_data = {
+                **self._sensor_data,
+                CONF_INVERTER_BRAND: brand,
+                CONF_INVERTER_TRANSPORT: transport,
+            }
+            return await self.async_step_devices()
+
+        detected = detect_inverter_brand(self.hass)
+        description_placeholders = {
+            "detected": (
+                f"✓ Auto-detected {INVERTER_BRANDS[detected[0]][detected[1]]} — pre-selected below."
+                if detected
+                else "Couldn't auto-detect your inverter — select your brand below."
+            ),
+        }
+        return self.async_show_form(
+            step_id="inverter",
+            data_schema=_inverter_schema({}, detected),
+            description_placeholders=description_placeholders,
         )
 
     async def async_step_devices(
@@ -537,6 +573,27 @@ def _battery_schema(defaults: dict) -> vol.Schema:
     return vol.Schema(schema_dict)
 
 
+def _inverter_schema(defaults: dict, detected: tuple[str, str] | None) -> vol.Schema:
+    options = [
+        {"value": f"{brand}:{transport}", "label": label}
+        for brand, transports in INVERTER_BRANDS.items()
+        for transport, label in transports.items()
+    ]
+    # A previously saved selection (options flow reconfigure) wins over a fresh guess.
+    current = None
+    if defaults.get(CONF_INVERTER_BRAND) and defaults.get(CONF_INVERTER_TRANSPORT):
+        current = f"{defaults[CONF_INVERTER_BRAND]}:{defaults[CONF_INVERTER_TRANSPORT]}"
+    elif detected:
+        current = f"{detected[0]}:{detected[1]}"
+
+    key = vol.Required(_FIELD_INVERTER_SELECT, default=current) if current else vol.Required(_FIELD_INVERTER_SELECT)
+    return vol.Schema({
+        key: selector.SelectSelector(
+            selector.SelectSelectorConfig(options=options, mode=selector.SelectSelectorMode.DROPDOWN)
+        ),
+    })
+
+
 class GridLensOptionsFlow(config_entries.OptionsFlow):
     """Handle options flow."""
 
@@ -608,12 +665,41 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
 
             if not errors:
                 self._sensor_data = {**self._sensor_data, **user_input}
+                if has_battery:
+                    return await self.async_step_inverter()
                 return await self.async_step_devices()
 
         return self.async_show_form(
             step_id="battery",
             data_schema=_battery_schema(entry_data),
             errors=errors,
+        )
+
+    async def async_step_inverter(self, user_input=None):
+        """Pick which inverter brand/transport ControlManager should dispatch to."""
+        entry_data = self._config_entry.data
+
+        if user_input is not None:
+            brand, _, transport = user_input[_FIELD_INVERTER_SELECT].partition(":")
+            self._sensor_data = {
+                **self._sensor_data,
+                CONF_INVERTER_BRAND: brand,
+                CONF_INVERTER_TRANSPORT: transport,
+            }
+            return await self.async_step_devices()
+
+        detected = detect_inverter_brand(self.hass)
+        description_placeholders = {
+            "detected": (
+                f"✓ Auto-detected {INVERTER_BRANDS[detected[0]][detected[1]]} — pre-selected below."
+                if detected
+                else "Couldn't auto-detect your inverter — select your brand below."
+            ),
+        }
+        return self.async_show_form(
+            step_id="inverter",
+            data_schema=_inverter_schema(entry_data, detected),
+            description_placeholders=description_placeholders,
         )
 
     async def async_step_devices(self, user_input=None):
