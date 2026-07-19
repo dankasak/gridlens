@@ -19,7 +19,7 @@ See full documentation in the releases.
 ### Plan Comparison Card
 ```yaml
 type: custom:electricity-plan-comparison-card
-entity: sensor.grid_lens_amber_monthly_cost
+entity: sensor.grid_lens_current_plan_monthly_cost
 show_breakdown: true
 show_battery_schedule: true
 ```

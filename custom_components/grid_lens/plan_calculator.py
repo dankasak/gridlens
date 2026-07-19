@@ -11,7 +11,7 @@ from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import statistics_during_period
 
 from .battery_optimizer import BatteryOptimizer
-from .retailer_plans import plans_from_api_data, RetailerPlan
+from .retailer_plans import plans_from_api_data, build_rate_caps, RetailerPlan
 from .const import (
     CONF_ENERGY_SENSOR,
     CONF_SOLAR_SENSOR,
@@ -104,11 +104,12 @@ class PlanCalculator:
         start_date: datetime = None,
         end_date: datetime = None,
         on_plan_ready=None,  # async callable(plan_key, detail, meta) — called after each plan
+        on_progress=None,    # async callable(message, step, total) — called after each data fetch
     ) -> dict[str, Any]:
         """Calculate costs for all plans based on historical usage.
         
         With battery:
-        - Current plan (Amber): Uses ACTUAL battery behavior from sensors
+        - Current plan: Uses ACTUAL battery behavior from sensors
         - Alternative plans: Uses OPTIMIZED battery strategy
         
         Args:
@@ -124,15 +125,44 @@ class PlanCalculator:
         # Calculate actual days in period. Use round() so that a period ending at
         # 23:59:59 (total_seconds just under N×86400) still counts as N days.
         actual_days = round((end_date - start_date).total_seconds() / 86400)
-        
+
+        # Build the fetch-phase step count up front so the SSE stream can report
+        # real progress instead of one opaque "Fetching…" message for the whole
+        # phase. Each condition below mirrors an `if <sensor>:` fetch further down.
+        _fetch_total = 1  # usage_data is always fetched
+        if self.solar_sensor:
+            _fetch_total += 1
+        if self.grid_export_sensor:
+            _fetch_total += 1
+        if self.battery_power_sensor:
+            _fetch_total += 1
+        if self.deferrable_load_sensors:
+            _fetch_total += 1
+        if self.battery_soc_sensor:
+            _fetch_total += 1
+        if any(getattr(p, 'aemo_price_sensor', None) for p in self._get_plans()):
+            _fetch_total += 1
+        if self.import_price_sensor:
+            _fetch_total += 1
+        if self.export_price_sensor:
+            _fetch_total += 1
+        _fetch_done = 0
+
+        async def _progress(message: str) -> None:
+            nonlocal _fetch_done
+            _fetch_done += 1
+            if on_progress:
+                await on_progress(message, _fetch_done, _fetch_total)
+
         usage_data = await self._get_usage_data(start_date, end_date)
+        await _progress("Fetched grid import / load history")
 
         if not usage_data:
             _LOGGER.info("No usage data available yet")
             return {
-                "amber_actual_cost": 0,
-                "amber_monthly_fee": 25.00,
-                "amber_total": 25.00,
+                "current_plan_energy_cost": 0,
+                "current_plan_monthly_fee": 25.00,
+                "current_plan_total": 25.00,
                 "alternative_plans": {},
                 "usage_days": 0,
                 "start_date": start_date.isoformat(),
@@ -146,6 +176,7 @@ class PlanCalculator:
         solar_data = []
         if self.solar_sensor:
             solar_data = await self._get_usage_data(start_date, end_date, self.solar_sensor)
+            await _progress("Fetched solar production history")
 
         # Determine grid import and export.
         # When dedicated import/export sensors are configured, use them directly —
@@ -169,6 +200,7 @@ class PlanCalculator:
             export_fine_data = await self._get_usage_data(
                 start_date, end_date, self.grid_export_sensor, period="5minute"
             )
+            await _progress("Fetched grid export history")
         elif self.solar_sensor and solar_data:
             # No dedicated export sensor: derive import/export from (total load) − solar
             usage_data, grid_export_data = self._calculate_grid_import(usage_data, solar_data)
@@ -177,25 +209,31 @@ class PlanCalculator:
                 f"export: {sum(d['value'] for d in grid_export_data):.2f} kWh"
             )
 
-        # Calculate Amber actual cost with ACTUAL battery behavior
-        amber_cost = await self._calculate_amber_cost_with_battery(
-            usage_data,
-            grid_export_data,
-            solar_data,
-            start_date,
-            end_date
-        )
-
-        # Fetch actual battery charge/discharge history once.
+        # Fetch actual battery charge/discharge history once — this is the most
+        # expensive query in the whole calculation (raw state_changes over the
+        # full period for a high-frequency power sensor, then integrated in
+        # Python), so it must not be fetched more than once per calculation.
         # Used for:
-        #   1. Computing true house load for LP (strips grid-to-battery charging)
-        #   2. Populating battery chart columns on market-linked plan profiles
+        #   1. Feeding the current-plan cost calculation (actual behavior)
+        #   2. Computing true house load for LP (strips grid-to-battery charging)
+        #   3. Populating battery chart columns on market-linked plan profiles
         battery_data: list[dict] = []
         battery_hod_avg: dict = {}
         if self.battery_power_sensor:
             battery_data = await self._get_battery_behavior(start_date, end_date)
             if battery_data:
                 battery_hod_avg = self._aggregate_battery_by_hod(battery_data)
+            await _progress("Fetched battery charge/discharge history")
+
+        # Calculate current plan's actual cost with ACTUAL battery behavior
+        current_plan_energy_cost = await self._calculate_current_plan_cost_with_battery(
+            usage_data,
+            grid_export_data,
+            solar_data,
+            start_date,
+            end_date,
+            battery_data=battery_data,
+        )
 
         # True house load = solar + grid_import - grid_export + discharge - charge.
         # When EMHASS/HEMS grid-charges the battery, that shows up as grid import
@@ -215,6 +253,7 @@ class PlanCalculator:
         deferrable_per_sensor_hod: list[dict] = []
         if self.deferrable_load_sensors:
             deferrable_data, deferrable_loads, deferrable_per_sensor_hod = await self._get_deferrable_data(start_date, end_date)
+            await _progress("Fetched deferrable load history")
             if deferrable_data:
                 deferrable_hod_avg = self._aggregate_kwh_by_hod(deferrable_data)
                 for load in deferrable_loads:
@@ -234,6 +273,7 @@ class PlanCalculator:
             soc_hod_avg = await self._get_avg_stat_by_hod(
                 self.battery_soc_sensor, start_date, end_date, stat="mean"
             )
+            await _progress("Fetched battery SOC history")
 
         # Average home load and solar by hour-of-day for chart display.
         home_load_hod_avg = self._aggregate_kwh_by_hod(base_load_data)
@@ -255,13 +295,21 @@ class PlanCalculator:
         # PEA calculation for Flow Power (and any future plan with aemo_price_sensor).
         # Fetch AEMO dispatch prices once; compute PEA from actual grid import vs market prices.
         pea_results: dict = {}  # plan_key → pea_result dict
-        for _pea_plan in self._get_plans():
-            aemo_sensor = getattr(_pea_plan, 'aemo_price_sensor', None)
+        _aemo_price_cache: dict[str, list[dict]] = {}  # aemo_sensor → price series
+        _pea_plans_with_sensor = [
+            p for p in self._get_plans() if getattr(p, 'aemo_price_sensor', None)
+        ]
+        for _pea_plan in _pea_plans_with_sensor:
+            aemo_sensor = _pea_plan.aemo_price_sensor
             bpea = getattr(_pea_plan, 'bpea', 0.017)
-            if not aemo_sensor:
-                continue
             _pea_key = f"{_pea_plan.retailer} - {_pea_plan.plan_name}"
-            price_series = await self._fetch_5min_prices(aemo_sensor, start_date, end_date)
+            # Multiple plans (e.g. several Flow Power variants) share the same
+            # household AEMO sensor — fetch its raw 5-min history only once.
+            if aemo_sensor not in _aemo_price_cache:
+                _aemo_price_cache[aemo_sensor] = await self._fetch_5min_prices(
+                    aemo_sensor, start_date, end_date
+                )
+            price_series = _aemo_price_cache[aemo_sensor]
             if price_series:
                 result = self._compute_pea_credit(usage_data, price_series, bpea)
                 if result:
@@ -276,6 +324,8 @@ class PlanCalculator:
                     "No AEMO price data for PEA calculation (%s); check %s has statistics",
                     _pea_key, aemo_sensor,
                 )
+        if _pea_plans_with_sensor:
+            await _progress("Fetched AEMO spot price history")
 
         # Pre-fetch everything needed for per-plan hourly profiles and bill items
         # so these can be computed inside the plan loop (enabling streaming callbacks).
@@ -285,10 +335,12 @@ class PlanCalculator:
             avg_import_prices = await self._get_avg_price_by_hour(
                 self.import_price_sensor, start_date, end_date
             )
+            await _progress("Fetched import price history")
         if self.export_price_sensor:
             avg_export_prices = await self._get_avg_price_by_hour(
                 self.export_price_sensor, start_date, end_date
             )
+            await _progress("Fetched export price history")
         hourly_day_profile = self._compute_hourly_day_profile(usage_data, grid_export_data)
         display_import_cost, display_export_credit = await self._calculate_cost_breakdown(
             usage_data, grid_export_data
@@ -335,8 +387,8 @@ class PlanCalculator:
                 if is_current and self.import_price_sensor:
                     supply_cost = plan.daily_supply_charge * actual_days
                     subscription = getattr(plan, 'monthly_subscription_fee', 0.0) * (actual_days / 30.44)
-                    cost = amber_cost + supply_cost + subscription
-                    _LOGGER.warning(f"Current plan {plan_key}: actual energy ${amber_cost:.2f} + supply ${supply_cost:.2f} + subscription ${subscription:.2f} = ${cost:.2f}")
+                    cost = current_plan_energy_cost + supply_cost + subscription
+                    _LOGGER.warning(f"Current plan {plan_key}: actual energy ${current_plan_energy_cost:.2f} + supply ${supply_cost:.2f} + subscription ${subscription:.2f} = ${cost:.2f}")
 
                 fixed_credit = getattr(plan, 'fixed_daily_credit', 0.0) * actual_days
                 plan_costs[plan_key] = cost - fixed_credit
@@ -351,12 +403,12 @@ class PlanCalculator:
             elif is_current and self.import_price_sensor:
                 supply_cost = plan.daily_supply_charge * actual_days
                 subscription = getattr(plan, 'monthly_subscription_fee', 0.0) * (actual_days / 30.44)
-                cost = amber_cost + supply_cost + subscription
+                cost = current_plan_energy_cost + supply_cost + subscription
                 plan_costs[plan_key] = cost
                 plan_optimization_results[plan_key] = {
                     'breakdown': {
                         'total': round(cost, 2),
-                        'energy_cost': round(amber_cost, 2),
+                        'energy_cost': round(current_plan_energy_cost, 2),
                         'supply_charge': round(supply_cost, 2),
                         'subscription_fee': round(subscription, 2),
                         'note': f'Energy from price sensor; supply ${plan.daily_supply_charge:.2f}/day + subscription ${getattr(plan, "monthly_subscription_fee", 0.0):.2f}/month',
@@ -364,7 +416,7 @@ class PlanCalculator:
                     'strategy': plan.describe_strategy(),
                     'plan_info': plan.get_plan_info(),
                 }
-                _LOGGER.warning(f"Current plan {plan_key}: actual energy ${amber_cost:.2f} + supply ${supply_cost:.2f} + subscription ${subscription:.2f} = ${cost:.2f}")
+                _LOGGER.warning(f"Current plan {plan_key}: actual energy ${current_plan_energy_cost:.2f} + supply ${supply_cost:.2f} + subscription ${subscription:.2f} = ${cost:.2f}")
 
             else:
                 _LOGGER.warning(f"Using SIMPLE calculation for {plan_key}")
@@ -449,7 +501,7 @@ class PlanCalculator:
                     'usage_days': actual_days,
                     'start_date': start_date.isoformat(),
                     'end_date': end_date.isoformat(),
-                    'amber_total': current_plan_total or 0,
+                    'current_plan_total': current_plan_total or 0,
                     'energy_flows': energy_flows,
                     'deferrable_devices': [
                         {"name": d["name"], "sensor_id": d["sensor_id"]}
@@ -467,10 +519,8 @@ class PlanCalculator:
             current_plan_total = (
                 plan_costs[current_plan_name]
                 if current_plan_name and current_plan_name in plan_costs
-                else amber_cost + current_supply
+                else current_plan_energy_cost + current_supply
             )
-
-        amber_total = current_plan_total
 
         # Calculate potential savings vs current plan
         savings = {}
@@ -478,12 +528,13 @@ class PlanCalculator:
             savings[f"{plan_name}_vs_current"] = cost - current_plan_total
 
         return {
-            "amber_actual_cost": amber_cost,
-            "amber_monthly_fee": next(
-                (p.monthly_subscription_fee for p in self._get_plans() if p.retailer == "Amber Electric"),
+            "current_plan_energy_cost": current_plan_energy_cost,
+            "current_plan_monthly_fee": next(
+                (p.monthly_subscription_fee for p in self._get_plans()
+                 if f"{p.retailer} - {p.plan_name}" == current_plan_name),
                 0.0,
             ),
-            "amber_total": amber_total,
+            "current_plan_total": current_plan_total,
             "current_plan_name": current_plan_name,
             "alternative_plans": plan_costs,
             "plan_details": plan_optimization_results,  # New: detailed results for dashboard
@@ -685,6 +736,50 @@ class PlanCalculator:
             'approximate': True,
         }
 
+    def _split_capped_kwh(
+        self, plan, direction: str, local_dt, kwh: float,
+        daily_used: dict, cap_labels: dict,
+    ) -> list:
+        """Split ``kwh`` at ``local_dt`` across a capped rate's free portion and
+        its post-cap rate once ``daily_cap_kwh`` is exceeded for that calendar
+        day (e.g. GloBird ZEROHERO's free-window 50 kWh/day import cap, or its
+        15 kWh/day Super Export cap).
+
+        ``daily_used`` accumulates free-tier kWh already consumed today per
+        (direction, date, rate label) — callers share one dict across a whole
+        bill calculation so the running total is correct, and it naturally
+        resets per calendar day since the key includes the date.
+        ``cap_labels`` collects a display label for any post-cap rate
+        encountered, keyed by rounded rate, for callers that build energy
+        line items from rate value alone.
+
+        Returns ``[(rate, kwh_at_rate), ...]`` — a single-element list when
+        the matched rate has no cap (the common case).
+        """
+        get_info = plan.get_import_rate_info if direction == "import" else plan.get_export_rate_info
+        info = get_info(local_dt)
+        rate = info["rate"]
+        cap = info.get("daily_cap_kwh")
+        after_rate = info.get("rate_after_cap")
+        if kwh <= 0 or not cap or after_rate is None:
+            return [(rate, kwh)]
+
+        label = info.get("label") or "Energy"
+        key = (direction, local_dt.date(), label)
+        used = daily_used.get(key, 0.0)
+        remaining = max(0.0, cap - used)
+        free_kwh = min(kwh, remaining)
+        over_kwh = kwh - free_kwh
+        daily_used[key] = used + free_kwh
+
+        parts = []
+        if free_kwh > 1e-9:
+            parts.append((rate, free_kwh))
+        if over_kwh > 1e-9:
+            parts.append((after_rate, over_kwh))
+            cap_labels.setdefault(round(after_rate, 4), f"{label} (over cap)")
+        return parts
+
     def _compute_bill_items(
         self,
         plan,
@@ -713,6 +808,13 @@ class PlanCalculator:
             from backports.zoneinfo import ZoneInfo
         tz = ZoneInfo("Australia/Sydney")
 
+        # Shared across the import and export sections below so a plan with a
+        # capped rate on both directions (e.g. GloBird ZEROHERO) tracks each
+        # independently; keyed by (direction, date, label) so the free
+        # allowance naturally resets each calendar day.
+        daily_used: dict = {}
+        cap_labels: dict = {}
+
         supply_amount = round(plan.daily_supply_charge * actual_days, 2)
         subscription_fee = getattr(plan, 'monthly_subscription_fee', 0.0)
         subscription_amount = round(subscription_fee * actual_days / 30.44, 2) if subscription_fee else 0.0
@@ -732,14 +834,19 @@ class PlanCalculator:
                 total_import_kwh += kwh
                 if kwh > 1e-6:
                     local_dt = d['timestamp'].astimezone(tz)
-                    rk = round(plan.get_import_rate(local_dt), 4)
-                    tier_data[rk]['kwh'] += kwh
-                    tier_data[rk]['cost'] += kwh * rk
+                    for rate, part_kwh in self._split_capped_kwh(
+                            plan, "import", local_dt, kwh, daily_used, cap_labels):
+                        rk = round(rate, 4)
+                        tier_data[rk]['kwh'] += part_kwh
+                        tier_data[rk]['cost'] += part_kwh * rk
             dummy_slots = [{'hour': h, 'import_kwh': 0.0, 'import_cost': 0.0,
                             'export_kwh': 0.0, 'export_credit': 0.0} for h in range(48)]
             dummy_sections = plan.get_display_breakdown({'schedule': dummy_slots}).get('sections', [])
-            rate_to_label: dict = {round(s['rate'], 4): s['title']
-                                   for s in dummy_sections if s.get('rate', 0) > 0}
+            # cap_labels first so a real plan-defined label (dummy_sections) wins
+            # on collision — e.g. an after-cap rate that happens to equal another
+            # named tier's rate is shown under that tier's real name.
+            rate_to_label: dict = {**cap_labels, **{round(s['rate'], 4): s['title']
+                                   for s in dummy_sections if s.get('rate', 0) > 0}}
             all_rates = sorted(set(tier_data.keys()) | set(rate_to_label.keys()), reverse=True)
             if all_rates:
                 energy_lines = [{'label': rate_to_label.get(rk, 'Energy'),
@@ -762,26 +869,52 @@ class PlanCalculator:
             # import_rate (which correctly applies weekday/weekend rates).  To also
             # show tiers where the optimizer achieved 0 grid import, we probe the
             # plan's full rate structure using a zero-kWh dummy schedule.
+            #
+            # Capped rates (e.g. GloBird ZEROHERO's 50 kWh/day free-window import cap):
+            # the battery-dispatch solver (BatteryOptimizer, wired via import_caps/
+            # export_caps built by retailer_plans.build_rate_caps) already tracks the
+            # daily free-tier budget when deciding dispatch, and each schedule step
+            # carries an explicit free/over-cap kWh split (import_cap_free_kwh /
+            # import_cap_over_kwh) instead of one blended import_rate — bucket those
+            # directly so a day that crosses the cap mid-hour doesn't fragment into an
+            # odd one-off blended-rate tier.
             total_import_kwh = 0.0
             total_export_kwh = opt_result.get('total_export_kwh', 0.0)
             tier_data: dict = defaultdict(lambda: {'kwh': 0.0, 'cost': 0.0})
             for step in lp_schedule:
                 imp = step.get('import_kwh', 0.0)
                 total_import_kwh += imp
-                if imp > 1e-6:
+                free = step.get('import_cap_free_kwh', 0.0)
+                over = step.get('import_cap_over_kwh', 0.0)
+                if free > 1e-9:
+                    rk = round(step.get('import_cap_free_rate', 0.0), 4)
+                    tier_data[rk]['kwh']  += free
+                    tier_data[rk]['cost'] += free * rk
+                if over > 1e-9:
+                    rk = round(step.get('import_cap_over_rate', 0.0), 4)
+                    tier_data[rk]['kwh']  += over
+                    tier_data[rk]['cost'] += over * rk
+                uncapped = imp - free - over
+                if uncapped > 1e-6:
                     rk = round(step.get('import_rate', 0.0), 4)
-                    tier_data[rk]['kwh']  += imp
-                    tier_data[rk]['cost'] += step.get('import_cost', 0.0)
+                    tier_data[rk]['kwh']  += uncapped
+                    tier_data[rk]['cost'] += uncapped * rk
 
             # Discover plan-defined rate tiers and their labels via a dummy schedule
             # (all-zero kWh, 48 h so days=2 avoids division-by-zero in some plans).
             dummy_slots = [{'hour': h, 'import_kwh': 0.0, 'import_cost': 0.0,
                             'export_kwh': 0.0, 'export_credit': 0.0} for h in range(48)]
             dummy_sections = plan.get_display_breakdown({'schedule': dummy_slots}).get('sections', [])
+            # cap_labels (from build_rate_caps, carried on opt_result) first so a real
+            # plan-defined label wins on collision, same precedence as the actual-usage
+            # branch above.
             rate_to_label: dict = {
-                round(s['rate'], 4): s['title']
-                for s in dummy_sections
-                if s.get('cost', 0) >= 0 and s.get('rate', 0) > 0
+                **(opt_result.get('cap_labels', {}) if opt_result else {}),
+                **{
+                    round(s['rate'], 4): s['title']
+                    for s in dummy_sections
+                    if s.get('cost', 0) >= 0 and s.get('rate', 0) > 0
+                },
             }
 
             all_rates = sorted(set(tier_data.keys()) | set(rate_to_label.keys()), reverse=True)
@@ -805,10 +938,11 @@ class PlanCalculator:
             tier_data = defaultdict(lambda: {'kwh': 0.0, 'cost': 0.0})
             for d in usage_data:
                 local_dt = d['timestamp'].astimezone(tz)
-                rate = plan.get_import_rate(local_dt)
-                rk = round(rate, 4)
-                tier_data[rk]['kwh'] += d['value']
-                tier_data[rk]['cost'] += d['value'] * rate
+                for rate, part_kwh in self._split_capped_kwh(
+                        plan, "import", local_dt, d['value'], daily_used, cap_labels):
+                    rk = round(rate, 4)
+                    tier_data[rk]['kwh'] += part_kwh
+                    tier_data[rk]['cost'] += part_kwh * rate
 
             sorted_rates = sorted(tier_data.keys())
             n = len(sorted_rates)
@@ -825,6 +959,9 @@ class PlanCalculator:
                 label_map[sorted_rates[-1]] = 'Peak energy'
                 for r in sorted_rates[1:-1]:
                     label_map[r] = 'Shoulder energy'
+            # Prefer the real "(over cap)" label discovered while splitting,
+            # over the generic off-peak/peak/shoulder positional heuristic.
+            label_map.update({rk: lbl for rk, lbl in cap_labels.items() if rk in tier_data})
 
             if n > 0:
                 energy_lines = sorted([
@@ -869,13 +1006,17 @@ class PlanCalculator:
             for d in fine:
                 local_dt = d['timestamp'].astimezone(tz)
                 covered_hours.add(local_dt.replace(minute=0, second=0, microsecond=0))
-                rate = plan.get_export_rate(local_dt)
-                if rate > 0:
-                    fit_credit += d['value'] * rate
-                    fit_eligible_kwh += d['value']
+                for rate, part_kwh in self._split_capped_kwh(
+                        plan, "export", local_dt, d['value'], daily_used, cap_labels):
+                    if rate > 0:
+                        fit_credit += part_kwh * rate
+                        fit_eligible_kwh += part_kwh
             # Hourly fallback for hours outside short-term retention: pro-rate each
             # bucket across its two half-hours (windows never split finer than :30),
-            # assuming export is spread evenly within the bucket.
+            # assuming export is spread evenly within the bucket. Not cap-aware
+            # (only fires for data beyond 5-minute short-term retention, i.e. old
+            # historical gaps) — a capped export window here is priced at its free
+            # rate regardless of how much was already exported that day.
             for d in export_data:
                 local_dt = d['timestamp'].astimezone(tz)
                 if local_dt.replace(minute=0, second=0, microsecond=0) in covered_hours:
@@ -1656,34 +1797,34 @@ class PlanCalculator:
             _LOGGER.error(f"Error fetching battery behavior: {e}")
             return []
 
-    async def _calculate_amber_cost(self, usage_data: list[dict], export_data: list[dict]) -> float:
-        """Calculate actual Amber cost from usage and price data.
-        
+    async def _calculate_current_plan_cost(self, usage_data: list[dict], export_data: list[dict]) -> float:
+        """Calculate the current plan's actual cost from usage and price data.
+
         Cost = (Import kWh × Purchase Price) - (Export kWh × Feed-in Price)
-        
+
         Note: Can be NEGATIVE if export credits exceed import costs!
         """
         import_kwh = sum(d["value"] for d in usage_data) if usage_data else 0
         export_kwh = sum(d["value"] for d in export_data) if export_data else 0
-        
-        _LOGGER.warning(f"Amber calculation: import_kwh={import_kwh:.2f}, export_kwh={export_kwh:.2f}")
+
+        _LOGGER.warning(f"Current plan calculation: import_kwh={import_kwh:.2f}, export_kwh={export_kwh:.2f}")
         _LOGGER.warning(f"Has price sensor: {bool(self.import_price_sensor)}, Has feedin sensor: {bool(self.export_price_sensor)}")
-        
+
         if not self.import_price_sensor:
             # Estimate without price sensor
             import_cost = import_kwh * 0.15  # ~15c/kWh average
             export_credit = export_kwh * 0.05  # ~5c/kWh average feed-in
             net_cost = import_cost - export_credit
-            _LOGGER.warning(f"Amber cost (estimated): ${import_cost:.2f} import - ${export_credit:.2f} export = ${net_cost:.2f}")
+            _LOGGER.warning(f"Current plan cost (estimated): ${import_cost:.2f} import - ${export_credit:.2f} export = ${net_cost:.2f}")
             return net_cost  # Can be negative!
-        
-        # Use ACTUAL Amber prices from sensors
+
+        # Use ACTUAL prices from the configured price sensors
         import_cost = await self._calculate_cost_with_prices(
-            usage_data, 
+            usage_data,
             self.import_price_sensor,
             "import"
         )
-        
+
         export_credit = 0
         if self.export_price_sensor and export_data:
             export_credit = await self._calculate_cost_with_prices(
@@ -1691,10 +1832,10 @@ class PlanCalculator:
                 self.export_price_sensor,
                 "export"
             )
-        
+
         net_cost = import_cost - export_credit
-        _LOGGER.warning(f"Amber cost (ACTUAL prices): ${import_cost:.2f} import - ${export_credit:.2f} export = ${net_cost:.2f}")
-        
+        _LOGGER.warning(f"Current plan cost (ACTUAL prices): ${import_cost:.2f} import - ${export_credit:.2f} export = ${net_cost:.2f}")
+
         return net_cost  # Can be negative - you made money!
 
     async def _calculate_cost_with_prices(
@@ -1785,51 +1926,57 @@ class PlanCalculator:
             total_kwh = sum(d["value"] for d in usage_data)
             return total_kwh * avg_price
 
-    async def _calculate_amber_cost_with_battery(
+    async def _calculate_current_plan_cost_with_battery(
         self,
         usage_data: list[dict],
         export_data: list[dict],
         solar_data: list[dict],
         start_time: datetime,
         end_time: datetime,
+        battery_data: list[dict] | None = None,
     ) -> float:
-        """Calculate Amber cost accounting for actual battery behavior.
-        
+        """Calculate the current plan's cost accounting for actual battery behavior.
+
         If battery is configured:
         - Reads actual battery charge/discharge from sensors
         - This represents what you ACTUALLY did (via EMHASS or other system)
         - Calculates costs based on actual behavior
-        
+
         If no battery:
         - Falls back to standard calculation
+
+        Args:
+            battery_data: pre-fetched battery behavior, when the caller already
+                fetched it, to avoid re-running the expensive raw-history query.
         """
         if not self.has_battery or not self.battery_power_sensor:
             # No battery - use standard calculation
-            return await self._calculate_amber_cost(usage_data, export_data)
-        
-        # Get actual battery behavior
-        battery_data = await self._get_battery_behavior(start_time, end_time)
-        
+            return await self._calculate_current_plan_cost(usage_data, export_data)
+
+        # Get actual battery behavior (fetch only if the caller didn't already)
+        if battery_data is None:
+            battery_data = await self._get_battery_behavior(start_time, end_time)
+
         if not battery_data:
             _LOGGER.warning("No battery behavior data - using standard calculation")
-            return await self._calculate_amber_cost(usage_data, export_data)
-        
+            return await self._calculate_current_plan_cost(usage_data, export_data)
+
         # With battery, we need to account for what was actually imported/exported
         # Battery data shows charge/discharge, which affects grid import/export
         import_kwh = sum(d["value"] for d in usage_data) if usage_data else 0
         export_kwh = sum(d["value"] for d in export_data) if export_data else 0
-        
+
         # Log actual battery usage
         total_charge = sum(d['charge_kwh'] for d in battery_data)
         total_discharge = sum(d['discharge_kwh'] for d in battery_data)
-        
+
         _LOGGER.warning(
-            f"Amber with ACTUAL battery: import={import_kwh:.1f}kWh, export={export_kwh:.1f}kWh, "
+            f"Current plan with ACTUAL battery: import={import_kwh:.1f}kWh, export={export_kwh:.1f}kWh, "
             f"battery_charge={total_charge:.1f}kWh, battery_discharge={total_discharge:.1f}kWh"
         )
-        
+
         # Calculate costs using standard method (which already accounts for import/export)
-        return await self._calculate_amber_cost(usage_data, export_data)
+        return await self._calculate_current_plan_cost(usage_data, export_data)
 
     async def _calculate_plan_cost_with_battery_optimization(
         self,
@@ -1934,6 +2081,11 @@ class PlanCalculator:
             if demand_predicate:
                 demand_window_mask.append(1 if demand_predicate(local_dt) else 0)
 
+        # Capped rate windows (e.g. GloBird ZEROHERO's 50 kWh/day free-import window,
+        # or a capped Super Export credit) — without this the LP would treat the free
+        # tier as unlimited and dump/pull arbitrary kWh through it.
+        import_caps, export_caps, cap_labels = build_rate_caps(plan, start_time, T)
+
         # Translate each device's allowed local hours into a per-LP-hour mask so
         # the optimizer only schedules it when it is actually available (e.g. an
         # EV that is plugged in overnight cannot soak up midday solar).
@@ -1959,8 +2111,14 @@ class PlanCalculator:
                 deferrable_loads=lp_deferrable_loads,
                 demand_rate=demand_rate,
                 demand_window_mask=demand_window_mask,
+                import_caps=import_caps,
+                export_caps=export_caps,
             )
         )
+        # Carried through to _compute_bill_items so capped-rate tiers in the cost
+        # breakdown get a real label (e.g. "Free Window... (over cap)") instead of
+        # falling into the generic "Energy" bucket.
+        result['cap_labels'] = cap_labels
         _LOGGER.warning(
             "Optimiser solver=%s  import=%.1f kWh ($%.2f)  export=%.1f kWh ($%.2f)  net=$%.2f",
             result.get('solver', '?'),
@@ -2063,16 +2221,20 @@ class PlanCalculator:
         # Add daily supply charges
         total_cost += plan.daily_supply_charge * days
         
-        # Calculate usage costs using plan's get_import_rate method
+        # Calculate usage costs using plan's rate structure (cap-aware: splits
+        # kWh across a capped rate's free portion and its post-cap rate once
+        # daily_cap_kwh is exceeded for that calendar day).
         total_kwh = 0
+        daily_used: dict = {}
+        cap_labels: dict = {}
         for usage in usage_data:
             timestamp = usage["timestamp"]
             kwh = usage["value"]
             total_kwh += kwh
-            
-            # Get rate from plan for this specific time
-            rate = plan.get_import_rate(timestamp)
-            total_cost += kwh * rate
+
+            for rate, part_kwh in self._split_capped_kwh(
+                    plan, "import", timestamp, kwh, daily_used, cap_labels):
+                total_cost += part_kwh * rate
         
         _LOGGER.debug(
             f"Plan {plan.retailer} - {plan.plan_name}: {total_kwh:.2f} kWh, "

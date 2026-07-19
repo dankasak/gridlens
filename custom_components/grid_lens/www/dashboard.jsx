@@ -24,7 +24,7 @@ export default function ElectricityDashboard() {
   const fetchSensorConfig = async () => {
     try {
       // Get the integration config which includes sensor mappings
-      const response = await fetch('/api/states/sensor.amber_monthly_cost');
+      const response = await fetch('/api/states/sensor.grid_lens_current_plan_monthly_cost');
       
       if (!response.ok) {
         throw new Error('Integration not configured');

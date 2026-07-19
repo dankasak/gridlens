@@ -117,7 +117,7 @@ async def _calculate_and_populate_sensors(
     raise HomeAssistantError("calculate_period service is deprecated. Use the Grid Lens dashboard for plan comparisons.")
 
 
-async def _populate_amber_actual(
+async def _populate_current_plan_actual(
     hass: HomeAssistant,
     calculator: PlanCalculator,
     plan_id: str,
@@ -127,7 +127,7 @@ async def _populate_amber_actual(
     solar_data: list,
     export_data: list,
 ) -> None:
-    """Populate Amber sensors with actual behavior."""
+    """Populate current-plan sensors with actual behavior."""
     
     # Group data by hour
     hourly_data = {}
@@ -175,15 +175,15 @@ async def _populate_amber_actual(
     # Update sensors for each hour
     for hour, data in sorted(hourly_data.items()):
         # Estimate prices based on time of day
-        buy_price = amber_plan.get_import_rate(hour)
-        sell_price = amber_plan.get_export_rate(hour)
-        
+        buy_price = current_plan.get_import_rate(hour)
+        sell_price = current_plan.get_export_rate(hour)
+
         data["buy_price"] = buy_price
         data["sell_price"] = sell_price
-        
+
         hourly_cost = (data["grid_import"] * buy_price) - (data["grid_export"] * sell_price)
-        
-        await _update_plan_sensors(hass, plan_id, hour, data, hourly_cost, "Actual Amber behavior")
+
+        await _update_plan_sensors(hass, plan_id, hour, data, hourly_cost, "Actual current-plan behavior")
 
 
 async def _populate_plan_optimized(

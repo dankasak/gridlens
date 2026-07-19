@@ -17,6 +17,9 @@ class GridLensCard extends HTMLElement {
     this._streamPhase = null;   // 'fetching' | 'optimising' | null
     this._plansDone = 0;
     this._plansTotal = 0;
+    this._fetchStep = 0;
+    this._fetchTotal = 0;
+    this._fetchMessage = '';
     this._activeSource = null;
   }
 
@@ -73,6 +76,9 @@ class GridLensCard extends HTMLElement {
     this._streamPhase = 'fetching';
     this._plansDone = 0;
     this._plansTotal = 0;
+    this._fetchStep = 0;
+    this._fetchTotal = 0;
+    this._fetchMessage = '';
     this._data = null;   // clear stale data so we render from stream only
     if (startDate) this._startDate = startDate.substring(0, 10);
     if (endDate)   this._endDate   = endDate.substring(0, 10);
@@ -85,8 +91,11 @@ class GridLensCard extends HTMLElement {
 
     src.addEventListener('status', (e) => {
       const d = JSON.parse(e.data);
-      this._streamPhase = d.phase || 'fetching';
-      this._plansTotal  = d.plans_total || this._plansTotal;
+      this._streamPhase   = d.phase || 'fetching';
+      this._plansTotal    = d.plans_total || this._plansTotal;
+      this._fetchStep     = d.fetch_step  || this._fetchStep;
+      this._fetchTotal    = d.fetch_total || this._fetchTotal;
+      this._fetchMessage  = d.message || this._fetchMessage;
       this._showStreamProgress();
     });
 
@@ -101,7 +110,7 @@ class GridLensCard extends HTMLElement {
           plan_details: {},
           current_plan_name: d.current_plan_name,
           alternative_plans: {},
-          amber_total: 0,
+          current_plan_total: 0,
           usage_days: d.usage_days || 0,
           start_date: d.start_date || '',
           end_date: d.end_date || '',
@@ -113,7 +122,7 @@ class GridLensCard extends HTMLElement {
       }
       this._data.plan_details[d.plan_key] = d.detail;
       this._data.alternative_plans = d.alternative_plans || {};
-      this._data.amber_total = d.amber_total || 0;
+      this._data.current_plan_total = d.current_plan_total || 0;
       this.render();
     });
 
@@ -143,11 +152,15 @@ class GridLensCard extends HTMLElement {
 
   _showStreamProgress() {
     const phase = this._streamPhase;
-    const msg = phase === 'fetching'
-      ? 'Fetching energy data…'
+    const isFetching = phase === 'fetching';
+    const msg = isFetching
+      ? (this._fetchMessage
+          ? `${this._fetchMessage} (${this._fetchStep} / ${this._fetchTotal || '?'})`
+          : 'Fetching energy data…')
       : `Optimising plans… ${this._plansDone} / ${this._plansTotal}`;
-    const pct = this._plansTotal > 0
-      ? Math.round(this._plansDone / this._plansTotal * 100) : 0;
+    const pct = isFetching
+      ? (this._fetchTotal > 0 ? Math.round(this._fetchStep / this._fetchTotal * 100) : 0)
+      : (this._plansTotal > 0 ? Math.round(this._plansDone / this._plansTotal * 100) : 0);
     this.shadowRoot.innerHTML = `
       <style>
         :host{display:block}
@@ -572,7 +585,7 @@ class GridLensCard extends HTMLElement {
     }
 
     const planDetails = this._data.plan_details || {};
-    const amberTotal = this._data.amber_total || 0;
+    const currentPlanTotalFallback = this._data.current_plan_total || 0;
     const currentPlanName = this._data.current_plan_name || null;
     const usageDays = this._data.usage_days || 30;
     const calcDate = (this._data.calculation_date || '').substring(0, 10);
@@ -590,7 +603,7 @@ class GridLensCard extends HTMLElement {
     // Totals needed for colour-coding (avoid ?? for broad browser compat)
     const _cpEntry = currentPlanName ? planDetails[currentPlanName] : null;
     const _cpRaw = _cpEntry && _cpEntry.breakdown ? _cpEntry.breakdown.total : null;
-    const currentPlanTotal = (_cpRaw != null) ? _cpRaw : amberTotal;
+    const currentPlanTotal = (_cpRaw != null) ? _cpRaw : currentPlanTotalFallback;
     const minTotal = plansToShow.reduce((m, entry) => {
       const t = entry[1].breakdown ? entry[1].breakdown.total : null;
       return (t != null && t < m) ? t : m;
@@ -1037,7 +1050,7 @@ class GridLensCard extends HTMLElement {
 
   static getStubConfig() {
     return {
-      entity: 'sensor.grid_lens_amber_monthly_cost',
+      entity: 'sensor.grid_lens_current_plan_monthly_cost',
       show_breakdown: true,
       show_charts: true,
     };

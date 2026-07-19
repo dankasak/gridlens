@@ -66,9 +66,15 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     # Register Lovelace resource modules using the runtime collection (like simple_timer)
     # This ensures the frontend is notified immediately and stale entries are cleaned up.
+    # Every card URL carries a ?v= cache-buster: HA's static-path caching for /grid_lens
+    # is disabled (cache_headers=False above), but browsers still hold onto an
+    # already-imported ES module for the tab's lifetime — bumping the query string
+    # forces a genuinely new URL so a plain restart (without this) can silently
+    # leave users on stale card JS even after a hard-refresh.
+    _CARD_VERSION = "20260719a"
     card_urls = [
-        "/grid_lens/cards/grid-lens-card.js",
-        "/grid_lens/cards/grid-lens-flow-card.js",
+        f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
     ]
     stale_urls = {
         "/grid_lens/cards/electricity-plan-comparison-card.js",
@@ -81,15 +87,19 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         if lovelace_data and hasattr(lovelace_data, "resources"):
             resources = lovelace_data.resources
             await resources.async_get_info()
-            # Remove stale entries
+            # Remove legacy-named stale entries, plus any entry whose base URL
+            # matches a current card but whose query string (version) is outdated.
+            desired_by_base = {url.split("?")[0]: url for url in card_urls}
             for item in list(resources.async_items()):
-                if item.get("url", "").split("?")[0] in stale_urls:
+                item_url = item.get("url", "")
+                base = item_url.split("?")[0]
+                if base in stale_urls or (base in desired_by_base and item_url != desired_by_base[base]):
                     try:
                         await resources.async_delete_item(item["id"])
                     except Exception:
                         pass
-            # Add new entries if not already present
-            existing = {item.get("url", "").split("?")[0] for item in resources.async_items()}
+            # Add entries that aren't already present at their current version
+            existing = {item.get("url", "") for item in resources.async_items()}
             for url in card_urls:
                 if url not in existing:
                     await resources.async_create_item({"res_type": "module", "url": url})
@@ -97,7 +107,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             # Fallback: write directly to store
             resources_store = Store(hass, 1, "lovelace_resources")
             data = await resources_store.async_load() or {"items": []}
-            data["items"] = [i for i in data["items"] if i["url"] not in stale_urls]
+            desired_by_base = {url.split("?")[0]: url for url in card_urls}
+            data["items"] = [
+                i for i in data["items"]
+                if i["url"].split("?")[0] not in stale_urls
+                and not (i["url"].split("?")[0] in desired_by_base and i["url"] != desired_by_base[i["url"].split("?")[0]])
+            ]
             existing_urls = {item["url"] for item in data["items"]}
             for url in card_urls:
                 if url not in existing_urls:
@@ -145,7 +160,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                             "path": "plan-comparison",
                             "cards": [{
                                 "type": "custom:grid-lens-card",
-                                "entity": "sensor.grid_lens_amber_monthly_cost",
+                                "entity": "sensor.grid_lens_current_plan_monthly_cost",
                             }]
                         }]
                     }
@@ -315,7 +330,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             response_data = {
                 'plan_details': plan_details,
                 'energy_flows': coordinator.data.get('energy_flows', {}),
-                'amber_total': coordinator.data.get('amber_total', 0),
+                'current_plan_total': coordinator.data.get('current_plan_total', 0),
                 'current_plan_name': coordinator.data.get('current_plan_name'),
                 'deferrable_devices': coordinator.data.get('deferrable_devices', []),
                 'usage_days': coordinator.data.get('usage_days', 0),
@@ -505,7 +520,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 # Per-plan costs and savings
                 summary = {
                     'current_plan': data.get('current_plan_name'),
-                    'current_plan_total_dollars': data.get('amber_total', 0),
+                    'current_plan_total_dollars': data.get('current_plan_total', 0),
                     'usage_days': data.get('usage_days', 0),
                     'period_start': data.get('start_date'),
                     'period_end': data.get('end_date'),
@@ -678,7 +693,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     'plans_total':       plans_total,
                     'current_plan_name': meta.get('current_plan_name'),
                     'alternative_plans': meta.get('alternative_plans', {}),
-                    'amber_total':       meta.get('amber_total', 0),
+                    'current_plan_total': meta.get('current_plan_total', 0),
                     'usage_days':        meta.get('usage_days', 0),
                     'start_date':        meta.get('start_date', ''),
                     'end_date':          meta.get('end_date', ''),
@@ -686,8 +701,19 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     'deferrable_devices': meta.get('deferrable_devices', []),
                 })
 
+            async def on_fetch_progress(message, step, total):
+                await send('status', {
+                    'phase':       'fetching',
+                    'message':     message,
+                    'fetch_step':  step,
+                    'fetch_total': total,
+                    'plans_total': plans_total,
+                })
+
             result = await calculator.calculate_plan_costs(
-                start_date, end_date, on_plan_ready=on_plan_ready
+                start_date, end_date,
+                on_plan_ready=on_plan_ready,
+                on_progress=on_fetch_progress,
             )
             await send('complete', result)
             return resp

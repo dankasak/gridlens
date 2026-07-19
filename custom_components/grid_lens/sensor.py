@@ -26,7 +26,7 @@ async def async_setup_entry(
 
     # Original comparison sensors
     sensors = [
-        AmberCostSensor(coordinator, entry),
+        CurrentPlanCostSensor(coordinator, entry),
         BestAlternativePlanSensor(coordinator, entry),
         PotentialSavingsSensor(coordinator, entry),
     ]
@@ -71,10 +71,10 @@ class GridLensSensorBase(CoordinatorEntity, SensorEntity):
         }
 
 
-class AmberCostSensor(GridLensSensorBase):
-    """Sensor showing current Amber Electric cost."""
+class CurrentPlanCostSensor(GridLensSensorBase):
+    """Sensor showing the cost of the user's actual current plan."""
 
-    _attr_name = "Amber Monthly Cost"
+    _attr_name = "Current Plan Monthly Cost"
     _attr_native_unit_of_measurement = "$"
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:currency-usd"
@@ -82,24 +82,25 @@ class AmberCostSensor(GridLensSensorBase):
     @property
     def unique_id(self) -> str:
         """Return unique ID."""
-        return f"{self._entry.entry_id}_amber_cost"
+        return f"{self._entry.entry_id}_current_plan_cost"
 
     @property
     def native_value(self) -> float | None:
         """Return the state of the sensor."""
-        if not self.coordinator.data or "amber_total" not in self.coordinator.data:
+        if not self.coordinator.data or "current_plan_total" not in self.coordinator.data:
             return None
-        return round(self.coordinator.data["amber_total"], 2)
+        return round(self.coordinator.data["current_plan_total"], 2)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return additional attributes."""
         if not self.coordinator.data:
             return {}
-        
+
         attrs = {
-            "energy_cost": self.coordinator.data.get("amber_actual_cost", 0),
-            "subscription_fee": self.coordinator.data.get("amber_monthly_fee", 25.00),
+            "plan_name": self.coordinator.data.get("current_plan_name"),
+            "energy_cost": self.coordinator.data.get("current_plan_energy_cost", 0),
+            "subscription_fee": self.coordinator.data.get("current_plan_monthly_fee", 25.00),
             "calculation_days": self.coordinator.data.get("usage_days", 0),
             "last_updated": self.coordinator.data.get("calculation_date"),
             # Expose sensor configuration for dashboard
@@ -160,13 +161,13 @@ class BestAlternativePlanSensor(GridLensSensorBase):
             }
         
         plans = self.coordinator.data["alternative_plans"]
-        amber_total = self.coordinator.data.get("amber_total", 0)
-        
+        current_plan_total = self.coordinator.data.get("current_plan_total", 0)
+
         attributes = {}
         for plan_name, cost in plans.items():
             attributes[plan_name] = {
                 "monthly_cost": round(cost, 2),
-                "vs_amber": round(cost - amber_total, 2),
+                "vs_current_plan": round(cost - current_plan_total, 2),
             }
         
         return attributes
@@ -187,25 +188,25 @@ class PotentialSavingsSensor(GridLensSensorBase):
 
     @property
     def native_value(self) -> float | None:
-        """Return potential savings (negative means Amber is cheaper)."""
+        """Return potential savings (negative means the current plan is cheaper)."""
         if not self.coordinator.data or "alternative_plans" not in self.coordinator.data:
             return None
-        
+
         # If waiting for data, return 0
         if self.coordinator.data.get("status") == "waiting_for_data":
             return 0
-        
+
         plans = self.coordinator.data["alternative_plans"]
-        amber_total = self.coordinator.data.get("amber_total", 0)
-        
+        current_plan_total = self.coordinator.data.get("current_plan_total", 0)
+
         if not plans:
             return None
-        
+
         # Find best alternative
         best_cost = min(plans.values())
-        
-        # Negative value means Amber is cheaper
-        savings = amber_total - best_cost
+
+        # Negative value means the current plan is cheaper
+        savings = current_plan_total - best_cost
         return round(savings, 2)
 
     @property
@@ -222,19 +223,20 @@ class PotentialSavingsSensor(GridLensSensorBase):
             }
         
         plans = self.coordinator.data.get("alternative_plans", {})
-        amber_total = self.coordinator.data.get("amber_total", 0)
-        
+        current_plan_total = self.coordinator.data.get("current_plan_total", 0)
+        current_plan_name = self.coordinator.data.get("current_plan_name") or "your current plan"
+
         if not plans:
             return {}
-        
+
         best_plan = min(plans.items(), key=lambda x: x[1])
-        
+
         return {
             "best_alternative": best_plan[0],
             "best_alternative_cost": round(best_plan[1], 2),
-            "current_amber_cost": round(amber_total, 2),
+            "current_plan_cost": round(current_plan_total, 2),
             "recommendation": (
-                "Stay with Amber" if amber_total <= best_plan[1]
+                f"Stay with {current_plan_name}" if current_plan_total <= best_plan[1]
                 else f"Consider switching to {best_plan[0]}"
             ),
         }

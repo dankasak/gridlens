@@ -416,7 +416,7 @@ async function load(params) {
     const data = await resp.json();
 
     const currentName = data.current_plan_name;
-    const amberTotal = data.amber_total || 0;
+    const currentPlanTotal = data.current_plan_total || 0;
     const days = data.usage_days || 30;
     const start = data.start_date ? data.start_date.slice(0, 10) : '';
     const end = data.end_date ? data.end_date.slice(0, 10) : '';
@@ -437,7 +437,7 @@ async function load(params) {
     plans.forEach(([name, details]) => {
       const bd = details.breakdown || {};
       const isCurrent = name === currentName;
-      const savings = (bd.total || 0) - amberTotal;
+      const savings = (bd.total || 0) - currentPlanTotal;
       const cheaper = savings < -0.05;
       const boxClass = isCurrent ? '' : cheaper ? ' cheaper' : ' costlier';
       const label = isCurrent ? 'YOUR CURRENT PLAN'
