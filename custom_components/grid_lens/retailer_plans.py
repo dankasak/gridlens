@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict
 
 _LOGGER = logging.getLogger(__name__)
@@ -139,7 +139,25 @@ class PlanFromData(RetailerPlan):
             return minute_of_day >= s or minute_of_day < e
         return s <= minute_of_day < e
 
+    @staticmethod
+    def _in_season(window: dict, dt: datetime) -> bool:
+        """Seasonal windows carry {"season": {"start": "MM-DD", "end": "MM-DD"}}
+        (inclusive both ends, wrapping the new year, e.g. 11-01..03-31).
+        No season key = year-round."""
+        season = window.get("season")
+        if not season:
+            return True
+        start, end = season.get("start"), season.get("end")
+        if not start or not end:
+            return True
+        probe = f"{dt.month:02d}-{dt.day:02d}"
+        if start <= end:
+            return start <= probe <= end
+        return probe >= start or probe <= end
+
     def _in_window(self, window: dict, dt: datetime) -> bool:
+        if not self._in_season(window, dt):
+            return False
         # Sub-hour time range (from the DB's true TIME range) takes precedence.
         start, end = window.get("start"), window.get("end")
         if start is not None and end is not None:
@@ -151,7 +169,11 @@ class PlanFromData(RetailerPlan):
 
     def _in_window_hour(self, window: dict, hour: int) -> bool:
         # For hour-granular display/labels: a time-range window counts for an hour if
-        # it overlaps any part of that hour.
+        # it overlaps any part of that hour. No date is available here, so seasonal
+        # windows count when their season contains TODAY (display approximation;
+        # all pricing paths go through the fully date-aware _in_window instead).
+        if not self._in_season(window, datetime.now()):
+            return False
         start, end = window.get("start"), window.get("end")
         if start is not None and end is not None:
             return any(
@@ -282,6 +304,25 @@ class PlanFromData(RetailerPlan):
         return result
 
 
+def _prepare_plan_data(plan_id: str, plan_data: dict,
+                       network_operators: dict | None) -> dict:
+    """Copy plan JSON with id defaulted and network-operator demand data merged
+    (only for plans with demand_charge_active, only where the plan JSON doesn't
+    already carry the fields)."""
+    data = dict(plan_data)
+    data.setdefault("id", plan_id)
+    if network_operators and data.get("flags", {}).get("demand_charge_active"):
+        network_key = data.get("network", "").lower()
+        operator = network_operators.get(network_key) or {}
+        if operator:
+            data.setdefault("charges", {})
+            if "demand_charge_per_kw_per_day" not in data["charges"]:
+                data["charges"]["demand_charge_per_kw_per_day"] = operator.get("demand_charge_per_kw_per_day", 0.0)
+            if "demand_window" not in data:
+                data["demand_window"] = operator.get("demand_window")
+    return data
+
+
 def plans_from_api_data(plan_dict: dict, network_operators: dict | None = None) -> list[RetailerPlan]:
     """Create RetailerPlan objects from the /plans API response dict.
 
@@ -296,24 +337,113 @@ def plans_from_api_data(plan_dict: dict, network_operators: dict | None = None) 
     Tier enforcement is done by the API — free tier returns only the locked plan,
     paid tier returns all plans.
     """
-    result = []
+    return [PlanFromData(_prepare_plan_data(pid, pdata, network_operators))
+            for pid, pdata in plan_dict.items()]
+
+
+class VersionedPlan(RetailerPlan):
+    """A plan with temporal versions (/plans/history): routes every
+    date-sensitive rate lookup to the version in force at that instant, so a
+    billing period spanning a retailer price change is priced correctly.
+
+    Fixed per-day charges (supply, subscription, VPP credit) are exposed as
+    period-weighted averages over the analysis window, so the calculator's
+    ``daily_supply_charge * actual_days`` sites produce the exact
+    across-versions total without modification. All other attributes mirror the
+    latest version.
+    """
+
+    _TZ = None  # lazily resolved Australia/Sydney (effective dates are local)
+
+    def __init__(self, segments: list[tuple[str | None, str | None, "PlanFromData"]],
+                 period_start: datetime, period_end: datetime) -> None:
+        # NOTE deliberately no super().__init__() — attributes are copied from
+        # the newest version below, then fixed charges are re-weighted.
+        parsed = [
+            (date.fromisoformat(f) if f else None,
+             date.fromisoformat(t) if t else None, p)
+            for f, t, p in segments
+        ]
+        latest = parsed[-1][2]
+        self.__dict__.update(latest.__dict__)
+        self._segments = parsed
+        self._latest = latest
+
+        ps, pe = self._local_date(period_start), self._local_date(period_end)
+        total_days = max((pe - ps).days, 1)
+        for attr in ("daily_supply_charge", "monthly_subscription_fee",
+                     "fixed_daily_credit"):
+            weighted = 0.0
+            for i, (eff_from, eff_to, p) in enumerate(self._segments):
+                # Days before the first version are priced by the oldest
+                # version (see _plan_at), so weight them to it as well.
+                seg_start = ps if (i == 0 or not eff_from) else max(ps, eff_from)
+                seg_end = min(pe, eff_to) if eff_to else pe
+                overlap = max((seg_end - seg_start).days, 0)
+                weighted += (getattr(p, attr, 0.0) or 0.0) * overlap
+            self.__dict__[attr] = weighted / total_days
+
+    @classmethod
+    def _local_date(cls, dt: datetime) -> date:
+        if cls._TZ is None:
+            try:
+                from zoneinfo import ZoneInfo
+            except ImportError:
+                from backports.zoneinfo import ZoneInfo
+            cls._TZ = ZoneInfo("Australia/Sydney")
+        return dt.astimezone(cls._TZ).date() if dt.tzinfo else dt.date()
+
+    def _plan_at(self, dt: datetime) -> "PlanFromData":
+        d = self._local_date(dt)
+        for eff_from, eff_to, p in self._segments:
+            if (eff_from is None or d >= eff_from) and (eff_to is None or d < eff_to):
+                return p
+        # Before the first version's effectivity: the oldest version is the
+        # best available stand-in; after the last: the latest.
+        return self._segments[0][2] if (self._segments[0][0]
+                                        and d < self._segments[0][0]) else self._latest
+
+    def get_import_rate(self, dt: datetime) -> float:
+        return self._plan_at(dt).get_import_rate(dt)
+
+    def get_export_rate(self, dt: datetime) -> float:
+        return self._plan_at(dt).get_export_rate(dt)
+
+    def get_import_rate_info(self, dt: datetime) -> Dict:
+        return self._plan_at(dt).get_import_rate_info(dt)
+
+    def get_export_rate_info(self, dt: datetime) -> Dict:
+        return self._plan_at(dt).get_export_rate_info(dt)
+
+    def describe_strategy(self) -> str:
+        return self._latest.describe_strategy()
+
+    def get_display_breakdown(self, optimization_result: Dict) -> Dict:
+        return self._latest.get_display_breakdown(optimization_result)
+
+
+def versioned_plans_from_history(plan_dict: dict, history: dict,
+                                 network_operators: dict | None,
+                                 period_start: datetime,
+                                 period_end: datetime) -> list[RetailerPlan]:
+    """Like plans_from_api_data, but plans with more than one version
+    overlapping the period become VersionedPlan wrappers built from the
+    /plans/history payload ({plan_id: [{effective_from, effective_to, plan}]}).
+    Plans absent from the history payload fall back to their current data.
+    """
+    result: list[RetailerPlan] = []
     for plan_id, plan_data in plan_dict.items():
-        data = dict(plan_data)
-        data.setdefault("id", plan_id)
-
-        # Merge network operator demand data if retailer passes it through
-        if network_operators and data.get("flags", {}).get("demand_charge_active"):
-            network_key = data.get("network", "").lower()
-            operator = network_operators.get(network_key) or {}
-            if operator:
-                data.setdefault("charges", {})
-                # Only inject operator data if not already in the plan JSON
-                if "demand_charge_per_kw_per_day" not in data["charges"]:
-                    data["charges"]["demand_charge_per_kw_per_day"] = operator.get("demand_charge_per_kw_per_day", 0.0)
-                if "demand_window" not in data:
-                    data["demand_window"] = operator.get("demand_window")
-
-        result.append(PlanFromData(data))
+        versions = (history or {}).get(plan_id) or []
+        if len(versions) <= 1:
+            result.append(PlanFromData(
+                _prepare_plan_data(plan_id, plan_data, network_operators)))
+            continue
+        segments = [
+            (v.get("effective_from"), v.get("effective_to"),
+             PlanFromData(_prepare_plan_data(plan_id, v["plan"], network_operators)))
+            for v in versions
+        ]
+        result.append(VersionedPlan(segments, period_start, period_end))
     return result
 
 

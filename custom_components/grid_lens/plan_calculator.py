@@ -11,7 +11,10 @@ from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import statistics_during_period
 
 from .battery_optimizer import BatteryOptimizer
-from .retailer_plans import plans_from_api_data, build_rate_caps, RetailerPlan
+from .retailer_plans import (
+    plans_from_api_data, versioned_plans_from_history, build_rate_caps,
+    RetailerPlan,
+)
 from .const import (
     CONF_ENERGY_SENSOR,
     CONF_SOLAR_SENSOR,
@@ -59,6 +62,13 @@ class PlanCalculator:
         # Set by the SSE handler before calling calculate_plan_costs.
         self.plan_data: dict | None = None
 
+        # Plan version history for the analysis period, fetched from
+        # /plans/history at the start of calculate_plan_costs. When present,
+        # _get_plans() returns VersionedPlan wrappers so past intervals are
+        # priced with the plan version in force at the time.
+        self.plan_history: dict | None = None
+        self._history_period: tuple | None = None  # (start_dt, end_dt)
+
         # Network operator definitions fetched from API (operator_key → operator_data dict).
         # Set by the SSE handler before calling calculate_plan_costs.
         self.network_operators: dict = {}
@@ -93,11 +103,69 @@ class PlanCalculator:
             _LOGGER.info(f"Battery optimizer initialized: {self.battery_capacity}kWh battery")
 
     def _get_plans(self) -> list[RetailerPlan]:
-        """Return plan objects from API data. Tier filtering is enforced by the API."""
+        """Return plan objects from API data. Tier filtering is enforced by the API.
+
+        When version history for the analysis period has been loaded
+        (see _fetch_plan_history), plans that changed during the period come
+        back as VersionedPlan wrappers; otherwise current-version plans.
+        """
         if not self.plan_data:
             _LOGGER.warning("No plan data loaded from API; calculation will have no plans.")
             return []
+        if self.plan_history and self._history_period:
+            return versioned_plans_from_history(
+                self.plan_data, self.plan_history, self.network_operators,
+                self._history_period[0], self._history_period[1])
         return plans_from_api_data(self.plan_data, self.network_operators)
+
+    async def _fetch_plan_history(self, start_date: datetime, end_date: datetime) -> None:
+        """Fetch /plans/history for the analysis period. Best-effort: any
+        failure leaves plan_history unset and calculation proceeds on current
+        rates (the pre-versioning behaviour)."""
+        from homeassistant.helpers.aiohttp_client import async_get_clientsession
+        import aiohttp as _aiohttp
+        from .const import (
+            CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL, CONF_STATE,
+            CONF_DISTRIBUTOR,
+        )
+        self.plan_history = None
+        self._history_period = None
+        api_key = self.entry.data.get(CONF_GRIDLENS_API_KEY, "")
+        api_url = self.entry.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
+        if not api_key:
+            return
+        params = {
+            "state": self.entry.data.get(CONF_STATE, "NSW"),
+            "from": start_date.date().isoformat(),
+            "to": end_date.date().isoformat(),
+        }
+        network = self.entry.data.get(CONF_DISTRIBUTOR, "")
+        if network:
+            params["network"] = network
+        try:
+            session = async_get_clientsession(self.hass)
+            async with session.get(
+                f"{api_url}/plans/history", params=params,
+                headers={"X-API-Key": api_key,
+                         "User-Agent": "GridLens-HA-Integration/1.0"},
+                timeout=_aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status != 200:
+                    _LOGGER.warning("plans/history returned %s; using current rates",
+                                    resp.status)
+                    return
+                payload = await resp.json()
+        except Exception as exc:
+            _LOGGER.warning("plans/history fetch failed (%s); using current rates", exc)
+            return
+        history = payload.get("plans") or {}
+        self.plan_history = history
+        self._history_period = (start_date, end_date)
+        n_versioned = sum(1 for v in history.values() if len(v) > 1)
+        if n_versioned:
+            _LOGGER.info("Plan history loaded: %d plan(s) changed during the "
+                         "analysis period; old intervals will use the rates in "
+                         "force at the time", n_versioned)
 
     async def calculate_plan_costs(
         self,
@@ -125,6 +193,10 @@ class PlanCalculator:
         # Calculate actual days in period. Use round() so that a period ending at
         # 23:59:59 (total_seconds just under N×86400) still counts as N days.
         actual_days = round((end_date - start_date).total_seconds() / 86400)
+
+        # Load plan version history so past intervals are priced with the plan
+        # version in force at the time (falls back to current rates on failure).
+        await self._fetch_plan_history(start_date, end_date)
 
         # Build the fetch-phase step count up front so the SSE stream can report
         # real progress instead of one opaque "Fetching…" message for the whole
