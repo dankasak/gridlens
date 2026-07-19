@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict
 
 _LOGGER = logging.getLogger(__name__)
@@ -34,6 +34,16 @@ class RetailerPlan(ABC):
 
     def get_export_rate(self, dt: datetime) -> float:
         return self.feed_in_tariff
+
+    def get_import_rate_info(self, dt: datetime) -> Dict:
+        """Rate plus daily-cap metadata for the matched window. Base plans have
+        no cap concept; ``PlanFromData`` overrides this with the real lookup."""
+        return {"rate": self.get_import_rate(dt), "label": None,
+                "daily_cap_kwh": None, "rate_after_cap": None}
+
+    def get_export_rate_info(self, dt: datetime) -> Dict:
+        return {"rate": self.get_export_rate(dt), "label": None,
+                "daily_cap_kwh": None, "rate_after_cap": None}
 
     @abstractmethod
     def describe_strategy(self) -> str:
@@ -152,15 +162,29 @@ class PlanFromData(RetailerPlan):
             return True
         return hour in hours
 
-    def _match_rate(self, rates: list, dt: datetime) -> float:
+    def _match_rate_def(self, rates: list, dt: datetime) -> dict | None:
         for rate_def in rates:
-            rate = rate_def.get("rate")
-            if rate is None:
+            if rate_def.get("rate") is None:
                 continue
             for window in rate_def.get("windows", []):
                 if self._in_window(window, dt):
-                    return float(rate)
-        return 0.0
+                    return rate_def
+        return None
+
+    def _match_rate(self, rates: list, dt: datetime) -> float:
+        rate_def = self._match_rate_def(rates, dt)
+        return float(rate_def["rate"]) if rate_def is not None else 0.0
+
+    def _rate_info(self, rates: list, dt: datetime) -> Dict:
+        rate_def = self._match_rate_def(rates, dt)
+        if rate_def is None:
+            return {"rate": 0.0, "label": None, "daily_cap_kwh": None, "rate_after_cap": None}
+        return {
+            "rate": float(rate_def["rate"]),
+            "label": rate_def.get("label"),
+            "daily_cap_kwh": rate_def.get("daily_cap_kwh"),
+            "rate_after_cap": rate_def.get("rate_after_cap"),
+        }
 
     def _rate_label_for_hour(self, hour: int) -> str:
         for rate_def in self._import_rates:
@@ -176,6 +200,12 @@ class PlanFromData(RetailerPlan):
 
     def get_export_rate(self, dt: datetime) -> float:
         return self._match_rate(self._export_rates, dt)
+
+    def get_import_rate_info(self, dt: datetime) -> Dict:
+        return self._rate_info(self._import_rates, dt)
+
+    def get_export_rate_info(self, dt: datetime) -> Dict:
+        return self._rate_info(self._export_rates, dt)
 
     def describe_strategy(self) -> str:
         return self._strategy
@@ -285,3 +315,56 @@ def plans_from_api_data(plan_dict: dict, network_operators: dict | None = None) 
 
         result.append(PlanFromData(data))
     return result
+
+
+def build_rate_caps(
+    plan: RetailerPlan, start: datetime, n_slots: int, slot_minutes: int = 60,
+) -> tuple[list[Dict], list[Dict], Dict]:
+    """Build BatteryOptimizer.optimize_hourly_schedule's import_caps/export_caps
+    hour-mask descriptors from a plan's per-slot rate lookup, grouping slots by rate
+    label so multiple slots sharing the same capped rate definition (e.g. every hour
+    of GloBird ZEROHERO's daily free-import window) share one daily_cap_kwh/
+    rate_after_cap budget rather than each getting its own.
+
+    Also returns cap_labels: {round(rate_after_cap, 4): "<label> (over cap)"} for
+    callers building a cost breakdown by rate value that want a real label for the
+    post-cap tier instead of a generic one — mirrors PlanCalculator._split_capped_kwh's
+    labelling for the actual-usage bill-reporting path.
+
+    Returns ([], [], {}) for a plan with no capped rates (the common case) — the
+    optimizer then behaves exactly as it did before caps existed.
+
+    ``start`` is added to in its original tz (usually UTC) and only converted to
+    Australia/Sydney per resulting instant — matching PlanCalculator's rate-window
+    lookups elsewhere — because converting once up front and then adding hours to
+    an already-localized datetime does not correctly track DST transitions.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    tz = ZoneInfo("Australia/Sydney")
+
+    cap_labels: Dict = {}
+
+    def _build(get_info) -> list[Dict]:
+        groups: Dict[str, Dict] = {}
+        for t in range(n_slots):
+            dt = (start + timedelta(minutes=t * slot_minutes)).astimezone(tz)
+            info = get_info(dt)
+            cap = info.get("daily_cap_kwh")
+            after = info.get("rate_after_cap")
+            if not cap or after is None:
+                continue
+            label = info.get("label") or "Energy"
+            group = groups.setdefault(label, {
+                "daily_cap_kwh": cap, "rate_after_cap": after,
+                "hour_mask": [0] * n_slots,
+            })
+            group["hour_mask"][t] = 1
+            cap_labels.setdefault(round(after, 4), f"{label} (over cap)")
+        return list(groups.values())
+
+    import_caps = _build(plan.get_import_rate_info)
+    export_caps = _build(plan.get_export_rate_info)
+    return import_caps, export_caps, cap_labels

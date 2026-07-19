@@ -19,6 +19,17 @@ LP formulation (per hour t):
     Availability   : def_i[t] = 0 outside the device's allowed hours (hour_mask)
     Daily totals   : Σ_{t in day d} def_i[t] = daily_kwh_i  (per device per day,
                      capped at what the availability window can physically deliver)
+    Capped rates   : for hours inside a capped-rate window w (e.g. GloBird ZEROHERO's
+                     50 kWh/day free import window), P_imp[t] splits into a free
+                     tranche and an over-cap tranche: P_imp[t] = free_w[t] + over_w[t],
+                     priced at the window's normal rate and rate_after_cap respectively,
+                     with Σ_{t in w, day d} free_w[t] ≤ daily_cap_kwh_w. Symmetric for
+                     P_exp (e.g. a capped Super Export credit reverting to a lower FiT).
+                     Because the free tranche is always the cheaper choice (0 < rate_after_cap
+                     for import; the capped export credit > its reverting rate), a plain LP
+                     fills it first with no extra ordering constraint needed — the standard
+                     convex block-tariff trick. Off (zero extra variables) unless the plan
+                     actually has a capped rate.
 
 Including def_i in the energy balance lets the LP correctly price deferrable load
 scheduling: during solar surplus, def_i reduces P_exp (opportunity cost = rate_exp);
@@ -83,6 +94,8 @@ class BatteryOptimizer:
         export_penalty: float = 0.0,
         no_grid_charge: bool = False,
         terminal_soc_value: float = None,
+        import_caps: List[Dict] = None,
+        export_caps: List[Dict] = None,
     ) -> Dict:
         """Return an optimal hourly schedule minimising net energy cost.
 
@@ -114,6 +127,16 @@ class BatteryOptimizer:
         the battery or shifting deferrable loads out of the window). Left at the
         default (rate 0 / mask None) the model behaves exactly as before.
 
+        import_caps / export_caps: optional list of capped-rate-window descriptors, each
+          {'daily_cap_kwh': float, 'rate_after_cap': float, 'hour_mask': list[int] len T}
+          (1 = this LP hour falls inside the window). Within a window, cumulative import
+          (or export) at the window's normal rate is capped at daily_cap_kwh per calendar
+          day (hours grouped in chunks of 24/timestep_hours, matching the deferrable-load
+          daily-total grouping below); hours/energy beyond the cap that day are priced at
+          rate_after_cap instead. Mirrors daily_cap_kwh/rate_after_cap on PlanFromData's
+          rate windows — build these with retailer_plans.build_rate_caps(). Left at the
+          default (None) the model behaves exactly as before.
+
         Tries LP first; falls back to greedy if scipy is unavailable or infeasible.
         """
         if deferrable_loads is None:
@@ -137,7 +160,8 @@ class BatteryOptimizer:
                                      timestep_hours=timestep_hours,
                                      soc_reward=soc_reward, export_penalty=export_penalty,
                                      no_grid_charge=no_grid_charge,
-                                     terminal_soc_value=terminal_soc_value)
+                                     terminal_soc_value=terminal_soc_value,
+                                     import_caps=import_caps, export_caps=export_caps)
         except ImportError:
             _LOGGER.warning(
                 "PuLP not yet installed — using greedy fallback. "
@@ -183,13 +207,14 @@ class BatteryOptimizer:
     def _lp_optimize(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads,
                      demand_rate=0.0, demand_window_mask=None, timestep_hours=1.0,
                      soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
-                     terminal_soc_value=None):
+                     terminal_soc_value=None, import_caps=None, export_caps=None):
         """Build and solve the LP. Raises on failure so caller can fall back."""
         # HiGHS/PuLP paths model none of the extras below; only the scipy path (the
         # complete, production path) does. Skip straight to scipy for any of them.
         # (terminal_soc_value softens the terminal-SOC constraint — scipy-only.)
         demand_active = demand_rate > 0 and demand_window_mask and any(demand_window_mask)
-        if (not demand_active and timestep_hours == 1.0
+        caps_active = bool(import_caps) or bool(export_caps)
+        if (not demand_active and not caps_active and timestep_hours == 1.0
                 and soc_reward == 0.0 and export_penalty == 0.0 and not no_grid_charge
                 and terminal_soc_value is None):
             try:
@@ -206,7 +231,8 @@ class BatteryOptimizer:
                                   timestep_hours=timestep_hours,
                                   soc_reward=soc_reward, export_penalty=export_penalty,
                                   no_grid_charge=no_grid_charge,
-                                  terminal_soc_value=terminal_soc_value)
+                                  terminal_soc_value=terminal_soc_value,
+                                  import_caps=import_caps, export_caps=export_caps)
         except ImportError:
             pass  # scipy not available — try PuLP
         except Exception as exc:
@@ -229,7 +255,7 @@ class BatteryOptimizer:
     def _lp_scipy(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads,
                   demand_rate=0.0, demand_window_mask=None, timestep_hours=1.0,
                   soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
-                  terminal_soc_value=None):
+                  terminal_soc_value=None, import_caps=None, export_caps=None):
         import numpy as np
         from scipy.optimize import linprog
         from scipy.sparse import lil_matrix
@@ -249,12 +275,34 @@ class BatteryOptimizer:
         demand_active = demand_rate > 0 and demand_window_mask and any(demand_window_mask)
 
         # Variable layout:
-        #   [imp(T) | exp(T) | cha(T) | dis(T) | soc(T) | def_0(T) | ... | def_{N-1}(T) | P?]
+        #   [imp(T) | exp(T) | cha(T) | dis(T) | soc(T) | def_0(T) | ... | def_{N-1}(T) | P? | cap tranches...]
         # Each device i has its own block of T variables starting at (5+i)*T.
         # P (peak kW) is a single trailing scalar, present only when demand_active.
         I, X, C, D, S = 0, T, 2*T, 3*T, 4*T
         P_idx = (5 + N) * T
         n = (5 + N) * T + (1 if demand_active else 0)
+
+        # Capped-rate windows (e.g. GloBird ZEROHERO's 50 kWh/day free import window):
+        # for each hour inside a window, imp[t] (or exp[t]) is decomposed into a free
+        # tranche and an over-cap tranche via a linking equality, each block sized to
+        # exactly the window's hours (not all T) so uncapped plans pay zero extra cost.
+        cap_blocks = []
+        for direction, caps in (("import", import_caps or []), ("export", export_caps or [])):
+            for cw in caps:
+                mask = cw.get("hour_mask") or []
+                hours = [t for t in range(T) if t < len(mask) and mask[t]]
+                if not hours:
+                    continue
+                free_idx0 = n
+                n += len(hours)
+                over_idx0 = n
+                n += len(hours)
+                cap_blocks.append({
+                    "direction": direction, "hours": hours,
+                    "free_idx0": free_idx0, "over_idx0": over_idx0,
+                    "rate_after_cap": cw["rate_after_cap"],
+                    "daily_cap_kwh": cw["daily_cap_kwh"],
+                })
 
         c_obj = np.zeros(n)
         c_obj[I:I+T] = r_imp
@@ -271,6 +319,21 @@ class BatteryOptimizer:
             c_obj[X:X+T] += export_penalty
         if soc_reward:
             c_obj[S:S+T] -= soc_reward
+        # Capped hours: the base imp[t]/exp[t] cost above (including any export_penalty
+        # just added) is replaced by the tranche costs below — zeroed here, last, so it
+        # can't be double-counted. Free tranche is priced at the window's normal rate
+        # (same value r_imp[t]/r_exp[t] already carries) plus the same tiny export_penalty
+        # tie-breaker (so capped export hours keep the same degeneracy nudge as uncapped
+        # ones); over-cap tranche at rate_after_cap.
+        for cb in cap_blocks:
+            base = I if cb["direction"] == "import" else X
+            rates = r_imp if cb["direction"] == "import" else r_exp
+            sign = 1.0 if cb["direction"] == "import" else -1.0
+            penalty = export_penalty if cb["direction"] == "export" else 0.0
+            for j, t in enumerate(cb["hours"]):
+                c_obj[base + t] = 0.0
+                c_obj[cb["free_idx0"] + j] = sign * rates[t] + penalty
+                c_obj[cb["over_idx0"] + j] = sign * cb["rate_after_cap"] + penalty
         # Soft terminal-SOC valuation (Bug 2 fix, rolling-horizon use only). When set, the
         # hard terminal floor (soc[T-1] >= E0) is dropped below and end-of-horizon stored
         # energy is instead valued here at terminal_soc_value $/kWh — so the LP is not forced
@@ -304,8 +367,11 @@ class BatteryOptimizer:
             else:
                 ub[(5+i)*T:(5+i)*T+T] = dev['max_kw'] * dt
 
-        # Equality constraints: T (energy balance) + T (SOC update) + N*n_days (per-device daily totals)
-        n_eq = 2*T + N * n_days
+        # Equality constraints: T (energy balance) + T (SOC update) + N*n_days
+        # (per-device daily totals) + one linking row per capped hour
+        # (imp[t] or exp[t] = free tranche + over-cap tranche for that hour).
+        cap_link_rows = sum(len(cb["hours"]) for cb in cap_blocks)
+        n_eq = 2*T + N * n_days + cap_link_rows
         A_eq = lil_matrix((n_eq, n))
         b_eq = np.zeros(n_eq)
 
@@ -353,6 +419,20 @@ class BatteryOptimizer:
                 target = dev['daily_kwh'] * (t1 - t0) / slots_per_day
                 b_eq[row] = min(target, avail_slots * dev['max_kw'] * dt)
 
+        # Cap-tranche linking: imp[t] (or exp[t]) = free[t] + over[t] for every hour
+        # inside a capped-rate window, so the tranche split always matches the total
+        # grid flow already constrained everywhere else (energy balance, big-M, demand
+        # window, no-grid-charge).
+        row = 2*T + N * n_days
+        for cb in cap_blocks:
+            base = I if cb["direction"] == "import" else X
+            for j, t in enumerate(cb["hours"]):
+                A_eq[row, base + t] = 1.0
+                A_eq[row, cb["free_idx0"] + j] = -1.0
+                A_eq[row, cb["over_idx0"] + j] = -1.0
+                b_eq[row] = 0.0
+                row += 1
+
         # Terminal SOC: the battery must end the window at least as full as it
         # started, so its initial charge is a loan, not free energy.  Clamped to
         # the SOC bounds in case the reported initial SOC lies outside them.
@@ -369,7 +449,17 @@ class BatteryOptimizer:
         # imp[t] - Σ def_i[t] ≤ load[t]  ⇒  grid may cover house load + deferrable devices,
         # but any battery charge must come from solar surplus only.
         ngc_rows = T if no_grid_charge else 0
-        n_ub = term_rows + len(demand_hours) + ngc_rows
+        # Daily cumulative cap: one row per (cap window, calendar day) covered by that
+        # window's hours, using the same slots_per_day chunking as the deferrable-load
+        # daily totals above. Σ free[j] over that day's hours ≤ daily_cap_kwh.
+        cap_day_groups = []
+        for cb in cap_blocks:
+            days: dict[int, list[int]] = {}
+            for j, t in enumerate(cb["hours"]):
+                days.setdefault(t // slots_per_day, []).append(j)
+            for js in days.values():
+                cap_day_groups.append((cb, js))
+        n_ub = term_rows + len(demand_hours) + ngc_rows + len(cap_day_groups)
         A_ub = lil_matrix((n_ub, n)) if n_ub else None
         b_ub = np.zeros(n_ub) if n_ub else None
         r = 0
@@ -389,6 +479,11 @@ class BatteryOptimizer:
                     A_ub[r, (5 + i) * T + t] = -1.0
                 b_ub[r] = load[t]
                 r += 1
+        for cb, js in cap_day_groups:
+            for j in js:
+                A_ub[r, cb["free_idx0"] + j] = 1.0
+            b_ub[r] = cb["daily_cap_kwh"]
+            r += 1
 
         result = linprog(c_obj,
                          A_ub=(A_ub.tocsr() if A_ub is not None else None),
@@ -406,6 +501,19 @@ class BatteryOptimizer:
         total_import_kwh = total_export_kwh = 0.0
         total_import_cost = total_export_credit = 0.0
 
+        # Per-hour tranche split for capped hours, keyed by hour: (free_kwh, over_kwh,
+        # free_rate, over_rate). Used below to report the true blended cost/rate instead
+        # of the flat r_imp[t]/r_exp[t] (which only reflects the free-tier rate).
+        import_tranche = {}
+        export_tranche = {}
+        for cb in cap_blocks:
+            rates = r_imp if cb["direction"] == "import" else r_exp
+            target = import_tranche if cb["direction"] == "import" else export_tranche
+            for j, t in enumerate(cb["hours"]):
+                free_val = max(0.0, x[cb["free_idx0"] + j])
+                over_val = max(0.0, x[cb["over_idx0"] + j])
+                target[t] = (free_val, over_val, rates[t], cb["rate_after_cap"])
+
         for t in range(T):
             i_raw = max(0.0, x[I+t])
             e = max(0.0, x[X+t])
@@ -421,8 +529,27 @@ class BatteryOptimizer:
             ch = max(0.0, x[C+t])
             di = max(0.0, x[D+t])
             so = max(self.min_soc_kwh, min(self.max_soc_kwh, soc_vals[t]))
-            ic = i * r_imp[t]
-            ec = e * r_exp[t]
+
+            # Capped hours: cost/rate come from the tranche split (pre-netting values —
+            # more accurate than post-net flat-rate multiplication, and the only way to
+            # correctly price an hour where the day's cap boundary falls mid-hour).
+            imp_free = imp_over = exp_free = exp_over = 0.0
+            imp_free_rate = imp_over_rate = exp_free_rate = exp_over_rate = 0.0
+            if t in import_tranche:
+                imp_free, imp_over, imp_free_rate, imp_over_rate = import_tranche[t]
+                ic = imp_free * imp_free_rate + imp_over * imp_over_rate
+                imp_rate_out = ic / (imp_free + imp_over) if (imp_free + imp_over) > 1e-9 else imp_free_rate
+            else:
+                ic = i * r_imp[t]
+                imp_rate_out = r_imp[t]
+            if t in export_tranche:
+                exp_free, exp_over, exp_free_rate, exp_over_rate = export_tranche[t]
+                ec = exp_free * exp_free_rate + exp_over * exp_over_rate
+                exp_rate_out = ec / (exp_free + exp_over) if (exp_free + exp_over) > 1e-9 else exp_free_rate
+            else:
+                ec = e * r_exp[t]
+                exp_rate_out = r_exp[t]
+
             total_import_kwh   += i;  total_export_kwh    += e
             total_import_cost  += ic; total_export_credit += ec
             schedule.append({
@@ -432,8 +559,12 @@ class BatteryOptimizer:
                 'deferrable_kwh': deferred,
                 'deferrable_per_device': [max(0.0, x[(5+ii)*T+t]) for ii in range(N)],
                 'soc_percent': so / self.capacity_kwh * 100.0,
-                'import_rate': r_imp[t], 'export_rate': r_exp[t],
+                'import_rate': imp_rate_out, 'export_rate': exp_rate_out,
                 'import_cost': ic, 'export_credit': ec,
+                'import_cap_free_kwh': imp_free, 'import_cap_over_kwh': imp_over,
+                'import_cap_free_rate': imp_free_rate, 'import_cap_over_rate': imp_over_rate,
+                'export_cap_free_kwh': exp_free, 'export_cap_over_kwh': exp_over,
+                'export_cap_free_rate': exp_free_rate, 'export_cap_over_rate': exp_over_rate,
             })
 
         _LOGGER.warning(
@@ -442,6 +573,17 @@ class BatteryOptimizer:
             [(f"{d['daily_kwh']:.1f}kWh/d@{d['max_kw']}kW") for d in deferrable_loads],
             result.status,
         )
+        if cap_blocks:
+            for cb in cap_blocks:
+                target = import_tranche if cb["direction"] == "import" else export_tranche
+                free_total = sum(v[0] for t, v in target.items() if t in cb["hours"])
+                over_total = sum(v[1] for t, v in target.items() if t in cb["hours"])
+                _LOGGER.warning(
+                    "cap block %s: %d hours, daily_cap=%.1f, rate_after_cap=%.3f, "
+                    "free=%.2fkWh, over_cap=%.2fkWh",
+                    cb["direction"], len(cb["hours"]), cb["daily_cap_kwh"],
+                    cb["rate_after_cap"], free_total, over_total,
+                )
         return {
             'schedule':            schedule,
             'total_import_kwh':    total_import_kwh,

@@ -22,6 +22,7 @@ from .forecast import FlatLoadForecaster, ForecastProvider, HourOfDayLoadForecas
 from .load_history import build_hour_of_day_load
 from .planner import AdvisoryPlanner
 from .rates import PlanRateForecaster
+from ..retailer_plans import build_rate_caps
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -318,9 +319,18 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             min_soc_percent=float(self._cfg("battery_min_soc", 10.0)),
             max_soc_percent=opt_max_soc,
         )
+        # Capped rate windows (e.g. GloBird ZEROHERO's 50 kWh/day free-import window)
+        # on the user's actual current plan — without this the live dispatch would
+        # treat the free tier as unlimited. A no-op ([], [], {}) for the common case
+        # of a plan with no capped rates.
+        import_caps, export_caps, _cap_labels = build_rate_caps(
+            self._plan, bundle.start, bundle.slots, bundle.slot_minutes
+        )
         result = AdvisoryPlanner(optimizer).plan(
             bundle, initial_soc_percent=soc,
             deferrable_loads=self._deferrable_for_horizon(bundle),
+            import_caps=import_caps,
+            export_caps=export_caps,
         )
 
         # Feed the fresh plan to the control manager (it acts on it only while the master

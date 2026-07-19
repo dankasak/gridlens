@@ -60,6 +60,8 @@ class AdvisoryPlanner:
         deferrable_loads: Optional[list[dict]] = None,
         demand_rate: float = 0.0,
         demand_window_mask: Optional[list[int]] = None,
+        import_caps: Optional[list[dict]] = None,
+        export_caps: Optional[list[dict]] = None,
     ) -> AdvisoryResult:
         dt_h = bundle.dt_hours
         terminal_value = (
@@ -78,6 +80,8 @@ class AdvisoryPlanner:
             soc_reward=self.soc_reward,
             no_grid_charge=self.no_grid_charge,
             terminal_soc_value=terminal_value,
+            import_caps=import_caps,
+            export_caps=export_caps,
         )
 
         devs = deferrable_loads or []
