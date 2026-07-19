@@ -574,10 +574,11 @@ class GridLensAdvisoryCard extends HTMLElement {
   }
 
   // The EMS mode the executor will actually command for a slot. Mirrors
-  // ScheduleExecutor._resolve_charge: a solar-only CHARGE slot (no grid
-  // contribution) runs as Maximum Self-consumption — the inverter fills the
-  // battery from PV surplus without importing; only a genuine grid top-up
-  // (grid_charge_w > ~0) is issued as Command Charging (PV first).
+  // ScheduleExecutor._resolve_charge: a CHARGE slot only runs as Command Charging
+  // (PV first) when the plan wants a *material* grid top-up — a real share of the
+  // slot AND above an absolute floor. Otherwise (solar charge, or a trivial LP grid
+  // nibble) it runs as Maximum Self-consumption, which resets the charge-rate cap to
+  // hardware max and fills the battery from all surplus PV without importing.
   _execMode(row) {
     if (row.action !== 'charge') return row.action;
     let gw = row.grid_charge_w;
@@ -588,7 +589,8 @@ class GridLensAdvisoryCard extends HTMLElement {
       const dtH = step / 3600000;
       gw = Math.max(0, ((+row.buy_kwh || 0) - (+row.load_kwh || 0) - (+row.deferrable_kwh || 0))) / dtH * 1000;
     }
-    return gw > 1 ? 'charge' : 'self_use';
+    const pw = +row.power_w || 0;
+    return (gw > 250 && gw >= 0.5 * pw) ? 'charge' : 'self_use';
   }
 
   // Collapse the per-slot executed EMS mode into just the points where it

@@ -40,12 +40,15 @@ class DispatchInterval:
 
     The executor uses ``grid_charge_w`` — NOT ``power_w`` — to decide *how* to charge:
 
-    * ``grid_charge_w <= 0`` (solar-only): charge via self-consumption, which pulls the
-      battery up from surplus PV and **never imports grid to charge**. Commanding
-      ``force_charge(power_w)`` here (PV-first at the full rate) would make the inverter
-      import whenever instantaneous PV surplus < ``power_w`` — the 10 kW import-spike bug.
-    * ``grid_charge_w > 0`` (genuine grid charge): ``force_charge(grid_charge_w)`` so the
-      grid rate cap is the planned grid contribution, never the full charge rate.
+    * solar charge (``grid_charge_w`` immaterial — see ``_resolve_charge``): charge via
+      self-consumption, which pulls the battery up from surplus PV at the hardware-max rate
+      and **never imports grid to charge**. Commanding ``force_charge(power_w)`` here
+      (PV-first at the full rate) would make the inverter import whenever instantaneous PV
+      surplus < ``power_w`` — the 10 kW import-spike bug — and a *tiny* ``grid_charge_w``
+      passed to ``force_charge`` would instead cap total charge power at that tiny value,
+      throttling the solar charge and dumping surplus PV to a $0 export.
+    * material grid charge (grid a real share of the slot): ``force_charge(grid_charge_w)``
+      so the grid rate cap is the planned grid contribution, never the full charge rate.
     """
 
     start: datetime
@@ -210,20 +213,31 @@ class ScheduleExecutor:
             return self._resolve_charge(current)
         return current.action, current.power_w
 
-    # Grid contributions below this (watts) are treated as solar-only charging — guards
-    # against float noise in the plan's kWh→W conversion tipping a solar slot into a
-    # spurious grid-import command.
-    _GRID_CHARGE_EPS_W = 1.0
+    # A CHARGE slot only runs as a grid-charge (force_charge) when the plan wants a
+    # *material* amount of grid import: a real share of the slot (fraction) AND above an
+    # absolute floor. Everything else is treated as solar charging and runs as Maximum
+    # Self-consumption, which (a) resets the charge-rate cap to hardware max and (b) lets
+    # the battery absorb ALL surplus PV.
+    #
+    # A tiny grid nibble (LP rounding, e.g. ~135 W on a 3.2 kW solar charge) must NOT
+    # become a force_charge: force_charge sets the ESS max-charging-limit to the commanded
+    # watts, and that limit caps TOTAL battery charge power — so charging at ~135 W would
+    # throttle the solar charge and dump the surplus PV to a $0 export while the battery
+    # sits half-empty. Self-consumption instead pulls the battery up from all surplus PV.
+    _GRID_CHARGE_MIN_W = 250.0
+    _GRID_CHARGE_MIN_FRACTION = 0.5
 
     def _resolve_charge(self, iv: DispatchInterval) -> tuple[BatteryAction, float]:
         """Split a CHARGE slot into its real execution intent.
 
-        * grid contribution > eps → genuine grid charge: force-charge at the *grid* watts.
-        * otherwise → solar-only charge: run self-consumption so the battery fills from PV
-          surplus and the inverter never imports grid to charge it.
+        * material grid contribution (e.g. the evening pre-peak grid top-up) → genuine
+          grid charge: force-charge at the *grid* watts.
+        * otherwise → solar charge: run self-consumption so the battery fills from PV
+          surplus at the hardware-max rate and the inverter never imports grid to charge it.
         """
-        if iv.grid_charge_w > self._GRID_CHARGE_EPS_W:
-            return BatteryAction.CHARGE, iv.grid_charge_w
+        grid_w = iv.grid_charge_w
+        if grid_w > self._GRID_CHARGE_MIN_W and grid_w >= self._GRID_CHARGE_MIN_FRACTION * max(iv.power_w, 0.0):
+            return BatteryAction.CHARGE, grid_w
         return BatteryAction.SELF_USE, 0.0
 
     def status(self) -> dict:

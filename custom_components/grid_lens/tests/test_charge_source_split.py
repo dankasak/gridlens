@@ -8,8 +8,15 @@ setpoint makes the inverter import from the grid whenever instantaneous PV surpl
 below the setpoint — real grid-import spikes where the plan predicted ~0 import.
 
 The fix threads a ``grid_charge_w`` intent through ``DispatchInterval``:
-  * solar-only charge (``grid_charge_w <= eps``)  -> self-consumption (never imports)
-  * genuine grid charge (``grid_charge_w > eps``)  -> force_charge at the *grid* watts
+  * solar charge (grid contribution immaterial) -> self-consumption (never imports; the
+    charge-rate cap is reset to hardware max so the battery absorbs ALL surplus PV)
+  * material grid charge (grid a real share of the slot AND above an absolute floor)
+    -> force_charge at the *grid* watts
+
+A grid contribution is "material" only when it exceeds ``_GRID_CHARGE_MIN_W`` (250 W) AND
+is at least ``_GRID_CHARGE_MIN_FRACTION`` (50%) of the slot's total charge. A tiny LP grid
+nibble (e.g. 135 W on a 3.2 kW solar charge) is NOT material: force_charging at it would
+cap total battery charge power at 135 W and dump the surplus PV to a $0 export.
 
 These tests exercise the REAL executor and planner logic. Home Assistant and scipy are
 not importable in this container, so their modules are stubbed and the target source
@@ -227,6 +234,37 @@ def test_grid_charge_below_eps_is_solar():
     ex.set_plan([slot], updated_at=_FIXED_NOW)
     _tick(ex, _FIXED_NOW + timedelta(seconds=1))
     assert "force_charge" not in bc.names(), bc.calls
+    assert bc.names() == ["set_self_consumption_mode"], bc.calls
+
+
+def test_immaterial_grid_nibble_on_solar_charge_is_self_consumption():
+    """Regression for the live free-export bug: a predominantly-solar charge slot with a
+    tiny LP grid nibble (135 W grid on a 3.24 kW charge) must run as self-consumption, NOT
+    force_charge at 135 W — otherwise the ESS charge cap is pinned at 135 W and the surplus
+    PV is exported for $0 while the battery sits half-empty."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.CHARGE,
+        power_w=3_242.6, grid_charge_w=134.9,  # mostly solar; grid is 4% of the slot
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    assert "force_charge" not in bc.names(), (
+        f"immaterial grid nibble issued a grid force_charge: {bc.calls}")
+    assert bc.names() == ["set_self_consumption_mode"], bc.calls
+
+
+def test_material_grid_above_floor_but_minority_share_is_solar():
+    """A grid contribution above the absolute floor but a minority of the slot (solar is
+    the majority) stays solar-only — self-consumption soaks up the larger PV surplus rather
+    than capping total charge at the smaller grid figure."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.CHARGE,
+        power_w=5_000.0, grid_charge_w=1_000.0,  # 1 kW grid = 20% of a 5 kW charge
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
     assert bc.names() == ["set_self_consumption_mode"], bc.calls
 
 
