@@ -37,6 +37,9 @@ class DispatchInterval:
     slot (used for display / the SOC trajectory). ``grid_charge_w`` is the portion of a
     CHARGE slot that the plan intends to source **from the grid** (import beyond house +
     deferrable load). It is 0 for solar-only charge slots and for non-charge slots.
+    ``export_w`` is the portion of a DISCHARGE slot that the plan intends to sell **to the
+    grid** (discharge beyond house + deferrable load). It is 0 for load-covering discharge
+    slots and for non-discharge slots.
 
     The executor uses ``grid_charge_w`` — NOT ``power_w`` — to decide *how* to charge:
 
@@ -49,12 +52,20 @@ class DispatchInterval:
       throttling the solar charge and dumping surplus PV to a $0 export.
     * material grid charge (grid a real share of the slot): ``force_charge(grid_charge_w)``
       so the grid rate cap is the planned grid contribution, never the full charge rate.
+
+    Symmetrically, ``export_w`` — NOT ``power_w`` — decides *how* to discharge (see
+    ``_resolve_discharge``): a discharge that only covers house load gains nothing from
+    forcing "battery first" mode — self-consumption already discharges to match load with
+    no rate forced, so real-time load dipping below the plan's slot-average discharge can
+    never spill into a $0 export. Only a discharge with a material export component forces
+    the battery-first rate the plan actually wants to sell.
     """
 
     start: datetime
     action: BatteryAction
     power_w: float = 0.0
     grid_charge_w: float = 0.0
+    export_w: float = 0.0
 
 
 @dataclass
@@ -211,6 +222,8 @@ class ScheduleExecutor:
             return BatteryAction.SELF_USE, 0.0
         if current.action == BatteryAction.CHARGE:
             return self._resolve_charge(current)
+        if current.action == BatteryAction.DISCHARGE:
+            return self._resolve_discharge(current)
         return current.action, current.power_w
 
     # A CHARGE slot only runs as a grid-charge (force_charge) when the plan wants a
@@ -238,6 +251,34 @@ class ScheduleExecutor:
         grid_w = iv.grid_charge_w
         if grid_w > self._GRID_CHARGE_MIN_W and grid_w >= self._GRID_CHARGE_MIN_FRACTION * max(iv.power_w, 0.0):
             return BatteryAction.CHARGE, grid_w
+        return BatteryAction.SELF_USE, 0.0
+
+    # A DISCHARGE slot only runs as a forced "battery first" discharge when the plan wants
+    # a *material* amount of export: a real share of the slot (fraction) AND above an
+    # absolute floor. Everything else is treated as load-covering discharge and runs as
+    # self-consumption, which discharges to match load exactly with no rate forced.
+    #
+    # force_discharge sets the ESS max-discharging-limit to the commanded watts and selects
+    # "battery first" mode, which drives discharge *toward* that setpoint — if real-time
+    # load falls below the plan's slot-average discharge, the excess spills to a $0 export
+    # (the discharge-side twin of the charge/grid-charge import-spike bug). A tiny LP
+    # discharge nibble (e.g. ~135 W to cover overnight load) must NOT become a
+    # force_discharge for the same reason a tiny grid nibble must not become a force_charge.
+    _EXPORT_MIN_W = 250.0
+    _EXPORT_MIN_FRACTION = 0.5
+
+    def _resolve_discharge(self, iv: DispatchInterval) -> tuple[BatteryAction, float]:
+        """Split a DISCHARGE slot into its real execution intent.
+
+        * material export (e.g. the paid evening peak) -> genuine forced discharge at the
+          slot's full planned rate, battery-first.
+        * otherwise -> load-covering discharge: run self-consumption so the battery meets
+          house load exactly and the inverter never forces a rate that could spill into a
+          $0 export.
+        """
+        export_w = iv.export_w
+        if export_w > self._EXPORT_MIN_W and export_w >= self._EXPORT_MIN_FRACTION * max(iv.power_w, 0.0):
+            return BatteryAction.DISCHARGE, iv.power_w
         return BatteryAction.SELF_USE, 0.0
 
     def status(self) -> dict:

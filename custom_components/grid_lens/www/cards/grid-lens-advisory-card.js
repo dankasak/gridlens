@@ -579,18 +579,39 @@ class GridLensAdvisoryCard extends HTMLElement {
   // slot AND above an absolute floor. Otherwise (solar charge, or a trivial LP grid
   // nibble) it runs as Maximum Self-consumption, which resets the charge-rate cap to
   // hardware max and fills the battery from all surplus PV without importing.
+  //
+  // Symmetrically mirrors ScheduleExecutor._resolve_discharge: a DISCHARGE slot only
+  // runs as Command Discharging (battery first) when the plan wants a *material* export
+  // — a real share of the slot AND above an absolute floor. Otherwise (load-covering
+  // discharge, or a trivial LP nibble) it runs as self-consumption, which already
+  // discharges to match load with no rate forced.
   _execMode(row) {
-    if (row.action !== 'charge') return row.action;
-    let gw = row.grid_charge_w;
-    if (gw == null) {
-      // Older sensor payloads lack grid_charge_w — derive it the same way the
-      // planner does: import beyond house + deferrable load must be battery charge.
-      const { step } = this._timeScale();
-      const dtH = step / 3600000;
-      gw = Math.max(0, ((+row.buy_kwh || 0) - (+row.load_kwh || 0) - (+row.deferrable_kwh || 0))) / dtH * 1000;
+    if (row.action === 'charge') {
+      let gw = row.grid_charge_w;
+      if (gw == null) {
+        // Older sensor payloads lack grid_charge_w — derive it the same way the
+        // planner does: import beyond house + deferrable load must be battery charge.
+        const { step } = this._timeScale();
+        const dtH = step / 3600000;
+        gw = Math.max(0, ((+row.buy_kwh || 0) - (+row.load_kwh || 0) - (+row.deferrable_kwh || 0))) / dtH * 1000;
+      }
+      const pw = +row.power_w || 0;
+      return (gw > 250 && gw >= 0.5 * pw) ? 'charge' : 'self_use';
     }
-    const pw = +row.power_w || 0;
-    return (gw > 250 && gw >= 0.5 * pw) ? 'charge' : 'self_use';
+    if (row.action === 'discharge') {
+      let ew = row.export_w;
+      if (ew == null) {
+        // Older sensor payloads lack export_w — derive it the same way the planner
+        // does: export energy, capped at the slot's total discharge.
+        const { step } = this._timeScale();
+        const dtH = step / 3600000;
+        const pw = +row.power_w || 0;
+        ew = Math.min(Math.max(0, +row.sell_kwh || 0), pw * dtH / 1000) / dtH * 1000;
+      }
+      const pw = +row.power_w || 0;
+      return (ew > 250 && ew >= 0.5 * pw) ? 'discharge' : 'self_use';
+    }
+    return row.action;
   }
 
   // Collapse the per-slot executed EMS mode into just the points where it

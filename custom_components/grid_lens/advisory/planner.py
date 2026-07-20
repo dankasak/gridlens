@@ -94,13 +94,14 @@ class AdvisoryPlanner:
         for step in schedule:
             t = int(step["hour"])
             start = bundle.start + timedelta(minutes=t * bundle.slot_minutes)
-            action, power_w, grid_charge_w = self._classify(step, dt_h)
+            action, power_w, grid_charge_w, export_w = self._classify(step, dt_h)
             plan.append(
                 DispatchInterval(
                     start=start,
                     action=action,
                     power_w=power_w,
                     grid_charge_w=grid_charge_w,
+                    export_w=export_w,
                 )
             )
             row = {
@@ -112,6 +113,10 @@ class AdvisoryPlanner:
                 # solar-only charge as Maximum Self-consumption, so the card's EMS
                 # timeline needs this to show the mode that will actually be commanded.
                 "grid_charge_w": round(grid_charge_w, 1),
+                # Export contribution of a DISCHARGE slot (0 = pure load coverage). The
+                # executor runs load-covering discharge as self-consumption, so the card's
+                # EMS timeline needs this to show the mode that will actually be commanded.
+                "export_w": round(export_w, 1),
                 "solar_kwh": round(step.get("solar_kwh", 0.0), 3),
                 "load_kwh": round(step.get("load_kwh", 0.0), 3),
                 "deferrable_kwh": round(step.get("deferrable_kwh", 0.0), 3),  # total (tooltip)
@@ -162,8 +167,9 @@ class AdvisoryPlanner:
             return 0.0
         return sum(rates) / len(rates)
 
-    def _classify(self, step: dict, dt_h: float) -> tuple[BatteryAction, float, float]:
-        """Map an optimizer slot to a battery action + average power (W) + grid-charge (W).
+    def _classify(self, step: dict, dt_h: float) -> tuple[BatteryAction, float, float, float]:
+        """Map an optimizer slot to a battery action + average power (W) + grid-charge (W)
+        + export (W).
 
         Schedule values are ENERGY (kWh) per slot, so power = energy / slot-hours.
 
@@ -173,6 +179,11 @@ class AdvisoryPlanner:
         import/export, so any import above load+deferrable is battery charging). It is 0
         for solar-only charge slots (import only covers load) and for non-charge slots.
         The executor uses it to pick self-consumption vs a real grid force-charge.
+
+        The fourth element, ``export_w``, is the portion of a DISCHARGE slot the plan
+        intends to sell **to the grid** (the slot's export energy, capped at the discharge
+        itself). It is 0 for load-covering discharge slots and for non-discharge slots. The
+        executor uses it to pick self-consumption vs a real forced "battery first" discharge.
         """
         charge = float(step.get("charge_kwh", 0.0))
         discharge = float(step.get("discharge_kwh", 0.0))
@@ -180,10 +191,11 @@ class AdvisoryPlanner:
         floor = self.threshold * dt_h
         if charge > floor and charge >= discharge:
             grid_charge_w = self._grid_charge_w(step, charge, dt_h)
-            return BatteryAction.CHARGE, charge / dt_h * 1000.0, grid_charge_w
+            return BatteryAction.CHARGE, charge / dt_h * 1000.0, grid_charge_w, 0.0
         if discharge > floor:
-            return BatteryAction.DISCHARGE, discharge / dt_h * 1000.0, 0.0
-        return BatteryAction.SELF_USE, 0.0, 0.0
+            export_w = self._export_w(step, discharge, dt_h)
+            return BatteryAction.DISCHARGE, discharge / dt_h * 1000.0, 0.0, export_w
+        return BatteryAction.SELF_USE, 0.0, 0.0, 0.0
 
     def _grid_charge_w(self, step: dict, charge_kwh: float, dt_h: float) -> float:
         """Grid contribution to *battery* charge for a CHARGE slot, in watts.
@@ -201,3 +213,16 @@ class AdvisoryPlanner:
         if grid_to_battery <= self.threshold * dt_h:
             return 0.0
         return grid_to_battery / dt_h * 1000.0
+
+    def _export_w(self, step: dict, discharge_kwh: float, dt_h: float) -> float:
+        """Export contribution of *battery* discharge for a DISCHARGE slot, in watts.
+
+        = export_kwh capped at the slot's total discharge energy (the battery can't sell
+        more than it discharges), converted to average power. Floored to 0 when at/below
+        the classification threshold so float noise never fabricates a forced discharge.
+        """
+        export_kwh = float(step.get("export_kwh", 0.0))
+        export_kwh = min(max(0.0, export_kwh), discharge_kwh)
+        if export_kwh <= self.threshold * dt_h:
+            return 0.0
+        return export_kwh / dt_h * 1000.0

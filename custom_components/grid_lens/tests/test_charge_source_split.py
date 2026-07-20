@@ -268,16 +268,66 @@ def test_material_grid_above_floor_but_minority_share_is_solar():
     assert bc.names() == ["set_self_consumption_mode"], bc.calls
 
 
-def test_discharge_slot_unchanged():
-    """Non-charge actions are unaffected by the split."""
+def test_load_covering_discharge_slot_never_force_discharges():
+    """A load-covering discharge slot (export_w == 0) must NOT issue force_discharge; it
+    must be executed as self-consumption so real-time load dipping below the plan's
+    slot-average discharge never spills into a $0 export."""
     ex, bc = _make_executor()
     slot = DispatchInterval(
-        start=_FIXED_NOW, action=BatteryAction.DISCHARGE, power_w=7_000.0,
+        start=_FIXED_NOW, action=BatteryAction.DISCHARGE,
+        power_w=7_000.0, export_w=0.0,
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    assert "force_discharge" not in bc.names(), (
+        f"load-covering discharge slot issued a forced discharge: {bc.calls}")
+    assert bc.names() == ["set_self_consumption_mode"], bc.calls
+
+
+def test_export_discharge_slot_force_discharges_with_full_power():
+    """A genuine export slot must issue force_discharge at the slot's full planned rate
+    (battery-first), not self-consumption."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.DISCHARGE,
+        power_w=10_000.0, export_w=8_780.0,  # 10 kW discharge, most of it exported
     )
     ex.set_plan([slot], updated_at=_FIXED_NOW)
     _tick(ex, _FIXED_NOW + timedelta(seconds=1))
     assert bc.names() == ["force_discharge"], bc.calls
-    assert bc.calls[0][1] == 7_000.0
+    _name, power_w, _dur = bc.calls[0]
+    assert power_w == 10_000.0, f"expected the full discharge rate, got {power_w}"
+
+
+def test_immaterial_export_nibble_on_load_discharge_is_self_consumption():
+    """Regression for the 0c/kWh-FiT bug: a predominantly load-covering discharge slot
+    with a tiny LP export nibble must run as self-consumption, NOT force_discharge at the
+    slot's rate — forcing that rate ("battery first") would spill any real-time load
+    shortfall into a $0 export."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.DISCHARGE,
+        power_w=398.6, export_w=0.0,  # early-morning slot, purely covering house load
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    assert "force_discharge" not in bc.names(), (
+        f"immaterial export nibble issued a forced discharge: {bc.calls}")
+    assert bc.names() == ["set_self_consumption_mode"], bc.calls
+
+
+def test_material_export_above_floor_but_minority_share_is_self_consumption():
+    """An export contribution above the absolute floor but a minority of the slot (load
+    coverage is the majority) stays self-consumption — the battery isn't forced to a rate
+    when most of the discharge is destined for the house, not the grid."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.DISCHARGE,
+        power_w=5_000.0, export_w=1_000.0,  # 1 kW export = 20% of a 5 kW discharge
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    assert bc.names() == ["set_self_consumption_mode"], bc.calls
 
 
 def test_stale_plan_hands_back_to_native():
@@ -305,10 +355,11 @@ def test_planner_solar_slot_grid_charge_zero():
         "load_kwh": 0.6,
         "deferrable_kwh": 0.4,
     }
-    action, power_w, grid_w = p._classify(step, dt_h=0.5)
+    action, power_w, grid_w, export_w = p._classify(step, dt_h=0.5)
     assert action == BatteryAction.CHARGE
     assert round(power_w, 1) == 10_000.0
     assert grid_w == 0.0, grid_w
+    assert export_w == 0.0, export_w
 
 
 def test_planner_grid_slot_computes_grid_watts():
@@ -321,7 +372,7 @@ def test_planner_grid_slot_computes_grid_watts():
         "load_kwh": 0.7,
         "deferrable_kwh": 0.3,  # -> grid-to-battery = 3 kWh over 0.5 h = 6 kW
     }
-    action, power_w, grid_w = p._classify(step, dt_h=0.5)
+    action, power_w, grid_w, _export_w = p._classify(step, dt_h=0.5)
     assert action == BatteryAction.CHARGE
     assert round(grid_w, 1) == 6_000.0, grid_w
     assert grid_w < power_w  # grid portion never exceeds the full charge rate
@@ -337,17 +388,50 @@ def test_planner_grid_charge_capped_at_total_charge():
         "load_kwh": 1.0,
         "deferrable_kwh": 1.0,  # grid-to-battery raw = 8 kWh, but capped at charge=2 kWh
     }
-    _action, power_w, grid_w = p._classify(step, dt_h=0.5)
+    _action, power_w, grid_w, _export_w = p._classify(step, dt_h=0.5)
     assert round(grid_w, 1) == round(power_w, 1) == 4_000.0, (grid_w, power_w)
 
 
 def test_planner_discharge_has_zero_grid_charge():
     p = _planner()
     step = {"charge_kwh": 0.0, "discharge_kwh": 4.0, "import_kwh": 0.0,
-            "load_kwh": 0.0, "deferrable_kwh": 0.0}
-    action, _power, grid_w = p._classify(step, dt_h=0.5)
+            "load_kwh": 0.0, "deferrable_kwh": 0.0, "export_kwh": 0.0}
+    action, _power, grid_w, _export_w = p._classify(step, dt_h=0.5)
     assert action == BatteryAction.DISCHARGE
     assert grid_w == 0.0
+
+
+def test_planner_load_covering_discharge_export_zero():
+    """export_kwh == 0 (all discharge covers house load) -> export_w == 0."""
+    p = _planner()
+    step = {"charge_kwh": 0.0, "discharge_kwh": 2.0,  # 4 kW over a 0.5 h slot
+            "import_kwh": 0.0, "load_kwh": 4.0, "deferrable_kwh": 0.0, "export_kwh": 0.0}
+    action, power_w, _grid_w, export_w = p._classify(step, dt_h=0.5)
+    assert action == BatteryAction.DISCHARGE
+    assert round(power_w, 1) == 4_000.0
+    assert export_w == 0.0, export_w
+
+
+def test_planner_export_slot_computes_export_watts():
+    """export_kwh feeds the grid -> export_w = that, in W."""
+    p = _planner()
+    step = {"charge_kwh": 0.0, "discharge_kwh": 5.0,  # 10 kW total discharge over 0.5 h
+             "import_kwh": 0.0, "load_kwh": 1.0, "deferrable_kwh": 0.0,
+             "export_kwh": 4.0}  # 4 kWh sold -> 8 kW
+    action, power_w, _grid_w, export_w = p._classify(step, dt_h=0.5)
+    assert action == BatteryAction.DISCHARGE
+    assert round(export_w, 1) == 8_000.0, export_w
+    assert export_w < power_w  # export portion never exceeds the full discharge rate
+
+
+def test_planner_export_capped_at_total_discharge():
+    """export-to-grid can never exceed the slot's total discharge energy."""
+    p = _planner()
+    step = {"charge_kwh": 0.0, "discharge_kwh": 1.0,  # only 1 kWh discharged this slot
+            "import_kwh": 0.0, "load_kwh": 0.0, "deferrable_kwh": 0.0,
+            "export_kwh": 3.0}  # export figure larger than the discharge itself
+    _action, power_w, _grid_w, export_w = p._classify(step, dt_h=0.5)
+    assert round(export_w, 1) == round(power_w, 1) == 2_000.0, (export_w, power_w)
 
 
 # ------------------------------------------ soft terminal-SOC valuation (Defect 2)
