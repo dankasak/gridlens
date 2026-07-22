@@ -46,8 +46,11 @@ def _install_stubs() -> None:
     event.async_call_later = lambda *a, **k: (lambda: None)
     uc = _mod("homeassistant.helpers.update_coordinator")
     uc.DataUpdateCoordinator = type("DataUpdateCoordinator", (), {})
+    storage = _mod("homeassistant.helpers.storage")
+    storage.Store = type("Store", (), {})
     helpers.event = event
     helpers.update_coordinator = uc
+    helpers.storage = storage
     ha.helpers = helpers
 
     util = _mod("homeassistant.util")
@@ -56,6 +59,15 @@ def _install_stubs() -> None:
     dt.as_local = lambda x: x
     util.dt = dt
     ha.util = util
+
+    components = _mod("homeassistant.components")
+    recorder = _mod("homeassistant.components.recorder")
+    recorder.get_instance = lambda hass: None
+    rec_stats = _mod("homeassistant.components.recorder.statistics")
+    rec_stats.statistics_during_period = lambda *a, **k: {}
+    recorder.statistics = rec_stats
+    components.recorder = recorder
+    ha.components = components
 
     # Synthetic package tree for the relative imports in coordinator.py.
     for pkg in ("gl", "gl.advisory"):
@@ -78,6 +90,9 @@ def _install_stubs() -> None:
     planner.AdvisoryPlanner = type("AdvisoryPlanner", (), {})
     rates = _mod("gl.advisory.rates")
     rates.PlanRateForecaster = type("PlanRateForecaster", (), {})
+    rp = _mod("gl.retailer_plans")
+    rp.build_rate_caps = lambda *a, **k: ([], [], {})
+    rp.build_conditional_credits = lambda *a, **k: []
 
 
 def _load_coordinator():

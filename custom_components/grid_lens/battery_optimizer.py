@@ -96,8 +96,24 @@ class BatteryOptimizer:
         terminal_soc_value: float = None,
         import_caps: List[Dict] = None,
         export_caps: List[Dict] = None,
+        conditional_credits: List[Dict] = None,
     ) -> Dict:
         """Return an optimal hourly schedule minimising net energy cost.
+
+        conditional_credits: optional list of day-scoped all-or-nothing bonus
+          descriptors, each {'label': str, 'condition': 'max_import_kwh',
+          'threshold_kwh': float (a $/kWh-style RATE, kWh per clock-hour —
+          scaled by dt internally, not a per-slot cap), 'amount_per_day':
+          float, 'hour_mask': list[int] len T} (built by
+          retailer_plans.build_conditional_credits).
+          Models plans like GloBird ZEROHERO's "$1/day when imports are 0.03
+          kWh/hour or less, 6pm-9pm" — a reward earned only if EVERY masked
+          hour's import stays at/under threshold_kwh for that calendar day, not
+          a continuous price signal like import_caps/export_caps above. Needs
+          a MILP binary indicator per (credit, day), so the scipy solve path
+          switches from linprog to scipy.optimize.milp whenever this is
+          non-empty (see _lp_scipy) — left at the default (None) the model
+          behaves exactly as before, still solved as a pure continuous LP.
 
         deferrable_loads is a list of per-device dicts, each with:
           'daily_kwh': float  — energy the device must consume per day
@@ -161,7 +177,8 @@ class BatteryOptimizer:
                                      soc_reward=soc_reward, export_penalty=export_penalty,
                                      no_grid_charge=no_grid_charge,
                                      terminal_soc_value=terminal_soc_value,
-                                     import_caps=import_caps, export_caps=export_caps)
+                                     import_caps=import_caps, export_caps=export_caps,
+                                     conditional_credits=conditional_credits)
         except ImportError:
             _LOGGER.warning(
                 "PuLP not yet installed — using greedy fallback. "
@@ -207,16 +224,18 @@ class BatteryOptimizer:
     def _lp_optimize(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads,
                      demand_rate=0.0, demand_window_mask=None, timestep_hours=1.0,
                      soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
-                     terminal_soc_value=None, import_caps=None, export_caps=None):
+                     terminal_soc_value=None, import_caps=None, export_caps=None,
+                     conditional_credits=None):
         """Build and solve the LP. Raises on failure so caller can fall back."""
         # HiGHS/PuLP paths model none of the extras below; only the scipy path (the
         # complete, production path) does. Skip straight to scipy for any of them.
         # (terminal_soc_value softens the terminal-SOC constraint — scipy-only.)
         demand_active = demand_rate > 0 and demand_window_mask and any(demand_window_mask)
         caps_active = bool(import_caps) or bool(export_caps)
+        credits_active = bool(conditional_credits)
         if (not demand_active and not caps_active and timestep_hours == 1.0
                 and soc_reward == 0.0 and export_penalty == 0.0 and not no_grid_charge
-                and terminal_soc_value is None):
+                and terminal_soc_value is None and not credits_active):
             try:
                 return self._lp_highspy(solar, load, r_imp, r_exp, E0, T, deferrable_loads)
             except ImportError:
@@ -232,7 +251,8 @@ class BatteryOptimizer:
                                   soc_reward=soc_reward, export_penalty=export_penalty,
                                   no_grid_charge=no_grid_charge,
                                   terminal_soc_value=terminal_soc_value,
-                                  import_caps=import_caps, export_caps=export_caps)
+                                  import_caps=import_caps, export_caps=export_caps,
+                                  conditional_credits=conditional_credits)
         except ImportError:
             pass  # scipy not available — try PuLP
         except Exception as exc:
@@ -255,7 +275,8 @@ class BatteryOptimizer:
     def _lp_scipy(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads,
                   demand_rate=0.0, demand_window_mask=None, timestep_hours=1.0,
                   soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
-                  terminal_soc_value=None, import_caps=None, export_caps=None):
+                  terminal_soc_value=None, import_caps=None, export_caps=None,
+                  conditional_credits=None):
         import numpy as np
         from scipy.optimize import linprog
         from scipy.sparse import lil_matrix
@@ -304,6 +325,45 @@ class BatteryOptimizer:
                     "daily_cap_kwh": cw["daily_cap_kwh"],
                 })
 
+        # Conditional day-credits (e.g. GloBird ZEROHERO's "$1/day when imports
+        # are <=0.03 kWh/hour, 6pm-9pm"): unlike the cap tranches above (a
+        # continuous price signal), this is all-or-nothing per calendar day, so
+        # it needs a binary indicator y[credit,day] rather than another LP
+        # variable — hence the milp() solve below whenever credit_blocks is
+        # non-empty. One binary per (credit, day) that has at least one masked
+        # hour in this horizon; a day only partially visible at the horizon's
+        # far edge still gets one (it'll be corrected on the next rolling
+        # replan once fully in view) — the caller is responsible for zeroing a
+        # day's mask entirely (not passing partial-day hours) when that day's
+        # credit is already unattainable (e.g. real grid import already
+        # exceeded the threshold earlier today).
+        credit_blocks = []
+        for cc in conditional_credits or []:
+            mask = cc.get("hour_mask") or []
+            day_index = cc.get("day_index") or []
+            hours = [t for t in range(T) if t < len(mask) and mask[t]]
+            if not hours:
+                continue
+            # Group by real calendar date (day_index), not t // slots_per_day —
+            # see build_conditional_credits for why (the LP horizon starts at
+            # "now", not local midnight, so a fixed 24h chunk can split one
+            # calendar day's window across two chunks). Falls back to the old
+            # chunking only if a caller doesn't supply day_index.
+            by_day: dict = {}
+            for t in hours:
+                key = day_index[t] if t < len(day_index) else t // slots_per_day
+                by_day.setdefault(key, []).append(t)
+            for d, day_hours in by_day.items():
+                credit_blocks.append({
+                    "hours": day_hours,
+                    "y_idx": n,
+                    "threshold_kwh": cc.get("threshold_kwh", 0.0),
+                    "amount_per_day": cc.get("amount_per_day", 0.0),
+                    "label": cc.get("label", "Conditional Credit"),
+                    "day": d,
+                })
+                n += 1
+
         c_obj = np.zeros(n)
         c_obj[I:I+T] = r_imp
         c_obj[X:X+T] = [-r for r in r_exp]
@@ -334,6 +394,11 @@ class BatteryOptimizer:
                 c_obj[base + t] = 0.0
                 c_obj[cb["free_idx0"] + j] = sign * rates[t] + penalty
                 c_obj[cb["over_idx0"] + j] = sign * cb["rate_after_cap"] + penalty
+        # y=1 (credit earned) subtracts amount_per_day from cost — the solver
+        # only sets it when the big-M constraint below (imp[t] <= threshold)
+        # can be satisfied for every hour of that credit's day.
+        for cb2 in credit_blocks:
+            c_obj[cb2["y_idx"]] -= cb2["amount_per_day"]
         # Soft terminal-SOC valuation (Bug 2 fix, rolling-horizon use only). When set, the
         # hard terminal floor (soc[T-1] >= E0) is dropped below and end-of-horizon stored
         # energy is instead valued here at terminal_soc_value $/kWh — so the LP is not forced
@@ -366,6 +431,8 @@ class BatteryOptimizer:
                     ub[(5+i)*T+t] = dev['max_kw'] * dt if mask[t] else 0.0
             else:
                 ub[(5+i)*T:(5+i)*T+T] = dev['max_kw'] * dt
+        for cb2 in credit_blocks:
+            ub[cb2["y_idx"]] = 1.0
 
         # Equality constraints: T (energy balance) + T (SOC update) + N*n_days
         # (per-device daily totals) + one linking row per capped hour
@@ -459,7 +526,16 @@ class BatteryOptimizer:
                 days.setdefault(t // slots_per_day, []).append(j)
             for js in days.values():
                 cap_day_groups.append((cb, js))
-        n_ub = term_rows + len(demand_hours) + ngc_rows + len(cap_day_groups)
+        # One big-M row per masked slot of each credit-day: imp[t] <= threshold
+        # when y=1 (imp[t] + M*y <= threshold + M; y=0 relaxes it to imp[t] <= M,
+        # already the physical ceiling everywhere else). threshold_kwh is a
+        # $/kWh-style RATE ("0.03 kWh/hour" per GloBird's fact sheet), so it's
+        # scaled by dt to a per-slot energy cap — same convention as
+        # deferrable devices' max_kw * dt above (matters because slot length
+        # varies: 30-min slots here, vs the 1-hour slots the plan's fact sheet
+        # language assumes).
+        credit_rows = sum(len(cb2["hours"]) for cb2 in credit_blocks)
+        n_ub = term_rows + len(demand_hours) + ngc_rows + len(cap_day_groups) + credit_rows
         A_ub = lil_matrix((n_ub, n)) if n_ub else None
         b_ub = np.zeros(n_ub) if n_ub else None
         r = 0
@@ -484,16 +560,40 @@ class BatteryOptimizer:
                 A_ub[r, cb["free_idx0"] + j] = 1.0
             b_ub[r] = cb["daily_cap_kwh"]
             r += 1
+        for cb2 in credit_blocks:
+            for t in cb2["hours"]:
+                A_ub[r, I+t] = 1.0
+                A_ub[r, cb2["y_idx"]] = M
+                b_ub[r] = cb2["threshold_kwh"] * dt + M
+                r += 1
 
-        result = linprog(c_obj,
-                         A_ub=(A_ub.tocsr() if A_ub is not None else None),
-                         b_ub=b_ub,
-                         A_eq=A_eq.tocsr(), b_eq=b_eq,
-                         bounds=list(zip(lb.tolist(), ub.tolist())),
-                         method='highs', options={'time_limit': 30.0})
+        # A conditional credit needs an integer y[credit,day] ∈ {0,1} — the plain
+        # LP path (linprog, used for every other plan) can't express that, so
+        # this switches to scipy.optimize.milp (same HiGHS backend, mixed
+        # integer/continuous) only when credit_blocks is non-empty. Every other
+        # plan takes the linprog path exactly as before.
+        if credit_blocks:
+            from scipy.optimize import milp, LinearConstraint, Bounds
+            integrality = np.zeros(n)
+            for cb2 in credit_blocks:
+                integrality[cb2["y_idx"]] = 1
+            constraints = [LinearConstraint(A_eq.tocsr(), b_eq, b_eq)]
+            if A_ub is not None:
+                constraints.append(LinearConstraint(A_ub.tocsr(), -np.inf, b_ub))
+            result = milp(c_obj, constraints=constraints, integrality=integrality,
+                         bounds=Bounds(lb, ub), options={'time_limit': 30.0})
+            solver_label = 'lp/scipy-milp'
+        else:
+            result = linprog(c_obj,
+                             A_ub=(A_ub.tocsr() if A_ub is not None else None),
+                             b_ub=b_ub,
+                             A_eq=A_eq.tocsr(), b_eq=b_eq,
+                             bounds=list(zip(lb.tolist(), ub.tolist())),
+                             method='highs', options={'time_limit': 30.0})
+            solver_label = 'lp/scipy'
 
         if result.status not in (0, 1):
-            raise RuntimeError(f"scipy linprog status {result.status}: {result.message}")
+            raise RuntimeError(f"scipy solve status {result.status}: {result.message}")
 
         x = result.x
         soc_vals = x[S:S+T]
@@ -568,11 +668,24 @@ class BatteryOptimizer:
             })
 
         _LOGGER.warning(
-            "scipy LP solved %d hours, %d deferrable devices %s, status=%s",
-            T, N,
+            "%s solved %d hours, %d deferrable devices %s, status=%s",
+            solver_label, T, N,
             [(f"{d['daily_kwh']:.1f}kWh/d@{d['max_kw']}kW") for d in deferrable_loads],
             result.status,
         )
+        conditional_credit_totals: dict = {}
+        for cb2 in credit_blocks:
+            earned = x[cb2["y_idx"]] > 0.5
+            entry = conditional_credit_totals.setdefault(cb2["label"], {
+                "days_earned": 0, "days_total": 0, "amount": 0.0,
+                "amount_per_day": cb2["amount_per_day"],
+            })
+            entry["days_total"] += 1
+            if earned:
+                entry["days_earned"] += 1
+                entry["amount"] += cb2["amount_per_day"]
+        if credit_blocks:
+            _LOGGER.warning("conditional credits: %s", conditional_credit_totals)
         if cap_blocks:
             for cb in cap_blocks:
                 target = import_tranche if cb["direction"] == "import" else export_tranche
@@ -593,7 +706,8 @@ class BatteryOptimizer:
             'net_cost':            total_import_cost - total_export_credit,
             'final_soc_percent':   max(0.0, soc_vals[T-1]) / self.capacity_kwh * 100.0,
             'demand_peak_kw':      (max(0.0, x[P_idx]) if demand_active else None),
-            'solver':              'lp/scipy',
+            'conditional_credits': conditional_credit_totals,
+            'solver':              solver_label,
         }
 
     # ---- HiGHS (preferred — ships its own binary) ----

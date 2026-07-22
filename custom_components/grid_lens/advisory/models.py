@@ -59,6 +59,9 @@ class AdvisoryResult:
     plan: list  # list[DispatchInterval]
     trajectory: list[dict]  # per-hour {start, soc_percent, action, power_w, ...}
     deferrable_names: list[str] = field(default_factory=list)
+    # {label: {days_earned, days_total, amount, amount_per_day}} — e.g. GloBird
+    # ZEROHERO's credit. Empty for plans without a conditional credit.
+    conditional_credits: dict = field(default_factory=dict)
 
     def to_attributes(self) -> dict[str, Any]:
         """Shape for a HA sensor's attributes (JSON-serialisable)."""
@@ -72,4 +75,5 @@ class AdvisoryResult:
             "solver": self.solver,
             "deferrable_names": self.deferrable_names,
             "trajectory": self.trajectory,
+            "conditional_credits": self.conditional_credits,
         }

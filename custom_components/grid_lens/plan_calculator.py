@@ -13,7 +13,7 @@ from homeassistant.components.recorder.statistics import statistics_during_perio
 from .battery_optimizer import BatteryOptimizer
 from .retailer_plans import (
     plans_from_api_data, versioned_plans_from_history, build_rate_caps,
-    RetailerPlan,
+    build_conditional_credits, RetailerPlan,
 )
 from .const import (
     CONF_ENERGY_SENSOR,
@@ -2157,6 +2157,12 @@ class PlanCalculator:
         # or a capped Super Export credit) — without this the LP would treat the free
         # tier as unlimited and dump/pull arbitrary kWh through it.
         import_caps, export_caps, cap_labels = build_rate_caps(plan, start_time, T)
+        # Conditional day-credits (e.g. GloBird ZEROHERO's "$1/day when imports
+        # are 0.03 kWh/hour or less, 6pm-9pm") — without this the comparison
+        # would understate a plan carrying one by up to its full annual value,
+        # since it's a distinct mechanism from build_rate_caps's continuous
+        # price tranches. A no-op ([]) for a plan without one.
+        conditional_credits = build_conditional_credits(plan, start_time, T)
 
         # Translate each device's allowed local hours into a per-LP-hour mask so
         # the optimizer only schedules it when it is actually available (e.g. an
@@ -2185,6 +2191,7 @@ class PlanCalculator:
                 demand_window_mask=demand_window_mask,
                 import_caps=import_caps,
                 export_caps=export_caps,
+                conditional_credits=conditional_credits,
             )
         )
         # Carried through to _compute_bill_items so capped-rate tiers in the cost
@@ -2257,13 +2264,17 @@ class PlanCalculator:
         days = len(hourly_solar) / 24
         supply_cost = plan.daily_supply_charge * days
 
-        total_cost = result['net_cost'] + supply_cost
+        conditional_total = sum(
+            c.get('amount', 0.0) for c in (result.get('conditional_credits') or {}).values()
+        )
+        total_cost = result['net_cost'] + supply_cost - conditional_total
 
         _LOGGER.info(
             f"Plan {plan.retailer} - {plan.plan_name} with OPTIMIZED battery: "
             f"import={result['total_import_kwh']:.1f}kWh (${result['total_import_cost']:.2f}), "
             f"export={result['total_export_kwh']:.1f}kWh (${result['total_export_credit']:.2f}), "
-            f"supply=${supply_cost:.2f}, total=${total_cost:.2f}"
+            f"supply=${supply_cost:.2f}, conditional_credits=${conditional_total:.2f}, "
+            f"total=${total_cost:.2f}"
         )
 
         return total_cost, result

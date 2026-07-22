@@ -24,6 +24,10 @@ class RetailerPlan(ABC):
         self.demand_charge_window = None
         self.fixed_daily_credit = 0.0
         self.monthly_subscription_fee = 0.0
+        # Day-scoped bonus credits (e.g. GloBird ZEROHERO's "$1/day when imports
+        # are 0.03 kWh/hour or less, 6pm-9pm"). Raw API shape: {label, condition,
+        # threshold_kwh, amount_per_day, window}. Base plans have none.
+        self._conditional_credits: list = []
         # PEA support: set by PlanFromData when plan JSON includes a "pea" block.
         self.aemo_price_sensor: str | None = None
         self.bpea: float = 0.017
@@ -52,6 +56,9 @@ class RetailerPlan(ABC):
     @abstractmethod
     def get_display_breakdown(self, optimization_result: Dict) -> Dict:
         pass
+
+    def get_conditional_credits(self) -> list:
+        return self._conditional_credits
 
     def get_plan_info(self) -> Dict:
         return {
@@ -109,6 +116,7 @@ class PlanFromData(RetailerPlan):
         self._import_rates = plan_data.get("import_rates", [])
         self._export_rates = plan_data.get("export_rates", [])
         self._strategy     = plan_data.get("strategy", "")
+        self._conditional_credits = plan_data.get("conditional_credits") or []
 
         # Default feed_in_tariff: first non-null export rate that applies all hours.
         for r in self._export_rates:
@@ -155,13 +163,18 @@ class PlanFromData(RetailerPlan):
             return start <= probe <= end
         return probe >= start or probe <= end
 
-    def _in_window(self, window: dict, dt: datetime) -> bool:
-        if not self._in_season(window, dt):
+    @staticmethod
+    def _in_window(window: dict, dt: datetime) -> bool:
+        """Date-aware window membership — no instance state, so callable as
+        ``PlanFromData._in_window(...)`` for plans/objects that carry a raw
+        window dict but aren't necessarily a PlanFromData (e.g. conditional
+        credits matched from ``build_conditional_credits``)."""
+        if not PlanFromData._in_season(window, dt):
             return False
         # Sub-hour time range (from the DB's true TIME range) takes precedence.
         start, end = window.get("start"), window.get("end")
         if start is not None and end is not None:
-            return self._in_time_range(start, end, dt.hour * 60 + dt.minute)
+            return PlanFromData._in_time_range(start, end, dt.hour * 60 + dt.minute)
         hours = window.get("hours", "all")
         if hours == "all":
             return True
@@ -287,8 +300,10 @@ class PlanFromData(RetailerPlan):
         supply = self.daily_supply_charge * days
         sub    = self.monthly_subscription_fee * (days / 30.44)
         credit = self.fixed_daily_credit * days
+        conditional = optimization_result.get("conditional_credits") or {}
+        conditional_total = sum(c.get("amount", 0.0) for c in conditional.values())
         energy = optimization_result.get("net_cost", 0.0)
-        total  = energy + supply + sub - credit
+        total  = energy + supply + sub - credit - conditional_total
 
         result: dict = {
             "sections":          sections,
@@ -301,6 +316,18 @@ class PlanFromData(RetailerPlan):
             result["subscription_fee"] = round(sub, 2)
         if credit:
             result["vpp_credit"] = round(credit, 2)
+        if conditional_total:
+            # Per-credit detail (days earned vs. days in the schedule), e.g.
+            # "ZEROHERO Credit: $3.00 (3/3 days)" — not just the total, so a
+            # day the LP failed to earn the credit is visible, not hidden.
+            result["conditional_credits"] = {
+                label: {
+                    "amount": round(c.get("amount", 0.0), 2),
+                    "days_earned": c.get("days_earned", 0),
+                    "days_total": c.get("days_total", 0),
+                }
+                for label, c in conditional.items()
+            }
         return result
 
 
@@ -498,3 +525,51 @@ def build_rate_caps(
     import_caps = _build(plan.get_import_rate_info)
     export_caps = _build(plan.get_export_rate_info)
     return import_caps, export_caps, cap_labels
+
+
+def build_conditional_credits(
+    plan: RetailerPlan, start: datetime, n_slots: int, slot_minutes: int = 60,
+) -> list[Dict]:
+    """Build BatteryOptimizer.optimize_hourly_schedule's conditional_credits
+    hour-mask descriptors from a plan's raw conditional-credit definitions —
+    day-scoped all-or-nothing bonuses like GloBird ZEROHERO's "$1/day when
+    imports are 0.03 kWh/hour or less, 6pm-9pm" (see PlanConditionalCredit in
+    the API's plan_models.py). Mirrors build_rate_caps's shape/grouping
+    approach, one entry per credit rather than grouped by label since each
+    credit already has exactly one window.
+
+    Returns [] for a plan with none (the common case).
+    """
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    tz = ZoneInfo("Australia/Sydney")
+
+    out: list[Dict] = []
+    for credit in plan.get_conditional_credits():
+        window = credit.get("window") or {}
+        mask = [0] * n_slots
+        # Real calendar-date ordinal per masked slot (-1 = unmasked), NOT
+        # t // slots_per_day: the LP horizon starts at "now" rather than local
+        # midnight, so a fixed-width slots_per_day chunk can land mid-window
+        # (e.g. horizon starting 7pm would chunk-boundary at 7pm the next day,
+        # splitting a 6-9pm window in two) — which would double the $1/day
+        # credit across two binaries for what's really one calendar day. Real
+        # dates group correctly regardless of what time the plan happens to run.
+        day_index = [-1] * n_slots
+        for t in range(n_slots):
+            dt = (start + timedelta(minutes=t * slot_minutes)).astimezone(tz)
+            if PlanFromData._in_window(window, dt):
+                mask[t] = 1
+                day_index[t] = dt.toordinal()
+        if any(mask):
+            out.append({
+                "label": credit.get("label", "Conditional Credit"),
+                "condition": credit.get("condition", "max_import_kwh"),
+                "threshold_kwh": float(credit.get("threshold_kwh") or 0.0),
+                "amount_per_day": float(credit.get("amount_per_day") or 0.0),
+                "hour_mask": mask,
+                "day_index": day_index,
+            })
+    return out

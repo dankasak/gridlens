@@ -62,6 +62,7 @@ class AdvisoryPlanner:
         demand_window_mask: Optional[list[int]] = None,
         import_caps: Optional[list[dict]] = None,
         export_caps: Optional[list[dict]] = None,
+        conditional_credits: Optional[list[dict]] = None,
     ) -> AdvisoryResult:
         dt_h = bundle.dt_hours
         terminal_value = (
@@ -82,6 +83,7 @@ class AdvisoryPlanner:
             terminal_soc_value=terminal_value,
             import_caps=import_caps,
             export_caps=export_caps,
+            conditional_credits=conditional_credits,
         )
 
         devs = deferrable_loads or []
@@ -102,6 +104,7 @@ class AdvisoryPlanner:
                     power_w=power_w,
                     grid_charge_w=grid_charge_w,
                     export_w=export_w,
+                    import_rate=step.get("import_rate"),
                 )
             )
             row = {
@@ -145,6 +148,7 @@ class AdvisoryPlanner:
             plan=plan,
             trajectory=trajectory,
             deferrable_names=defer_names,
+            conditional_credits=result.get("conditional_credits", {}),
         )
 
     @staticmethod

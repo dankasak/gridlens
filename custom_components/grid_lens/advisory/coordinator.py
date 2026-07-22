@@ -8,8 +8,10 @@ must never disturb the rest of the integration.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import timedelta, timezone
 
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.statistics import statistics_during_period
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
@@ -22,7 +24,7 @@ from .forecast import FlatLoadForecaster, ForecastProvider, HourOfDayLoadForecas
 from .load_history import build_hour_of_day_load
 from .planner import AdvisoryPlanner
 from .rates import PlanRateForecaster
-from ..retailer_plans import build_rate_caps
+from ..retailer_plans import build_rate_caps, build_conditional_credits
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -137,6 +139,40 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             self._load_forecaster = HourOfDayLoadForecaster(vector)
         self._meta_refreshed = dt_util.utcnow()
 
+        mgr = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_control")
+        if mgr is not None:
+            await self._refresh_entitlement(mgr)
+
+    async def _refresh_entitlement(self, mgr) -> None:
+        """Battery control is gated server-side, independent of the plan-comparison
+        tier (see ControlManager.set_entitled) — a paid plan-comparison subscription
+        does not by itself grant battery control. Fails safe on any error by leaving
+        entitlement unchanged rather than flipping it: `set_entitled` already defaults
+        closed until the first successful check, and a definitive False only comes from
+        a real 200 response, so a transient network blip can't yo-yo an already-granted
+        entitlement off and the executor on/off/on."""
+        import aiohttp as _aiohttp
+        from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+        from ..const import CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL, CONF_STATE
+
+        api_key = self._cfg(CONF_GRIDLENS_API_KEY, "")
+        api_url = self._cfg(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
+        state = self._cfg(CONF_STATE, "NSW")
+        try:
+            session = async_get_clientsession(self.hass)
+            async with session.get(
+                f"{api_url}/plans/meta",
+                params={"state": state},
+                headers={"X-API-Key": api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
+                timeout=_aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    await mgr.set_entitled(bool(data.get("battery_control", False)))
+        except Exception as err:  # noqa: BLE001 — advisory mode must never break on this
+            _LOGGER.debug("Advisory: entitlement check failed, leaving unchanged: %s", err)
+
     async def _deferrable_device_params(self) -> list:
         """Per-device deferrable params (name, daily_kwh, max_kw) from history — reuses the
         main calculator's logic so advisory schedules the same EV/pool loads.
@@ -213,6 +249,76 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             out.append({"daily_kwh": daily, "max_kw": maxkw, "hour_mask": mask,
                         "name": dev.get("name")})
         return out
+
+    # ------------------------------------------------------------- conditional credits
+    async def _exclude_lost_credits_today(self, credits: list[dict]) -> list[dict]:
+        """Zero out today's remaining masked hours for a conditional credit whose
+        real grid import already blew the threshold earlier in today's window.
+
+        Without this, a rolling replan that starts mid-window (or after an earlier
+        forecast miss let real import through) would have the LP fight to force
+        zero import for the rest of the window chasing a credit that's already
+        unrecoverable — today's occurrence needs EVERY masked hour under
+        threshold, and the LP only sees hours from "now" onward, not what
+        already happened. A no-op (returns credits unchanged) when the window
+        hasn't started yet today, or when history can't be checked.
+        """
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        tz = ZoneInfo("Australia/Sydney")
+        now_local = dt_util.now().astimezone(tz)
+        today_ord = now_local.date().toordinal()
+
+        sensor_id = self._cfg("energy_sensor", None)
+        raw_by_label = {c.get("label"): c for c in self._plan.get_conditional_credits()}
+
+        out: list[dict] = []
+        for credit in credits:
+            window = (raw_by_label.get(credit.get("label")) or {}).get("window") or {}
+            start_str = window.get("start")
+            if not sensor_id or not start_str:
+                out.append(credit)
+                continue
+            h, m = (int(p) for p in start_str.split(":")[:2])
+            window_start_today = now_local.replace(hour=h, minute=m, second=0, microsecond=0)
+            if now_local <= window_start_today:
+                out.append(credit)  # window hasn't started yet today — nothing elapsed
+                continue
+            if await self._credit_lost_since(
+                sensor_id, window_start_today, now_local, credit.get("threshold_kwh", 0.0)
+            ):
+                mask = list(credit.get("hour_mask") or [])
+                day_index = credit.get("day_index") or []
+                for i, d in enumerate(day_index):
+                    if d == today_ord:
+                        mask[i] = 0
+                credit = {**credit, "hour_mask": mask}
+                _LOGGER.info(
+                    "Conditional credit '%s' already lost for today — excluding "
+                    "remaining hours from this plan", credit.get("label"),
+                )
+            out.append(credit)
+        return out
+
+    async def _credit_lost_since(self, sensor_id: str, window_start, now_local,
+                                 threshold_kwh: float) -> bool:
+        """True if any already-elapsed clock-hour between window_start and now_local
+        imported more than threshold_kwh, per HA's hourly long-term statistics for
+        sensor_id (a daily-resetting total; "sum" is reset-aware)."""
+        try:
+            stats = await get_instance(self.hass).async_add_executor_job(
+                statistics_during_period,
+                self.hass, window_start.astimezone(timezone.utc),
+                now_local.astimezone(timezone.utc), {sensor_id}, "hour", None, {"sum"},
+            )
+        except Exception as exc:  # noqa: BLE001 — fail open, let the LP still try
+            _LOGGER.warning("Could not check conditional-credit history for %s: %s",
+                           sensor_id, exc)
+            return False
+        values = [r["sum"] for r in (stats or {}).get(sensor_id, []) if r.get("sum") is not None]
+        return any((cur - prev) > threshold_kwh for prev, cur in zip(values, values[1:]))
 
     # ------------------------------------------------------------------ cache
     async def async_load_cached(self) -> None:
@@ -326,11 +432,22 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         import_caps, export_caps, _cap_labels = build_rate_caps(
             self._plan, bundle.start, bundle.slots, bundle.slot_minutes
         )
+        # Conditional day-credits (e.g. GloBird ZEROHERO's "$1/day when imports
+        # are 0.03 kWh/hour or less, 6pm-9pm") — a no-op ([]) for the common
+        # case of a plan with none. today's occurrence is excluded if it's
+        # already unattainable (see _exclude_lost_credits_today) so the LP
+        # doesn't fight a lost cause.
+        conditional_credits = build_conditional_credits(
+            self._plan, bundle.start, bundle.slots, bundle.slot_minutes
+        )
+        if conditional_credits:
+            conditional_credits = await self._exclude_lost_credits_today(conditional_credits)
         result = AdvisoryPlanner(optimizer).plan(
             bundle, initial_soc_percent=soc,
             deferrable_loads=self._deferrable_for_horizon(bundle),
             import_caps=import_caps,
             export_caps=export_caps,
+            conditional_credits=conditional_credits,
         )
 
         # Feed the fresh plan to the control manager (it acts on it only while the master
