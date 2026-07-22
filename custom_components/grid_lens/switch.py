@@ -48,11 +48,24 @@ class GridLensBatteryControlSwitch(RestoreEntity, SwitchEntity):
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
+        self._manager.set_state_listener(self._on_manager_change)
         last = await self.async_get_last_state()
         want_on = True if last is None else (last.state == "on")  # default ON if no prior state
-        self._attr_is_on = want_on
         if want_on:
             await self._manager.enable()
+        # Reflect what actually happened, not just what was requested — enable() refuses
+        # (and stays refused) until the account's battery-control entitlement is confirmed,
+        # so a restored/default "on" doesn't lie about the real state. If entitlement lands
+        # a bit later, _on_manager_change picks up the auto-retry in set_entitled().
+        self._attr_is_on = self._manager.enabled
+        self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._manager.set_state_listener(None)
+        await super().async_will_remove_from_hass()
+
+    def _on_manager_change(self) -> None:
+        self._attr_is_on = self._manager.enabled
         self.async_write_ha_state()
 
     @property
