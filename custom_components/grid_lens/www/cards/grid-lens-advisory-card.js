@@ -208,12 +208,14 @@ class GridLensAdvisoryCard extends HTMLElement {
                 line-height:1.55; box-shadow:0 6px 18px rgba(0,0,0,.24); white-space:nowrap;
                 opacity:0; transition:opacity .08s; z-index:6; }
         .xtip .k { color:var(--muted); }
-        .modeline { list-style:none; margin:6px 0 0; padding:0; display:flex; flex-direction:column; gap:5px; }
-        .modeline li { display:flex; align-items:baseline; gap:7px; font-size:12.5px; color:var(--ink); }
+        .modeline { list-style:none; margin:6px 0 0; padding:0; display:flex; flex-direction:column; gap:8px; }
+        .modeline li { display:flex; flex-direction:column; gap:2px; font-size:12.5px; color:var(--ink); }
+        .modeline .row { display:flex; align-items:baseline; gap:7px; }
         .modeline .dot { width:8px; height:8px; border-radius:50%; flex:0 0 auto; align-self:center; }
         .modeline .t { font-variant-numeric:tabular-nums; font-weight:650; color:var(--ink2); min-width:38px; }
         .modeline .arrow { color:var(--muted); }
         .modeline .m { font-weight:550; }
+        .modeline .reason { font-size:11px; color:var(--muted); padding-left:15px; line-height:1.35; }
         .note { font-size:11px; color:var(--muted); margin-top:8px; line-height:1.4; }
         .waiting { padding:26px 8px; text-align:center; color:var(--ink2); font-size:13px; }
         .view-btn { transition:all 0.15s ease; font-weight:600; cursor:pointer; }
@@ -574,11 +576,14 @@ class GridLensAdvisoryCard extends HTMLElement {
   }
 
   // The EMS mode the executor will actually command for a slot. Mirrors
-  // ScheduleExecutor._resolve_charge: a CHARGE slot only runs as Command Charging
-  // (PV first) when the plan wants a *material* grid top-up — a real share of the
-  // slot AND above an absolute floor. Otherwise (solar charge, or a trivial LP grid
-  // nibble) it runs as Maximum Self-consumption, which resets the charge-rate cap to
-  // hardware max and fills the battery from all surplus PV without importing.
+  // ScheduleExecutor._resolve_charge: a CHARGE slot runs as Command Charging (PV first)
+  // when the plan wants a *material* grid top-up (a real share of the slot AND above an
+  // absolute floor), OR when any above-floor grid contribution falls in a genuinely FREE
+  // import slot (import_rate ~0) — there's no cost risk in claiming the full ceiling when
+  // import is free, so that case is force-charged even as a minority share. Otherwise
+  // (solar charge, or a trivial LP grid nibble) it runs as Maximum Self-consumption,
+  // which resets the charge-rate cap to hardware max and fills the battery from all
+  // surplus PV without importing.
   //
   // Symmetrically mirrors ScheduleExecutor._resolve_discharge: a DISCHARGE slot only
   // runs as Command Discharging (battery first) when the plan wants a *material* export
@@ -595,8 +600,11 @@ class GridLensAdvisoryCard extends HTMLElement {
         const dtH = step / 3600000;
         gw = Math.max(0, ((+row.buy_kwh || 0) - (+row.load_kwh || 0) - (+row.deferrable_kwh || 0))) / dtH * 1000;
       }
+      if (gw <= 250) return 'self_use';
+      const imp = row.import_rate != null ? +row.import_rate : null;
+      if (imp != null && imp <= 1e-6) return 'charge';  // free window — claim the full ceiling
       const pw = +row.power_w || 0;
-      return (gw > 250 && gw >= 0.5 * pw) ? 'charge' : 'self_use';
+      return (gw >= 0.5 * pw) ? 'charge' : 'self_use';
     }
     if (row.action === 'discharge') {
       let ew = row.export_w;
@@ -614,6 +622,38 @@ class GridLensAdvisoryCard extends HTMLElement {
     return row.action;
   }
 
+  // Human-readable "why" for a row's executed mode — built entirely from numbers
+  // already in the trajectory (no backend change / no payload growth). Kept in sync
+  // with the branches _execMode() actually took so the explanation never contradicts
+  // the mode shown next to it.
+  _reasonFor(row, mode) {
+    const imp = row.import_rate != null ? +row.import_rate : null;
+    const exp = row.export_rate != null ? +row.export_rate : null;
+    const free = imp != null && imp <= 1e-6;
+    const soc = clampPct(row.soc_percent);
+    if (row.action === 'charge') {
+      if (mode === 'charge') {
+        return free
+          ? `Free import window (${fmtC(imp)}/kWh) — topping up beyond solar to bank cheap energy for later.`
+          : `Grid-charging at ${fmtC(imp)}/kWh — the plan judges it worth buying now rather than later.`;
+      }
+      const gw = row.grid_charge_w || 0;
+      return gw > 1
+        ? `Charging mostly from solar — the grid share is too small to force a command, so it runs on self-consumption.`
+        : `Charging from solar surplus only — no grid import needed.`;
+    }
+    if (row.action === 'discharge') {
+      if (mode === 'discharge') {
+        return `Discharging to sell at ${fmtC(exp)}/kWh — a real export opportunity worth forcing.`;
+      }
+      return `Discharging to cover house load only — no export value here, so no rate is forced.`;
+    }
+    if (soc >= 99) {
+      return `Battery full — holding charge, no free capacity or arbitrage value right now.`;
+    }
+    return `Self-consumption — solar/battery cover load directly, no material charge or discharge planned.`;
+  }
+
   // Collapse the per-slot executed EMS mode into just the points where it
   // changes — derived client-side from the trajectory already on the sensor, no
   // Python involved. Local time (row.start parses as an ISO timestamp; fmtHour()
@@ -625,7 +665,7 @@ class GridLensAdvisoryCard extends HTMLElement {
     for (const row of t) {
       const a = this._execMode(row);
       if (a !== prev) {
-        out.push({ ms: new Date(row.start).getTime(), action: a });
+        out.push({ ms: new Date(row.start).getTime(), action: a, reason: this._reasonFor(row, a) });
         prev = a;
       }
     }
@@ -636,9 +676,12 @@ class GridLensAdvisoryCard extends HTMLElement {
     const trans = this._modeTransitions();
     if (!trans.length) return '<div class="sub">No plan data.</div>';
     const items = trans.map(x =>
-      `<li><span class="dot" style="background:${MODE_COLORS[x.action] || 'var(--idle)'}"></span>` +
-      `<span class="t">${fmtHour(x.ms)}</span><span class="arrow">&rarr;</span>` +
-      `<span class="m">${esc(modeLabel(x.action))}</span></li>`
+      `<li>` +
+        `<div class="row"><span class="dot" style="background:${MODE_COLORS[x.action] || 'var(--idle)'}"></span>` +
+        `<span class="t">${fmtHour(x.ms)}</span><span class="arrow">&rarr;</span>` +
+        `<span class="m">${esc(modeLabel(x.action))}</span></div>` +
+        `<div class="reason">${esc(x.reason)}</div>` +
+      `</li>`
     ).join('');
     return `<ul class="modeline">${items}</ul>`;
   }
@@ -737,6 +780,7 @@ class GridLensAdvisoryCard extends HTMLElement {
           `<div><span class="k" style="color:var(--predicted)">SOC plan</span> ${fmtPct(best.soc_percent)}` +
           (av != null ? ` · <span class="k" style="color:var(--actual)">actual</span> ${fmtPct(av)}` : '') + `</div>` +
           `<div><b>${actionLabel(best.action)}</b>${best.power_w ? ' · ' + Math.round(best.power_w) + ' W' : ''}</div>` +
+          `<div style="max-width:220px;white-space:normal;color:var(--ink2);font-size:10.5px;margin:1px 0 3px">${esc(this._reasonFor(best, this._execMode(best)))}</div>` +
           `<div><span class="k" style="color:var(--solar)">sun</span> ${((actualSolar != null ? actualSolar : (+best.solar_kwh || 0) * kwScale)).toFixed(2)} · <span class="k" style="color:var(--load)">load</span> ${((actualLoad != null ? actualLoad : (+best.load_kwh || 0) * kwScale)).toFixed(2)} kW</div>` +
           `<div><span class="k" style="color:var(--buy)">buy</span> ${((actualBuy != null ? actualBuy : (+best.buy_kwh || 0) * kwScale)).toFixed(2)} · <span class="k" style="color:var(--sell)">sell</span> ${((actualSell != null ? actualSell : (+best.sell_kwh || 0) * kwScale)).toFixed(2)} kW</div>` +
           (this._deferNames || []).map((nm, i) => {

@@ -52,6 +52,15 @@ class DispatchInterval:
       throttling the solar charge and dumping surplus PV to a $0 export.
     * material grid charge (grid a real share of the slot): ``force_charge(grid_charge_w)``
       so the grid rate cap is the planned grid contribution, never the full charge rate.
+    * grid charge during a genuinely FREE import slot (``import_rate`` ~0, e.g. GloBird
+      ZEROHERO's free window): any above-floor grid contribution is force-charged at
+      ``power_w`` (the full planned ceiling) regardless of its share of the slot — see
+      ``_resolve_charge``. There's no cost risk in over-committing the ceiling when
+      import is free, and skipping this would leave free energy unclaimed whenever solar
+      covers most-but-not-all of a charge slot.
+
+    ``import_rate`` is the slot's import price ($/kWh); ``None`` when unknown (treated as
+    non-free, preserving the material-share behaviour above).
 
     Symmetrically, ``export_w`` — NOT ``power_w`` — decides *how* to discharge (see
     ``_resolve_discharge``): a discharge that only covers house load gains nothing from
@@ -66,6 +75,7 @@ class DispatchInterval:
     power_w: float = 0.0
     grid_charge_w: float = 0.0
     export_w: float = 0.0
+    import_rate: Optional[float] = None
 
 
 @dataclass
@@ -239,17 +249,30 @@ class ScheduleExecutor:
     # sits half-empty. Self-consumption instead pulls the battery up from all surplus PV.
     _GRID_CHARGE_MIN_W = 250.0
     _GRID_CHARGE_MIN_FRACTION = 0.5
+    # $/kWh — at/below this, the slot's import is genuinely free (GloBird-style windows).
+    _FREE_RATE_EPS = 1e-6
 
     def _resolve_charge(self, iv: DispatchInterval) -> tuple[BatteryAction, float]:
         """Split a CHARGE slot into its real execution intent.
 
-        * material grid contribution (e.g. the evening pre-peak grid top-up) → genuine
-          grid charge: force-charge at the *grid* watts.
+        * genuinely free import (``import_rate`` ~0): any above-floor grid contribution
+          is force-charged at the slot's FULL planned ceiling (``power_w``), not just the
+          grid share. Safe specifically because the slot is free — PV-first mode still
+          draws solar first, grid only fills whatever solar doesn't cover, and the
+          ceiling is never higher than the plan's own target — so, unlike the priced
+          case below, solar is never throttled by an undersized ceiling.
+        * material grid contribution at a priced rate (e.g. the evening pre-peak grid
+          top-up) → genuine grid charge: force-charge at the *grid* watts only, so a real
+          cost is never paid for more than the plan intends.
         * otherwise → solar charge: run self-consumption so the battery fills from PV
           surplus at the hardware-max rate and the inverter never imports grid to charge it.
         """
         grid_w = iv.grid_charge_w
-        if grid_w > self._GRID_CHARGE_MIN_W and grid_w >= self._GRID_CHARGE_MIN_FRACTION * max(iv.power_w, 0.0):
+        if grid_w <= self._GRID_CHARGE_MIN_W:
+            return BatteryAction.SELF_USE, 0.0
+        if iv.import_rate is not None and iv.import_rate <= self._FREE_RATE_EPS:
+            return BatteryAction.CHARGE, iv.power_w
+        if grid_w >= self._GRID_CHARGE_MIN_FRACTION * max(iv.power_w, 0.0):
             return BatteryAction.CHARGE, grid_w
         return BatteryAction.SELF_USE, 0.0
 

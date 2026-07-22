@@ -268,6 +268,51 @@ def test_material_grid_above_floor_but_minority_share_is_solar():
     assert bc.names() == ["set_self_consumption_mode"], bc.calls
 
 
+def test_free_window_minority_grid_topup_uses_full_ceiling():
+    """A minority grid share during a genuinely FREE import slot (import_rate == 0, e.g.
+    GloBird ZEROHERO's free window) must still force-charge — at the slot's FULL planned
+    ceiling (power_w), not just the grid share — instead of falling back to
+    self-consumption the way the same share would at a priced rate."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.CHARGE,
+        power_w=10_000.0, grid_charge_w=1_018.7,  # 1 kW grid = ~10% of a 10 kW charge
+        import_rate=0.0,
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    assert bc.names() == ["force_charge"], bc.calls
+    _name, power_w, _dur = bc.calls[0]
+    assert power_w == 10_000.0, f"expected the full ceiling (10000), got {power_w}"
+
+
+def test_free_window_below_floor_grid_nibble_stays_solar():
+    """Float-noise grid contributions stay self-consumption even in a free window — the
+    absolute floor still applies before the free-rate override."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.CHARGE,
+        power_w=5_000.0, grid_charge_w=100.0, import_rate=0.0,
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    assert bc.names() == ["set_self_consumption_mode"], bc.calls
+
+
+def test_priced_minority_grid_topup_unaffected_by_free_rate_logic():
+    """Same minority grid share as the free-window test above, but at a real (non-zero)
+    import rate, must be unaffected — still solar-only self-consumption (guards against
+    the free-rate branch leaking into priced slots)."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.CHARGE,
+        power_w=10_000.0, grid_charge_w=1_018.7, import_rate=0.517,
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    assert bc.names() == ["set_self_consumption_mode"], bc.calls
+
+
 def test_load_covering_discharge_slot_never_force_discharges():
     """A load-covering discharge slot (export_w == 0) must NOT issue force_discharge; it
     must be executed as self-consumption so real-time load dipping below the plan's
