@@ -1,5 +1,22 @@
 # Changelog
 
+## [3.0.3] - 2026-07-22
+
+### Added
+- Conditional day-credits: the LP optimizer now models day-scoped all-or-nothing
+  bonuses like GloBird ZEROHERO's "$1/day when imports are 0.03 kWh/hour or less,
+  6pm-9pm" via a MILP binary indicator (switches the scipy solve from `linprog` to
+  `scipy.optimize.milp` only for plans that carry one). New `scipy>=1.9.0`
+  requirement (was already an undeclared transitive dependency).
+- Plan-comparison ranking now accounts for the earned credit, and the bill
+  breakdown shows a per-credit line (days earned vs. days in the schedule).
+
+### Fixed
+- `scipy` was imported but never declared in `manifest.json`'s requirements.
+
+(Changelog gap 2026-02-24 → 2026-07-22: several releases shipped without an entry
+here — manifest.json is the authoritative version history for that period.)
+
 ## [0.2.3] - 2026-02-24
 
 ### Fixed
