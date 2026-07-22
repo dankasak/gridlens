@@ -22,6 +22,8 @@
   const footer = document.createElement('footer');
   footer.innerHTML = `Grid Lens &copy; ${new Date().getFullYear()}
     &nbsp;·&nbsp; <a href="mailto:support@gridlens.au">support@gridlens.au</a>
-    &nbsp;·&nbsp; <a href="/privacy.html">Privacy</a>`;
+    &nbsp;·&nbsp; <a href="/privacy.html">Privacy</a>
+    &nbsp;·&nbsp; <a href="/terms.html">Terms</a>
+    &nbsp;·&nbsp; <a href="/refunds.html">Refunds</a>`;
   document.body.appendChild(footer);
 })();
