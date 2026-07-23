@@ -774,6 +774,19 @@ class GridLensCard extends HTMLElement {
             }
           }
 
+          // Conditional day-credits (e.g. GloBird ZEROHERO's $1/day)
+          if (bi.conditional_credits) {
+            rows += '<div class="bill-section-head bill-fit">Conditional credits</div>';
+            Object.entries(bi.conditional_credits).forEach(([label, c]) => {
+              rows += `<div class="breakdown-row bill-fit">
+                <div class="breakdown-label" style="color:inherit">${label}<br>
+                  <span style="font-size:11px;opacity:0.7">Earned ${c.days_earned}/${c.days_total}&thinsp;days</span>
+                </div>
+                <div class="breakdown-value" style="color:inherit">&minus;$${c.amount.toFixed(2)}</div>
+              </div>`;
+            });
+          }
+
           // Total + GST
           rows += `<div class="bill-total-row">
             <span>Total (inc. GST)</span><span>$${bi.total.toFixed(2)}</span>

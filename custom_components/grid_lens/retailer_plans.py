@@ -266,13 +266,23 @@ class PlanFromData(RetailerPlan):
             buckets[label]["kwh"]  += imp
             buckets[label]["cost"] += ic
 
+        # Nominal rate per label, used below when a bucket has zero kWh (e.g. a
+        # dummy all-zero schedule probing for labels) — cost/kwh would otherwise
+        # collapse to 0.0 and erase which tier (peak/off-peak/free window/etc)
+        # the label actually belongs to.
+        label_rates = {}
+        for rate_def in self._import_rates:
+            lbl = rate_def.get("label", "Energy")
+            label_rates.setdefault(lbl, float(rate_def.get("rate") or 0))
+
         sections = []
         for label, b in buckets.items():
             kwh, cost = b["kwh"], b["cost"]
+            rate = round(cost / kwh, 4) if kwh > 0 else label_rates.get(label, 0.0)
             sections.append({
                 "title": label,
                 "kwh":  round(kwh, 2),
-                "rate": round(cost / kwh, 4) if kwh > 0 else 0.0,
+                "rate": rate,
                 "cost": round(cost, 2),
             })
 
@@ -483,10 +493,12 @@ def build_rate_caps(
     of GloBird ZEROHERO's daily free-import window) share one daily_cap_kwh/
     rate_after_cap budget rather than each getting its own.
 
-    Also returns cap_labels: {round(rate_after_cap, 4): "<label> (over cap)"} for
-    callers building a cost breakdown by rate value that want a real label for the
-    post-cap tier instead of a generic one — mirrors PlanCalculator._split_capped_kwh's
-    labelling for the actual-usage bill-reporting path.
+    Also returns cap_labels: {round(rate, 4): "<label> (first N kWh/day)",
+    round(rate_after_cap, 4): "<label> (after N kWh/day)"} for callers building a
+    cost breakdown by rate value that want distinct, unambiguous labels for the
+    free and post-cap tiers instead of two rows that otherwise look identical —
+    mirrors PlanCalculator._split_capped_kwh's labelling for the actual-usage
+    bill-reporting path.
 
     Returns ([], [], {}) for a plan with no capped rates (the common case) — the
     optimizer then behaves exactly as it did before caps existed.
@@ -519,7 +531,8 @@ def build_rate_caps(
                 "hour_mask": [0] * n_slots,
             })
             group["hour_mask"][t] = 1
-            cap_labels.setdefault(round(after, 4), f"{label} (over cap)")
+            cap_labels.setdefault(round(info["rate"], 4), f"{label} (first {cap:g} kWh/day)")
+            cap_labels.setdefault(round(after, 4), f"{label} (after {cap:g} kWh/day)")
         return list(groups.values())
 
     import_caps = _build(plan.get_import_rate_info)
