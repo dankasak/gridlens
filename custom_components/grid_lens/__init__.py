@@ -786,6 +786,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = GridLensCoordinator(hass, entry)
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
+    # Per-day deferrable load overrides (Feature 2) — independent of battery/control,
+    # shared between the number.py entities and AdvisoryCoordinator. Created before the
+    # platforms are forwarded so number.py can look it up during its own setup.
+    from .deferrable_overrides import DeferrableOverrideStore
+    hass.data[DOMAIN][f"{entry.entry_id}_deferrable_overrides"] = DeferrableOverrideStore(
+        hass, entry.entry_id
+    )
+
     # Advisory mode (forecast-fed planning, read-only). Independent coordinator so it
     # never disturbs the manual plan-comparison flow. Best-effort — failures don't block.
     try:
@@ -843,6 +851,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(entry.entry_id)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_advisory", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_control", None)
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_overrides", None)
 
     return unload_ok
 

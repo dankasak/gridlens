@@ -199,11 +199,34 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             if combined:
                 hod = calc._aggregate_kwh_by_hod(combined)
                 self._deferrable_load_hod = [float(hod.get(h, 0.0)) for h in range(24)]
-            return defs or []
+            return await self._apply_overrides(defs or [])
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Advisory: deferrable device params unavailable: %s", err)
             self._deferrable_load_hod = [0.0] * 24
             return []
+
+    async def _apply_overrides(self, defs: list) -> list:
+        """Substitute today's per-device override (if set and unexpired) for the
+        historical daily_kwh average, so a dashboard "today boost" beats the 14-day
+        average for the rest of the local day (Feature 2). Note: only daily_kwh is
+        replaced — self._deferrable_load_hod (used to de-duplicate the base-load
+        vector) intentionally still reflects real meter history, not the override,
+        since that subtraction corrects for what the whole-home sensor already
+        metered, not what the optimizer should target going forward."""
+        store = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_deferrable_overrides")
+        if store is None:
+            return defs
+        out = []
+        for dev in defs:
+            override = await store.async_get(dev.get("sensor_id", ""))
+            if override > 0:
+                _LOGGER.warning(
+                    "Deferrable override active for %s: %.1f kWh today (was %.1f historical)",
+                    dev.get("name"), override, dev.get("daily_kwh", 0.0),
+                )
+                dev = {**dev, "daily_kwh": override}
+            out.append(dev)
+        return out
 
     def _subtract_deferrable_from_load(self, load_hod: list[float]) -> list[float]:
         """Base load = whole-home load minus deferrable devices, per hour-of-day, floored 0.
