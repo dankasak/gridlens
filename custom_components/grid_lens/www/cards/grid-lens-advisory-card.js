@@ -212,7 +212,7 @@ class GridLensAdvisoryCard extends HTMLElement {
         .modeline li { display:flex; flex-direction:column; gap:2px; font-size:12.5px; color:var(--ink); }
         .modeline .row { display:flex; align-items:baseline; gap:7px; }
         .modeline .dot { width:8px; height:8px; border-radius:50%; flex:0 0 auto; align-self:center; }
-        .modeline .t { font-variant-numeric:tabular-nums; font-weight:650; color:var(--ink2); min-width:38px; }
+        .modeline .t { font-variant-numeric:tabular-nums; font-weight:650; color:var(--ink2); min-width:38px; white-space:nowrap; }
         .modeline .arrow { color:var(--muted); }
         .modeline .m { font-weight:550; }
         .modeline .reason { font-size:11px; color:var(--muted); padding-left:15px; line-height:1.35; }
@@ -675,10 +675,11 @@ class GridLensAdvisoryCard extends HTMLElement {
   _modeTimelineHtml() {
     const trans = this._modeTransitions();
     if (!trans.length) return '<div class="sub">No plan data.</div>';
+    const today = new Date();
     const items = trans.map(x =>
       `<li>` +
         `<div class="row"><span class="dot" style="background:${MODE_COLORS[x.action] || 'var(--idle)'}"></span>` +
-        `<span class="t">${fmtHour(x.ms)}</span><span class="arrow">&rarr;</span>` +
+        `<span class="t">${fmtDayHour(x.ms, today)}</span><span class="arrow">&rarr;</span>` +
         `<span class="m">${esc(modeLabel(x.action))}</span></div>` +
         `<div class="reason">${esc(x.reason)}</div>` +
       `</li>`
@@ -894,6 +895,20 @@ const MODE_LABELS = {
 const MODE_COLORS = { self_use: 'var(--good)', charge: 'var(--charge)', discharge: 'var(--discharge)', idle: 'var(--idle)' };
 function modeLabel(a) { return MODE_LABELS[a] || (a ? esc(a) : '–'); }
 function fmtHour(ms) { const d = new Date(ms); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
+// HH:MM plus a day qualifier ("Today"/"Tomorrow"/weekday) whenever ms falls on a
+// different calendar day than `today` — the mode-timeline list has no x-axis position
+// to carry date info the way the charts do, so a bare "19:00" from a 36h horizon can
+// read as earlier than an earlier-listed "21:00" from the day before. Two dates never
+// go further apart than the horizon (36h), so "Today"/"Tomorrow" always suffices.
+function fmtDayHour(ms, today) {
+  const d = new Date(ms);
+  const dayDiff = Math.round((startOfDay(d) - startOfDay(today)) / 86400000);
+  const hm = fmtHour(ms);
+  if (dayDiff === 0) return hm;
+  if (dayDiff === 1) return `Tomorrow ${hm}`;
+  return `${d.toLocaleDateString([], { weekday: 'short' })} ${hm}`;
+}
+function startOfDay(d) { return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(); }
 function fmtTime(iso) { try { const d = new Date(iso); return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } }
 
 customElements.define('grid-lens-advisory-card', GridLensAdvisoryCard);
