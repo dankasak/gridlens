@@ -14,7 +14,7 @@ from .const import DOMAIN, PLAN_ID_TO_KEY, CONF_DISTRIBUTOR
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.SWITCH]
+PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.SWITCH, Platform.NUMBER]
 
 _HISTORY_STORAGE_KEY = "grid_lens_plan_history"
 _HISTORY_STORAGE_VERSION = 1

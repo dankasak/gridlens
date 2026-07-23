@@ -442,7 +442,16 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         )
         if conditional_credits:
             conditional_credits = await self._exclude_lost_credits_today(conditional_credits)
-        result = AdvisoryPlanner(optimizer).plan(
+        # Live value from the dashboard number entity (see number.py), not the
+        # config-flow snapshot — read fresh every tick so a change the user
+        # makes on the dashboard takes effect within one advisory cycle (2 min).
+        from ..runtime_settings import get_live_number
+        cents = get_live_number(
+            self.hass, self.entry.entry_id, "min_export_price",
+            float(self._cfg("min_export_price", 0.0)),
+        )
+        min_export_price = cents / 100.0
+        result = AdvisoryPlanner(optimizer, min_export_price=min_export_price).plan(
             bundle, initial_soc_percent=soc,
             deferrable_loads=self._deferrable_for_horizon(bundle),
             import_caps=import_caps,

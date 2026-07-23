@@ -140,6 +140,13 @@ CONF_BATTERY_DISCHARGE_POWER_SENSOR = "battery_discharge_power_sensor"
 CONF_BATTERY_MIN_SOC = "battery_min_soc"
 CONF_BATTERY_MAX_SOC = "battery_max_soc"
 
+# Minimum export price floor, in cents/kWh (0 = disabled, unchanged behaviour).
+# Below this price the optimizer stops treating grid export as valuable — it still
+# exports if nothing else can absorb the surplus, but prefers routing it into a
+# deferrable load or holding battery charge instead of selling cheap. Converted to
+# $/kWh (÷100) before reaching BatteryOptimizer, to match import/export rate units.
+CONF_MIN_EXPORT_PRICE = "min_export_price"
+
 # Which inverter driver ControlManager dispatches battery commands to (inverters/__init__.py).
 CONF_INVERTER_BRAND = "inverter_brand"
 CONF_INVERTER_TRANSPORT = "inverter_transport"

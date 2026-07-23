@@ -97,6 +97,7 @@ class BatteryOptimizer:
         import_caps: List[Dict] = None,
         export_caps: List[Dict] = None,
         conditional_credits: List[Dict] = None,
+        min_export_price: float = 0.0,
     ) -> Dict:
         """Return an optimal hourly schedule minimising net energy cost.
 
@@ -153,6 +154,14 @@ class BatteryOptimizer:
           rate windows — build these with retailer_plans.build_rate_caps(). Left at the
           default (None) the model behaves exactly as before.
 
+        min_export_price ($/kWh, optional): below this price, export is treated as
+          valueless in the objective — still legal (it remains the sink of last resort
+          when nothing else can absorb surplus solar), but no longer rewarded, so the
+          LP prefers routing surplus into a deferrable load or holding battery charge
+          instead of selling cheap. Does not affect capped export-rate windows
+          (export_caps above), which price their own tranches independently. Left at
+          the default (0.0) the model behaves exactly as before.
+
         Tries LP first; falls back to greedy if scipy is unavailable or infeasible.
         """
         if deferrable_loads is None:
@@ -178,7 +187,8 @@ class BatteryOptimizer:
                                      no_grid_charge=no_grid_charge,
                                      terminal_soc_value=terminal_soc_value,
                                      import_caps=import_caps, export_caps=export_caps,
-                                     conditional_credits=conditional_credits)
+                                     conditional_credits=conditional_credits,
+                                     min_export_price=min_export_price)
         except ImportError:
             _LOGGER.warning(
                 "PuLP not yet installed — using greedy fallback. "
@@ -225,7 +235,7 @@ class BatteryOptimizer:
                      demand_rate=0.0, demand_window_mask=None, timestep_hours=1.0,
                      soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
                      terminal_soc_value=None, import_caps=None, export_caps=None,
-                     conditional_credits=None):
+                     conditional_credits=None, min_export_price=0.0):
         """Build and solve the LP. Raises on failure so caller can fall back."""
         # HiGHS/PuLP paths model none of the extras below; only the scipy path (the
         # complete, production path) does. Skip straight to scipy for any of them.
@@ -235,7 +245,8 @@ class BatteryOptimizer:
         credits_active = bool(conditional_credits)
         if (not demand_active and not caps_active and timestep_hours == 1.0
                 and soc_reward == 0.0 and export_penalty == 0.0 and not no_grid_charge
-                and terminal_soc_value is None and not credits_active):
+                and terminal_soc_value is None and not credits_active
+                and min_export_price == 0.0):
             try:
                 return self._lp_highspy(solar, load, r_imp, r_exp, E0, T, deferrable_loads)
             except ImportError:
@@ -252,7 +263,8 @@ class BatteryOptimizer:
                                   no_grid_charge=no_grid_charge,
                                   terminal_soc_value=terminal_soc_value,
                                   import_caps=import_caps, export_caps=export_caps,
-                                  conditional_credits=conditional_credits)
+                                  conditional_credits=conditional_credits,
+                                  min_export_price=min_export_price)
         except ImportError:
             pass  # scipy not available — try PuLP
         except Exception as exc:
@@ -276,7 +288,7 @@ class BatteryOptimizer:
                   demand_rate=0.0, demand_window_mask=None, timestep_hours=1.0,
                   soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
                   terminal_soc_value=None, import_caps=None, export_caps=None,
-                  conditional_credits=None):
+                  conditional_credits=None, min_export_price=0.0):
         import numpy as np
         from scipy.optimize import linprog
         from scipy.sparse import lil_matrix
@@ -364,9 +376,24 @@ class BatteryOptimizer:
                 })
                 n += 1
 
+        # Minimum export price floor: below this, export earns nothing in the
+        # objective (still legal — it remains the sink of last resort when nothing
+        # else can absorb surplus solar — just no longer rewarded), so the LP
+        # prefers routing surplus into a deferrable load or holding battery charge
+        # instead of selling cheap. Only affects the base per-slot price built here;
+        # r_exp itself is untouched, so every reporting path below (ic/ec, tranche
+        # rates, cap_blocks' free-tier pricing further down) still uses the real
+        # rate — a below-floor export that does happen is still credited at what it
+        # actually earns. Capped export-rate windows overwrite this slot's cost with
+        # their own tranche pricing regardless, so the floor has no effect there.
+        r_exp_priced = (
+            [0.0 if r < min_export_price else r for r in r_exp]
+            if min_export_price > 0 else r_exp
+        )
+
         c_obj = np.zeros(n)
         c_obj[I:I+T] = r_imp
-        c_obj[X:X+T] = [-r for r in r_exp]
+        c_obj[X:X+T] = [-r for r in r_exp_priced]
         if demand_active:
             c_obj[P_idx] = demand_rate * n_days
         # Degeneracy regularizers (tiny, << the price signal). export_penalty makes a
@@ -673,6 +700,13 @@ class BatteryOptimizer:
             [(f"{d['daily_kwh']:.1f}kWh/d@{d['max_kw']}kW") for d in deferrable_loads],
             result.status,
         )
+        if min_export_price > 0:
+            floored_hours = sum(1 for r in r_exp if r < min_export_price)
+            _LOGGER.warning(
+                "min export price floor: $%.3f/kWh, %d/%d hours below floor "
+                "(unrewarded in objective, still export if nothing else absorbs surplus)",
+                min_export_price, floored_hours, T,
+            )
         conditional_credit_totals: dict = {}
         for cb2 in credit_blocks:
             earned = x[cb2["y_idx"]] > 0.5

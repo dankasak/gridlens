@@ -13,7 +13,7 @@ from homeassistant.components.recorder.statistics import statistics_during_perio
 from .battery_optimizer import BatteryOptimizer
 from .retailer_plans import (
     plans_from_api_data, versioned_plans_from_history, build_rate_caps,
-    build_conditional_credits, RetailerPlan,
+    build_conditional_credits, RetailerPlan, PlanFromData,
 )
 from .const import (
     CONF_ENERGY_SENSOR,
@@ -30,6 +30,7 @@ from .const import (
     CONF_BATTERY_CHARGE_POWER_SENSOR,
     CONF_BATTERY_MIN_SOC,
     CONF_BATTERY_MAX_SOC,
+    CONF_MIN_EXPORT_PRICE,
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_HOURS,
@@ -101,6 +102,19 @@ class PlanCalculator:
                 max_soc_percent=self.battery_max_soc,
             )
             _LOGGER.info(f"Battery optimizer initialized: {self.battery_capacity}kWh battery")
+
+    def _get_min_export_price(self) -> float:
+        """Live value from the dashboard number entity (see number.py), not a
+        cached config-flow snapshot — read fresh on every LP call so a change
+        the user makes takes effect on the next comparison, no reload needed.
+        Stored as c/kWh; converted here to $/kWh to match the optimizer's rate
+        units."""
+        from .runtime_settings import get_live_number
+        cents = get_live_number(
+            self.hass, self.entry.entry_id, "min_export_price",
+            self.entry.data.get(CONF_MIN_EXPORT_PRICE, 0.0),
+        )
+        return cents / 100.0
 
     def _get_plans(self) -> list[RetailerPlan]:
         """Return plan objects from API data. Tier filtering is enforced by the API.
@@ -847,10 +861,70 @@ class PlanCalculator:
         parts = []
         if free_kwh > 1e-9:
             parts.append((rate, free_kwh))
+            cap_labels.setdefault(round(rate, 4), f"{label} (first {cap:g} kWh/day)")
         if over_kwh > 1e-9:
             parts.append((after_rate, over_kwh))
-            cap_labels.setdefault(round(after_rate, 4), f"{label} (over cap)")
+            cap_labels.setdefault(round(after_rate, 4), f"{label} (after {cap:g} kWh/day)")
         return parts
+
+    def _calculate_actual_conditional_credits(
+        self, plan, usage_data: list[dict], actual_days: int,
+    ) -> tuple[float, dict]:
+        """Evaluate a plan's conditional day-credits (e.g. GloBird ZEROHERO's
+        $1/day for <=0.03 kWh/hour import, 6-9pm) against ACTUAL historical
+        import rather than the LP's hypothetical dispatch. Used only for the
+        plan the household is actually on: real behaviour, not an optimizer's
+        plan, determines whether the credit was earned each day.
+
+        Returns (total_amount, per_credit_detail) — detail mirrors
+        RetailerPlan.get_display_breakdown()'s 'conditional_credits' shape
+        (amount/days_earned/days_total per label) so both code paths render
+        identically on the dashboard.
+        """
+        from collections import defaultdict
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        tz = ZoneInfo("Australia/Sydney")
+
+        credit_defs = plan.get_conditional_credits()
+        if not credit_defs or not usage_data:
+            return 0.0, {}
+
+        total = 0.0
+        detail: dict = {}
+        for credit in credit_defs:
+            window = credit.get("window") or {}
+            threshold = float(credit.get("threshold_kwh") or 0.0)
+            amount_per_day = float(credit.get("amount_per_day") or 0.0)
+            label = credit.get("label", "Conditional Credit")
+
+            hourly_kwh: dict = defaultdict(float)  # (date_ordinal, hour) -> kWh
+            for d in usage_data:
+                local_dt = d["timestamp"].astimezone(tz)
+                if PlanFromData._in_window(window, local_dt):
+                    hourly_kwh[(local_dt.date().toordinal(), local_dt.hour)] += d["value"]
+
+            hours_by_day: dict = defaultdict(set)
+            for (day_ord, hour) in hourly_kwh:
+                hours_by_day[day_ord].add(hour)
+
+            days_earned = 0
+            for day_ord, hours_present in hours_by_day.items():
+                if all(hourly_kwh[(day_ord, h)] <= threshold for h in hours_present):
+                    days_earned += 1
+            days_total = len(hours_by_day)
+
+            if days_total:
+                amount = round(days_earned * amount_per_day, 2)
+                total += amount
+                detail[label] = {
+                    "amount": amount,
+                    "days_earned": days_earned,
+                    "days_total": days_total,
+                }
+        return round(total, 2), detail
 
     def _compute_bill_items(
         self,
@@ -914,11 +988,14 @@ class PlanCalculator:
             dummy_slots = [{'hour': h, 'import_kwh': 0.0, 'import_cost': 0.0,
                             'export_kwh': 0.0, 'export_credit': 0.0} for h in range(48)]
             dummy_sections = plan.get_display_breakdown({'schedule': dummy_slots}).get('sections', [])
-            # cap_labels first so a real plan-defined label (dummy_sections) wins
-            # on collision — e.g. an after-cap rate that happens to equal another
-            # named tier's rate is shown under that tier's real name.
-            rate_to_label: dict = {**cap_labels, **{round(s['rate'], 4): s['title']
-                                   for s in dummy_sections if s.get('rate', 0) > 0}}
+            # cap_labels wins on collision — it explicitly names both the free/
+            # under-cap and after-cap portions of a capped rate (e.g. "Free Window
+            # (first 50 kWh/day)" vs "Free Window (after 50 kWh/day)") so the two
+            # never render as the same indistinguishable label; the generic
+            # dummy_sections probe only fills in tiers cap_labels doesn't cover.
+            rate_to_label: dict = {**{round(s['rate'], 4): s['title']
+                                   for s in dummy_sections if s.get('rate', 0) >= 0},
+                                   **cap_labels}
             all_rates = sorted(set(tier_data.keys()) | set(rate_to_label.keys()), reverse=True)
             if all_rates:
                 energy_lines = [{'label': rate_to_label.get(rk, 'Energy'),
@@ -977,16 +1054,17 @@ class PlanCalculator:
             dummy_slots = [{'hour': h, 'import_kwh': 0.0, 'import_cost': 0.0,
                             'export_kwh': 0.0, 'export_credit': 0.0} for h in range(48)]
             dummy_sections = plan.get_display_breakdown({'schedule': dummy_slots}).get('sections', [])
-            # cap_labels (from build_rate_caps, carried on opt_result) first so a real
-            # plan-defined label wins on collision, same precedence as the actual-usage
-            # branch above.
+            # cap_labels (from build_rate_caps, carried on opt_result) wins on collision —
+            # same precedence, and same reasoning, as the actual-usage branch above: it
+            # explicitly names both the free/under-cap and after-cap portions so they
+            # never render as the same indistinguishable label.
             rate_to_label: dict = {
-                **(opt_result.get('cap_labels', {}) if opt_result else {}),
                 **{
                     round(s['rate'], 4): s['title']
                     for s in dummy_sections
-                    if s.get('cost', 0) >= 0 and s.get('rate', 0) > 0
+                    if s.get('cost', 0) >= 0 and s.get('rate', 0) >= 0
                 },
+                **(opt_result.get('cap_labels', {}) if opt_result else {}),
             }
 
             all_rates = sorted(set(tier_data.keys()) | set(rate_to_label.keys()), reverse=True)
@@ -1128,7 +1206,34 @@ class PlanCalculator:
         vpp_daily = getattr(plan, 'fixed_daily_credit', 0.0)
         vpp_credit = round(vpp_daily * actual_days, 2) if vpp_daily else 0.0
 
-        net_total = round(gross_charges - fit_credit - pea_credit - vpp_credit, 2)
+        # Conditional day-credits (e.g. GloBird ZEROHERO's $1/day for <=0.03 kWh/hour
+        # import, 6-9pm). For the current plan, evaluate against ACTUAL historical
+        # import (real behaviour decides what was earned) rather than the LP's
+        # hypothetical opt_result — otherwise this total silently omitted the credit
+        # entirely, since it's a distinct mechanism from the priced energy_lines above.
+        # For alternative/LP-optimised plans, reuse the LP's own earned-day count
+        # (already correctly reflected in their ranking cost) so this itemised total
+        # matches that ranking instead of double-guessing dispatch that never ran.
+        if import_cost_actual is not None:
+            conditional_amount, conditional_detail = self._calculate_actual_conditional_credits(
+                plan, usage_data, actual_days,
+            )
+        elif opt_result and opt_result.get('conditional_credits'):
+            conditional = opt_result['conditional_credits']
+            conditional_amount = round(sum(c.get('amount', 0.0) for c in conditional.values()), 2)
+            conditional_detail = {
+                label: {
+                    'amount': round(c.get('amount', 0.0), 2),
+                    'days_earned': c.get('days_earned', 0),
+                    'days_total': c.get('days_total', 0),
+                }
+                for label, c in conditional.items()
+            }
+        else:
+            conditional_amount, conditional_detail = 0.0, {}
+
+        net_total = round(
+            gross_charges - fit_credit - pea_credit - vpp_credit - conditional_amount, 2)
         gst_included = round(net_total / 11, 2)
 
         result: dict = {
@@ -1153,6 +1258,7 @@ class PlanCalculator:
             'vpp_credit': round(vpp_credit, 2) if vpp_credit else None,
             'pea_credit': round(pea_credit, 2) if pea_breakdown is not None else None,
             'pea_breakdown': pea_breakdown,
+            'conditional_credits': conditional_detail or None,
             'gross_charges': gross_charges,
             'gst_included': gst_included,
             'total': net_total,
@@ -2192,6 +2298,7 @@ class PlanCalculator:
                 import_caps=import_caps,
                 export_caps=export_caps,
                 conditional_credits=conditional_credits,
+                min_export_price=self._get_min_export_price(),
             )
         )
         # Carried through to _compute_bill_items so capped-rate tiers in the cost

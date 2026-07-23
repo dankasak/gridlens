@@ -30,6 +30,7 @@ class AdvisoryPlanner:
         soc_reward: float = 0.0003,
         no_grid_charge: bool = False,
         soft_terminal_soc: bool = True,
+        min_export_price: float = 0.0,
     ) -> None:
         self.optimizer = optimizer
         # Below this, an hour's charge/discharge is treated as self-consumption.
@@ -51,6 +52,11 @@ class AdvisoryPlanner:
         # the battery at horizon end (see _terminal_soc_value), so the LP keeps solar it
         # would otherwise dump but never grid-charges purely to hit a forced end-state.
         self.soft_terminal_soc = soft_terminal_soc
+        # Below this price ($/kWh), export earns nothing in the objective — the LP
+        # prefers routing surplus into a deferrable load or holding charge instead of
+        # selling cheap (still exports if nothing else can absorb the surplus). 0.0 =
+        # disabled, unchanged behaviour. See battery_optimizer.optimize_hourly_schedule.
+        self.min_export_price = min_export_price
 
     def plan(
         self,
@@ -84,6 +90,7 @@ class AdvisoryPlanner:
             import_caps=import_caps,
             export_caps=export_caps,
             conditional_credits=conditional_credits,
+            min_export_price=self.min_export_price,
         )
 
         devs = deferrable_loads or []
