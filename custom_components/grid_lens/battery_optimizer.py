@@ -299,6 +299,14 @@ class BatteryOptimizer:
         N = len(deferrable_loads)       # number of individual deferrable devices
         slots_per_day = int(round(24 / dt))
         n_days = math.ceil(T / slots_per_day)
+        # A day-chunk is "truncated" when the rolling horizon ends partway through it
+        # (chunks are anchored to horizon start, not midnight — see the deferrable
+        # daily-total constraint below for why only such chunks get relaxed). Given
+        # t1 = min(t0+slots_per_day, T), only the LAST chunk can ever be short.
+        truncated_days = {
+            d for d in range(n_days)
+            if min((d + 1) * slots_per_day, T) - d * slots_per_day < slots_per_day
+        }
 
         # Peak-demand shaving: add one auxiliary variable P (peak kW), constrained
         # to be ≥ grid import in every demand-window hour and priced at the demand
@@ -461,11 +469,13 @@ class BatteryOptimizer:
         for cb2 in credit_blocks:
             ub[cb2["y_idx"]] = 1.0
 
-        # Equality constraints: T (energy balance) + T (SOC update) + N*n_days
-        # (per-device daily totals) + one linking row per capped hour
+        # Equality constraints: T (energy balance) + T (SOC update) + N per
+        # non-truncated day (per-device daily totals — truncated days are a ≤ cap
+        # in A_ub instead, built further down) + one linking row per capped hour
         # (imp[t] or exp[t] = free tranche + over-cap tranche for that hour).
+        n_full_days = n_days - len(truncated_days)
         cap_link_rows = sum(len(cb["hours"]) for cb in cap_blocks)
-        n_eq = 2*T + N * n_days + cap_link_rows
+        n_eq = 2*T + N * n_full_days + cap_link_rows
         A_eq = lil_matrix((n_eq, n))
         b_eq = np.zeros(n_eq)
 
@@ -499,25 +509,45 @@ class BatteryOptimizer:
         # Device i on day d must consume exactly dev['daily_kwh'] (prorated for
         # partial days), capped at what its availability window can physically
         # deliver in that chunk so a narrow window cannot make the LP infeasible.
+        #
+        # EXCEPT the horizon's truncated day-chunk (if any): chunks are anchored to
+        # horizon start, not midnight, so the final chunk can land entirely outside a
+        # device's solar window (e.g. a rolling-horizon solve starting mid-afternoon
+        # ends its last day-chunk overnight, with no solar in it at all). Forcing that
+        # chunk's prorated total as a hard equality manufactures a "must run overnight"
+        # recommendation that has nothing to do with the real optimum — the real
+        # opportunity (tomorrow's solar, past this horizon) shows up on the next
+        # rolling replan a couple of minutes later. So a truncated chunk gets a ≤ cap
+        # (built into A_ub below) instead: the LP may leave it unmet rather than
+        # inventing a time to run it. Found live 2026-07-24 (GRIDLENS_CHECKLIST.md) —
+        # the advisory card's deferrable timeline showed both devices dumped to full
+        # power right at the horizon's last slot, well after their real cheap window.
+        daily_ub_specs: list[tuple[list[int], float]] = []
+        eq_row = 2 * T
         for i, dev in enumerate(deferrable_loads):
             mask = dev.get('hour_mask')
             for d in range(n_days):
                 t0 = d * slots_per_day
                 t1 = min(t0 + slots_per_day, T)
-                row = 2*T + i * n_days + d
-                for t in range(t0, t1):
-                    A_eq[row, (5+i)*T+t] = 1.0
                 avail_slots = (
                     sum(1 for t in range(t0, t1) if mask[t]) if mask else (t1 - t0)
                 )
                 target = dev['daily_kwh'] * (t1 - t0) / slots_per_day
-                b_eq[row] = min(target, avail_slots * dev['max_kw'] * dt)
+                target = min(target, avail_slots * dev['max_kw'] * dt)
+                cols = [(5 + i) * T + t for t in range(t0, t1)]
+                if d in truncated_days:
+                    daily_ub_specs.append((cols, target))
+                else:
+                    for col in cols:
+                        A_eq[eq_row, col] = 1.0
+                    b_eq[eq_row] = target
+                    eq_row += 1
 
         # Cap-tranche linking: imp[t] (or exp[t]) = free[t] + over[t] for every hour
         # inside a capped-rate window, so the tranche split always matches the total
         # grid flow already constrained everywhere else (energy balance, big-M, demand
         # window, no-grid-charge).
-        row = 2*T + N * n_days
+        row = eq_row
         for cb in cap_blocks:
             base = I if cb["direction"] == "import" else X
             for j, t in enumerate(cb["hours"]):
@@ -562,7 +592,10 @@ class BatteryOptimizer:
         # varies: 30-min slots here, vs the 1-hour slots the plan's fact sheet
         # language assumes).
         credit_rows = sum(len(cb2["hours"]) for cb2 in credit_blocks)
-        n_ub = term_rows + len(demand_hours) + ngc_rows + len(cap_day_groups) + credit_rows
+        n_ub = (
+            term_rows + len(demand_hours) + ngc_rows + len(cap_day_groups)
+            + credit_rows + len(daily_ub_specs)
+        )
         A_ub = lil_matrix((n_ub, n)) if n_ub else None
         b_ub = np.zeros(n_ub) if n_ub else None
         r = 0
@@ -570,6 +603,11 @@ class BatteryOptimizer:
             A_ub[0, S+T-1] = -1.0
             b_ub[0] = -E_end
             r = 1
+        for cols, b_val in daily_ub_specs:
+            for col in cols:
+                A_ub[r, col] = 1.0
+            b_ub[r] = b_val
+            r += 1
         for t in demand_hours:
             # P is peak kW; import[t] is energy per slot → power = energy / dt.
             A_ub[r, I+t]   =  1.0 / dt
