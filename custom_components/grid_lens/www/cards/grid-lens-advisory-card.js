@@ -25,6 +25,7 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._gc = 0;             // gradient-id counter (unique per render)
     this._actualEnergy = { solar: [], load: [], buy: [], sell: [] };
     this._deferNames = [];    // deferrable device names, one series each
+    this._deferMaxKw = [];    // deferrable device rated power (kW), parallel to _deferNames
     this._viewMode = 'today'; // 'today' = today only; 'horizon' = full 36h
   }
 
@@ -52,6 +53,7 @@ class GridLensAdvisoryCard extends HTMLElement {
     const a = st.attributes || {};
     this._traj = Array.isArray(a.trajectory) ? a.trajectory : null;
     this._deferNames = Array.isArray(a.deferrable_names) ? a.deferrable_names : [];
+    this._deferMaxKw = Array.isArray(a.deferrable_max_kw) ? a.deferrable_max_kw : [];
 
     // Read real-time applied action from the control switch (executor status)
     const switchSt = hass.states[this._config.control_switch_entity];
@@ -295,6 +297,16 @@ class GridLensAdvisoryCard extends HTMLElement {
           </div>
         </div>
       </div>
+      ${dnames.length ? `
+      <div class="sec"><h4>Deferrable loads — recommended on/off</h4>
+        <div style="display:flex;gap:16px;flex-wrap:wrap">
+          ${dnames.map((nm, i) => `
+            <div style="flex:1;min-width:200px">
+              <div style="font-size:11px;color:var(--ink2);margin-bottom:6px">${esc(nm)}</div>
+              ${this._deferTimelineHtml(i, deferColor(i))}
+            </div>`).join('')}
+        </div>
+      </div>` : ''}
       <div class="charts"><div class="xtip"></div>
       <div class="sec"><h4>SOC — planned vs measured</h4>
         <div class="legend">
@@ -683,6 +695,49 @@ class GridLensAdvisoryCard extends HTMLElement {
         `<span class="m">${esc(modeLabel(x.action))}</span></div>` +
         `<div class="reason">${esc(x.reason)}</div>` +
       `</li>`
+    ).join('');
+    return `<ul class="modeline">${items}</ul>`;
+  }
+
+  // Recommended on/off for deferrable device i in a given trajectory row. Devices like
+  // an EV charger or pool pump are physically only ever fully-on or off, but the LP's
+  // def_i is a continuous kWh-per-slot variable — a slot can legitimately land on a
+  // fractional value (e.g. 0.3 of a 1.8kW max) that has no direct on/off reading. Judge
+  // it against the device's own rated power (deferrable_max_kw, plumbed from the LP's
+  // device params) the same way _execMode() judges a charge/discharge slot against the
+  // battery's power_w — >=50% of max counts as "on". Falls back to an absolute 0.05kW
+  // floor (matches AdvisoryPlanner's own power_threshold_kw default) if an older sensor
+  // payload predates deferrable_max_kw being published.
+  _deferMode(i, row) {
+    const kwScale = 3600000 / this._timeScale().step;
+    const kw = (+row[`defer_${i}`] || 0) * kwScale;
+    const maxKw = (this._deferMaxKw && this._deferMaxKw[i]) || 0;
+    return maxKw > 0 ? (kw >= 0.5 * maxKw ? 'on' : 'off') : (kw >= 0.05 ? 'on' : 'off');
+  }
+
+  // Collapse device i's per-slot on/off recommendation into just the points where it
+  // changes, mirroring _modeTransitions() for the battery's EMS mode.
+  _deferTransitions(i) {
+    const t = this._traj || [];
+    const out = [];
+    let prev = null;
+    for (const row of t) {
+      const m = this._deferMode(i, row);
+      if (m !== prev) { out.push({ ms: new Date(row.start).getTime(), mode: m }); prev = m; }
+    }
+    return out;
+  }
+
+  _deferTimelineHtml(i, color) {
+    const trans = this._deferTransitions(i);
+    if (!trans.length) return '<div class="sub">No plan data.</div>';
+    const today = new Date();
+    const items = trans.map(x =>
+      `<li><div class="row">` +
+        `<span class="dot" style="background:${x.mode === 'on' ? color : 'var(--idle)'}"></span>` +
+        `<span class="t">${fmtDayHour(x.ms, today)}</span><span class="arrow">&rarr;</span>` +
+        `<span class="m">${x.mode === 'on' ? 'Recommended ON' : 'Off'}</span>` +
+      `</div></li>`
     ).join('');
     return `<ul class="modeline">${items}</ul>`;
   }

@@ -95,6 +95,7 @@ class AdvisoryPlanner:
 
         devs = deferrable_loads or []
         defer_names = [d.get("name") or f"Load {i + 1}" for i, d in enumerate(devs)]
+        defer_max_kw = [float(d.get("max_kw") or 0.0) for d in devs]
 
         schedule = result.get("schedule", [])
         plan: list[DispatchInterval] = []
@@ -155,6 +156,7 @@ class AdvisoryPlanner:
             plan=plan,
             trajectory=trajectory,
             deferrable_names=defer_names,
+            deferrable_max_kw=defer_max_kw,
             conditional_credits=result.get("conditional_credits", {}),
         )
 
