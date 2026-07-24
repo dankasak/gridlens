@@ -13,8 +13,15 @@ class ElectricityEnergyFlowCard extends HTMLElement {
   }
 
   set hass(hass) {
+    // Detect a live HA dark/light toggle (compared against the *previous* hass) so the
+    // canvas redraws immediately — otherwise the axis/label colors (read via
+    // getComputedStyle at draw time) would only refresh whenever fetchData()'s next
+    // response happens to land.
+    const darkChanged = !!(this._hass && this._hass.themes && hass.themes &&
+      this._hass.themes.darkMode !== hass.themes.darkMode);
     this._hass = hass;
     this.fetchData();
+    if (darkChanged) this.render();
   }
 
   async fetchData() {

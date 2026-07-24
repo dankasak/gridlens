@@ -1,0 +1,600 @@
+/*
+ * Shared plumbing + pure helpers for the Grid Lens advisory chart cards
+ * (grid-lens-{soc,dispatch,power,price,cash}-chart-card.js) and the slimmed
+ * grid-lens-advisory-card.js status card. Not a lovelace resource itself —
+ * just an ES module the registered card files import from.
+ *
+ * Each chart used to live inside one monolithic card sharing a single
+ * crosshair; they're now independent cards (so users can place/resize them
+ * with the standard Lovelace section editor), each with its own crosshair,
+ * its own Today/Horizon toggle, and its own throttled history fetch (scoped
+ * to only the series it actually plots — see wantsSocHistory/wantsEnergyHistory
+ * on GridLensChartCardBase).
+ */
+
+export const GW = 720, GML = 44, GMR = 12;  // shared plot geometry across every chart
+export const VIEW_BACK_MS = 2 * 3600000;    // show 2h of history to the left of "now"
+
+// ---------------------------------------------------------------- pure helpers
+
+// Downsample a {t,v} series to at most `max` points (keeps rendering light).
+export function ds(pts, max = 160) {
+  if (!pts || pts.length <= max) return pts || [];
+  const step = Math.ceil(pts.length / max);
+  const out = pts.filter((_, i) => i % step === 0);
+  if (out[out.length - 1] !== pts[pts.length - 1]) out.push(pts[pts.length - 1]);
+  return out;
+}
+// Catmull-Rom → cubic-bezier smoothing. pts = [[x,y],…] → SVG path 'd'.
+export function smoothPath(pts) {
+  if (!pts || !pts.length) return '';
+  if (pts.length < 3) return 'M' + pts.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' L');
+  const k = 0.16;
+  let d = `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[i ? i - 1 : 0], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2;
+    const c1x = p1[0] + (p2[0] - p0[0]) * k, c1y = p1[1] + (p2[1] - p0[1]) * k;
+    const c2x = p2[0] - (p3[0] - p1[0]) * k, c2y = p2[1] - (p3[1] - p1[1]) * k;
+    d += ` C${c1x.toFixed(1)},${c1y.toFixed(1)} ${c2x.toFixed(1)},${c2y.toFixed(1)} ${p2[0].toFixed(1)},${p2[1].toFixed(1)}`;
+  }
+  return d;
+}
+// Step-after interpolation: pts = [[x,y],…] sampled at each slot's start → SVG path 'd'
+// that holds each y at its sampled value until the next x, then jumps. Correct shape for
+// piecewise-constant series (e.g. per-slot import/export rate) — never overshoots past a
+// sampled value, unlike a cubic spline through a step function.
+export function stepPath(pts) {
+  if (!pts || !pts.length) return '';
+  let d = `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
+  for (let i = 1; i < pts.length; i++) {
+    const [x0, y0] = pts[i - 1];
+    const [x1, y1] = pts[i];
+    d += ` L${x1.toFixed(1)},${y0.toFixed(1)} L${x1.toFixed(1)},${y1.toFixed(1)}`;
+  }
+  return d;
+}
+// Timestamps for x-axis ticks: every local hour in [t0, t1] whose hour-of-day is a
+// multiple of everyH. Walks hour-by-hour reading localized hours, so ticks stay on
+// clean local clock times across a DST change.
+export function tickTimes(t0, t1, everyH = 3) {
+  const out = [];
+  const d = new Date(t0);
+  d.setMinutes(0, 0, 0);
+  while (d.getTime() < t0) d.setTime(d.getTime() + 3600000);
+  for (; d.getTime() <= t1; d.setTime(d.getTime() + 3600000)) {
+    if (d.getHours() % everyH === 0) out.push(d.getTime());
+  }
+  return out;
+}
+// Tick marks + HH:MM labels along the bottom axis, shared by every chart.
+export function xAxisTicks(X, t0, t1, axisY, fontSize = 10) {
+  let s = '';
+  for (const ms of tickTimes(t0, t1)) {
+    const x = X(ms);
+    s += `<line x1="${x}" y1="${axisY}" x2="${x}" y2="${axisY + 3}" stroke="var(--axis)"/>`;
+    s += `<text x="${x}" y="${axisY + 14}" text-anchor="middle" font-size="${fontSize}" fill="var(--muted)">${fmtHour(ms)}</text>`;
+  }
+  return s;
+}
+// Vertical fade gradient (color → transparent) for area fills.
+export function gradDef(id, color, topOpacity) {
+  return `<linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">`
+    + `<stop offset="0" style="stop-color:${color};stop-opacity:${topOpacity}"/>`
+    + `<stop offset="1" style="stop-color:${color};stop-opacity:0.02"/></linearGradient>`;
+}
+export function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+export function clampPct(v) { v = parseFloat(v); return isNaN(v) ? 0 : Math.max(0, Math.min(100, v)); }
+export function fmtPct(v) { v = parseFloat(v); return isNaN(v) ? '–' : v.toFixed(0) + '%'; }
+export function fmtC(v) { v = parseFloat(v); return isNaN(v) ? '–' : (v * 100).toFixed(0) + 'c'; }
+export function actionLabel(a) { return ({ charge: 'Charge', discharge: 'Discharge', self_use: 'Self-use', idle: 'Idle' }[a]) || (a ? esc(a) : '–'); }
+// Sigenergy EMS mode a slot's plan `action` will be executed as, for the control-state timeline.
+export const MODE_LABELS = {
+  self_use: 'Maximum Self-consumption',
+  charge: 'Command Charging (PV first)',
+  discharge: 'Command Discharging (battery first)',
+  idle: 'Standby',
+};
+export const MODE_COLORS = { self_use: 'var(--good)', charge: 'var(--charge)', discharge: 'var(--discharge)', idle: 'var(--idle)' };
+export function modeLabel(a) { return MODE_LABELS[a] || (a ? esc(a) : '–'); }
+export function fmtHour(ms) { const d = new Date(ms); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
+// HH:MM plus a day qualifier ("Today"/"Tomorrow"/weekday) whenever ms falls on a
+// different calendar day than `today` — the mode-timeline list has no x-axis position
+// to carry date info the way the charts do, so a bare "19:00" from a 36h horizon can
+// read as earlier than an earlier-listed "21:00" from the day before. Two dates never
+// go further apart than the horizon (36h), so "Today"/"Tomorrow" always suffices.
+export function fmtDayHour(ms, today) {
+  const d = new Date(ms);
+  const dayDiff = Math.round((startOfDay(d) - startOfDay(today)) / 86400000);
+  const hm = fmtHour(ms);
+  if (dayDiff === 0) return hm;
+  if (dayDiff === 1) return `Tomorrow ${hm}`;
+  return `${d.toLocaleDateString([], { weekday: 'short' })} ${hm}`;
+}
+export function startOfDay(d) { return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(); }
+export function fmtTime(iso) { try { const d = new Date(iso); return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } }
+
+// The EMS mode the executor will actually command for a slot. Mirrors
+// ScheduleExecutor._resolve_charge: a CHARGE slot runs as Command Charging (PV first)
+// when the plan wants a *material* grid top-up (a real share of the slot AND above an
+// absolute floor), OR when any above-floor grid contribution falls in a genuinely FREE
+// import slot (import_rate ~0) — there's no cost risk in claiming the full ceiling when
+// import is free, so that case is force-charged even as a minority share. Otherwise
+// (solar charge, or a trivial LP grid nibble) it runs as Maximum Self-consumption,
+// which resets the charge-rate cap to hardware max and fills the battery from all
+// surplus PV without importing.
+//
+// Symmetrically mirrors ScheduleExecutor._resolve_discharge: a DISCHARGE slot only
+// runs as Command Discharging (battery first) when the plan wants a *material* export
+// — a real share of the slot AND above an absolute floor. Otherwise (load-covering
+// discharge, or a trivial LP nibble) it runs as self-consumption, which already
+// discharges to match load with no rate forced.
+//
+// `stepMs` is the trajectory's slot duration — callers pass it explicitly (from their
+// own _timeScale()/_stepMs()) since this is a pure function, not a class method.
+export function execMode(row, stepMs) {
+  if (row.action === 'charge') {
+    let gw = row.grid_charge_w;
+    if (gw == null) {
+      const dtH = stepMs / 3600000;
+      gw = Math.max(0, ((+row.buy_kwh || 0) - (+row.load_kwh || 0) - (+row.deferrable_kwh || 0))) / dtH * 1000;
+    }
+    if (gw <= 250) return 'self_use';
+    const imp = row.import_rate != null ? +row.import_rate : null;
+    if (imp != null && imp <= 1e-6) return 'charge';  // free window — claim the full ceiling
+    const pw = +row.power_w || 0;
+    return (gw >= 0.5 * pw) ? 'charge' : 'self_use';
+  }
+  if (row.action === 'discharge') {
+    let ew = row.export_w;
+    if (ew == null) {
+      const dtH = stepMs / 3600000;
+      const pw = +row.power_w || 0;
+      ew = Math.min(Math.max(0, +row.sell_kwh || 0), pw * dtH / 1000) / dtH * 1000;
+    }
+    const pw = +row.power_w || 0;
+    return (ew > 250 && ew >= 0.5 * pw) ? 'discharge' : 'self_use';
+  }
+  return row.action;
+}
+
+// Human-readable "why" for a row's executed mode — built entirely from numbers
+// already in the trajectory. Kept in sync with the branches execMode() actually
+// took so the explanation never contradicts the mode shown next to it.
+export function reasonFor(row, mode) {
+  const imp = row.import_rate != null ? +row.import_rate : null;
+  const exp = row.export_rate != null ? +row.export_rate : null;
+  const free = imp != null && imp <= 1e-6;
+  const soc = clampPct(row.soc_percent);
+  if (row.action === 'charge') {
+    if (mode === 'charge') {
+      return free
+        ? `Free import window (${fmtC(imp)}/kWh) — topping up beyond solar to bank cheap energy for later.`
+        : `Grid-charging at ${fmtC(imp)}/kWh — the plan judges it worth buying now rather than later.`;
+    }
+    const gw = row.grid_charge_w || 0;
+    return gw > 1
+      ? `Charging mostly from solar — the grid share is too small to force a command, so it runs on self-consumption.`
+      : `Charging from solar surplus only — no grid import needed.`;
+  }
+  if (row.action === 'discharge') {
+    if (mode === 'discharge') {
+      return `Discharging to sell at ${fmtC(exp)}/kWh — a real export opportunity worth forcing.`;
+    }
+    return `Discharging to cover house load only — no export value here, so no rate is forced.`;
+  }
+  if (soc >= 99) {
+    return `Battery full — holding charge, no free capacity or arbitrage value right now.`;
+  }
+  return `Self-consumption — solar/battery cover load directly, no material charge or discharge planned.`;
+}
+
+// Multi-series line/area chart (forecast + optional "measured" overlays), used by the
+// power/price/cash chart cards. Pure function: gradient ids are derived from series
+// index (not a mutable counter), since each card only ever calls this once per render.
+export function multiLineChart(traj, timeScale, series, opts = {}) {
+  if (!traj || !traj.length) return '';
+  const g = { w: GW, h: opts.height || 160, ml: GML, mr: GMR, mt: 10, mb: 22 };
+  const { t0, t1 } = timeScale;
+  const X = (ms) => g.ml + (ms - t0) / (t1 - t0) * (g.w - g.ml - g.mr);
+  const nowMs = Date.now();
+  // Only plot slots inside the current view window — with Today selected, t0/t1 span
+  // just 24h while the trajectory itself can run 72h+, so unfiltered points map past
+  // the right edge and (since the SVG doesn't clip) visibly overflow the card.
+  const raw = series.map(s => {
+    if (s.points) return (s.points || [])
+      .filter(p => p.t.getTime() >= t0 && p.t.getTime() <= nowMs + 60000)
+      .map(p => ({ ms: p.t.getTime(), v: p.v }));
+    return traj
+      .filter(row => { const ms = new Date(row.start).getTime(); return ms >= t0 && ms <= t1; })
+      .map(row => ({ ms: new Date(row.start).getTime(), v: (+row[s.key] || 0) * (s.scale || 1) }));
+  });
+  let yMax = 0, yMin = opts.yMin != null ? opts.yMin : 0;
+  for (const pts of raw) for (const p of pts) { if (p.v > yMax) yMax = p.v; if (p.v < yMin) yMin = p.v; }
+  if (yMax === yMin) yMax = yMin + 1;
+  const Y = (v) => g.mt + (1 - (v - yMin) / (yMax - yMin)) * (g.h - g.mt - g.mb);
+  const fmt = opts.fmt || ((v) => v.toFixed(1));
+  let grid = '';
+  for (let k = 0; k <= 4; k++) {
+    const v = yMin + (yMax - yMin) * k / 4, y = Y(v);
+    grid += `<line x1="${g.ml}" y1="${y}" x2="${g.w - g.mr}" y2="${y}" stroke="var(--grid)"/>`;
+    grid += `<text x="${g.ml - 5}" y="${y + 3}" text-anchor="end" font-size="9" fill="var(--muted)">${fmt(v)}</text>`;
+  }
+  const xt = xAxisTicks(X, t0, t1, g.h - g.mb, 9);
+  const nowX = X(Math.min(Date.now(), t1));
+  const now = `<line x1="${nowX}" y1="${g.mt}" x2="${nowX}" y2="${g.h - g.mb}" stroke="var(--axis)" stroke-dasharray="2 3"/>`;
+  const zero = (yMin < 0) ? `<line x1="${g.ml}" y1="${Y(0)}" x2="${g.w - g.mr}" y2="${Y(0)}" stroke="var(--axis)"/>` : '';
+  let defs = '', paths = '';
+  const base = Y(Math.max(yMin, 0));
+  series.forEach((s, si) => {
+    const rp = raw[si];
+    if (!rp.length) return;
+    const pts = rp.map(p => [X(p.ms), Y(p.v)]);
+    let d, rightX = pts[pts.length - 1][0];
+    if (s.step) {
+      d = stepPath(pts);
+      const endX = X(t1);
+      if (endX > rightX) {
+        d += ` L${endX.toFixed(1)},${pts[pts.length - 1][1].toFixed(1)}`;
+        rightX = endX;
+      }
+    } else {
+      d = smoothPath(pts);
+    }
+    if (s.area) {
+      const gid = 'g' + si;
+      defs += gradDef(gid, s.color, 0.48);
+      paths += `<path d="${d} L${rightX.toFixed(1)},${base.toFixed(1)} L${pts[0][0].toFixed(1)},${base.toFixed(1)} Z" fill="url(#${gid})"/>`;
+    }
+    paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.actual ? 1.75 : 2.5}" opacity="${s.actual ? 0.9 : 1}" stroke-linejoin="round" stroke-linecap="round" ${s.dash ? 'stroke-dasharray="5 4"' : ''}/>`;
+  });
+  return `<svg viewBox="0 0 ${g.w} ${g.h}" class="chart-svg" role="img"><defs>${defs}</defs>${grid}${zero}${xt}${now}${paths}`
+    + `<line class="xhair" x1="0" x2="0" y1="${g.mt}" y2="${g.h - g.mb}" stroke="var(--ink2)" stroke-width="1" opacity="0"/></svg>`;
+}
+
+// Shared inner CSS (no <style> wrapper) — imported by both the chart-card base class
+// and the standalone advisory-status card so both look consistent without depending on
+// class inheritance to share styling.
+export const STYLE = `
+  :host {
+    --surface: var(--card-background-color);
+    --plane: var(--secondary-background-color);
+    --ink: var(--primary-text-color);
+    --ink2: var(--secondary-text-color);
+    --muted: var(--disabled-text-color, var(--secondary-text-color));
+    --grid: var(--divider-color);
+    --axis: var(--divider-color);
+    --border: var(--divider-color);
+    --predicted:#2563eb; --actual:#ea580c; --charge:#2563eb; --discharge:#ea580c;
+    --idle:#94918a; --fit:rgba(245,158,11,.20); --good:#059669;
+    --solar:#f59e0b; --load:#7c3aed; --buy:#e11d48; --sell:#0d9488; --cum:#2563eb;
+    --defer1:#db2777; --defer2:#0891b2; --defer3:#65a30d; --defer4:#c2410c;
+  }
+  :host(.dark) {
+    --predicted:#60a5fa; --actual:#fb923c; --charge:#60a5fa; --discharge:#fb923c;
+    --fit:rgba(251,191,36,.22); --good:#10b981;
+    --solar:#fbbf24; --load:#a78bfa; --buy:#fb7185; --sell:#2dd4bf; --cum:#60a5fa;
+    --defer1:#f472b6; --defer2:#22d3ee; --defer3:#a3e635; --defer4:#fb923c;
+  }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:14px;
+          padding:16px 18px; font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+          color:var(--ink); }
+  .hd { display:flex; align-items:baseline; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+  .title { font-size:15px; font-weight:650; letter-spacing:.2px; }
+  .sub { font-size:12px; color:var(--ink2); }
+  .badge { font-size:11px; font-weight:650; padding:2px 8px; border-radius:20px;
+           border:1px solid var(--border); color:var(--ink2); }
+  .badge.ok { color:var(--good); border-color:color-mix(in srgb,var(--good) 40%,transparent); }
+  .badge.stale { color:var(--solar); border-color:color-mix(in srgb,var(--solar) 45%,transparent); }
+  .sec { margin-top:14px; }
+  .sec h4 { margin:0 0 4px; font-size:12px; font-weight:600; color:var(--ink2); }
+  .legend { display:flex; gap:14px; font-size:11px; color:var(--ink2); margin:2px 0 6px; flex-wrap:wrap; }
+  .legend i { display:inline-block; width:16px; height:0; vertical-align:middle; margin-right:5px; }
+  .swatch { display:inline-block; width:10px; height:10px; border-radius:2px; vertical-align:middle; margin-right:5px; }
+  svg { width:100%; height:auto; display:block; overflow:visible; }
+  .charts { position:relative; }
+  .chart-svg { cursor:crosshair; }
+  .xtip { position:absolute; pointer-events:none; background:var(--surface); color:var(--ink);
+          border:1px solid var(--border); border-radius:9px; padding:7px 10px; font-size:11px;
+          line-height:1.55; box-shadow:0 6px 18px rgba(0,0,0,.24); white-space:nowrap;
+          opacity:0; transition:opacity .08s; z-index:6; }
+  .xtip .k { color:var(--muted); }
+  .modeline { list-style:none; margin:6px 0 0; padding:0; display:flex; flex-direction:column; gap:8px; }
+  .modeline li { display:flex; flex-direction:column; gap:2px; font-size:12.5px; color:var(--ink); }
+  .modeline .row { display:flex; align-items:baseline; gap:7px; }
+  .modeline .dot { width:8px; height:8px; border-radius:50%; flex:0 0 auto; align-self:center; }
+  .modeline .t { font-variant-numeric:tabular-nums; font-weight:650; color:var(--ink2); min-width:38px; white-space:nowrap; }
+  .modeline .arrow { color:var(--muted); }
+  .modeline .m { font-weight:550; }
+  .modeline .reason { font-size:11px; color:var(--muted); padding-left:15px; line-height:1.35; }
+  .note { font-size:11px; color:var(--muted); margin-top:8px; line-height:1.4; }
+  .waiting { padding:26px 8px; text-align:center; color:var(--ink2); font-size:13px; }
+  .view-btn { transition:all 0.15s ease; font-weight:600; cursor:pointer; }
+  .view-btn:hover { background:color-mix(in srgb, var(--ink) 8%, transparent); }
+  .view-btn.active { background:var(--surface); color:var(--good); }
+`;
+
+// ---------------------------------------------------------------- base class
+
+// Shared plumbing for the 5 standalone chart cards. Subclasses implement:
+//   get title()            -> string
+//   _legendHtml()           -> string
+//   _chartSvg()              -> string (must include a `.chart-svg` root and,
+//                                        if it wants a crosshair, an `.xhair` line)
+//   _tooltipHtml(bestMs, best, isHistory)  -> string | falsy (optional; falsy = no
+//                                              floating tooltip, just the crosshair line)
+//   get wantsSocHistory()    -> boolean (default false)
+//   get wantsEnergyHistory() -> boolean (default false)
+export class GridLensChartCardBase extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    this._config = {};
+    this._hass = null;
+    this._traj = null;
+    this._summary = {};
+    this._actual = [];
+    this._lastFetch = 0;
+    this._sig = '';
+    this._actualEnergy = { solar: [], load: [], buy: [], sell: [] };
+    this._deferNames = [];
+    this._deferMaxKw = [];
+    this._viewMode = 'today';
+    this._dark = false;
+  }
+
+  get wantsSocHistory() { return false; }
+  get wantsEnergyHistory() { return false; }
+
+  setConfig(config) {
+    if (!config || !config.entity) throw new Error('Define "entity" (the planned_dispatch sensor)');
+    this._config = Object.assign({
+      soc_entity: 'sensor.sigen_plant_ess_soc',
+      solar_power_entity: 'sensor.sigen_0_total_pv_power',
+      load_power_entity: 'sensor.sigen_plant_general_load_power',
+      grid_power_entity: 'sensor.sigen_plant_grid_sensor_active_power',
+    }, config);
+    this._sig = '';
+    this._renderShell();
+  }
+
+  getCardSize() { return 4; }
+
+  set hass(hass) {
+    this._hass = hass;
+    const dark = !!(hass.themes && hass.themes.darkMode);
+    if (dark !== this._dark) { this._dark = dark; this.classList.toggle('dark', dark); }
+
+    const st = hass.states[this._config.entity];
+    if (!st) { this._summary = { status: 'unknown' }; this._traj = null; this._paint(); return; }
+
+    const a = st.attributes || {};
+    this._traj = Array.isArray(a.trajectory) ? a.trajectory : null;
+    this._deferNames = Array.isArray(a.deferrable_names) ? a.deferrable_names : [];
+    this._deferMaxKw = Array.isArray(a.deferrable_max_kw) ? a.deferrable_max_kw : [];
+
+    this._summary = {
+      status: a.status || st.state,
+      plan_name: a.plan_name,
+      reason: a.reason,
+      restored: a.restored === true,
+    };
+
+    const wantsHistory = this.wantsSocHistory || this.wantsEnergyHistory;
+    const socSt = hass.states[this._config.soc_entity];
+    const curSoc = socSt ? parseFloat(socSt.state) : NaN;
+
+    const now = Date.now();
+    if (this._traj && wantsHistory && (now - this._lastFetch > 60000)) {
+      this._lastFetch = now;
+      this._fetchActual(hass, curSoc).catch(() => {});
+    } else if (this.wantsSocHistory && !isNaN(curSoc)) {
+      this._mergeNow(curSoc);
+    }
+
+    const sig = `${st.last_updated}|${curSoc}|${this._actual.length}`;
+    if (sig !== this._sig) { this._sig = sig; this._paint(); }
+  }
+
+  async _fetchActual(hass, curSoc) {
+    try {
+      if (!this._traj || !this._traj.length) return;
+      let start;
+      if (this._viewMode === 'today') {
+        const now = new Date();
+        start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      } else {
+        start = new Date(new Date(this._traj[0].start).getTime() - VIEW_BACK_MS);
+      }
+      const end = new Date();
+      const c = this._config;
+      const eids = [];
+      if (this.wantsSocHistory) eids.push(c.soc_entity);
+      if (this.wantsEnergyHistory) eids.push(c.solar_power_entity, c.load_power_entity, c.grid_power_entity);
+      const uniq = [...new Set(eids)].filter(Boolean);
+      if (!uniq.length) return;
+      const url = `history/period/${start.toISOString()}?filter_entity_id=${uniq.join(',')}` +
+                  `&end_time=${encodeURIComponent(end.toISOString())}&minimal_response&significant_changes_only`;
+      const res = await hass.callApi('GET', url);
+      const byId = {};
+      for (const arr of (res || [])) {
+        if (arr && arr.length && arr[0].entity_id) byId[arr[0].entity_id] = arr;
+      }
+      if (this.wantsSocHistory) {
+        const soc = this._series(byId[c.soc_entity]);
+        if (!isNaN(curSoc)) soc.push({ t: end, v: curSoc });
+        this._actual = ds(soc);
+      }
+      if (this.wantsEnergyHistory) {
+        const toKw = (eid) => {
+          const s = hass.states[eid];
+          return (s && s.attributes && s.attributes.unit_of_measurement === 'W') ? 0.001 : 1;
+        };
+        const fS = toKw(c.solar_power_entity), fL = toKw(c.load_power_entity), fG = toKw(c.grid_power_entity);
+        const grid = this._series(byId[c.grid_power_entity]);
+        this._actualEnergy = {
+          solar: ds(this._series(byId[c.solar_power_entity]).map(p => ({ t: p.t, v: Math.max(0, p.v * fS) }))),
+          load: ds(this._series(byId[c.load_power_entity]).map(p => ({ t: p.t, v: Math.max(0, p.v * fL) }))),
+          buy: ds(grid.map(p => ({ t: p.t, v: Math.max(0, p.v * fG) }))),
+          sell: ds(grid.map(p => ({ t: p.t, v: Math.max(0, -p.v * fG) }))),
+        };
+      }
+      this._sig = '';
+      this._paint();
+    } catch (e) { /* history unavailable — forecast-only is fine */ }
+  }
+
+  _series(rows) {
+    const pts = [];
+    for (const r of (rows || [])) {
+      const v = parseFloat(r.state);
+      if (!isNaN(v)) pts.push({ t: new Date(r.last_changed || r.lu), v });
+    }
+    return pts;
+  }
+
+  _mergeNow(curSoc) {
+    const end = new Date();
+    if (this._actual.length && (end - this._actual[this._actual.length - 1].t) < 60000) return;
+    this._actual = this._actual.concat([{ t: end, v: curSoc }]);
+  }
+
+  _timeScale() {
+    const t = this._traj;
+    const planStart = new Date(t[0].start).getTime();
+    const step = t.length > 1 ? (new Date(t[1].start).getTime() - planStart) : 1800000;
+    let t1 = new Date(t[t.length - 1].start).getTime() + step;
+
+    let t0;
+    if (this._viewMode === 'today') {
+      const now = new Date();
+      const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+      t0 = midnight;
+      const endOfDay = midnight + 24 * 3600000;
+      t1 = Math.min(t1, endOfDay);
+    } else {
+      t0 = planStart - VIEW_BACK_MS;
+    }
+    return { t0, t1, step, planStart };
+  }
+
+  _xOf(ms) {
+    const { t0, t1 } = this._timeScale();
+    return GML + (ms - t0) / (t1 - t0) * (GW - GML - GMR);
+  }
+
+  // Hook for a subclass to add card-specific CSS on top of the shared STYLE block
+  // (e.g. a max-height cap) without every other chart card inheriting it too.
+  get extraStyle() { return ''; }
+
+  _renderShell() {
+    this.shadowRoot.innerHTML = `
+      <style>${STYLE}${this.extraStyle}</style>
+      <div class="card">
+        <div class="hd">
+          <div class="title">${esc(this.title)}</div>
+          <div class="toggle-wrap"></div>
+        </div>
+        <div class="body"></div>
+      </div>
+    `;
+  }
+
+  _paint() {
+    const body = this.shadowRoot && this.shadowRoot.querySelector('.body');
+    const toggleWrap = this.shadowRoot && this.shadowRoot.querySelector('.toggle-wrap');
+    if (!body) return;
+    const s = this._summary || {};
+
+    if (toggleWrap) toggleWrap.innerHTML = this._toggleHtml();
+    this._wireViewToggle();
+
+    if (!this._traj || s.status !== 'ok') {
+      body.innerHTML = `<div class="waiting">Advisory plan not available yet${s.reason ? '<br><span class="sub">' + esc(s.reason) + '</span>' : ''}</div>`;
+      return;
+    }
+
+    body.innerHTML = `
+      <div class="legend">${this._legendHtml()}</div>
+      <div class="charts"><div class="xtip"></div>${this._chartSvg()}</div>
+    `;
+    this._wireCrosshair();
+  }
+
+  _toggleHtml() {
+    return `
+      <div style="display:flex;gap:4px;padding:2px;background:var(--plane);border:1px solid var(--border);border-radius:6px">
+        <button id="toggle-today" class="view-btn ${this._viewMode === 'today' ? 'active' : ''}" style="padding:4px 10px;border:none;background:transparent;color:var(--ink);cursor:pointer;font-size:11px;border-radius:4px">Today</button>
+        <button id="toggle-horizon" class="view-btn ${this._viewMode === 'horizon' ? 'active' : ''}" style="padding:4px 10px;border:none;background:transparent;color:var(--ink);cursor:pointer;font-size:11px;border-radius:4px">Full horizon</button>
+      </div>`;
+  }
+
+  _wireViewToggle() {
+    const todayBtn = this.shadowRoot.querySelector('#toggle-today');
+    const horizonBtn = this.shadowRoot.querySelector('#toggle-horizon');
+    if (!todayBtn || !horizonBtn) return;
+    const switchTo = (mode) => {
+      if (this._viewMode === mode) return;
+      this._viewMode = mode;
+      this._lastFetch = 0;
+      this._sig = '';
+      if (this._hass && (this.wantsSocHistory || this.wantsEnergyHistory)) {
+        this._fetchActual(this._hass, parseFloat(this._hass.states[this._config.soc_entity]?.state ?? 'NaN')).catch(() => {});
+      }
+      this._paint();
+    };
+    todayBtn.addEventListener('click', () => switchTo('today'));
+    horizonBtn.addEventListener('click', () => switchTo('horizon'));
+  }
+
+  _wireCrosshair() {
+    const charts = this.shadowRoot.querySelector('.charts');
+    if (!charts || !this._traj || !this._traj.length) return;
+    const svg = this.shadowRoot.querySelector('.chart-svg');
+    const xhair = this.shadowRoot.querySelector('.xhair');
+    const tip = this.shadowRoot.querySelector('.xtip');
+    if (!svg || !tip) return;
+
+    const move = (ev) => {
+      const { t0, t1 } = this._timeScale();
+      const r = ev.currentTarget.getBoundingClientRect();
+      const frac = Math.max(0, Math.min(1,
+        ((ev.clientX - r.left) / r.width * GW - GML) / (GW - GML - GMR)));
+      const ms = t0 + frac * (t1 - t0);
+      const trajStart = new Date(this._traj[0].start).getTime();
+      const isHistory = ms < trajStart;
+
+      let bestMs, best = null;
+      if (!isHistory) {
+        best = this._traj[0];
+        let bd = Infinity;
+        for (const s of this._traj) { const d = Math.abs(new Date(s.start).getTime() - ms); if (d < bd) { bd = d; best = s; } }
+        bestMs = new Date(best.start).getTime();
+      } else {
+        bestMs = ms;
+      }
+
+      const bx = this._xOf(bestMs);
+      if (xhair) { xhair.setAttribute('x1', bx); xhair.setAttribute('x2', bx); xhair.setAttribute('opacity', '1'); }
+
+      const html = this._tooltipHtml ? this._tooltipHtml(bestMs, best, isHistory) : null;
+      if (html) {
+        tip.innerHTML = html;
+        const cr = charts.getBoundingClientRect();
+        const flip = (ev.clientX - cr.left) > cr.width * 0.62;
+        tip.style.left = (ev.clientX - cr.left) + 'px';
+        tip.style.top = (ev.clientY - cr.top) + 'px';
+        tip.style.transform = flip ? 'translate(calc(-100% - 14px), -50%)' : 'translate(14px, -50%)';
+        tip.style.opacity = '1';
+      } else {
+        tip.style.opacity = '0';
+      }
+    };
+    const leave = () => {
+      if (xhair) xhair.setAttribute('opacity', '0');
+      tip.style.opacity = '0';
+    };
+
+    svg.addEventListener('mousemove', move);
+    charts.addEventListener('mouseleave', leave);
+  }
+}

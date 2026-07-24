@@ -71,10 +71,18 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260719a"
+    _CARD_VERSION = "20260725g"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-powerflow-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-advisory-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-soc-chart-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-dispatch-chart-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-power-chart-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-price-chart-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-cash-chart-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-flex-row-card.js?v={_CARD_VERSION}",
     ]
     stale_urls = {
         "/grid_lens/cards/electricity-plan-comparison-card.js",
