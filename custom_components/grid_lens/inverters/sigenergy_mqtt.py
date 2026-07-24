@@ -29,7 +29,7 @@ from typing import Optional
 
 from homeassistant.core import HomeAssistant
 
-from .base import InverterController, InverterState, InverterStatus
+from .base import BatteryAction, InverterController, InverterState, InverterStatus
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,6 +44,15 @@ MODE_DISCHARGE_ESS = "Command Discharging (Output power from the battery first)"
 # Fallback rate caps (kW) if the number entity does not expose a ``max`` attribute.
 _DEFAULT_CHARGE_CAP_KW = 12.6
 _DEFAULT_DISCHARGE_CAP_KW = 14.4
+
+# Expected mode string per abstract action, for verify_mode(). DISCHARGE isn't listed —
+# it depends on ``discharge_mode_pv_first`` (instance config), so it's resolved from
+# ``self._discharge_mode`` instead. IDLE/CHARGE/SELF_USE are fixed regardless of config.
+_ACTION_MODES = {
+    BatteryAction.IDLE: MODE_STANDBY,
+    BatteryAction.CHARGE: MODE_CHARGE_PV,
+    BatteryAction.SELF_USE: MODE_SELF_CONSUMPTION,
+}
 
 _DEFAULT_ENTITIES = {
     "enable": "switch.sigen_plant_remote_ems_enable",
@@ -190,6 +199,20 @@ class SigenergyMqttController(InverterController):
         ok = await self._switch(self._e["enable"], turn_on=False) and ok
         _LOGGER.info("Sigenergy Remote EMS disabled; native control restored")
         return ok
+
+    async def verify_mode(self, action: BatteryAction) -> Optional[bool]:
+        """Compare the live ``select.*_remote_ems_control_mode`` state against what
+        ``action`` should have commanded. Used by the guardrail to catch a command
+        that silently didn't land (e.g. lost across an MQTT bridge reconnect)."""
+        expected = (
+            self._discharge_mode if action == BatteryAction.DISCHARGE else _ACTION_MODES.get(action)
+        )
+        if expected is None:
+            return None
+        running = self._state(self._e["mode"])
+        if running is None:
+            return None
+        return running.state == expected
 
     async def _reset_rate_limits(self) -> bool:
         """Restore charge/discharge rate caps to rated max — force_charge/force_discharge

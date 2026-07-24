@@ -176,6 +176,18 @@ class BatteryController:
     async def read_soc(self) -> Optional[float]:
         return await self._read_soc()
 
+    async def verify_applied(self) -> Optional[bool]:
+        """Does the live hardware mode still match ``current_action``?
+
+        None means the driver can't tell (unsupported, or the read failed) — treat
+        that as inconclusive, not as a mismatch. See ``InverterController.verify_mode``.
+        """
+        try:
+            return await self.driver.verify_mode(self.current_action)
+        except Exception as err:  # noqa: BLE001 — a bad read must not crash a tick
+            _LOGGER.error("Mode verification failed: %s", err)
+            return None
+
     # ------------------------------------------------------------------ internals
     def _require_battery(self) -> bool:
         if not self.driver.supports_battery_control:

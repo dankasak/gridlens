@@ -4,9 +4,11 @@ The optimizer produces a **plan**: a time-ordered list of ``DispatchInterval`` s
 executor ticks on interval boundaries, looks up the interval covering *now*, and issues
 the corresponding :class:`BatteryController` command. It owns three responsibilities:
 
-* **Transition economy** — self-consumption is only (re)issued on transition; active modes
-  (charge/discharge/idle) are re-issued each tick so the guardrail's auto-expiry stays
-  armed and power tracks the plan.
+* **Transition economy** — self-consumption is only (re)issued on transition, or when a
+  live mode readback (``BatteryController.verify_applied``) shows the hardware drifted
+  from what was applied (e.g. a transport reconnect clobbered the mode write); active
+  modes (charge/discharge/idle) are re-issued each tick so the guardrail's auto-expiry
+  stays armed and power tracks the plan.
 * **Watchdog** — if the plan goes stale (the optimizer stopped refreshing it), revert to
   native control once and stay degraded until a fresh plan arrives.
 * **Deadman** — :meth:`stop` (and unload) calls ``restore_normal`` so turning the system
@@ -168,14 +170,21 @@ class ScheduleExecutor:
 
             action, power_w = self._desired(now)
 
-            # Transition economy: don't re-spam self-consumption every tick.
+            # Transition economy: don't re-spam self-consumption every tick — unless
+            # the hardware has drifted from what we believe we applied (e.g. a
+            # transport reconnect clobbered the mode write). verify_applied() returns
+            # None when the driver can't tell; only an explicit False breaks the hold.
             if (
                 action == BatteryAction.SELF_USE
                 and self._status.applied_action == BatteryAction.SELF_USE
                 and not self._status.degraded
             ):
-                self._status.note = "holding_self_use"
-                return
+                if await self.bc.verify_applied() is not False:
+                    self._status.note = "holding_self_use"
+                    return
+                _LOGGER.warning(
+                    "Self-use hold: hardware mode drifted from applied state — re-issuing"
+                )
 
             if await self._apply(action, power_w):
                 self._status.applied_action = action

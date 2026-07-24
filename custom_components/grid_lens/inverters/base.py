@@ -166,6 +166,17 @@ class InverterController(ABC):
         """
         return False
 
+    async def verify_mode(self, action: BatteryAction) -> Optional[bool]:
+        """Does the *live* hardware mode still match a previously commanded ``action``?
+
+        A fire-and-forget command (e.g. an MQTT publish) can be lost or clobbered by
+        a transport reconnect without the driver ever seeing an error — this lets the
+        guardrail notice hardware drifted away from what it believes was applied.
+        Returns ``None`` when the driver can't tell (unsupported, or the read failed);
+        callers must treat ``None`` as inconclusive, never as a mismatch.
+        """
+        return None
+
     # --------------------------------------------------------------------- helper
     async def test_connection(self) -> tuple[bool, str]:
         try:
