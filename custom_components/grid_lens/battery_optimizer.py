@@ -48,6 +48,172 @@ from typing import Dict, List
 _LOGGER = logging.getLogger(__name__)
 
 
+def _reprice_slot(row: Dict, delta_kwh: float) -> tuple:
+    """Recompute a slot's import/export kWh and $ cost after shifting
+    ``delta_kwh`` of deferrable-load energy into (positive) or out of
+    (negative) it, holding battery charge/discharge and solar/load fixed.
+    Returns ``(new_import_kwh, new_export_kwh, new_cost)`` where
+    ``cost = import_cost - export_credit``.
+    """
+    net = (row['import_kwh'] - row['export_kwh']) + delta_kwh
+    new_i = max(0.0, net)
+    new_e = max(0.0, -net)
+    cost = new_i * row['import_rate'] - new_e * row['export_rate']
+    return new_i, new_e, cost
+
+
+def _slot_marginal_tiers(schedule: List[Dict], dev_idx: int, slots: List[int], cap_kwh: float) -> list:
+    """Split each slot's [0, cap_kwh] deferrable capacity into a cheap tier —
+    the amount absorbable without inducing any grid import at all, i.e. the
+    solar/export headroom already sitting in that slot, priced at its
+    opportunity cost (export_rate) — and an expensive tier for any remainder,
+    priced at import_rate. This mirrors the LP's own capped-rate tranche
+    trick (free tranche + over-cap tranche) at the level of a single slot.
+
+    Returns a flat list of ``(unit_cost, slot, tier_capacity)`` so a caller can
+    sort by cost and fill greedily — that greedy fill finds the true
+    cost-minimising arrangement of a *fixed total* across these slots, so a
+    consolidation built from it can only cost the same or less than whatever
+    arrangement the LP originally happened to land on.
+    """
+    tiers = []
+    for t in slots:
+        row = schedule[t]
+        old_def = row['deferrable_per_device'][dev_idx]
+        # s = the deferrable level at which this slot's net import/export
+        # would sit at exactly zero — i.e. how much of [0, cap_kwh] is
+        # "free" (comes from otherwise-exported solar) rather than grid.
+        s = old_def + row['export_kwh'] - row['import_kwh']
+        s = max(0.0, min(cap_kwh, s))
+        if s > 1e-9:
+            tiers.append((row['export_rate'], t, s))
+        if cap_kwh - s > 1e-9:
+            tiers.append((row['import_rate'], t, cap_kwh - s))
+    return tiers
+
+
+def _front_load_device_day(schedule: List[Dict], dev_idx: int, slots: List[int], cap_kwh: float) -> None:
+    """Rearrange device ``dev_idx``'s deferrable energy across ``slots`` (one
+    calendar day's eligible slots) into the cheapest possible arrangement of
+    the SAME total, only committing if doing so does not increase total cost
+    across the touched slots. Ties are expected and are the point: def_i has
+    zero direct objective cost, so the LP is often indifferent to how it's
+    split across equally-free hours — this picks the least-fragmented of the
+    equally-good options, using chronological order as the tie-break so
+    equally-cheap capacity fills into the earliest slots first (favouring one
+    contiguous block over a scattered one).
+    """
+    if not slots:
+        return
+    total = sum(schedule[t]['deferrable_per_device'][dev_idx] for t in slots)
+    if total <= 1e-9:
+        return
+
+    tiers = _slot_marginal_tiers(schedule, dev_idx, slots, cap_kwh)
+    tiers.sort(key=lambda tup: (tup[0], tup[1]))  # cheapest first, then earliest
+
+    target = {t: 0.0 for t in slots}
+    remaining = total
+    for unit_cost, t, capacity in tiers:
+        if remaining <= 1e-9:
+            break
+        take = min(capacity, remaining)
+        target[t] += take
+        remaining -= take
+
+    old_cost = 0.0
+    new_cost = 0.0
+    changes = {}
+    for t in slots:
+        row = schedule[t]
+        old_def = row['deferrable_per_device'][dev_idx]
+        new_def = target[t]
+        delta = new_def - old_def
+        if abs(delta) < 1e-9:
+            continue
+        new_i, new_e, cost_t = _reprice_slot(row, delta)
+        old_cost += row['import_cost'] - row['export_credit']
+        new_cost += cost_t
+        changes[t] = (new_def, new_i, new_e)
+
+    if not changes or new_cost > old_cost + 1e-6:
+        return  # no-op, or would make the plan more expensive — leave as solved
+
+    for t, (new_def, new_i, new_e) in changes.items():
+        row = schedule[t]
+        row['deferrable_per_device'][dev_idx] = new_def
+        row['deferrable_kwh'] = sum(row['deferrable_per_device'])
+        row['import_kwh'] = new_i
+        row['export_kwh'] = new_e
+        row['import_cost'] = new_i * row['import_rate']
+        row['export_credit'] = new_e * row['export_rate']
+
+
+def consolidate_deferrable_schedule(
+    schedule: List[Dict],
+    deferrable_loads: List[Dict],
+    *,
+    dt: float,
+    slots_per_day: int,
+    protected_hours=None,
+) -> None:
+    """Post-process pass: collapse each deferrable device's fragmented per-slot
+    LP allocation into the fewest contiguous blocks per calendar day, without
+    ever increasing the plan's total cost.
+
+    Why this exists: def_i has zero direct objective cost in the LP (see the
+    module docstring) — only Σ def_i[t] per device per day is constrained — so
+    whenever several slots in a day carry equal marginal cost for that
+    device's energy (e.g. a whole solar-surplus stretch, or a flat off-peak
+    window), the solver is mathematically indifferent to how it splits the
+    day's total between them. In practice this produces schedules that flick a
+    real EV charger or pool pump on and off across the day — provably no
+    cheaper than one continuous block, but with none of the real-world
+    wear/inconvenience of that modelled. Found live 2026-07-24: the advisory
+    card's per-device on/off timeline showed an EV charger toggling full-power
+    on/off/on/off across an afternoon with identical $0 marginal cost either
+    way (GRIDLENS_CHECKLIST.md).
+
+    This is a mutate-in-place, pure-Python pass over the already-solved
+    ``schedule`` (no re-solve, no scipy/numpy dependency — testable without
+    the LXC). It re-derives each touched slot's import/export kWh from the
+    same energy-balance equation the LP itself uses (holding battery
+    charge/discharge and solar/load fixed) and only commits a consolidation
+    when the recomputed cost across the touched slots is <= the original —
+    ties (the common case) are accepted, anything that would raise the bill
+    is rejected outright. Hard guarantee: net_cost from the returned schedule
+    can only stay the same or improve, never regress.
+
+    Demand-window hours, capped-rate hours, and conditional-credit masked
+    hours are passed in as ``protected_hours`` and left untouched entirely —
+    correctly re-deriving their side constraints (peak-kW, daily free-tranche
+    totals, per-hour import ceilings for a credit) is real LP surgery, out of
+    scope for this cheap post-process. Those slots keep whatever the solver
+    originally produced.
+
+    A real day almost always mixes a cheap/free stretch (solar surplus) with
+    an expensive one (overnight import), so slots are never just grouped by
+    time — each eligible slot's own marginal cost (via
+    ``_slot_marginal_tiers``) decides where energy actually lands; a plain
+    "fill the earliest slots" pass would happily shove energy into an
+    expensive overnight hour and get correctly rejected for the whole day.
+    """
+    protected = protected_hours or set()
+    T = len(schedule)
+    n_days = (T + slots_per_day - 1) // slots_per_day
+    for i, dev in enumerate(deferrable_loads):
+        mask = dev.get('hour_mask')
+        cap_kwh = dev['max_kw'] * dt
+        for d in range(n_days):
+            t0 = d * slots_per_day
+            t1 = min(t0 + slots_per_day, T)
+            eligible = [
+                t for t in range(t0, t1)
+                if (mask[t] if mask else True) and t not in protected
+            ]
+            _front_load_device_day(schedule, i, eligible, cap_kwh)
+
+
 class BatteryOptimizer:
     """LP-based battery scheduler with greedy fallback."""
 
@@ -731,6 +897,21 @@ class BatteryOptimizer:
                 'export_cap_free_kwh': exp_free, 'export_cap_over_kwh': exp_over,
                 'export_cap_free_rate': exp_free_rate, 'export_cap_over_rate': exp_over_rate,
             })
+
+        if N:
+            protected_hours = (
+                set(demand_hours)
+                | {t for cb in cap_blocks for t in cb["hours"]}
+                | {t for cb2 in credit_blocks for t in cb2["hours"]}
+            )
+            consolidate_deferrable_schedule(
+                schedule, deferrable_loads, dt=dt, slots_per_day=slots_per_day,
+                protected_hours=protected_hours,
+            )
+            total_import_kwh = sum(r['import_kwh'] for r in schedule)
+            total_export_kwh = sum(r['export_kwh'] for r in schedule)
+            total_import_cost = sum(r['import_cost'] for r in schedule)
+            total_export_credit = sum(r['export_credit'] for r in schedule)
 
         _LOGGER.warning(
             "%s solved %d hours, %d deferrable devices %s, status=%s",
