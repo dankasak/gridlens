@@ -8,18 +8,24 @@
  * chroma-keys them client-side via canvas so they drop onto the node circles
  * cleanly in both light and dark theme. Cached per URL so it only runs once.
  *
- * EV has no generated icon yet (out of Leonardo credits for today) — it falls
- * back to a dashed ring + mdi placeholder icon until one is supplied via the
- * `icons.ev` config key.
+ * Deferrable-load nodes pick an icon by matching their name (and power/switch
+ * entity ids) against DEFER_ICON_RULES below — e.g. an "EV Mobile Charger" gets
+ * the EV charger icon, a hot water system gets the water heater one. Anything
+ * unmatched keeps the dashed ring + mdi placeholder. `deferrable_icons` maps a
+ * load name onto a built-in key or a URL of your own when the name doesn't say.
  *
  * Config (all optional — defaults match this install's Sigenergy/EVConduit entities):
  *   type: custom:grid-lens-powerflow-card
  *   solar_power_entity, load_power_entity, grid_power_entity,
  *   battery_power_entity, soc_entity, ev_power_entity, ev_active_entity
- *   icons: { solar, battery, home, grid, ev }   // URLs; omit/null = placeholder
+ *   icons: { solar, battery, home, grid, ev, water_heater }  // URLs; omit/null = placeholder
+ *   deferrable_icons: { "Smart Load 01": water_heater }      // load name -> icon key or URL
  *   max_height: 420   // fixed height (px) for the diagram; set 0/null for natural (aspect-ratio) height
  *   max_width: null   // cap (px) on how wide the card grows; set 0/null to fill its container
  *   icon_scale: 1.0   // multiplier on node/icon size (1.5 = 50% bigger); viewBox grows to fit
+ *   font_scale: 1.0   // multiplier on label text size, independent of icon_scale
+ *   name_font_size: null    // px override for the node-name label (e.g. "Battery"); wins over font_scale
+ *   value_font_size: null   // px override for the value label (e.g. "1.23 kW"); wins over font_scale
  */
 
 const _bgCache = new Map();
@@ -60,24 +66,19 @@ function stripWhiteBg(src) {
 }
 
 const MIN_KW = 0.05; // below this, treat a flow as idle (no animation)
-const DEFER_ROW_CY = 420; // y-centre of the deferrable-load node row (below the main diagram)
 
-// Layout: home hub in the middle, four satellites, elbow-curve connectors —
-// fixed geometry, not configurable. This is a POC for one specific dashboard,
-// not a general-purpose card.
-const NODES = {
-  solar:   { cx: 70,  cy: 60,  r: 30, name: 'Solar',   color: '--c-solar' },
-  grid:    { cx: 330, cy: 60,  r: 30, name: 'Grid',    color: '--c-grid' },
-  home:    { cx: 200, cy: 190, r: 42, name: 'Home',    color: '--c-home' },
-  battery: { cx: 70,  cy: 320, r: 30, name: 'Battery', color: '--c-battery' },
-  ev:      { cx: 330, cy: 320, r: 30, name: 'EV',      color: '--c-ev' },
-};
-const PATHS = {
-  solar:   'M70,60 Q70,190 200,190',
-  grid:    'M330,60 Q330,190 200,190',
-  battery: 'M70,320 Q70,190 200,190',
-  ev:      'M200,190 Q330,190 330,320',
-};
+// Deferrable-load nodes have no configured icon of their own, so pick one from what the load
+// is called (falling back to its power/switch entity ids, which often carry the appliance
+// name when the friendly name doesn't). First match wins — keep the specific patterns first.
+// `key` indexes into config.icons; `mdi` is the placeholder used when that icon is unset.
+const DEFER_ICON_RULES = [
+  { re: /(hot[\s_-]*water|water[\s_-]*heat|\bhws\b|boiler|immersion)/i, key: 'water_heater', mdi: 'mdi:water-boiler' },
+  { re: /(\bevse?\b|electric[\s_-]*vehicle|wallbox|\bcharger\b|\bcar\b)/i, key: 'ev', mdi: 'mdi:ev-station' },
+];
+
+// Layout is fully computed (see render()/_bottomActors): Solar + Grid feed the central Home
+// hub from the top; Battery + deferrable loads (+ optional EV) fan out on an even radial arc
+// below it, generic in the item count. The viewBox is derived from the resulting node bounds.
 
 class GridLensPowerFlowCard extends HTMLElement {
   constructor() {
@@ -97,10 +98,19 @@ class GridLensPowerFlowCard extends HTMLElement {
         battery: '/grid_lens/icons/grid-lens-battery.jpg',
         home: '/grid_lens/icons/grid-lens-home.jpg',
         grid: '/grid_lens/icons/grid-lens-grid.jpg',
-        ev: null, // no asset yet — placeholder icon
+        ev: '/grid_lens/icons/grid-lens-ev-charger.jpg',
+        water_heater: '/grid_lens/icons/grid-lens-water-heater.jpg',
       },
       (config && config.icons) || {}
     );
+    // Per-load icon overrides given as a URL are registered under a synthetic `defer:<name>`
+    // key so they go through the same preload/chroma-key path as the built-in icons. Values
+    // that name a built-in key instead ("water_heater") need no registration.
+    for (const [name, val] of Object.entries((config && config.deferrable_icons) || {})) {
+      if (typeof val === 'string' && /^(\/|https?:|data:)/.test(val)) {
+        icons[`defer:${name.trim().toLowerCase()}`] = val;
+      }
+    }
     this._config = Object.assign(
       {
         solar_power_entity: 'sensor.sigen_0_total_pv_power',
@@ -118,9 +128,20 @@ class GridLensPowerFlowCard extends HTMLElement {
         // which GridLens sensor to read (else the card finds the first one exposing the attr).
         deferrable_loads: null,
         deferrable_source_entity: null,
+        // Icon override per deferrable load, keyed by load name (case-insensitive). The value
+        // is either a built-in icons key ('water_heater', 'ev', …) or a URL. Only needed when
+        // the name doesn't match DEFER_ICON_RULES — e.g. a generic "Smart Load 01".
+        deferrable_icons: {},
+        // Show the dedicated EV satellite node (evconduit by default). Set false when the EV
+        // is already represented as a deferrable load (its own switch/plug) to avoid drawing
+        // it twice.
+        show_ev: true,
         max_height: 420, // fixed height (px); set null/0 for natural (aspect-ratio) height
         max_width: null, // fixed width (px); set null/0 to fill the card's container
         icon_scale: 1.0, // multiplier on node/icon size (1.5 = 50% bigger); viewBox grows to fit
+        font_scale: 1.0, // multiplier on label text size, independent of icon_scale
+        name_font_size: null, // px override for the node-name label; wins over font_scale
+        value_font_size: null, // px override for the value label (e.g. "1.23 kW"); wins over font_scale
       },
       config
     );
@@ -214,40 +235,56 @@ class GridLensPowerFlowCard extends HTMLElement {
     };
   }
 
-  _node(key, valueLabel) {
-    const n = NODES[key];
-    // Node centres stay put (the connector paths anchor to them); only the radius
-    // scales, so a bigger icon_scale grows the circle/icon/labels without moving the
-    // layout. render() grows the viewBox height to keep the enlarged labels in frame.
-    const r = n.r * (this._config.icon_scale || 1);
-    const dataUrl = this._imgData[key];
+  // Label font sizes track icon_scale by default so the text stays legible next to enlarged
+  // icons (previously fixed, so it looked tiny at icon_scale 2). font_scale adjusts text size
+  // independently (e.g. bigger icons, same labels), and name_font_size/value_font_size are
+  // explicit px overrides for when a multiplier isn't precise enough.
+  _fs() {
+    const c = this._config;
+    const scale = (c.icon_scale || 1) * (c.font_scale || 1);
+    return {
+      name: c.name_font_size != null ? +c.name_font_size : +(12 * scale).toFixed(1),
+      val: c.value_font_size != null ? +c.value_font_size : +(11 * scale).toFixed(1),
+    };
+  }
+
+  // Generic node renderer, driven by a descriptor { cx, cy, r, colorVar, imgKey, icon,
+  // name, value, dim }. Used for every node (sources, hub, and the radial actors) so the
+  // layout can be fully computed instead of hardcoded per node.
+  _pnode(a) {
+    const fs = this._fs();
+    const nameY = a.cy + a.r + fs.name + 2;
+    const valY = nameY + fs.val + 3;
+    const dataUrl = a.imgKey ? this._imgData[a.imgKey] : null;
     const hasImage = !!dataUrl;
-    const clipId = `pf-clip-${key}`;
-    const image = hasImage
-      ? `<clipPath id="${clipId}"><circle cx="${n.cx}" cy="${n.cy}" r="${r - 3}"/></clipPath>
-         <image href="${dataUrl}" x="${n.cx - r}" y="${n.cy - r}" width="${r * 2}" height="${r * 2}"
+    const clipId = `pf-clip-${Math.round(a.cx)}-${Math.round(a.cy)}`;
+    const inner = hasImage
+      ? `<clipPath id="${clipId}"><circle cx="${a.cx}" cy="${a.cy}" r="${a.r - 3}"/></clipPath>
+         <image href="${dataUrl}" x="${a.cx - a.r}" y="${a.cy - a.r}" width="${a.r * 2}" height="${a.r * 2}"
                 clip-path="url(#${clipId})" preserveAspectRatio="xMidYMid slice"/>`
-      : `<foreignObject x="${n.cx - r}" y="${n.cy - r}" width="${r * 2}" height="${r * 2}">
+      : `<foreignObject x="${a.cx - a.r}" y="${a.cy - a.r}" width="${a.r * 2}" height="${a.r * 2}">
            <div xmlns="http://www.w3.org/1999/xhtml" class="placeholder-icon">
-             <ha-icon icon="mdi:${key === 'ev' ? 'ev-station' : 'help-circle-outline'}"></ha-icon>
+             <ha-icon icon="${a.icon || 'mdi:help-circle-outline'}"></ha-icon>
            </div>
          </foreignObject>`;
     return `
-      <g class="node">
-        <circle class="ring ${hasImage ? '' : 'placeholder'}" cx="${n.cx}" cy="${n.cy}" r="${r}"
-                style="--nc: var(${n.color})"/>
-        ${image}
-        <text x="${n.cx}" y="${n.cy + r + 16}" text-anchor="middle" class="node-name">${n.name}</text>
-        <text x="${n.cx}" y="${n.cy + r + 30}" text-anchor="middle" class="node-value">${valueLabel}</text>
+      <g class="node${a.dim ? ' dim' : ''}">
+        <circle class="ring ${hasImage ? '' : 'placeholder'}" cx="${a.cx}" cy="${a.cy}" r="${a.r}"
+                style="--nc: var(${a.colorVar})"/>
+        ${inner}
+        <text x="${a.cx}" y="${nameY}" text-anchor="middle" class="node-name" style="font-size:${fs.name}px">${a.name}</text>
+        <text x="${a.cx}" y="${valY}" text-anchor="middle" class="node-value" style="font-size:${fs.val}px">${a.value}</text>
       </g>`;
   }
 
-  _connectorSvg(key, conn) {
-    const d = PATHS[key];
-    const n = NODES[key];
-    const dur = Math.max(0.4, 2.0 / (0.4 + conn.kw)).toFixed(2);
-    const cls = ['flow', conn.active ? 'active' : 'idle', conn.reverse ? 'reverse' : ''].join(' ').trim();
-    return `<path class="${cls}" d="${d}" style="--nc: var(${n.color}); animation-duration: ${dur}s"/>`;
+  // A straight radial spoke from a peripheral node to the hub. Animation flows node→hub by
+  // default (a source/discharge feeding Home); `reverse` flows hub→node (import, battery
+  // charge, or a load drawing from Home).
+  _spoke(a, hub) {
+    const dur = Math.max(0.4, 2.0 / (0.4 + a.kw)).toFixed(2);
+    const cls = ['flow', a.active ? 'active' : 'idle', a.reverse ? 'reverse' : ''].join(' ').trim();
+    return `<path class="${cls}" d="M${a.cx.toFixed(1)},${a.cy.toFixed(1)} L${hub.cx},${hub.cy}"
+             style="--nc: var(${a.colorVar}); animation-duration: ${dur}s"/>`;
   }
 
   // Type-1 deferrable loads: a dynamic row of nodes below the main diagram, each a sub-load
@@ -279,16 +316,46 @@ class GridLensPowerFlowCard extends HTMLElement {
       .map((d) => ({ name: d.name, power_entity: d.power_entity, switch_entity: d.switch_entity || null }));
   }
 
-  _deferLayout() {
-    const loads = this._resolveDeferLoads();
-    const n = loads.length;
-    if (!n) return [];
+  // Which icon a deferrable load draws with: an explicit deferrable_icons entry wins,
+  // otherwise the name/entity keyword rules, otherwise the generic plug placeholder.
+  // Returns { imgKey, mdi } — imgKey null means "no image, use the mdi glyph".
+  _deferIcon(ld) {
+    const overrides = this._config.deferrable_icons || {};
+    const name = (ld.name || '').trim();
+    const hit = Object.keys(overrides).find((k) => k.trim().toLowerCase() === name.toLowerCase());
+    if (hit) {
+      const val = overrides[hit];
+      if (!val) return { imgKey: null, mdi: 'mdi:power-plug' };
+      // A built-in key resolves directly; anything else was registered as `defer:<name>`.
+      const imgKey = this._config.icons[val] !== undefined ? val : `defer:${hit.trim().toLowerCase()}`;
+      return { imgKey, mdi: 'mdi:power-plug' };
+    }
+    const haystack = [name, ld.power_entity || '', ld.switch_entity || ''].join(' ');
+    for (const rule of DEFER_ICON_RULES) {
+      if (rule.re.test(haystack)) return { imgKey: rule.key, mdi: rule.mdi };
+    }
+    return { imgKey: null, mdi: 'mdi:power-plug' };
+  }
+
+  // The "consumer" group — Battery + every deferrable load (+ the optional EV node) — placed
+  // on an even radial arc below the Home hub. Generic in the count: 1 item sits straight down,
+  // N items fan out symmetrically, and the arc radius is grown so nodes never overlap. Returns
+  // positioned actor descriptors (the same shape _pnode/_spoke consume).
+  _bottomActors(f, conn, hub) {
     const scale = this._config.icon_scale || 1;
-    const r = 26 * scale;
-    const cy = DEFER_ROW_CY;
-    const x0 = 60, x1 = 340;
-    return loads.map((ld, i) => {
-      const cx = n === 1 ? 200 : Math.round(x0 + i * ((x1 - x0) / (n - 1)));
+    const actors = [{
+      baseR: 30, colorVar: '--c-battery', imgKey: 'battery', icon: 'mdi:battery',
+      name: 'Battery', value: conn.battery.label,
+      active: conn.battery.active, reverse: conn.battery.reverse, kw: conn.battery.kw, dim: false,
+    }];
+    if (this._config.show_ev !== false) {
+      actors.push({
+        baseR: 26, colorVar: '--c-ev', imgKey: 'ev', icon: 'mdi:ev-station',
+        name: 'EV', value: conn.ev.label,
+        active: conn.ev.active, reverse: true, kw: conn.ev.kw, dim: !conn.ev.active,
+      });
+    }
+    this._resolveDeferLoads().forEach((ld, i) => {
       const kw = this._toKw(ld.power_entity);
       let on;
       if (ld.switch_entity) {
@@ -297,38 +364,31 @@ class GridLensPowerFlowCard extends HTMLElement {
       } else {
         on = kw > MIN_KW;
       }
-      return {
-        cx, cy, r, on, kw,
-        name: ld.name || `Load ${i + 1}`,
-        color: `--c-def${(i % 4) + 1}`,
-        // Elbow from Home (200,190): horizontal toward the node's x, then straight down —
-        // same style as the fixed satellites' connectors.
-        path: `M200,190 Q${cx},190 ${cx},${cy}`,
-      };
+      const ic = this._deferIcon(ld);
+      actors.push({
+        baseR: 26, colorVar: `--c-def${(i % 4) + 1}`, imgKey: ic.imgKey, icon: ic.mdi,
+        name: ld.name || `Load ${i + 1}`, value: `${kw.toFixed(2)} kW`,
+        active: on && kw > MIN_KW, reverse: true, kw, dim: !on,
+      });
     });
-  }
 
-  _deferConnectorSvg(d) {
-    const active = d.on && d.kw > MIN_KW;
-    const dur = Math.max(0.4, 2.0 / (0.4 + d.kw)).toFixed(2);
-    const cls = ['flow', active ? 'active' : 'idle'].join(' ');
-    return `<path class="${cls}" d="${d.path}" style="--nc: var(${d.color}); animation-duration: ${dur}s"/>`;
-  }
-
-  _deferNodeSvg(d) {
-    const label = `${d.kw.toFixed(2)} kW`;
-    const dim = d.on ? '' : ' dim';
-    return `
-      <g class="node${dim}">
-        <circle class="ring" cx="${d.cx}" cy="${d.cy}" r="${d.r}" style="--nc: var(${d.color})"/>
-        <foreignObject x="${d.cx - d.r}" y="${d.cy - d.r}" width="${d.r * 2}" height="${d.r * 2}">
-          <div xmlns="http://www.w3.org/1999/xhtml" class="placeholder-icon">
-            <ha-icon icon="mdi:power-plug"></ha-icon>
-          </div>
-        </foreignObject>
-        <text x="${d.cx}" y="${d.cy + d.r + 15}" text-anchor="middle" class="node-name">${d.name}</text>
-        <text x="${d.cx}" y="${d.cy + d.r + 28}" text-anchor="middle" class="node-value">${label}</text>
-      </g>`;
+    const M = actors.length;
+    const maxR = Math.max(...actors.map((a) => a.baseR * scale));
+    // Even angular spread, centred straight-down (phi=0); wider fan for more items.
+    const spanDeg = M <= 1 ? 0 : Math.min(170, 52 * (M - 1));
+    const span = (spanDeg * Math.PI) / 180;
+    let R = 120 + maxR; // base clearance from the hub centre
+    if (M > 1) {
+      const dphi = span / (M - 1);
+      R = Math.max(R, (2 * maxR + 18) / (2 * Math.sin(dphi / 2))); // guarantee no overlap
+    }
+    actors.forEach((a, i) => {
+      const phi = M === 1 ? 0 : (-span / 2 + (i * span) / (M - 1));
+      a.cx = hub.cx + R * Math.sin(phi);
+      a.cy = hub.cy + R * Math.cos(phi);
+      a.r = a.baseR * scale;
+    });
+    return actors;
   }
 
   render() {
@@ -373,8 +433,15 @@ class GridLensPowerFlowCard extends HTMLElement {
           width:100%; height:100%; display:flex; align-items:center; justify-content:center;
         }
         .placeholder-icon ha-icon { color: var(--secondary-text-color); --mdc-icon-size: 30px; }
-        .node-name { font-size:12px; font-weight:600; fill:var(--primary-text-color); }
-        .node-value { font-size:10.5px; fill:var(--secondary-text-color); }
+        /* Halo: paint a card-background-coloured stroke behind the glyphs so an animated
+           flow line passing under a label is knocked out instead of showing through it.
+           font-size is set inline per node so it can scale with icon_scale. */
+        .node-name, .node-value {
+          paint-order: stroke; stroke: var(--card-background-color); stroke-width: 4px;
+          stroke-linejoin: round;
+        }
+        .node-name { font-weight:600; fill:var(--primary-text-color); }
+        .node-value { fill:var(--secondary-text-color); }
         .flow { fill:none; stroke-width:2; }
         .flow.idle { stroke:var(--divider-color); opacity:.6; }
         .flow.active {
@@ -390,30 +457,42 @@ class GridLensPowerFlowCard extends HTMLElement {
       </style>
     `;
 
-    const nodesHtml = [
-      this._node('solar', conn.solar.label),
-      this._node('grid', conn.grid.label),
-      this._node('battery', conn.battery.label),
-      this._node('ev', conn.ev.label),
-      this._node('home', `${f.loadKw.toFixed(2)} kW`),
-    ].join('');
-
-    const connectorsHtml = ['solar', 'grid', 'battery', 'ev']
-      .map((key) => this._connectorSvg(key, conn[key])).join('');
-
-    // Type-1 deferrable loads: an extra row below the main diagram. Connectors drawn first
-    // (under the fixed nodes), then their nodes.
-    const defer = this._deferLayout();
-    const deferConnHtml = defer.map((d) => this._deferConnectorSvg(d)).join('');
-    const deferNodesHtml = defer.map((d) => this._deferNodeSvg(d)).join('');
-
-    // The lowest-drawn element is either the bottom satellites' value label (cy 320 + r + 30)
-    // or, when deferrable loads are present, their row's value label (DEFER_ROW_CY + r + 28).
-    // Grow the viewBox height to match icon_scale so labels never clip; width stays 400.
     const scale = this._config.icon_scale || 1;
-    const baseH = Math.max(380, Math.ceil(356 + 30 * scale));
-    const deferH = defer.length ? Math.ceil(DEFER_ROW_CY + 26 * scale + 40) : 0;
-    const vbH = Math.max(baseH, deferH);
+    const fs = this._fs();
+
+    // Home hub in the centre; Solar and Grid are the two top sources feeding it.
+    const hub = {
+      cx: 200, cy: 190, r: 42 * scale, colorVar: '--c-home', imgKey: 'home', icon: null,
+      name: 'Home', value: `${f.loadKw.toFixed(2)} kW`, dim: false,
+    };
+    const sources = [
+      { cx: 70, cy: 60, r: 30 * scale, colorVar: '--c-solar', imgKey: 'solar', icon: null,
+        name: 'Solar', value: conn.solar.label, active: conn.solar.active, reverse: false, kw: conn.solar.kw, dim: false },
+      { cx: 330, cy: 60, r: 30 * scale, colorVar: '--c-grid', imgKey: 'grid', icon: null,
+        name: 'Grid', value: conn.grid.label, active: conn.grid.active, reverse: conn.grid.reverse, kw: conn.grid.kw, dim: false },
+    ];
+    // Consumer group (Battery + deferrable loads + optional EV), spread evenly on a radial arc.
+    const actors = this._bottomActors(f, conn, hub);
+    const peripherals = [...sources, ...actors];
+
+    // Spokes under nodes; hub drawn last-of-the-fixed so its icon sits above the spoke ends.
+    const connectorsHtml = peripherals.map((a) => this._spoke(a, hub)).join('');
+    const nodesHtml = [...sources, hub, ...actors].map((a) => this._pnode(a)).join('');
+
+    // Fully computed viewBox: fit every node's circle + its labels below it, with padding.
+    // Keeps the diagram framed for any actor count / icon_scale, even when nodes fall outside
+    // the old fixed 400-wide box.
+    const labelDrop = fs.name + fs.val + 8;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const a of [...peripherals, hub]) {
+      minX = Math.min(minX, a.cx - a.r);
+      maxX = Math.max(maxX, a.cx + a.r);
+      minY = Math.min(minY, a.cy - a.r);
+      maxY = Math.max(maxY, a.cy + a.r + labelDrop);
+    }
+    const pad = 10;
+    const vb = `${(minX - pad).toFixed(1)} ${(minY - pad).toFixed(1)} ` +
+               `${(maxX - minX + 2 * pad).toFixed(1)} ${(maxY - minY + 2 * pad).toFixed(1)}`;
 
     this.shadowRoot.innerHTML = `
       ${styles}
@@ -422,11 +501,9 @@ class GridLensPowerFlowCard extends HTMLElement {
           <span class="title">Power Flow</span>
           <span class="badge">PROOF OF CONCEPT</span>
         </div>
-        <svg viewBox="0 0 400 ${vbH}">
+        <svg viewBox="${vb}">
           ${connectorsHtml}
-          ${deferConnHtml}
           ${nodesHtml}
-          ${deferNodesHtml}
         </svg>
       </ha-card>
     `;
