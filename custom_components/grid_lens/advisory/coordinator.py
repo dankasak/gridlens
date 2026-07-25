@@ -139,14 +139,21 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             self._load_forecaster = HourOfDayLoadForecaster(vector)
         self._meta_refreshed = dt_util.utcnow()
 
-        mgr = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_control")
-        if mgr is not None:
-            await self._refresh_entitlement(mgr)
+        # Both control managers share the same server-side `battery_control` entitlement
+        # (product decision 2026-07-23 — no separate deferrable_control column yet). Poll
+        # once and push to whichever managers exist for this entry.
+        managers = [
+            self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_control"),
+            self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_load_control"),
+        ]
+        managers = [m for m in managers if m is not None]
+        if managers:
+            await self._refresh_entitlement(managers)
 
-    async def _refresh_entitlement(self, mgr) -> None:
-        """Battery control is gated server-side, independent of the plan-comparison
-        tier (see ControlManager.set_entitled) — a paid plan-comparison subscription
-        does not by itself grant battery control. Fails safe on any error by leaving
+    async def _refresh_entitlement(self, managers: list) -> None:
+        """Battery + deferrable-load control are gated server-side, independent of the
+        plan-comparison tier (see ControlManager.set_entitled) — a paid plan-comparison
+        subscription does not by itself grant control. Fails safe on any error by leaving
         entitlement unchanged rather than flipping it: `set_entitled` already defaults
         closed until the first successful check, and a definitive False only comes from
         a real 200 response, so a transient network blip can't yo-yo an already-granted
@@ -169,7 +176,9 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    await mgr.set_entitled(bool(data.get("battery_control", False)))
+                    entitled = bool(data.get("battery_control", False))
+                    for mgr in managers:
+                        await mgr.set_entitled(entitled)
         except Exception as err:  # noqa: BLE001 — advisory mode must never break on this
             _LOGGER.debug("Advisory: entitlement check failed, leaving unchanged: %s", err)
 
@@ -482,11 +491,14 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             conditional_credits=conditional_credits,
         )
 
-        # Feed the fresh plan to the control manager (it acts on it only while the master
-        # switch is on; keeping it current means enabling control acts immediately).
+        # Feed the fresh plan to the control managers (they act on it only while their
+        # master switch is on; keeping it current means enabling control acts immediately).
         mgr = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_control")
         if mgr is not None:
             mgr.set_plan(result.plan)
+        load_mgr = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_load_control")
+        if load_mgr is not None:
+            load_mgr.set_plan(result.plan)
 
         next_action = result.plan[0].action.value if result.plan else "self_use"
         next_power = result.plan[0].power_w if result.plan else 0.0

@@ -77,7 +77,7 @@
       },
       "device_power": {
         "title": "Deferrable Load Power Limits & Availability",
-        "description": "For each device, enter its maximum rated power (kW) and the hours it is **available to run**. Power caps how much the optimizer can assign in any hour; availability stops it scheduling a device when it can't run (e.g. an EV that is only plugged in overnight).\n\nHours format: `all`, or clock ranges like `18-08` (6pm–8am, wraps midnight) or `0-6,12-14`. End hour is exclusive.\n\n{devices}",
+        "description": "For each device, enter its maximum rated power (kW) and the hours it is **available to run**. Power caps how much the optimizer can assign in any hour; availability stops it scheduling a device when it can't run (e.g. an EV that is only plugged in overnight).\n\nHours format: `all`, or clock ranges like `18-08` (6pm–8am, wraps midnight) or `0-6,12-14`. End hour is exclusive.\n\nOptionally pick a **control switch** for a device: a `switch.*` entity GridLens will turn on/off to run that load at the optimal times (each gets its own default-off master switch you enable when ready). Leave blank for forecast-only devices.\n\n{devices}",
         "data": {
           "max_kw_0": "Device 1 — max power",
           "hours_0": "Device 1 — available hours",
@@ -98,7 +98,17 @@
           "max_kw_8": "Device 9 — max power",
           "hours_8": "Device 9 — available hours",
           "max_kw_9": "Device 10 — max power",
-          "hours_9": "Device 10 — available hours"
+          "hours_9": "Device 10 — available hours",
+          "switch_0": "Device 1 — control switch (optional)",
+          "switch_1": "Device 2 — control switch (optional)",
+          "switch_2": "Device 3 — control switch (optional)",
+          "switch_3": "Device 4 — control switch (optional)",
+          "switch_4": "Device 5 — control switch (optional)",
+          "switch_5": "Device 6 — control switch (optional)",
+          "switch_6": "Device 7 — control switch (optional)",
+          "switch_7": "Device 8 — control switch (optional)",
+          "switch_8": "Device 9 — control switch (optional)",
+          "switch_9": "Device 10 — control switch (optional)"
         }
       },
       "current_plan": {
@@ -187,7 +197,7 @@
       },
       "device_power": {
         "title": "Deferrable Load Power Limits & Availability",
-        "description": "For each device, enter its maximum rated power (kW) and the hours it is available to run.\n\nHours format: `all`, or clock ranges like `18-08` (6pm–8am, wraps midnight) or `0-6,12-14`. End hour is exclusive.\n\n{devices}",
+        "description": "For each device, enter its maximum rated power (kW) and the hours it is available to run.\n\nHours format: `all`, or clock ranges like `18-08` (6pm–8am, wraps midnight) or `0-6,12-14`. End hour is exclusive.\n\nOptionally pick a **control switch** for a device: a `switch.*` entity GridLens will turn on/off to run that load at the optimal times (each gets its own default-off master switch you enable when ready). Leave blank for forecast-only devices.\n\n{devices}",
         "data": {
           "max_kw_0": "Device 1 — max power",
           "hours_0": "Device 1 — available hours",
@@ -208,7 +218,17 @@
           "max_kw_8": "Device 9 — max power",
           "hours_8": "Device 9 — available hours",
           "max_kw_9": "Device 10 — max power",
-          "hours_9": "Device 10 — available hours"
+          "hours_9": "Device 10 — available hours",
+          "switch_0": "Device 1 — control switch (optional)",
+          "switch_1": "Device 2 — control switch (optional)",
+          "switch_2": "Device 3 — control switch (optional)",
+          "switch_3": "Device 4 — control switch (optional)",
+          "switch_4": "Device 5 — control switch (optional)",
+          "switch_5": "Device 6 — control switch (optional)",
+          "switch_6": "Device 7 — control switch (optional)",
+          "switch_7": "Device 8 — control switch (optional)",
+          "switch_8": "Device 9 — control switch (optional)",
+          "switch_9": "Device 10 — control switch (optional)"
         }
       },
       "current_plan": {

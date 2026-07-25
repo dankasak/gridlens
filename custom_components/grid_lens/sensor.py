@@ -10,7 +10,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, PLANS, METRICS, METRIC_INFO, PLAN_NAMES
+from .const import (
+    DOMAIN, PLANS, METRICS, METRIC_INFO, PLAN_NAMES,
+    CONF_DEFERRABLE_LOAD_SENSORS, CONF_DEFERRABLE_LOAD_MAX_KW,
+    CONF_DEFERRABLE_LOAD_SWITCHES,
+)
+from .entity_lookup import resolve_power_sensor, resolve_device_name
 from .plan_sensors import PlanMetricSensor
 
 _LOGGER = logging.getLogger(__name__)
@@ -109,13 +114,43 @@ class CurrentPlanCostSensor(GridLensSensorBase):
             "export_sensor": self._entry.data.get("grid_export_sensor"),
             "import_price_sensor": self._entry.data.get("import_price_sensor"),
             "export_price_sensor": self._entry.data.get("export_price_sensor"),
+            # Deferrable loads with their auto-discovered real-time power sensor — consumed by
+            # the power-flow card so it shows each load's live consumption without hand-config.
+            "deferrable_loads": self._build_deferrable_loads(),
         }
-        
+
         # Add status message if waiting for data
         if self.coordinator.data.get("status") == "waiting_for_data":
             attrs["status"] = self.coordinator.data.get("message", "Waiting for data")
-        
+
         return attrs
+
+    def _build_deferrable_loads(self) -> list[dict[str, Any]]:
+        """Each configured deferrable device + its auto-resolved power sensor.
+
+        power_entity is discovered from the device behind the configured energy sensor (or the
+        control switch) via entity_lookup.resolve_power_sensor — None if it can't be matched
+        confidently. controllable = a control switch is configured (a type-1 on/off load)."""
+        data = self._entry.data
+        sensors = data.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or []
+        max_kw = data.get(CONF_DEFERRABLE_LOAD_MAX_KW, []) or []
+        switches = data.get(CONF_DEFERRABLE_LOAD_SWITCHES, []) or []
+        out: list[dict[str, Any]] = []
+        for i, sensor_id in enumerate(sensors):
+            sw = switches[i] if i < len(switches) else ""
+            try:
+                power = resolve_power_sensor(self.hass, sensor_id, sw or None)
+            except Exception:  # noqa: BLE001 — discovery is best-effort, never break the sensor
+                power = None
+            out.append({
+                "name": resolve_device_name(self.hass, sw or None, sensor_id) or sensor_id,
+                "energy_entity": sensor_id,
+                "power_entity": power,
+                "switch_entity": sw or None,
+                "max_kw": float(max_kw[i]) if i < len(max_kw) else None,
+                "controllable": bool(sw),
+            })
+        return out
 
 
 class BestAlternativePlanSensor(GridLensSensorBase):

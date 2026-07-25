@@ -155,6 +155,12 @@ CONF_INVERTER_TRANSPORT = "inverter_transport"
 CONF_DEFERRABLE_LOAD_SENSORS = "deferrable_load_sensors"  # list of sensor IDs
 CONF_DEFERRABLE_LOAD_MAX_KW = "deferrable_load_max_kw"    # list of max kW, parallel to sensors
 CONF_DEFERRABLE_LOAD_HOURS = "deferrable_load_hours"      # list of hour specs, parallel to sensors
+# Optional per-device control switch (switch.* entity), parallel to sensors. A device with
+# a switch configured becomes a "type 1" controllable simple load: GridLens turns it on/off
+# per the optimized schedule (gated by its own default-OFF master switch). Empty string = no
+# switch = forecast-only, exactly like before this feature. EV/OCPP chargers with richer
+# control (charge-current setpoints) are a later, separate mechanism — not this switch list.
+CONF_DEFERRABLE_LOAD_SWITCHES = "deferrable_load_switches"  # list of switch IDs ("" = none)
 
 
 def parse_hours_spec(spec: str | None) -> set[int] | None:

@@ -78,6 +78,11 @@ class DispatchInterval:
     grid_charge_w: float = 0.0
     export_w: float = 0.0
     import_rate: Optional[float] = None
+    # Planned average power (W) for each configured deferrable device this slot, in the
+    # same device order as CONF_DEFERRABLE_LOAD_SENSORS. Consumed by LoadControlManager to
+    # decide each device's switch on/off (via its own ≥50%-of-max_kw threshold). The battery
+    # executor never reads this; it's a parallel control channel for simple on/off loads.
+    deferrable_w: list[float] = field(default_factory=list)
 
 
 @dataclass

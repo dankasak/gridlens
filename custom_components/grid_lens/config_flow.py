@@ -39,6 +39,7 @@ from .const import (
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_HOURS,
+    CONF_DEFERRABLE_LOAD_SWITCHES,
     CONF_CURRENT_PLAN,
     parse_hours_spec,
     CONF_GRIDLENS_EMAIL,
@@ -347,8 +348,13 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "invalid_hours"
             if not errors:
                 max_kw_list = [float(user_input.get(f"max_kw_{i}", 3.5)) for i in range(len(selected))]
+                # Optional control switch per device ("" = forecast-only, no actuation).
+                switches_list = [
+                    str(user_input.get(f"switch_{i}", "") or "") for i in range(len(selected))
+                ]
                 self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_HOURS] = hours_list
+                self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
                 return await self.async_step_current_plan()
 
         schema_dict = {}
@@ -365,6 +371,11 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 )
             )
             schema_dict[vol.Optional(f"hours_{i}", default="all")] = selector.TextSelector()
+            # Optional: a switch.* entity GridLens turns on/off to actuate this load. Leave
+            # unset for forecast-only devices (e.g. an ESS-managed port with no HA switch).
+            schema_dict[vol.Optional(f"switch_{i}")] = selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="switch")
+            )
 
         return self.async_show_form(
             step_id="device_power",
@@ -739,11 +750,17 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
 
         existing_max_kw = entry_data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
         existing_hours = entry_data.get(CONF_DEFERRABLE_LOAD_HOURS, [])
+        existing_switches = entry_data.get(CONF_DEFERRABLE_LOAD_SWITCHES, [])
         # Existing lists are keyed by position in the previously saved sensor
         # list; map by sensor_id so reordering/removing devices keeps defaults.
         prev_sensors = entry_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
         prev_kw = {s: existing_max_kw[i] for i, s in enumerate(prev_sensors) if i < len(existing_max_kw)}
         prev_hours = {s: existing_hours[i] for i, s in enumerate(prev_sensors) if i < len(existing_hours)}
+        prev_switch = {
+            s: existing_switches[i]
+            for i, s in enumerate(prev_sensors)
+            if i < len(existing_switches) and existing_switches[i]
+        }
 
         errors: dict[str, str] = {}
         if user_input is not None:
@@ -758,8 +775,12 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 errors["base"] = "invalid_hours"
             if not errors:
                 max_kw_list = [float(user_input.get(f"max_kw_{i}", 3.5)) for i in range(len(selected))]
+                switches_list = [
+                    str(user_input.get(f"switch_{i}", "") or "") for i in range(len(selected))
+                ]
                 self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_HOURS] = hours_list
+                self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
                 return await self.async_step_current_plan()
 
         schema_dict = {}
@@ -778,6 +799,16 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             )
             schema_dict[vol.Optional(f"hours_{i}", default=prev_hours.get(sensor_id, "all"))] = (
                 selector.TextSelector()
+            )
+            # Optional control switch; pre-fill the previously saved one (vol.Optional with
+            # no default when unset, so the field renders empty rather than forcing a value).
+            prev_sw = prev_switch.get(sensor_id)
+            switch_key = (
+                vol.Optional(f"switch_{i}", default=prev_sw)
+                if prev_sw else vol.Optional(f"switch_{i}")
+            )
+            schema_dict[switch_key] = selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="switch")
             )
 
         return self.async_show_form(

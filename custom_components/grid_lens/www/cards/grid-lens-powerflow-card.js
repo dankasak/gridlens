@@ -60,6 +60,7 @@ function stripWhiteBg(src) {
 }
 
 const MIN_KW = 0.05; // below this, treat a flow as idle (no animation)
+const DEFER_ROW_CY = 420; // y-centre of the deferrable-load node row (below the main diagram)
 
 // Layout: home hub in the middle, four satellites, elbow-curve connectors —
 // fixed geometry, not configurable. This is a POC for one specific dashboard,
@@ -109,6 +110,14 @@ class GridLensPowerFlowCard extends HTMLElement {
         soc_entity: 'sensor.sigen_plant_ess_soc',
         ev_power_entity: 'sensor.evconduit_charge_rate',
         ev_active_entity: 'sensor.evconduit_is_charging',
+        // Type-1 deferrable loads (simple on/off appliances), shown as their own nodes off
+        // Home with live power. By default (null) the card AUTO-DISCOVERS them from a GridLens
+        // sensor's `deferrable_loads` attribute (name + auto-resolved power_entity + switch),
+        // so no hand-config is needed. Set an explicit array of { name, power_entity,
+        // switch_entity? } to override, or [] to hide the row. deferrable_source_entity pins
+        // which GridLens sensor to read (else the card finds the first one exposing the attr).
+        deferrable_loads: null,
+        deferrable_source_entity: null,
         max_height: 420, // fixed height (px); set null/0 for natural (aspect-ratio) height
         max_width: null, // fixed width (px); set null/0 to fill the card's container
         icon_scale: 1.0, // multiplier on node/icon size (1.5 = 50% bigger); viewBox grows to fit
@@ -145,7 +154,15 @@ class GridLensPowerFlowCard extends HTMLElement {
       c.solar_power_entity, c.load_power_entity, c.grid_power_entity,
       c.battery_power_entity, c.soc_entity, c.ev_power_entity, c.ev_active_entity,
     ];
-    const sig = watch.map((e) => (hass.states[e] ? hass.states[e].state : '')).join('|');
+    if (c.deferrable_source_entity) watch.push(c.deferrable_source_entity);
+    const loads = this._resolveDeferLoads();
+    for (const ld of loads) {
+      if (ld && ld.power_entity) watch.push(ld.power_entity);
+      if (ld && ld.switch_entity) watch.push(ld.switch_entity);
+    }
+    // Include the resolved load identity so a reconfigure (set of loads changes) re-renders.
+    const sig = watch.map((e) => (hass.states[e] ? hass.states[e].state : '')).join('|')
+      + '#' + loads.map((l) => l.power_entity).join(',');
     if (sig !== this._sig) { this._sig = sig; this.render(); }
   }
 
@@ -233,6 +250,87 @@ class GridLensPowerFlowCard extends HTMLElement {
     return `<path class="${cls}" d="${d}" style="--nc: var(${n.color}); animation-duration: ${dur}s"/>`;
   }
 
+  // Type-1 deferrable loads: a dynamic row of nodes below the main diagram, each a sub-load
+  // of Home. Positions are computed from the count so 1..N loads spread evenly across the
+  // width; each cycles through the --c-defN palette (matches the advisory card's device
+  // colours). Returns [{ cx, cy, r, name, kw, on, color, path }].
+  // The effective deferrable-load list: an explicit config array wins; otherwise read the
+  // `deferrable_loads` attribute the GridLens integration publishes (auto-discovered power
+  // sensors), from the pinned source entity or the first sensor exposing it. Only loads with
+  // a real power_entity are drawable.
+  _resolveDeferLoads() {
+    const c = this._config;
+    if (Array.isArray(c.deferrable_loads)) return c.deferrable_loads;
+    const hass = this._hass;
+    if (!hass) return [];
+    let attr = null;
+    if (c.deferrable_source_entity && hass.states[c.deferrable_source_entity]) {
+      attr = hass.states[c.deferrable_source_entity].attributes.deferrable_loads;
+    } else {
+      for (const eid of Object.keys(hass.states)) {
+        if (!eid.startsWith('sensor.')) continue;
+        const a = hass.states[eid].attributes;
+        if (a && Array.isArray(a.deferrable_loads)) { attr = a.deferrable_loads; break; }
+      }
+    }
+    if (!Array.isArray(attr)) return [];
+    return attr
+      .filter((d) => d && d.power_entity)
+      .map((d) => ({ name: d.name, power_entity: d.power_entity, switch_entity: d.switch_entity || null }));
+  }
+
+  _deferLayout() {
+    const loads = this._resolveDeferLoads();
+    const n = loads.length;
+    if (!n) return [];
+    const scale = this._config.icon_scale || 1;
+    const r = 26 * scale;
+    const cy = DEFER_ROW_CY;
+    const x0 = 60, x1 = 340;
+    return loads.map((ld, i) => {
+      const cx = n === 1 ? 200 : Math.round(x0 + i * ((x1 - x0) / (n - 1)));
+      const kw = this._toKw(ld.power_entity);
+      let on;
+      if (ld.switch_entity) {
+        const st = this._hass && this._hass.states[ld.switch_entity];
+        on = !!st && String(st.state).toLowerCase() === 'on';
+      } else {
+        on = kw > MIN_KW;
+      }
+      return {
+        cx, cy, r, on, kw,
+        name: ld.name || `Load ${i + 1}`,
+        color: `--c-def${(i % 4) + 1}`,
+        // Elbow from Home (200,190): horizontal toward the node's x, then straight down —
+        // same style as the fixed satellites' connectors.
+        path: `M200,190 Q${cx},190 ${cx},${cy}`,
+      };
+    });
+  }
+
+  _deferConnectorSvg(d) {
+    const active = d.on && d.kw > MIN_KW;
+    const dur = Math.max(0.4, 2.0 / (0.4 + d.kw)).toFixed(2);
+    const cls = ['flow', active ? 'active' : 'idle'].join(' ');
+    return `<path class="${cls}" d="${d.path}" style="--nc: var(${d.color}); animation-duration: ${dur}s"/>`;
+  }
+
+  _deferNodeSvg(d) {
+    const label = `${d.kw.toFixed(2)} kW`;
+    const dim = d.on ? '' : ' dim';
+    return `
+      <g class="node${dim}">
+        <circle class="ring" cx="${d.cx}" cy="${d.cy}" r="${d.r}" style="--nc: var(${d.color})"/>
+        <foreignObject x="${d.cx - d.r}" y="${d.cy - d.r}" width="${d.r * 2}" height="${d.r * 2}">
+          <div xmlns="http://www.w3.org/1999/xhtml" class="placeholder-icon">
+            <ha-icon icon="mdi:power-plug"></ha-icon>
+          </div>
+        </foreignObject>
+        <text x="${d.cx}" y="${d.cy + d.r + 15}" text-anchor="middle" class="node-name">${d.name}</text>
+        <text x="${d.cx}" y="${d.cy + d.r + 28}" text-anchor="middle" class="node-value">${label}</text>
+      </g>`;
+  }
+
   render() {
     if (!this._config) return;
     const f = this._flows();
@@ -255,9 +353,11 @@ class GridLensPowerFlowCard extends HTMLElement {
         :host {
           --c-solar:#f59e0b; --c-grid:#8b7cf6; --c-battery:#22c55e; --c-ev:#06b6d4;
           --c-home: var(--primary-text-color);
+          --c-def1:#e11d48; --c-def2:#0d9488; --c-def3:#7c3aed; --c-def4:#ca8a04;
         }
         :host(.dark) {
           --c-solar:#fbbf24; --c-grid:#a78bfa; --c-battery:#4ade80; --c-ev:#22d3ee;
+          --c-def1:#fb7185; --c-def2:#2dd4bf; --c-def3:#a78bfa; --c-def4:#facc15;
         }
         ha-card { ${widthRule} }
         .head { display:flex; align-items:center; gap:8px; padding:10px 14px 0; }
@@ -286,6 +386,7 @@ class GridLensPowerFlowCard extends HTMLElement {
         @keyframes pf-flow { to { stroke-dashoffset: -56; } }
         .node .ring.placeholder ~ .node-value,
         .node .ring.placeholder ~ .node-name { opacity: .85; }
+        .node.dim { opacity: .4; }
       </style>
     `;
 
@@ -300,11 +401,19 @@ class GridLensPowerFlowCard extends HTMLElement {
     const connectorsHtml = ['solar', 'grid', 'battery', 'ev']
       .map((key) => this._connectorSvg(key, conn[key])).join('');
 
-    // The lowest-drawn element is the bottom satellites' value label, at
-    // cy(320) + r + 30 (+ text descender). Grow the viewBox height to match icon_scale
-    // so the labels never clip; width stays 400 (fine for scales up to ~2×).
+    // Type-1 deferrable loads: an extra row below the main diagram. Connectors drawn first
+    // (under the fixed nodes), then their nodes.
+    const defer = this._deferLayout();
+    const deferConnHtml = defer.map((d) => this._deferConnectorSvg(d)).join('');
+    const deferNodesHtml = defer.map((d) => this._deferNodeSvg(d)).join('');
+
+    // The lowest-drawn element is either the bottom satellites' value label (cy 320 + r + 30)
+    // or, when deferrable loads are present, their row's value label (DEFER_ROW_CY + r + 28).
+    // Grow the viewBox height to match icon_scale so labels never clip; width stays 400.
     const scale = this._config.icon_scale || 1;
-    const vbH = Math.max(380, Math.ceil(356 + 30 * scale));
+    const baseH = Math.max(380, Math.ceil(356 + 30 * scale));
+    const deferH = defer.length ? Math.ceil(DEFER_ROW_CY + 26 * scale + 40) : 0;
+    const vbH = Math.max(baseH, deferH);
 
     this.shadowRoot.innerHTML = `
       ${styles}
@@ -315,7 +424,9 @@ class GridLensPowerFlowCard extends HTMLElement {
         </div>
         <svg viewBox="0 0 400 ${vbH}">
           ${connectorsHtml}
+          ${deferConnHtml}
           ${nodesHtml}
+          ${deferNodesHtml}
         </svg>
       </ha-card>
     `;

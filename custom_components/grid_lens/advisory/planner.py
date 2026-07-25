@@ -105,6 +105,13 @@ class AdvisoryPlanner:
             t = int(step["hour"])
             start = bundle.start + timedelta(minutes=t * bundle.slot_minutes)
             action, power_w, grid_charge_w, export_w = self._classify(step, dt_h)
+            # Per-device deferrable energy (kWh/slot) → average power (W) for the control
+            # channel. Same device order as the config lists; missing entries → 0.
+            per_dev = step.get("deferrable_per_device", []) or []
+            deferrable_w = [
+                (float(per_dev[j]) / dt_h * 1000.0) if j < len(per_dev) else 0.0
+                for j in range(len(defer_names))
+            ]
             plan.append(
                 DispatchInterval(
                     start=start,
@@ -113,6 +120,7 @@ class AdvisoryPlanner:
                     grid_charge_w=grid_charge_w,
                     export_w=export_w,
                     import_rate=step.get("import_rate"),
+                    deferrable_w=deferrable_w,
                 )
             )
             row = {

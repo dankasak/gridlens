@@ -71,7 +71,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260725g"
+    _CARD_VERSION = "20260725h"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -785,6 +785,14 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     return True
 
 
+async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload the entry when its options/data change (Reconfigure). Needed so a newly
+    assigned deferrable control switch (or any device config change) actually takes effect
+    without a full HA restart — the control managers + platform entities are built at
+    setup time from entry.data."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Grid Lens from a config entry."""
     _LOGGER.info("Setting up Grid Lens")
@@ -793,6 +801,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     coordinator = GridLensCoordinator(hass, entry)
     hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     # Per-day deferrable load overrides (Feature 2) — independent of battery/control,
     # shared between the number.py entities and AdvisoryCoordinator. Created before the
@@ -824,6 +833,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception as _ctl_err:  # noqa: BLE001
             _LOGGER.warning("Battery control setup failed: %s", _ctl_err)
 
+    # Deferrable-load control manager (actuation for simple on/off loads). Independent of
+    # has_battery — created whenever any deferrable device has a control switch configured.
+    # INERT until its per-device master switch is turned on (default OFF); no switch writes
+    # on setup. Deadman = leave loads as-is (never forces off).
+    try:
+        from .control.load_control_manager import LoadControlManager
+        _load_mgr = LoadControlManager(hass, entry)
+        if _load_mgr.has_controllable():
+            hass.data[DOMAIN][f"{entry.entry_id}_load_control"] = _load_mgr
+    except Exception as _load_err:  # noqa: BLE001
+        _LOGGER.warning("Deferrable load control setup failed: %s", _load_err)
+
     # Register services
     from .services import async_setup_services
     await async_setup_services(hass, entry)
@@ -847,7 +868,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    # Deadman: if control is active, restore native EMS before tearing down.
+    # Deadman: if battery control is active, restore native EMS before tearing down.
     _mgr = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_control")
     if _mgr is not None:
         try:
@@ -855,10 +876,19 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception:  # noqa: BLE001
             pass
 
+    # Load control deadman = leave loads as-is: stop ticking, never force a switch off.
+    _load_mgr = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_load_control")
+    if _load_mgr is not None:
+        try:
+            _load_mgr.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         hass.data[DOMAIN].pop(entry.entry_id)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_advisory", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_control", None)
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_load_control", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_overrides", None)
 
     return unload_ok

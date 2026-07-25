@@ -19,9 +19,23 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
+    entities: list[SwitchEntity] = []
     manager = hass.data[DOMAIN].get(f"{entry.entry_id}_control")
     if manager is not None:
-        async_add_entities([GridLensBatteryControlSwitch(manager, entry)])
+        entities.append(GridLensBatteryControlSwitch(manager, entry))
+
+    # One master switch per controllable deferrable load (device with a control switch
+    # configured). Default OFF (opt-in) — unlike the battery switch's default ON — since
+    # physically toggling a real appliance has more consequence than a battery mode change.
+    load_mgr = hass.data[DOMAIN].get(f"{entry.entry_id}_load_control")
+    if load_mgr is not None:
+        for index, controller in load_mgr.controllers.items():
+            entities.append(
+                GridLensDeferrableLoadSwitch(load_mgr, entry, index, controller.name)
+            )
+
+    if entities:
+        async_add_entities(entities)
 
 
 class GridLensBatteryControlSwitch(RestoreEntity, SwitchEntity):
@@ -79,5 +93,64 @@ class GridLensBatteryControlSwitch(RestoreEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         await self._manager.disable()
+        self._attr_is_on = False
+        self.async_write_ha_state()
+
+
+class GridLensDeferrableLoadSwitch(RestoreEntity, SwitchEntity):
+    """ON = GridLens turns this simple deferrable load's ``switch.*`` on/off per the plan.
+
+    Restores its last state across restarts but **defaults OFF** (opt-in) — unlike the
+    battery switch's default ON. Turning a real appliance on/off has more direct real-world
+    consequence than a battery mode change, so a fresh install never actuates a load until
+    the user explicitly enables it. Enabling is still refused (and reflected here) until the
+    account's control entitlement is confirmed; set_entitled()'s auto-resume flips it on a
+    little after boot without a manual re-toggle.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:power-plug"
+
+    def __init__(self, manager, entry: ConfigEntry, index: int, device_name: str) -> None:
+        self._manager = manager
+        self._index = index
+        self._attr_name = f"{device_name} Control"
+        self._attr_unique_id = f"{entry.entry_id}_deferrable_control_{index}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_is_on = False
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._manager.set_state_listener(self._index, self._on_manager_change)
+        last = await self.async_get_last_state()
+        want_on = last is not None and last.state == "on"  # default OFF if no prior state
+        if want_on:
+            await self._manager.enable(self._index)
+        self._attr_is_on = self._manager.is_enabled(self._index)
+        self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._manager.set_state_listener(self._index, None)
+        await super().async_will_remove_from_hass()
+
+    def _on_manager_change(self) -> None:
+        self._attr_is_on = self._manager.is_enabled(self._index)
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return self._manager.status().get("devices", {}).get(self._index, {})
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._manager.enable(self._index)
+        self._attr_is_on = self._manager.is_enabled(self._index)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._manager.disable(self._index)
         self._attr_is_on = False
         self.async_write_ha_state()
