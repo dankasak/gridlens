@@ -14,10 +14,16 @@
  * unmatched keeps the dashed ring + mdi placeholder. `deferrable_icons` maps a
  * load name onto a built-in key or a URL of your own when the name doesn't say.
  *
- * Config (all optional — defaults match this install's Sigenergy/EVConduit entities):
+ * Config (all optional):
  *   type: custom:grid-lens-powerflow-card
  *   solar_power_entity, load_power_entity, grid_power_entity,
  *   battery_power_entity, soc_entity, ev_power_entity, ev_active_entity
+ *     — no installed-brand defaults; every install's entities differ, so these are
+ *       unset until configured. Exception: solar_power_entity, when left unset, auto-
+ *       discovers from HA's own Energy Dashboard prefs (the "solar" source's stat_rate)
+ *       — the one universal live-power slot HA core provides. See _solarEntity().
+ *   price_source_entity: null  // GridLens dispatch sensor to read the current buy/sell rate
+ *     from (its `trajectory` attribute — the LP optimizer's own schedule); null auto-discovers
  *   icons: { solar, battery, home, grid, ev, water_heater }  // URLs; omit/null = placeholder
  *   deferrable_icons: { "Smart Load 01": water_heater }      // load name -> icon key or URL
  *   max_height: 420   // fixed height (px) for the diagram; set 0/null for natural (aspect-ratio) height
@@ -26,6 +32,16 @@
  *   font_scale: 1.0   // multiplier on label text size, independent of icon_scale
  *   name_font_size: null    // px override for the node-name label (e.g. "Battery"); wins over font_scale
  *   value_font_size: null   // px override for the value label (e.g. "1.23 kW"); wins over font_scale
+ *   max_ball_kw: null  // hardware ceiling ball size is scaled against — shared by every
+ *     connector so flows are comparable to each other; null auto-reads the GridLens dispatch
+ *     sensor's battery_max_charge_kw/battery_max_discharge_kw (config-derived, any brand)
+ *
+ * Active connectors render as a faint static rail plus a small stream of pulsating balls
+ * (SVG animateMotion) travelling along it; ball radius scales (sqrt) from a small dot near 0kW
+ * up to a full-size ball at max_ball_kw, the SAME ceiling for every connector — so e.g. two
+ * flows of ~4.5kW (a battery charging and a hot water element, say) render as the same size as
+ * each other, both visibly smaller than a 9kW solar ball, regardless of how each node's own
+ * hardware happens to be rated.
  */
 
 const _bgCache = new Map();
@@ -89,6 +105,15 @@ class GridLensPowerFlowCard extends HTMLElement {
     this._dark = false;
     this._imgData = {};   // key -> resolved data URL (or null once we know there's no source)
     this._pending = new Set();
+    // HA's own Energy Dashboard prefs (.storage/energy) — undefined until fetched, then either
+    // a resolved solar live-power entity id or null if none is configured. See _solarEntity().
+    this._energySolarEntity = undefined;
+    // A fixed reference clock for ball motion. render() rebuilds the whole SVG (and therefore
+    // every <animateMotion>) on basically any hass state change, so a ball's position can't be
+    // "remembered" across renders the normal way — instead each ball's begin offset is computed
+    // fresh every render from real elapsed time against this epoch, so a freshly-recreated
+    // element seeks to where it should be rather than snapping back to its fixed stagger point.
+    this._epoch = performance.now();
   }
 
   setConfig(config) {
@@ -113,13 +138,28 @@ class GridLensPowerFlowCard extends HTMLElement {
     }
     this._config = Object.assign(
       {
-        solar_power_entity: 'sensor.sigen_0_total_pv_power',
-        load_power_entity: 'sensor.sigen_plant_general_load_power',
-        grid_power_entity: 'sensor.sigen_plant_grid_sensor_active_power',
-        battery_power_entity: 'sensor.sigen_plant_ess_power',
-        soc_entity: 'sensor.sigen_plant_ess_soc',
-        ev_power_entity: 'sensor.evconduit_charge_rate',
-        ev_active_entity: 'sensor.evconduit_is_charging',
+        // No installed-brand defaults (Sigenergy/EVConduit/etc.) — every install's entity ids
+        // differ, so these are simply unset until configured. solar_power_entity is the one
+        // exception: leave it null and the card auto-discovers it from HA's own Energy
+        // Dashboard preferences (the "solar" source's stat_rate — the one genuinely
+        // brand-agnostic live-power slot HA core provides), same as any Energy dashboard card
+        // would use. See _solarEntity(). The rest have no such universal source (confirmed by
+        // checking power-flow-card-plus, a widely-used multi-brand card, which also just
+        // requires explicit entity config for grid/battery — nothing auto-discovers those) —
+        // set them explicitly for your install.
+        solar_power_entity: null,
+        load_power_entity: null,
+        grid_power_entity: null,
+        battery_power_entity: null,
+        soc_entity: null,
+        ev_power_entity: null,
+        ev_active_entity: null,
+        // Live grid buy/sell rate, shown as a second line under Grid's flow status, read from
+        // the current slot of a GridLens dispatch/planning sensor's `trajectory` attribute —
+        // the LP optimizer's own rate schedule (the same data the Price chart card plots), not
+        // a raw retailer feed. null (default) auto-discovers the first sensor exposing a
+        // trajectory of import_rate/export_rate slots; pin one explicitly if you have several.
+        price_source_entity: null,
         // Type-1 deferrable loads (simple on/off appliances), shown as their own nodes off
         // Home with live power. By default (null) the card AUTO-DISCOVERS them from a GridLens
         // sensor's `deferrable_loads` attribute (name + auto-resolved power_entity + switch),
@@ -142,6 +182,14 @@ class GridLensPowerFlowCard extends HTMLElement {
         font_scale: 1.0, // multiplier on label text size, independent of icon_scale
         name_font_size: null, // px override for the node-name label; wins over font_scale
         value_font_size: null, // px override for the value label (e.g. "1.23 kW"); wins over font_scale
+        // Hardware ceiling (kW) ball size is scaled against — the same ceiling for every
+        // connector, so a flow's size is comparable across the whole diagram (9kW of solar
+        // splitting ~50/50 to battery+hot water should render the two receiving balls at
+        // roughly half the solar ball's size, not just "a fraction of that node's own
+        // capacity"). null auto-reads the GridLens dispatch sensor's
+        // battery_max_charge_kw/battery_max_discharge_kw (config-derived, works for any
+        // inverter brand); see _maxKw().
+        max_ball_kw: null,
       },
       config
     );
@@ -165,14 +213,34 @@ class GridLensPowerFlowCard extends HTMLElement {
     }
   }
 
+  // Fetches HA's Energy Dashboard preferences once and pulls out the solar source's live-power
+  // entity (stat_rate) — the one universal, brand-agnostic live-power slot HA core provides
+  // (grid/battery sources only carry cumulative energy stats, not a live rate). Mirrors
+  // _kickOffImageLoads()'s fetch-once-then-render pattern. See _solarEntity().
+  _kickOffEnergyPrefs() {
+    if (this._energySolarEntity !== undefined || !this._hass) return;
+    this._hass.callWS({ type: 'energy/get_prefs' }).then((prefs) => {
+      const solar = (prefs.energy_sources || []).find((s) => s.type === 'solar');
+      this._energySolarEntity = (solar && solar.stat_rate) || null;
+      this.render();
+    }).catch(() => { this._energySolarEntity = null; });
+  }
+
+  // Effective solar power entity: explicit config wins; otherwise whatever HA's Energy
+  // Dashboard has configured as the solar source's live-power sensor, if anything.
+  _solarEntity() {
+    return this._config.solar_power_entity || this._energySolarEntity || null;
+  }
+
   set hass(hass) {
     this._hass = hass;
     const dark = !!(hass.themes && hass.themes.darkMode);
     if (dark !== this._dark) { this._dark = dark; this.classList.toggle('dark', dark); }
+    this._kickOffEnergyPrefs();
 
     const c = this._config;
     const watch = [
-      c.solar_power_entity, c.load_power_entity, c.grid_power_entity,
+      this._solarEntity(), c.load_power_entity, c.grid_power_entity,
       c.battery_power_entity, c.soc_entity, c.ev_power_entity, c.ev_active_entity,
     ];
     if (c.deferrable_source_entity) watch.push(c.deferrable_source_entity);
@@ -181,9 +249,15 @@ class GridLensPowerFlowCard extends HTMLElement {
       if (ld && ld.power_entity) watch.push(ld.power_entity);
       if (ld && ld.switch_entity) watch.push(ld.switch_entity);
     }
+    // The price trajectory can refresh (new LP optimizer run) without the dispatch sensor's
+    // own state string changing (e.g. still "charge"), so watch its generated_at attribute too.
+    const priceEid = this._resolveDispatchEntityId();
+    const priceSt = priceEid && hass.states[priceEid];
+    const priceSig = priceSt ? `${priceSt.state}@${(priceSt.attributes || {}).generated_at || ''}` : '';
     // Include the resolved load identity so a reconfigure (set of loads changes) re-renders.
     const sig = watch.map((e) => (hass.states[e] ? hass.states[e].state : '')).join('|')
-      + '#' + loads.map((l) => l.power_entity).join(',');
+      + '#' + loads.map((l) => l.power_entity).join(',')
+      + '#' + priceSig;
     if (sig !== this._sig) { this._sig = sig; this.render(); }
   }
 
@@ -195,9 +269,48 @@ class GridLensPowerFlowCard extends HTMLElement {
     return (st.attributes && st.attributes.unit_of_measurement === 'W') ? v / 1000 : v;
   }
 
+  // The GridLens dispatch/planning sensor — carries the LP optimizer's own buy/sell rate
+  // schedule (`trajectory`, same data the Price chart card plots) plus this install's
+  // battery power limits (`battery_max_charge_kw`/`battery_max_discharge_kw`, straight from
+  // config, not a vendor-specific entity). Used for both the price line and the ball-sizing
+  // ceiling below, since both want "the plan GridLens is actually working from," not a raw
+  // sensor. An explicit price_source_entity wins; otherwise auto-discover the first sensor
+  // exposing a trajectory of slots with import_rate/export_rate, mirroring how
+  // _resolveDeferLoads() auto-discovers the deferrable-loads sensor.
+  _resolveDispatchEntityId() {
+    const c = this._config;
+    if (c.price_source_entity) return c.price_source_entity;
+    const hass = this._hass;
+    if (!hass) return null;
+    for (const eid of Object.keys(hass.states)) {
+      if (!eid.startsWith('sensor.')) continue;
+      const traj = hass.states[eid].attributes && hass.states[eid].attributes.trajectory;
+      if (Array.isArray(traj) && traj.length && 'import_rate' in traj[0]) return eid;
+    }
+    return null;
+  }
+
+  // Current buy/sell rate (c/kWh) as the trajectory slot covering "now" — the last slot whose
+  // start time isn't in the future. Trajectory slots are in $/kWh and chronological.
+  _currentRatesC() {
+    const eid = this._resolveDispatchEntityId();
+    const st = eid && this._hass && this._hass.states[eid];
+    const traj = st && Array.isArray(st.attributes.trajectory) ? st.attributes.trajectory : null;
+    if (!traj || !traj.length) return { buyC: null, sellC: null };
+    const now = Date.now();
+    let slot = traj[0];
+    for (const s of traj) {
+      if (new Date(s.start).getTime() > now) break;
+      slot = s;
+    }
+    const buyC = typeof slot.import_rate === 'number' ? slot.import_rate * 100 : null;
+    const sellC = typeof slot.export_rate === 'number' ? slot.export_rate * 100 : null;
+    return { buyC, sellC };
+  }
+
   _flows() {
     const c = this._config;
-    const solarKw = this._toKw(c.solar_power_entity);
+    const solarKw = this._toKw(this._solarEntity());
     const loadKw = this._toKw(c.load_power_entity);
     const gridKw = this._toKw(c.grid_power_entity);       // >0 import, <0 export
     const battKw = this._toKw(c.battery_power_entity);    // >0 charge, <0 discharge
@@ -206,13 +319,20 @@ class GridLensPowerFlowCard extends HTMLElement {
     const socPct = socSt ? parseFloat(socSt.state) : NaN;
     const evActiveSt = this._hass && this._hass.states[c.ev_active_entity];
     const evActive = !!evActiveSt && String(evActiveSt.state).toLowerCase() === 'true';
-    return { solarKw, loadKw, gridKw, battKw, socPct, evKw, evActive };
+    const { buyC, sellC } = this._currentRatesC();
+    return { solarKw, loadKw, gridKw, battKw, socPct, evKw, evActive, buyC, sellC };
   }
 
   // Per-connector: active?, reversed (relative to the path's drawn direction),
   // magnitude (kW, for animation speed), and a human label.
   _connectors(f) {
     const soc = isNaN(f.socPct) ? '' : ` · ${f.socPct.toFixed(0)}%`;
+    // Only the side actually in play: buy price while importing, sell price while exporting,
+    // nothing while idle — showing both regardless of direction implied a rate was being paid
+    // when it wasn't.
+    const priceLine = f.gridKw > MIN_KW && f.buyC != null ? `\n@ ${f.buyC.toFixed(1)}c/kWh`
+      : f.gridKw < -MIN_KW && f.sellC != null ? `\n@ ${f.sellC.toFixed(1)}c/kWh`
+      : '';
     return {
       solar: {
         active: f.solarKw > MIN_KW, reverse: false, kw: f.solarKw,
@@ -220,13 +340,13 @@ class GridLensPowerFlowCard extends HTMLElement {
       },
       grid: {
         active: Math.abs(f.gridKw) > MIN_KW, reverse: f.gridKw < 0, kw: Math.abs(f.gridKw),
-        label: f.gridKw > MIN_KW ? `Importing ${f.gridKw.toFixed(2)} kW`
-          : f.gridKw < -MIN_KW ? `Exporting ${(-f.gridKw).toFixed(2)} kW` : 'Idle',
+        label: (f.gridKw > MIN_KW ? `Importing ${f.gridKw.toFixed(2)} kW`
+          : f.gridKw < -MIN_KW ? `Exporting ${(-f.gridKw).toFixed(2)} kW` : 'Idle') + priceLine,
       },
       battery: {
         active: Math.abs(f.battKw) > MIN_KW, reverse: f.battKw > 0, kw: Math.abs(f.battKw),
-        label: (f.battKw > MIN_KW ? `Charging ${f.battKw.toFixed(2)} kW`
-          : f.battKw < -MIN_KW ? `Discharging ${(-f.battKw).toFixed(2)} kW` : 'Idle') + soc,
+        label: f.battKw > MIN_KW ? `Charging\n${f.battKw.toFixed(2)} kW${soc}`
+          : f.battKw < -MIN_KW ? `Discharging\n${(-f.battKw).toFixed(2)} kW${soc}` : `Idle${soc}`,
       },
       ev: {
         active: f.evActive && f.evKw > MIN_KW, reverse: false, kw: f.evKw,
@@ -244,8 +364,17 @@ class GridLensPowerFlowCard extends HTMLElement {
     const scale = (c.icon_scale || 1) * (c.font_scale || 1);
     return {
       name: c.name_font_size != null ? +c.name_font_size : +(12 * scale).toFixed(1),
-      val: c.value_font_size != null ? +c.value_font_size : +(11 * scale).toFixed(1),
+      val: c.value_font_size != null ? +c.value_font_size : +(14 * scale).toFixed(1),
     };
+  }
+
+  // Splits a node value on '\n' into stacked <tspan> lines (e.g. battery's "Discharging"
+  // on its own line above the kW/SOC figures); single-line values render unchanged.
+  _valueLines(a) {
+    const lines = String(a.value).split('\n');
+    if (lines.length === 1) return lines[0];
+    const lh = this._fs().val + 2;
+    return lines.map((line, i) => `<tspan x="${a.cx}" dy="${i === 0 ? 0 : lh}">${line}</tspan>`).join('');
   }
 
   // Generic node renderer, driven by a descriptor { cx, cy, r, colorVar, imgKey, icon,
@@ -272,19 +401,83 @@ class GridLensPowerFlowCard extends HTMLElement {
         <circle class="ring ${hasImage ? '' : 'placeholder'}" cx="${a.cx}" cy="${a.cy}" r="${a.r}"
                 style="--nc: var(${a.colorVar})"/>
         ${inner}
-        <text x="${a.cx}" y="${nameY}" text-anchor="middle" class="node-name" style="font-size:${fs.name}px">${a.name}</text>
-        <text x="${a.cx}" y="${valY}" text-anchor="middle" class="node-value" style="font-size:${fs.val}px">${a.value}</text>
+        <text x="${a.cx}" y="${nameY}" text-anchor="middle" class="node-name" style="font-size:${fs.name}px; fill:var(${a.colorVar})">${a.name}</text>
+        <text x="${a.cx}" y="${valY}" text-anchor="middle" class="node-value" style="font-size:${fs.val}px; fill:var(${a.colorVar})">${this._valueLines(a)}</text>
       </g>`;
   }
 
-  // A straight radial spoke from a peripheral node to the hub. Animation flows node→hub by
-  // default (a source/discharge feeding Home); `reverse` flows hub→node (import, battery
-  // charge, or a load drawing from Home).
+  // One hardware ceiling (kW), shared by every connector, that ball size is scaled against.
+  // A single shared scale is the point: it's what makes a 4.5kW battery ball and a 4.5kW hot
+  // water ball come out the same size, and both visibly smaller than a 9kW solar ball — sizing
+  // each connector against its own separate ceiling (an EVSE's 7.2kW vs a powerpoint's 2.4kW)
+  // made flows incomparable, since two very different absolute kW values could both read as
+  // "80% of my own capacity" and look the same size.
+  //
+  // Auto-reads battery_max_charge_kw/battery_max_discharge_kw off the GridLens dispatch
+  // sensor (see _resolveDispatchEntityId()) and takes the larger — these come straight from
+  // this install's config entry (whatever the user entered for their battery during
+  // config_flow), so this works for any inverter brand rather than reading a vendor-specific
+  // entity. Falls back to a plain constant if no battery is configured; max_ball_kw overrides
+  // either outright.
+  _maxKw() {
+    const c = this._config;
+    if (c.max_ball_kw != null) return c.max_ball_kw;
+    const eid = this._resolveDispatchEntityId();
+    const st = eid && this._hass && this._hass.states[eid];
+    const a = st && st.attributes;
+    const chg = a && typeof a.battery_max_charge_kw === 'number' ? a.battery_max_charge_kw : 0;
+    const dis = a && typeof a.battery_max_discharge_kw === 'number' ? a.battery_max_discharge_kw : 0;
+    const found = Math.max(chg, dis);
+    return found > 0 ? found : 10;
+  }
+
+  // A straight radial spoke from a peripheral node to the hub: a faint always-on "rail" plus,
+  // when active, a small stream of pulsating balls travelling along it via SMIL animateMotion.
+  // Direction follows `reverse` (hub→node for import/charge/loads, node→hub otherwise) — that's
+  // baked into which end of the path is the start, since animateMotion has no reverse switch
+  // the way the old dash-offset animation did. Ball radius scales (sqrt, for area-proportionate
+  // perception) from a small dot at ~0kW up to a full-size ball at maxKw, so glancing at ball
+  // size gives a sense of how close a flow is to this install's hardware ceiling. Travel speed
+  // only nudges gently with the same fraction (slow throughout) — size, not speed, is meant to
+  // carry the magnitude story.
   _spoke(a, hub) {
-    const dur = Math.max(0.4, 2.0 / (0.4 + a.kw)).toFixed(2);
-    const cls = ['flow', a.active ? 'active' : 'idle', a.reverse ? 'reverse' : ''].join(' ').trim();
-    return `<path class="${cls}" d="M${a.cx.toFixed(1)},${a.cy.toFixed(1)} L${hub.cx},${hub.cy}"
-             style="--nc: var(${a.colorVar}); animation-duration: ${dur}s"/>`;
+    const [x1, y1, x2, y2] = a.reverse
+      ? [hub.cx, hub.cy, a.cx.toFixed(1), a.cy.toFixed(1)]
+      : [a.cx.toFixed(1), a.cy.toFixed(1), hub.cx, hub.cy];
+    const pathId = `pf-rail-${Math.round(a.cx)}-${Math.round(a.cy)}`;
+    const rail = `<path id="${pathId}" class="rail${a.active ? ' active' : ''}" d="M${x1},${y1} L${x2},${y2}"
+             style="--nc: var(${a.colorVar})"/>`;
+    if (!a.active) return rail;
+
+    const scale = this._config.icon_scale || 1;
+    const minR = 2.2 * scale, maxR = 8 * scale;
+    const frac = Math.max(0, Math.min(1, a.kw / (a.maxKw || 10)));
+    const r = (minR + (maxR - minR) * Math.sqrt(frac));
+    const durNum = 5.5 - 3 * frac; // 5.5s near-idle down to 2.5s at the connector's ceiling
+    const dur = durNum.toFixed(2);
+    const rLo = (r * 0.8).toFixed(1), rHi = (r * 1.15).toFixed(1);
+    // Position each ball from real elapsed time (mod its duration) rather than a fixed stagger,
+    // so a re-render seeks the freshly-recreated <animateMotion> to where it should already be
+    // instead of snapping every ball back to 0%/33%/66% along the path — see _epoch above.
+    const elapsed = (performance.now() - this._epoch) / 1000;
+    const pulseDur = 1.1;
+    const balls = [0, 1, 2].map((i) => {
+      const stagger = (i / 3) * durNum;
+      const phase = (elapsed + stagger) % durNum;
+      const begin = (-phase).toFixed(2);
+      // Same continuity trick for the pulse: without it, this restarts at rLo on every
+      // re-render (every few seconds, from routine sensor updates) — visible as a size
+      // "pop" roughly every ~pulseDur worth of cycles, independent of the position fix above.
+      const pulsePhase = (elapsed + stagger) % pulseDur;
+      const pulseBegin = (-pulsePhase).toFixed(2);
+      return `<circle class="ball" r="${r.toFixed(1)}" style="--nc: var(${a.colorVar})">
+          <animateMotion dur="${dur}s" begin="${begin}s" repeatCount="indefinite">
+            <mpath href="#${pathId}"/>
+          </animateMotion>
+          <animate attributeName="r" values="${rLo};${rHi};${rLo}" dur="${pulseDur}s" begin="${pulseBegin}s" repeatCount="indefinite"/>
+        </circle>`;
+    }).join('');
+    return rail + balls;
   }
 
   // Type-1 deferrable loads: a dynamic row of nodes below the main diagram, each a sub-load
@@ -343,18 +536,26 @@ class GridLensPowerFlowCard extends HTMLElement {
   // positioned actor descriptors (the same shape _pnode/_spoke consume).
   _bottomActors(f, conn, hub) {
     const scale = this._config.icon_scale || 1;
+    const maxKw = this._maxKw();
     const actors = [{
       baseR: 30, colorVar: '--c-battery', imgKey: 'battery', icon: 'mdi:battery',
       name: 'Battery', value: conn.battery.label,
       active: conn.battery.active, reverse: conn.battery.reverse, kw: conn.battery.kw, dim: false,
+      maxKw,
     }];
     if (this._config.show_ev !== false) {
       actors.push({
         baseR: 26, colorVar: '--c-ev', imgKey: 'ev', icon: 'mdi:ev-station',
         name: 'EV', value: conn.ev.label,
         active: conn.ev.active, reverse: true, kw: conn.ev.kw, dim: !conn.ev.active,
+        maxKw,
       });
     }
+    // Hot water gets its own dedicated silver colour (matches the rest of the palette's
+    // fixed-role hues) rather than cycling through --c-defN with the other loads; it's
+    // pulled out of the rotation first so a hot water system doesn't also burn one of the
+    // 4 generic slots other deferrable loads cycle through.
+    let defColorIdx = 0;
     this._resolveDeferLoads().forEach((ld, i) => {
       const kw = this._toKw(ld.power_entity);
       let on;
@@ -365,10 +566,12 @@ class GridLensPowerFlowCard extends HTMLElement {
         on = kw > MIN_KW;
       }
       const ic = this._deferIcon(ld);
+      const colorVar = ic.imgKey === 'water_heater' ? '--c-hotwater' : `--c-def${(defColorIdx++ % 4) + 1}`;
       actors.push({
-        baseR: 26, colorVar: `--c-def${(i % 4) + 1}`, imgKey: ic.imgKey, icon: ic.mdi,
+        baseR: 26, colorVar, imgKey: ic.imgKey, icon: ic.mdi,
         name: ld.name || `Load ${i + 1}`, value: `${kw.toFixed(2)} kW`,
         active: on && kw > MIN_KW, reverse: true, kw, dim: !on,
+        maxKw,
       });
     });
 
@@ -377,7 +580,7 @@ class GridLensPowerFlowCard extends HTMLElement {
     // Even angular spread, centred straight-down (phi=0); wider fan for more items.
     const spanDeg = M <= 1 ? 0 : Math.min(170, 52 * (M - 1));
     const span = (spanDeg * Math.PI) / 180;
-    let R = 120 + maxR; // base clearance from the hub centre
+    let R = 140 + maxR; // base clearance from the hub centre
     if (M > 1) {
       const dphi = span / (M - 1);
       R = Math.max(R, (2 * maxR + 18) / (2 * Math.sin(dphi / 2))); // guarantee no overlap
@@ -411,12 +614,20 @@ class GridLensPowerFlowCard extends HTMLElement {
     const styles = `
       <style>
         :host {
-          --c-solar:#f59e0b; --c-grid:#8b7cf6; --c-battery:#22c55e; --c-ev:#06b6d4;
+          /* Solar/EV/Grid/Battery/Hot-water hexes are shared with the power chart card's
+             --solar/--gridflow/--battery (grid-lens-chart-common.js) so the same flow reads
+             as the same colour across both cards — validated together via the dataviz
+             skill's validate_palette.js (OKLab CVD deltaE, --pairs all) in both modes. EV
+             deliberately reuses this palette's old solar hex (previously #f59e0b/#fbbf24)
+             now that solar has its own distinct yellow. */
+          --c-solar:#9c8208; --c-grid:#8b7cf6; --c-battery:#22c55e; --c-ev:#f59e0b;
+          --c-hotwater:#94a3b8;
           --c-home: var(--primary-text-color);
           --c-def1:#e11d48; --c-def2:#0d9488; --c-def3:#7c3aed; --c-def4:#ca8a04;
         }
         :host(.dark) {
-          --c-solar:#fbbf24; --c-grid:#a78bfa; --c-battery:#4ade80; --c-ev:#22d3ee;
+          --c-solar:#b8960a; --c-grid:#a78bfa; --c-battery:#4ade80; --c-ev:#fbbf24;
+          --c-hotwater:#cbd5e1;
           --c-def1:#fb7185; --c-def2:#2dd4bf; --c-def3:#a78bfa; --c-def4:#facc15;
         }
         ha-card { ${widthRule} }
@@ -442,34 +653,37 @@ class GridLensPowerFlowCard extends HTMLElement {
         }
         .node-name { font-weight:600; fill:var(--primary-text-color); }
         .node-value { fill:var(--secondary-text-color); }
-        .flow { fill:none; stroke-width:2; }
-        .flow.idle { stroke:var(--divider-color); opacity:.6; }
-        .flow.active {
-          stroke: var(--nc); stroke-width:3; stroke-dasharray:5 9; stroke-linecap:round;
-          filter: drop-shadow(0 0 3px var(--nc));
-          animation-name: pf-flow; animation-timing-function: linear; animation-iteration-count: infinite;
-        }
-        .flow.active.reverse { animation-direction: reverse; }
-        @keyframes pf-flow { to { stroke-dashoffset: -56; } }
+        .rail { fill:none; stroke-width:2; stroke:var(--divider-color); opacity:.55; }
+        .rail.active { stroke: var(--nc); opacity:.22; }
+        .ball { fill: var(--nc); filter: drop-shadow(0 0 4px var(--nc)); }
         .node .ring.placeholder ~ .node-value,
         .node .ring.placeholder ~ .node-name { opacity: .85; }
-        .node.dim { opacity: .4; }
+        /* .node.dim opacity fade disabled 2026-07-28 for review — re-enable by
+           reverting. dim is still computed/set per node as before, just
+           not visually applied. */
+        .node.dim { opacity: 1; }
       </style>
     `;
 
     const scale = this._config.icon_scale || 1;
     const fs = this._fs();
 
-    // Home hub in the centre; Solar and Grid are the two top sources feeding it.
+    // Home hub in the centre, sized the same as the peripheral nodes (not a bigger centrepiece)
+    // so it reads as one of the flow's actors rather than dominating the diagram; Solar and Grid
+    // are the two top sources feeding it, pushed out toward the card's edges to use the room
+    // that freed up.
     const hub = {
-      cx: 200, cy: 190, r: 42 * scale, colorVar: '--c-home', imgKey: 'home', icon: null,
+      cx: 200, cy: 190, r: 30 * scale, colorVar: '--c-home', imgKey: 'home', icon: null,
       name: 'Home', value: `${f.loadKw.toFixed(2)} kW`, dim: false,
     };
+    const sharedMaxKw = this._maxKw();
     const sources = [
-      { cx: 70, cy: 60, r: 30 * scale, colorVar: '--c-solar', imgKey: 'solar', icon: null,
-        name: 'Solar', value: conn.solar.label, active: conn.solar.active, reverse: false, kw: conn.solar.kw, dim: false },
-      { cx: 330, cy: 60, r: 30 * scale, colorVar: '--c-grid', imgKey: 'grid', icon: null,
-        name: 'Grid', value: conn.grid.label, active: conn.grid.active, reverse: conn.grid.reverse, kw: conn.grid.kw, dim: false },
+      { cx: 40, cy: 60, r: 30 * scale, colorVar: '--c-solar', imgKey: 'solar', icon: null,
+        name: 'Solar', value: conn.solar.label, active: conn.solar.active, reverse: false, kw: conn.solar.kw, dim: false,
+        maxKw: sharedMaxKw },
+      { cx: 360, cy: 60, r: 30 * scale, colorVar: '--c-grid', imgKey: 'grid', icon: null,
+        name: 'Grid', value: conn.grid.label, active: conn.grid.active, reverse: conn.grid.reverse, kw: conn.grid.kw, dim: false,
+        maxKw: sharedMaxKw },
     ];
     // Consumer group (Battery + deferrable loads + optional EV), spread evenly on a radial arc.
     const actors = this._bottomActors(f, conn, hub);

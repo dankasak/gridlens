@@ -26,6 +26,27 @@ from homeassistant.helpers import entity_registry as er
 _MIN_PREFIX_MATCH = 6
 
 
+async def async_get_energy_dashboard_names(hass: HomeAssistant) -> dict[str, str]:
+    """Map each Energy Dashboard "individual device" consumption sensor to its user-set label.
+
+    This is the only place a rename like "Hot Water" actually lives — the Energy Dashboard
+    stores it against the tracked sensor, not on the entity itself. Best-effort: an empty dict
+    just means callers fall back to the entity's own name."""
+    try:
+        from homeassistant.components.energy import data as energy_data
+
+        manager = await energy_data.async_get_manager(hass)
+        if not manager.data:
+            return {}
+        return {
+            dev["stat_consumption"]: dev["name"]
+            for dev in manager.data.get("device_consumption", [])
+            if dev.get("stat_consumption") and dev.get("name")
+        }
+    except Exception:  # noqa: BLE001 — naming is best-effort, never break the sensor
+        return {}
+
+
 def _common_prefix_len(a: str, b: str) -> int:
     n = 0
     for ca, cb in zip(a, b):
@@ -49,23 +70,35 @@ def _power_sensors_on_device(reg, device_id: str) -> list[str]:
 _NAME_SUFFIXES = (" Total Consumption", " Consumption", " Energy", " Power")
 
 
-def resolve_device_name(hass: HomeAssistant, *anchors: Optional[str]) -> Optional[str]:
+def resolve_device_name(
+    hass: HomeAssistant,
+    *anchors: Optional[str],
+    dashboard_names: Optional[dict[str, str]] = None,
+) -> Optional[str]:
     """A clean display name for a deferrable load, resolved reliably at setup time.
 
     Tries each anchor (e.g. the control switch first — it names the appliance — then the
-    energy sensor): the entity registry's ``name``/``original_name`` (populated from disk at
-    startup, before the owning integration has published state, so it beats reading a live
-    ``friendly_name`` that may not exist yet), then the live ``friendly_name``, then a
-    humanized object_id. Trailing metering words are trimmed so a "… Energy" sensor doesn't
-    make the load read "Foo Energy"."""
+    energy sensor), in priority order: the entity registry's explicit ``name`` override, then
+    the Energy Dashboard's per-device label (``dashboard_names``, if the caller has one — this
+    is where a user-facing rename like "Hot Water" actually lives, since it's set on the Energy
+    Dashboard's individual-device tracker, not on the entity itself), then the registry's
+    ``original_name`` (populated from disk at startup, before the owning integration has
+    published state, so it beats reading a live ``friendly_name`` that may not exist yet), then
+    the live ``friendly_name``, then a humanized object_id. Trailing metering words are trimmed
+    so a "… Energy" sensor doesn't make the load read "Foo Energy"."""
     reg = er.async_get(hass)
+    dashboard_names = dashboard_names or {}
     for anchor in anchors:
         if not anchor:
             continue
         name = None
         ent = reg.async_get(anchor)
         if ent is not None:
-            name = ent.name or ent.original_name
+            name = ent.name
+        if not name:
+            name = dashboard_names.get(anchor)
+        if not name and ent is not None:
+            name = ent.original_name
         if not name:
             st = hass.states.get(anchor)
             if st is not None:

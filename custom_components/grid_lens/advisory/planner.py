@@ -96,6 +96,7 @@ class AdvisoryPlanner:
         devs = deferrable_loads or []
         defer_names = [d.get("name") or f"Load {i + 1}" for i, d in enumerate(devs)]
         defer_max_kw = [float(d.get("max_kw") or 0.0) for d in devs]
+        defer_sensor_ids = [d.get("sensor_id") or "" for d in devs]
 
         schedule = result.get("schedule", [])
         plan: list[DispatchInterval] = []
@@ -141,6 +142,10 @@ class AdvisoryPlanner:
                 "deferrable_kwh": round(step.get("deferrable_kwh", 0.0), 3),  # total (tooltip)
                 "buy_kwh": round(step.get("import_kwh", 0.0), 3),      # grid import
                 "sell_kwh": round(step.get("export_kwh", 0.0), 3),     # grid export
+                # Net battery flow for the slot: +charge (into battery) / -discharge (out).
+                # Lets the power chart plot one signed battery line instead of two positive
+                # ones, matching how buy/sell are combined client-side into a net grid line.
+                "battery_kwh": round(step.get("charge_kwh", 0.0) - step.get("discharge_kwh", 0.0), 3),
                 "import_rate": round(step.get("import_rate", 0.0), 4),
                 "export_rate": round(step.get("export_rate", 0.0), 4),
                 "cost": round(step.get("import_cost", 0.0), 4),        # $ spent buying
@@ -165,7 +170,10 @@ class AdvisoryPlanner:
             trajectory=trajectory,
             deferrable_names=defer_names,
             deferrable_max_kw=defer_max_kw,
+            deferrable_sensor_ids=defer_sensor_ids,
             conditional_credits=result.get("conditional_credits", {}),
+            battery_max_charge_kw=self.optimizer.max_charge_rate_kw,
+            battery_max_discharge_kw=self.optimizer.max_discharge_rate_kw,
         )
 
     @staticmethod

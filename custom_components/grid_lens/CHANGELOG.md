@@ -1,5 +1,49 @@
 # Changelog
 
+## [3.1.0] - 2026-07-29
+
+### Added
+- Power Flow card: live buy/sell price line under Grid's status, read from a GridLens
+  dispatch sensor's planned rate trajectory (auto-discovered, or pin one via
+  `price_source_entity`).
+- Power Flow card: connectors now render as a rail plus a stream of pulsating balls
+  (SMIL animation) sized against a shared hardware ceiling (`max_ball_kw`, auto-read from
+  the dispatch sensor's battery charge/discharge limits) so flows are visually comparable
+  across nodes instead of each scaled to its own node's capacity.
+- Power Flow card: `solar_power_entity` auto-discovers from Home Assistant's own Energy
+  Dashboard preferences when left unset — the one universal live-power slot HA core
+  provides.
+- Power chart card: Buy/Sell collapsed into one signed net Grid line, plus a new signed
+  Battery (charge/discharge) line; y-axis is forced symmetric around 0 for these.
+- `entity_lookup`: deferrable device display names now prefer the Energy Dashboard's own
+  per-device label (where a rename like "Hot Water" actually lives) ahead of the entity
+  registry's original name.
+- New-install dashboard seeding (`__init__.py`) now builds the full Plan Comparison +
+  Battery Plan view by resolving every entity from the registry via each platform's
+  unique_id, instead of a single hardcoded card.
+- `AdvisoryResult` exposes `deferrable_sensor_ids` (a reliable join key between a
+  trajectory device slot and its real power sensor) and this install's configured
+  `battery_max_charge_kw` / `battery_max_discharge_kw`.
+
+### Changed
+- Power Flow card: no more installed-brand default entities (previously hardcoded to this
+  dev rig's Sigenergy/EVConduit ids) — every entity except auto-discovered solar must now
+  be configured explicitly.
+- Power Flow card: dedicated colour for hot water instead of cycling through the generic
+  deferrable-load palette; smaller Home hub sized to match peripheral nodes; palette
+  shared with the chart cards so the same flow reads as the same colour everywhere.
+- `sigenergy_mqtt` default entity ids updated to the current `sigenergy2mqtt` add-on
+  naming (old ids carried a stray `_2` / `_plant_ess_` suffix left over from a
+  now-uninstalled legacy Modbus integration).
+
+### Fixed
+- Power chart card: chart no longer letterboxes empty space above/below the plot when a
+  card pins an explicit height whose aspect ratio doesn't match the SVG viewBox
+  (`preserveAspectRatio="none"`); header/legend spacing tightened so more of the card's
+  height goes to the chart itself instead of its header chrome.
+- Options flow no longer fails `SelectSelector` validation for the whole deferrable-loads
+  field when a previously-saved sensor selection has since been renamed or removed.
+
 ## [3.0.3] - 2026-07-22
 
 ### Added

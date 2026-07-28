@@ -727,6 +727,11 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             return await self.async_step_device_power()
 
         current = entry_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
+        # Drop any previously-saved sensor no longer offered by the discovery scan
+        # (e.g. renamed/deleted since last configured) — an invalid default fails
+        # SelectSelector validation for the whole field, blocking new selections too.
+        valid_values = {opt["value"] for opt in self._device_options}
+        current = [c for c in current if c in valid_values]
 
         return self.async_show_form(
             step_id="devices",

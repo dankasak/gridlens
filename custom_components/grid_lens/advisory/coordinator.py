@@ -48,8 +48,8 @@ HORIZON_HOURS = 36
 SLOT_MINUTES = 30  # 30-min resolution captures Flow Power's 17:30-19:30 boundaries
 
 # Sensible defaults for this deployment (overridable via entry.data later).
-DEFAULT_SOC_SENSOR = "sensor.sigen_plant_ess_soc"
-DEFAULT_LOAD_SENSOR = "sensor.sigen_plant_accumulated_consumed_energy"
+DEFAULT_SOC_SENSOR = "sensor.sigen_0_plant_battery_soc"
+DEFAULT_LOAD_SENSOR = "sensor.sigen_0_lifetime_consumed_energy"
 
 
 class AdvisoryCoordinator(DataUpdateCoordinator):
@@ -279,7 +279,7 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
                     for j in range(bundle.slots)
                 ]
             out.append({"daily_kwh": daily, "max_kw": maxkw, "hour_mask": mask,
-                        "name": dev.get("name")})
+                        "name": dev.get("name"), "sensor_id": dev.get("sensor_id")})
         return out
 
     # ------------------------------------------------------------- conditional credits

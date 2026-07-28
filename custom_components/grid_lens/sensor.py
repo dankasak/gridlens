@@ -142,8 +142,11 @@ class CurrentPlanCostSensor(GridLensSensorBase):
                 power = resolve_power_sensor(self.hass, sensor_id, sw or None)
             except Exception:  # noqa: BLE001 — discovery is best-effort, never break the sensor
                 power = None
+            dashboard_names = getattr(self.coordinator, "energy_dashboard_names", None)
             out.append({
-                "name": resolve_device_name(self.hass, sw or None, sensor_id) or sensor_id,
+                "name": resolve_device_name(
+                    self.hass, sw or None, sensor_id, dashboard_names=dashboard_names
+                ) or sensor_id,
                 "energy_entity": sensor_id,
                 "power_entity": power,
                 "switch_entity": sw or None,

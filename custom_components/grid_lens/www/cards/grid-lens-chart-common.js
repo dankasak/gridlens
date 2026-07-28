@@ -25,6 +25,33 @@ export function ds(pts, max = 160) {
   if (out[out.length - 1] !== pts[pts.length - 1]) out.push(pts[pts.length - 1]);
   return out;
 }
+// Step-carry-forward value of a {t,v} series (time-ascending, as returned by _series()) in
+// effect at `ms` — the last point at-or-before `ms`, or 0 before the series starts. Matches
+// how HA history actually behaves (a state persists until its next recorded change).
+function stepValueAt(pts, ms) {
+  if (!pts || !pts.length || ms < pts[0].t.getTime()) return 0;
+  let v = pts[0].v;
+  for (const p of pts) {
+    if (p.t.getTime() > ms) break;
+    v = p.v;
+  }
+  return v;
+}
+// Subtract one or more step-held series from a base series, sampled at the base series' own
+// timestamps. Used to turn a measured whole-home load reading into a "general load" reading
+// (whole-home minus deferrable devices) matching what the forecast side already plots —
+// mirrors the server-side coordinator._subtract_deferrable_from_load, including the floor at 0
+// (a noisy whole-home meter can momentarily read below a deferrable device's own reading).
+export function subtractStepSeries(basePts, subtractorArrays) {
+  if (!basePts || !basePts.length) return [];
+  const subs = (subtractorArrays || []).filter(s => s && s.length);
+  if (!subs.length) return basePts;
+  return basePts.map(p => {
+    const ms = p.t.getTime();
+    const sub = subs.reduce((acc, s) => acc + stepValueAt(s, ms), 0);
+    return { t: p.t, v: Math.max(0, p.v - sub) };
+  });
+}
 // Catmull-Rom → cubic-bezier smoothing. pts = [[x,y],…] → SVG path 'd'.
 export function smoothPath(pts) {
   if (!pts || !pts.length) return '';
@@ -191,6 +218,11 @@ export function reasonFor(row, mode) {
 // Multi-series line/area chart (forecast + optional "measured" overlays), used by the
 // power/price/cash chart cards. Pure function: gradient ids are derived from series
 // index (not a mutable counter), since each card only ever calls this once per render.
+// Each forecast series reads `row[s.key]` unless it supplies `s.calc(row)` instead (e.g.
+// combining two trajectory fields into one signed net value). opts.symmetric forces the
+// y-domain to [-m, m] (m = max abs of the natural range) so 0 sits at the vertical centre
+// instead of wherever the data's own min/max happen to land — for a chart mixing
+// positive-only series with a signed one (e.g. net grid import/export).
 export function multiLineChart(traj, timeScale, series, opts = {}) {
   if (!traj || !traj.length) return '';
   const g = { w: GW, h: opts.height || 160, ml: GML, mr: GMR, mt: 10, mb: 22 };
@@ -206,10 +238,11 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
       .map(p => ({ ms: p.t.getTime(), v: p.v }));
     return traj
       .filter(row => { const ms = new Date(row.start).getTime(); return ms >= t0 && ms <= t1; })
-      .map(row => ({ ms: new Date(row.start).getTime(), v: (+row[s.key] || 0) * (s.scale || 1) }));
+      .map(row => ({ ms: new Date(row.start).getTime(), v: (s.calc ? s.calc(row) : (+row[s.key] || 0)) * (s.scale || 1) }));
   });
   let yMax = 0, yMin = opts.yMin != null ? opts.yMin : 0;
   for (const pts of raw) for (const p of pts) { if (p.v > yMax) yMax = p.v; if (p.v < yMin) yMin = p.v; }
+  if (opts.symmetric) { const m = Math.max(Math.abs(yMin), Math.abs(yMax)); yMin = -m; yMax = m; }
   if (yMax === yMin) yMax = yMin + 1;
   const Y = (v) => g.mt + (1 - (v - yMin) / (yMax - yMin)) * (g.h - g.mt - g.mb);
   const fmt = opts.fmt || ((v) => v.toFixed(1));
@@ -247,7 +280,13 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
     }
     paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.actual ? 1.75 : 2.5}" opacity="${s.actual ? 0.9 : 1}" stroke-linejoin="round" stroke-linecap="round" ${s.dash ? 'stroke-dasharray="5 4"' : ''}/>`;
   });
-  return `<svg viewBox="0 0 ${g.w} ${g.h}" class="chart-svg" role="img"><defs>${defs}</defs>${grid}${zero}${xt}${now}${paths}`
+  // preserveAspectRatio="none": a line/area chart has no inherent aspect ratio to
+  // protect (x is time, y is an independent unit) — stretching to exactly fill
+  // whatever box CSS gives it is correct here. Without this, a caller that pins an
+  // explicit CSS height (e.g. grid-lens-power-chart-card's max_height) whose aspect
+  // ratio doesn't match the viewBox gets letterboxed: the default "xMidYMid meet"
+  // scales uniformly and pads the mismatch as empty space above/below the plot.
+  return `<svg viewBox="0 0 ${g.w} ${g.h}" preserveAspectRatio="none" class="chart-svg" role="img"><defs>${defs}</defs>${grid}${zero}${xt}${now}${paths}`
     + `<line class="xhair" x1="0" x2="0" y1="${g.mt}" y2="${g.h - g.mb}" stroke="var(--ink2)" stroke-width="1" opacity="0"/></svg>`;
 }
 
@@ -266,14 +305,30 @@ export const STYLE = `
     --border: var(--divider-color);
     --predicted:#2563eb; --actual:#ea580c; --charge:#2563eb; --discharge:#ea580c;
     --idle:#94918a; --fit:rgba(245,158,11,.20); --good:#059669;
-    --solar:#f59e0b; --load:#7c3aed; --buy:#e11d48; --sell:#0d9488; --cum:#2563eb;
-    --defer1:#db2777; --defer2:#0891b2; --defer3:#65a30d; --defer4:#c2410c;
+    /* solar/gridflow/battery are shared with the Power Flow card's --c-solar/--c-grid/
+       --c-battery (grid-lens-powerflow-card.js) so the same flow reads as the same
+       colour across both cards. Re-validated as a set (solar/load/gridflow/battery,
+       OKLab CVD deltaE, dataviz skill's validate_palette.js, --pairs all): all checks
+       pass in light mode; dark mode passes CVD separation and the normal-vision floor
+       (only the lightness-band guideline sits outside range, same as the pre-existing
+       defer/battery/grid dark hues below — not a distinguishability issue). --buy/--sell
+       are for the Price chart's import/export *rate* lines only (two genuinely separate
+       rates, not a flow) — the power chart plots one signed net --gridflow line instead. */
+    --solar:#9c8208; --load:#db2777; --gridflow:#8b7cf6; --battery:#22c55e;
+    --buy:#e11d48; --sell:#0d9488; --cum:#2563eb;
+    /* defer1-3 clear the CVD target (deltaE>=8) and normal-vision floor (>=15) in both
+       modes. defer4 sits in the CVD floor band (deltaE 6-8) here in light mode only —
+       the fixed base hues plus 3 clean new ones already crowd the wheel, so a 4th
+       distinguishable-from-all-7 hue is legal only with the secondary encoding this
+       chart already ships (legend + tooltip name labels), not on color alone. */
+    --defer1:#125795; --defer2:#0e6e11; --defer3:#7d386a; --defer4:#989401;
   }
   :host(.dark) {
     --predicted:#60a5fa; --actual:#fb923c; --charge:#60a5fa; --discharge:#fb923c;
     --fit:rgba(251,191,36,.22); --good:#10b981;
-    --solar:#fbbf24; --load:#a78bfa; --buy:#fb7185; --sell:#2dd4bf; --cum:#60a5fa;
-    --defer1:#f472b6; --defer2:#22d3ee; --defer3:#a3e635; --defer4:#fb923c;
+    --solar:#b8960a; --load:#f472b6; --gridflow:#a78bfa; --battery:#4ade80;
+    --buy:#fb7185; --sell:#2dd4bf; --cum:#60a5fa;
+    --defer1:#196ea9; --defer2:#3c7800; --defer3:#c30c92; --defer4:#ab5e5a;
   }
   .card { background:var(--surface); border:1px solid var(--border); border-radius:14px;
           padding:16px 18px; font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
@@ -335,9 +390,10 @@ export class GridLensChartCardBase extends HTMLElement {
     this._actual = [];
     this._lastFetch = 0;
     this._sig = '';
-    this._actualEnergy = { solar: [], load: [], buy: [], sell: [] };
+    this._actualEnergy = { solar: [], load: [], grid: [], battery: [], defer: [] };
     this._deferNames = [];
     this._deferMaxKw = [];
+    this._deferSensorIds = [];
     this._viewMode = 'today';
     this._dark = false;
   }
@@ -345,13 +401,21 @@ export class GridLensChartCardBase extends HTMLElement {
   get wantsSocHistory() { return false; }
   get wantsEnergyHistory() { return false; }
 
+  // Hook for a wantsEnergyHistory subclass to name its deferrable devices' real power
+  // sensors: { [sensor_id]: power_entity }, keyed by the device's configured energy
+  // entity_id (matches _deferSensorIds, not _deferNames — see that field's comment).
+  // Default = none (no deferrable devices configured, or this chart doesn't care about
+  // them) — _fetchActual() below fetches nothing extra and _actualEnergy.defer stays empty.
+  _deferPowerEntities() { return {}; }
+
   setConfig(config) {
     if (!config || !config.entity) throw new Error('Define "entity" (the planned_dispatch sensor)');
     this._config = Object.assign({
-      soc_entity: 'sensor.sigen_plant_ess_soc',
+      soc_entity: 'sensor.sigen_0_plant_battery_soc',
       solar_power_entity: 'sensor.sigen_0_total_pv_power',
-      load_power_entity: 'sensor.sigen_plant_general_load_power',
+      load_power_entity: 'sensor.sigen_0_general_load_power',
       grid_power_entity: 'sensor.sigen_plant_grid_sensor_active_power',
+      battery_power_entity: 'sensor.sigen_0_plant_battery_power',
     }, config);
     this._sig = '';
     this._renderShell();
@@ -371,6 +435,10 @@ export class GridLensChartCardBase extends HTMLElement {
     this._traj = Array.isArray(a.trajectory) ? a.trajectory : null;
     this._deferNames = Array.isArray(a.deferrable_names) ? a.deferrable_names : [];
     this._deferMaxKw = Array.isArray(a.deferrable_max_kw) ? a.deferrable_max_kw : [];
+    // Join key for matching a trajectory device slot to its real power sensor — see
+    // _deferPowerEntities() in grid-lens-power-chart-card.js. Not the same string as
+    // deferrable_names (that's a display label; this is the configured energy entity_id).
+    this._deferSensorIds = Array.isArray(a.deferrable_sensor_ids) ? a.deferrable_sensor_ids : [];
 
     this._summary = {
       status: a.status || st.state,
@@ -409,7 +477,8 @@ export class GridLensChartCardBase extends HTMLElement {
       const c = this._config;
       const eids = [];
       if (this.wantsSocHistory) eids.push(c.soc_entity);
-      if (this.wantsEnergyHistory) eids.push(c.solar_power_entity, c.load_power_entity, c.grid_power_entity);
+      const deferMap = this.wantsEnergyHistory ? (this._deferPowerEntities() || {}) : {};
+      if (this.wantsEnergyHistory) eids.push(c.solar_power_entity, c.load_power_entity, c.grid_power_entity, c.battery_power_entity, ...Object.values(deferMap));
       const uniq = [...new Set(eids)].filter(Boolean);
       if (!uniq.length) return;
       const url = `history/period/${start.toISOString()}?filter_entity_id=${uniq.join(',')}` +
@@ -430,12 +499,33 @@ export class GridLensChartCardBase extends HTMLElement {
           return (s && s.attributes && s.attributes.unit_of_measurement === 'W') ? 0.001 : 1;
         };
         const fS = toKw(c.solar_power_entity), fL = toKw(c.load_power_entity), fG = toKw(c.grid_power_entity);
+        const fB = toKw(c.battery_power_entity);
         const grid = this._series(byId[c.grid_power_entity]);
+        const loadRaw = this._series(byId[c.load_power_entity]).map(p => ({ t: p.t, v: Math.max(0, p.v * fL) }));
+        // Per-device deferrable actuals, same order as _deferNames/_deferSensorIds (so they
+        // share the forecast dashed lines' colours) — joined on the device's sensor_id, not
+        // its display name (deferrable_names is a separately-cleaned label that need not
+        // match the `deferrable_loads` attribute's name for the same device — see
+        // AdvisoryResult.deferrable_sensor_ids). Devices with no resolvable power sensor
+        // contribute an empty series and are simply not drawn/subtracted.
+        const deferRaw = (this._deferSensorIds || []).map(sid => {
+          const eid = deferMap[sid];
+          if (!eid || !byId[eid]) return [];
+          const fD = toKw(eid);
+          return this._series(byId[eid]).map(p => ({ t: p.t, v: Math.max(0, p.v * fD) }));
+        });
         this._actualEnergy = {
           solar: ds(this._series(byId[c.solar_power_entity]).map(p => ({ t: p.t, v: Math.max(0, p.v * fS) }))),
-          load: ds(this._series(byId[c.load_power_entity]).map(p => ({ t: p.t, v: Math.max(0, p.v * fL) }))),
-          buy: ds(grid.map(p => ({ t: p.t, v: Math.max(0, p.v * fG) }))),
-          sell: ds(grid.map(p => ({ t: p.t, v: Math.max(0, -p.v * fG) }))),
+          // "Load" here means the same thing the forecast side means by it — whole-home
+          // load minus deferrable devices — so the two sides of "now" read consistently.
+          load: ds(subtractStepSeries(loadRaw, deferRaw)),
+          // Signed, unsplit: >0 import, <0 export — one line instead of two, matching the
+          // forecast side's net grid_kwh and the powerflow card's own sign convention.
+          grid: ds(grid.map(p => ({ t: p.t, v: p.v * fG }))),
+          // Signed: >0 charging (into battery), <0 discharging (out), same convention as
+          // the powerflow card's battery_power_entity reading.
+          battery: ds(this._series(byId[c.battery_power_entity]).map(p => ({ t: p.t, v: p.v * fB }))),
+          defer: deferRaw.map(pts => ds(pts)),
         };
       }
       this._sig = '';

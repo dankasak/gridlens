@@ -5,12 +5,12 @@
  * Config:
  *   type: custom:grid-lens-soc-chart-card
  *   entity: sensor.roof_grid_lens_nsw_planned_dispatch   (required)
- *   soc_entity: sensor.sigen_plant_ess_soc               (actual SOC, optional)
+ *   soc_entity: sensor.sigen_0_plant_battery_soc          (actual SOC, optional)
  */
 import {
   GW, GML, GMR, GridLensChartCardBase,
   clampPct, esc, fmtPct, fmtC, fmtHour, smoothPath, gradDef, xAxisTicks, actionLabel, reasonFor, execMode,
-} from './grid-lens-chart-common.js?v=20260724c';
+} from './grid-lens-chart-common.js?v=20260728q';
 
 class GridLensSocChartCard extends GridLensChartCardBase {
   get title() { return 'SOC — planned vs measured'; }

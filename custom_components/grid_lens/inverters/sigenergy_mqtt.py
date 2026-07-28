@@ -5,20 +5,26 @@ second Modbus master (which would contend with sigenergy2mqtt's own connection),
 driver drives the entities that bridge already publishes:
 
   Controls (writable):
-    switch.sigen_plant_remote_ems_enable            Remote EMS master enable
+    switch.sigen_0_plant_remote_ems                 Remote EMS master enable
     select.sigen_0_plant_remote_ems_control_mode    EMS mode (strings below)
-    number.sigen_plant_ess_max_charging_limit_2     charge-rate cap  (kW)
-    number.sigen_plant_ess_max_discharging_limit_2  discharge-rate cap (kW)
-    number.sigen_plant_grid_point_maximum_export_limitation  export cap (kW)
+    number.sigen_0_plant_max_charging_limit         charge-rate cap  (kW)
+    number.sigen_0_plant_max_discharging_limit      discharge-rate cap (kW)
+    number.sigen_0_plant_grid_max_export_limit      export cap (kW)
 
   Telemetry (read):
-    sensor.sigen_plant_ess_soc                  % (SOC)
-    sensor.sigen_plant_ess_power                kW, >0 charging / <0 discharging
+    sensor.sigen_0_plant_battery_soc            % (SOC)
+    sensor.sigen_0_plant_battery_power          kW, >0 charging / <0 discharging
     sensor.sigen_0_total_pv_power               kW
     sensor.sigen_plant_grid_sensor_active_power kW, >0 import / <0 export
-    sensor.sigen_plant_general_load_power       kW
+    sensor.sigen_0_general_load_power           kW
     sensor.sigen_plant_ess_rated_energy_capacity kWh
-    sensor.sigen_plant_ess_soh                  %
+    sensor.sigen_0_plant_battery_soh            %
+
+  Entity IDs above reflect the ``sigenergy2mqtt`` add-on's current naming (verified live
+  2026-07-26). They previously carried a stray ``_2``/``_plant_ess_`` collision suffix left
+  over from the old TypQxQ Sigenergy-Local-Modbus integration, which briefly coexisted with
+  this bridge and claimed the "clean" entity_id first; that integration is gone now, so the
+  IDs were reset to the bridge's own defaults.
 
 All native values are kW; this driver converts to/from canonical watts.
 """
@@ -55,20 +61,20 @@ _ACTION_MODES = {
 }
 
 _DEFAULT_ENTITIES = {
-    "enable": "switch.sigen_plant_remote_ems_enable",
+    "enable": "switch.sigen_0_plant_remote_ems",
     "mode": "select.sigen_0_plant_remote_ems_control_mode",
-    "charge_limit": "number.sigen_plant_ess_max_charging_limit_2",
-    "discharge_limit": "number.sigen_plant_ess_max_discharging_limit_2",
-    "export_limit": "number.sigen_plant_grid_point_maximum_export_limitation",
-    "backup_reserve": "number.sigen_plant_backup_soc",
-    "discharge_floor": "number.sigen_plant_discharge_cut_off_soc",
-    "soc": "sensor.sigen_plant_ess_soc",
-    "battery_power": "sensor.sigen_plant_ess_power",
+    "charge_limit": "number.sigen_0_plant_max_charging_limit",
+    "discharge_limit": "number.sigen_0_plant_max_discharging_limit",
+    "export_limit": "number.sigen_0_plant_grid_max_export_limit",
+    "backup_reserve": "number.sigen_0_plant_ess_backup_soc",
+    "discharge_floor": "number.sigen_0_plant_ess_discharge_cut_off_soc",
+    "soc": "sensor.sigen_0_plant_battery_soc",
+    "battery_power": "sensor.sigen_0_plant_battery_power",
     "pv_power": "sensor.sigen_0_total_pv_power",
     "grid_power": "sensor.sigen_plant_grid_sensor_active_power",
-    "load_power": "sensor.sigen_plant_general_load_power",
+    "load_power": "sensor.sigen_0_general_load_power",
     "capacity": "sensor.sigen_plant_ess_rated_energy_capacity",
-    "soh": "sensor.sigen_plant_ess_soh",
+    "soh": "sensor.sigen_0_plant_battery_soh",
 }
 
 

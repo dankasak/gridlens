@@ -37,6 +37,139 @@ Contents:
 """
 
 
+def _build_seed_views(hass: HomeAssistant) -> list[dict]:
+    """Dashboard views seeded for a brand-new install.
+
+    Every entity id is resolved from the entity registry by the unique_id each
+    platform assigns (f"{entry.entry_id}_..."), never hardcoded — a config entry's
+    device-name-derived slug (e.g. "roof_grid_lens_nsw") is unique per install and
+    can't be guessed. Cards/tiles that need an entity which doesn't resolve (no
+    battery configured, no deferrable loads, etc.) are simply omitted rather than
+    shipping a broken reference. See CLAUDE.md's "build for the general case, not
+    this install" — nothing here should assume a specific inverter brand or account.
+    """
+    from homeassistant.helpers import entity_registry as er
+
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if not entries:
+        # Shouldn't happen (this only runs once a config entry exists), but with
+        # no entry to resolve real entity ids against, fall back to a bare card.
+        return [{
+            "type": "panel", "title": "Plan Comparison", "path": "plan-comparison",
+            "cards": [{"type": "custom:grid-lens-card"}],
+        }]
+    # One shared "Grid Lens" dashboard, so a multi-entry install just gets the
+    # first entry's data — matches how the dashboard itself is domain-wide today.
+    entry = entries[0]
+    reg = er.async_get(hass)
+
+    def eid(unique_id: str) -> str | None:
+        for domain in ("sensor", "switch", "number"):
+            found = reg.async_get_entity_id(domain, DOMAIN, unique_id)
+            if found:
+                return found
+        return None
+
+    current_plan_cost = eid(f"{entry.entry_id}_current_plan_cost")
+    plan_comparison_view = {
+        "type": "panel", "title": "Plan Comparison", "path": "plan-comparison",
+        "cards": [{
+            "type": "custom:grid-lens-card",
+            **({"entity": current_plan_cost} if current_plan_cost else {}),
+        }],
+    }
+    views = [plan_comparison_view]
+
+    dispatch = eid(f"{entry.entry_id}_planned_dispatch")
+    if not dispatch:
+        # Advisory/battery-plan system not set up for this entry (e.g. still
+        # initializing) — the Plan Comparison view alone is still useful.
+        return views
+
+    top_row = [{
+        "type": "custom:grid-lens-flex-row-card",
+        "gap": 16,
+        "cards": [
+            {
+                "type": "custom:grid-lens-powerflow-card",
+                "max_height": 600, "max_width": 600, "flex": "0 1 600px",
+                "icon_scale": 1.5, "font_scale": 0.7,
+                # Live solar/grid/battery/EV POWER sensors aren't collected by
+                # config_flow (only daily-energy sensors are, for the plan-
+                # comparison LP) — the card falls back to its own built-in example
+                # defaults until that's added as a proper config field. SOC is
+                # genuinely install-agnostic config already, so pass it through.
+                **({"soc_entity": entry.data.get("battery_soc_sensor")}
+                   if entry.data.get("battery_soc_sensor") else {}),
+            },
+            {
+                "type": "custom:grid-lens-power-chart-card",
+                "entity": dispatch, "max_height": 510, "flex": "1 1 300px",
+            },
+        ],
+        "grid_options": {"columns": "full"},
+    }]
+
+    boost_tiles = []
+    if entry.data.get("has_battery"):
+        min_export = eid(f"{entry.entry_id}_min_export_price")
+        if min_export:
+            boost_tiles.append({
+                "type": "tile", "entity": min_export, "name": "Min export price",
+                "features": [{"type": "numeric-input"}],
+            })
+    for sensor_id in entry.data.get("deferrable_load_sensors", []) or []:
+        boost = eid(f"{entry.entry_id}_deferrable_override_{sensor_id}")
+        if boost:
+            boost_tiles.append({
+                "type": "tile", "entity": boost, "features": [{"type": "numeric-input"}],
+            })
+
+    status_tiles = []
+    battery_control = eid(f"{entry.entry_id}_battery_control")
+    if battery_control:
+        status_tiles.append({
+            "type": "tile", "entity": battery_control, "name": "Battery control",
+            "state_content": ["state", "note"], "features": [{"type": "toggle"}],
+        })
+    for label, key in (
+        ("Now", "advisory_next_action"), ("SOC now", "advisory_soc_now"),
+        ("Planned end", "advisory_planned_end_soc"), ("Plan net cost", "advisory_net_cost"),
+    ):
+        found = eid(f"{entry.entry_id}_{key}")
+        if found:
+            status_tiles.append({"type": "tile", "entity": found, "name": label})
+
+    sections = [{"column_span": 3, "cards": top_row}]
+    if boost_tiles:
+        sections.append({"column_span": 3, "cards": [{
+            "type": "grid", "columns": len(boost_tiles), "square": False,
+            "cards": boost_tiles, "grid_options": {"columns": "full"},
+        }]})
+    if status_tiles:
+        sections.append({"column_span": 3, "cards": [{
+            "type": "grid", "columns": len(status_tiles), "square": False,
+            "cards": status_tiles, "grid_options": {"columns": "full"},
+        }]})
+    sections.append({"column_span": 3, "cards": [{
+        "type": "custom:grid-lens-advisory-card", "entity": dispatch,
+        "grid_options": {"columns": "full"},
+    }]})
+    for card_kind in ("soc", "dispatch", "price", "cash"):
+        sections.append({"column_span": 3, "cards": [{
+            "type": f"custom:grid-lens-{card_kind}-chart-card", "entity": dispatch,
+            "grid_options": {"columns": "full"},
+        }]})
+
+    views.append({
+        "path": "plan", "type": "sections", "icon": "mdi:battery-clock",
+        "title": "Battery Plan", "max_columns": 3, "dense_section_placement": False,
+        "header": {"layout": "responsive", "badges_position": "bottom", "badges_wrap": "wrap"},
+        "cards": [], "sections": sections,
+    })
+    return views
+
+
 def _plan_from_history(entries: list, start_date) -> str | None:
     """Return the plan name active at start_date (latest entry whose date <= start_date)."""
     query = start_date.date().isoformat() if hasattr(start_date, 'date') else str(start_date)[:10]
@@ -71,7 +204,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260725l"
+    _CARD_VERSION = "20260728q"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -162,15 +295,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 await content_store.async_save({
                     "config": {
                         "title": "Grid Lens",
-                        "views": [{
-                            "type": "panel",
-                            "title": "Plan Comparison",
-                            "path": "plan-comparison",
-                            "cards": [{
-                                "type": "custom:grid-lens-card",
-                                "entity": "sensor.grid_lens_current_plan_monthly_cost",
-                            }]
-                        }]
+                        "views": _build_seed_views(hass),
                     }
                 })
 
@@ -908,12 +1033,16 @@ class GridLensCoordinator(DataUpdateCoordinator):
         self.entry = entry
         self.hass = hass
         self.calculator = None  # Will be created on first update
+        self.energy_dashboard_names: dict[str, str] = {}
 
     async def _async_update_data(self):
         """Fetch data from energy sensors and calculate plan comparisons."""
         import aiohttp
         from .plan_calculator import PlanCalculator
         from .const import CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL, CONF_STATE
+        from .entity_lookup import async_get_energy_dashboard_names
+
+        self.energy_dashboard_names = await async_get_energy_dashboard_names(self.hass)
 
         api_key = self.entry.data.get(CONF_GRIDLENS_API_KEY, "")
         api_url = self.entry.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
