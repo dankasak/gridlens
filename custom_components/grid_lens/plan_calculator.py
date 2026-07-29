@@ -34,11 +34,13 @@ from .const import (
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_HOURS,
+    CONF_DEFERRABLE_LOAD_SWITCHES,
     CONF_HAS_DEMAND_TARIFF,
     DEFAULT_DEMAND_WINDOW_HOURS,
     POPULAR_EV_PLANS,
     parse_hours_spec,
 )
+from .entity_lookup import resolve_device_name, async_get_energy_dashboard_names
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -88,6 +90,7 @@ class PlanCalculator:
         self.deferrable_load_sensors: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
         self.deferrable_load_max_kw: list[float] = entry.data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
         self.deferrable_load_hours: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_HOURS, [])
+        self.deferrable_load_switches: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_SWITCHES, [])
         self.current_plan_override: str | None = entry.data.get("current_plan")
         
         # Initialize battery optimizer if battery is configured
@@ -1360,6 +1363,12 @@ class PlanCalculator:
         deferrable_loads: list[dict] = []
         per_sensor_hod_avgs: list[dict] = []
         days = max(1, round((end_time - start_time).total_seconds() / 86400))
+        # Same name resolution as sensor.py's _build_deferrable_loads (control switch
+        # anchor first, then the Energy Dashboard's per-device label, e.g. "Hot Water")
+        # so the power chart's legend/tooltip names match the power-flow card's — a raw
+        # friendly_name here would instead surface the underlying sensor's own name
+        # (e.g. a Sigenergy smart port) whenever the two diverge.
+        dashboard_names = await async_get_energy_dashboard_names(self.hass)
 
         for i, sensor_id in enumerate(self.deferrable_load_sensors):
             raw = await self._get_usage_data(start_time, end_time, sensor_id)
@@ -1370,7 +1379,10 @@ class PlanCalculator:
 
             divisor = 1.0
             state_obj = self.hass.states.get(sensor_id)
-            name = state_obj.attributes.get("friendly_name", sensor_id) if state_obj else sensor_id
+            sw = self.deferrable_load_switches[i] if i < len(self.deferrable_load_switches) else ""
+            name = resolve_device_name(
+                self.hass, sw or None, sensor_id, dashboard_names=dashboard_names
+            ) or sensor_id
             if state_obj:
                 unit = state_obj.attributes.get("unit_of_measurement", "")
                 if unit == "Wh":

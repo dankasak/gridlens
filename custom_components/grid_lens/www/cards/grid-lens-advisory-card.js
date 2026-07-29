@@ -17,8 +17,8 @@
  *   control_switch_entity: switch.roof_grid_lens_nsw_battery_control (optional)
  */
 import {
-  STYLE, esc, fmtTime, fmtDayHour, modeLabel, MODE_COLORS, execMode, reasonFor,
-} from './grid-lens-chart-common.js?v=20260728q';
+  STYLE, esc, fmtTime, fmtDayHour, modeLabel, MODE_COLORS, execMode, reasonFor, deferColorFor,
+} from './grid-lens-chart-common.js?v=20260729d';
 
 class GridLensAdvisoryCard extends HTMLElement {
   constructor() {
@@ -119,7 +119,9 @@ class GridLensAdvisoryCard extends HTMLElement {
     }
 
     const dnames = this._deferNames || [];
-    const deferColor = (i) => `var(--defer${(i % 4) + 1})`;
+    // Matches the Power Flow card's own per-device colour assignment (a hot-water device
+    // gets a dedicated colour pulled out of the rotation) — see deferColorFor() in chart-common.js.
+    const deferColor = (i) => deferColorFor(dnames, i);
 
     body.innerHTML = header +
       `<div class="sec"><h4>Control-mode timeline (EMS)</h4>

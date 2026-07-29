@@ -12,8 +12,8 @@
  *   max_width: null   // cap (px) on how wide the card grows; set 0/null to fill its container
  */
 import {
-  GridLensChartCardBase, multiLineChart, esc, fmtHour,
-} from './grid-lens-chart-common.js?v=20260728q';
+  GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor,
+} from './grid-lens-chart-common.js?v=20260729d';
 
 class GridLensPowerChartCard extends GridLensChartCardBase {
   get title() { return 'Power — measured & forecast (kW)'; }
@@ -38,7 +38,9 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       + ` .card { padding: 10px 16px; } .legend { margin: 0 0 4px; gap: 10px; }`;
   }
 
-  _deferColor(i) { return `var(--defer${(i % 4) + 1})`; }
+  // Matches the Power Flow card's own per-device colour assignment (a hot-water device gets
+  // a dedicated colour pulled out of the rotation) — see deferColorFor() in chart-common.js.
+  _deferColor(i) { return deferColorFor(this._deferNames, i); }
 
   // Real power sensors for the configured deferrable devices, keyed by each device's
   // configured energy entity_id (matches GridLensChartCardBase._deferSensorIds — the
@@ -47,11 +49,11 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
   // same auto-discovery pattern as _resolveDeferLoads() in grid-lens-powerflow-card.js,
   // scanning for any sensor exposing it rather than assuming a fixed entity id.
   //
-  // Deliberately NOT keyed by name: deferrable_names (on the dispatch sensor) is built
-  // from the energy sensor's raw friendly_name, while this attribute's `name` runs through
-  // resolve_device_name (entity-registry name / Energy Dashboard rename / trimmed
-  // suffixes) — the same device can legitimately show two different strings on the two
-  // sensors, so a name join silently matches nothing for most real installs.
+  // Deliberately NOT keyed by name: both this attribute's `name` and the dispatch sensor's
+  // deferrable_names now go through the same resolve_device_name priority (entity-registry
+  // name / Energy Dashboard rename / trimmed suffixes), so they'll usually agree — but a
+  // user is still free to rename one entity and not the other, so the energy entity_id
+  // (the actual join key) is the only join that's guaranteed not to silently match nothing.
   _deferPowerEntities() {
     const hass = this._hass;
     if (!hass) return {};
@@ -103,12 +105,21 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
         { key: 'load_kwh', color: 'var(--load)', scale: kwScale },
         { calc: (row) => this._gridNet(row), color: 'var(--gridflow)', area: true, scale: kwScale },
         { key: 'battery_kwh', color: 'var(--battery)', scale: kwScale },
-        ...dnames.map((nm, i) => ({ key: `defer_${i}`, color: this._deferColor(i), dash: true, scale: kwScale })),
+        // step: true — a deferrable device's planned power is piecewise-constant (off, or on
+        // at ~max_kw for a slot), not a smooth ramp. Without it smoothPath's cubic spline
+        // curves gradually up from 0 toward the turn-on slot instead of holding flat at 0
+        // until the device actually switches on. See stepPath()'s own comment.
+        ...dnames.map((nm, i) => ({ key: `defer_${i}`, color: this._deferColor(i), dash: true, scale: kwScale, step: true })),
         { points: this._actualEnergy.solar, color: 'var(--solar)', actual: true },
         { points: this._actualEnergy.load, color: 'var(--load)', actual: true },
         { points: this._actualEnergy.grid, color: 'var(--gridflow)', actual: true },
         { points: this._actualEnergy.battery, color: 'var(--battery)', actual: true },
-        ...dnames.map((nm, i) => ({ points: actualDefer[i], color: this._deferColor(i), actual: true, dash: true })),
+        // step: true here too — a real deferrable appliance (EV charger, hot water element)
+        // switches on/off in seconds on the hardware side, but HA's history API only samples
+        // on significant_changes_only, so two sparse readings (last "off", first "on") would
+        // otherwise get smoothPath'd into the exact same diagonal-ramp artifact as the
+        // forecast series above, just drawn from real sensor data instead of planned data.
+        ...dnames.map((nm, i) => ({ points: actualDefer[i], color: this._deferColor(i), actual: true, dash: true, step: true })),
       ],
     };
   }

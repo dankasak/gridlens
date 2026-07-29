@@ -110,6 +110,30 @@ export function gradDef(id, color, topOpacity) {
     + `<stop offset="1" style="stop-color:${color};stop-opacity:0.02"/></linearGradient>`;
 }
 export function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+// Same hot-water detection as the Power Flow card's DEFER_ICON_RULES water_heater rule
+// (grid-lens-powerflow-card.js) — kept in sync manually since the two cards don't share a
+// module family; if you touch one pattern, touch the other.
+export const HOT_WATER_RE = /(hot[\s_-]*water|water[\s_-]*heat|\bhws\b|boiler|immersion)/i;
+
+// Colour for the i-th deferrable device in `names` (a sensor's deferrable_names attribute),
+// matching the Power Flow card's own per-device colour assignment (_bottomActors): a
+// hot-water device gets the dedicated --hotwater colour pulled OUT of the --deferN rotation
+// (not counted against it) instead of cycling through it like every other load, so a given
+// slot index means the same device — and reads the same colour — on both cards regardless of
+// where a hot-water device happens to sit in the configured list. Only checks the device's
+// display name (that's all a chart/timeline has); the Power Flow card also matches against
+// the power/switch entity ids, so a device named ambiguously but wired to an entity id that
+// mentions "hot water" can still show mismatched colours between the two — narrower gap than
+// not checking at all.
+export function deferColorFor(names, i) {
+  if (HOT_WATER_RE.test((names && names[i]) || '')) return 'var(--hotwater)';
+  let idx = 0;
+  for (let j = 0; j < i; j += 1) {
+    if (!HOT_WATER_RE.test((names && names[j]) || '')) idx += 1;
+  }
+  return `var(--defer${(idx % 4) + 1})`;
+}
 export function clampPct(v) { v = parseFloat(v); return isNaN(v) ? 0 : Math.max(0, Math.min(100, v)); }
 export function fmtPct(v) { v = parseFloat(v); return isNaN(v) ? '–' : v.toFixed(0) + '%'; }
 export function fmtC(v) { v = parseFloat(v); return isNaN(v) ? '–' : (v * 100).toFixed(0) + 'c'; }
@@ -265,10 +289,17 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
     let d, rightX = pts[pts.length - 1][0];
     if (s.step) {
       d = stepPath(pts);
-      const endX = X(t1);
-      if (endX > rightX) {
-        d += ` L${endX.toFixed(1)},${pts[pts.length - 1][1].toFixed(1)}`;
-        rightX = endX;
+      // Hold the last value flat out to the chart's right edge — sensible for a forecast
+      // (nothing better to show past the last planned slot) but wrong for an `actual`
+      // (measured) series: its last point is simply "now", the real data boundary, and
+      // extending it would draw a real sensor reading as if it continued forever into the
+      // future instead of stopping where the measurement actually stops.
+      if (!s.actual) {
+        const endX = X(t1);
+        if (endX > rightX) {
+          d += ` L${endX.toFixed(1)},${pts[pts.length - 1][1].toFixed(1)}`;
+          rightX = endX;
+        }
       }
     } else {
       d = smoothPath(pts);
@@ -316,19 +347,29 @@ export const STYLE = `
        rates, not a flow) — the power chart plots one signed net --gridflow line instead. */
     --solar:#9c8208; --load:#db2777; --gridflow:#8b7cf6; --battery:#22c55e;
     --buy:#e11d48; --sell:#0d9488; --cum:#2563eb;
-    /* defer1-3 clear the CVD target (deltaE>=8) and normal-vision floor (>=15) in both
-       modes. defer4 sits in the CVD floor band (deltaE 6-8) here in light mode only —
-       the fixed base hues plus 3 clean new ones already crowd the wheel, so a 4th
-       distinguishable-from-all-7 hue is legal only with the secondary encoding this
-       chart already ships (legend + tooltip name labels), not on color alone. */
-    --defer1:#125795; --defer2:#0e6e11; --defer3:#7d386a; --defer4:#989401;
+    /* defer1-4 and hotwater are the SAME hex values as the Power Flow card's own
+       --c-def1-4/--c-hotwater (grid-lens-powerflow-card.js), so a device reads as the same
+       colour whether you're looking at its icon on the flow diagram or its dashed line here
+       — validated together via the dataviz skill (validate_palette.js, against
+       solar/load/gridflow/battery, adjacent pairs): all checks pass except --hotwater's
+       chroma floor (it's a deliberately desaturated "pulled out of rotation" neutral, same
+       exception already relied on by --idle above — legend + tooltip name labels carry the
+       identity, not colour alone). */
+    --defer1:#e11d48; --defer2:#0d9488; --defer3:#7c3aed; --defer4:#ca8a04;
+    --hotwater:#94a3b8;
   }
   :host(.dark) {
     --predicted:#60a5fa; --actual:#fb923c; --charge:#60a5fa; --discharge:#fb923c;
     --fit:rgba(251,191,36,.22); --good:#10b981;
     --solar:#b8960a; --load:#f472b6; --gridflow:#a78bfa; --battery:#4ade80;
     --buy:#fb7185; --sell:#2dd4bf; --cum:#60a5fa;
-    --defer1:#196ea9; --defer2:#3c7800; --defer3:#c30c92; --defer4:#ab5e5a;
+    /* --defer3 deliberately differs from the Power Flow card's own dark --c-def3 (#a78bfa) —
+       that value duplicates --c-grid in that card's own dark palette (a pre-existing bug,
+       fixed there too, see grid-lens-powerflow-card.js), not something to propagate here.
+       Same CVD-exception profile as light mode above (lightness-band non-issue + hotwater
+       chroma floor). */
+    --defer1:#fb7185; --defer2:#2dd4bf; --defer3:#8b5cf6; --defer4:#facc15;
+    --hotwater:#cbd5e1;
   }
   .card { background:var(--surface); border:1px solid var(--border); border-radius:14px;
           padding:16px 18px; font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
@@ -504,9 +545,10 @@ export class GridLensChartCardBase extends HTMLElement {
         const loadRaw = this._series(byId[c.load_power_entity]).map(p => ({ t: p.t, v: Math.max(0, p.v * fL) }));
         // Per-device deferrable actuals, same order as _deferNames/_deferSensorIds (so they
         // share the forecast dashed lines' colours) — joined on the device's sensor_id, not
-        // its display name (deferrable_names is a separately-cleaned label that need not
-        // match the `deferrable_loads` attribute's name for the same device — see
-        // AdvisoryResult.deferrable_sensor_ids). Devices with no resolvable power sensor
+        // its display name. deferrable_names now goes through the same resolve_device_name
+        // priority as the `deferrable_loads` attribute's name, so they'll usually agree, but
+        // a user renaming just one of the two entities is still possible — see
+        // AdvisoryResult.deferrable_sensor_ids. Devices with no resolvable power sensor
         // contribute an empty series and are simply not drawn/subtracted.
         const deferRaw = (this._deferSensorIds || []).map(sid => {
           const eid = deferMap[sid];

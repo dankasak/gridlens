@@ -66,12 +66,12 @@ class AdvisoryResult:
     deferrable_max_kw: list[float] = field(default_factory=list)
     # Same order as deferrable_names/deferrable_max_kw — each device's configured energy
     # sensor entity_id (plan_calculator._get_deferrable_data's 'sensor_id'). deferrable_names
-    # is a cleaned-up *display* string (raw friendly_name, not run through the same
-    # suffix-trimming/dashboard-rename logic sensor.py's `deferrable_loads` attribute uses),
-    # so two different GridLens sensors can legitimately show different names for the same
-    # device. This id is the only reliable join key a card has for matching "this trajectory
-    # slot" to "this device's real-time power sensor" — see _deferPowerEntities() in
-    # grid-lens-power-chart-card.js.
+    # is resolved via entity_lookup.resolve_device_name (same control-switch/Energy Dashboard/
+    # entity-registry priority sensor.py's `deferrable_loads` attribute uses), so the name
+    # shown here should match the power-flow card's for the same device — but this id, not
+    # the name, is still the only reliable join key a card has for matching "this trajectory
+    # slot" to "this device's real-time power sensor" (a user could still rename one place and
+    # not the other) — see _deferPowerEntities() in grid-lens-power-chart-card.js.
     deferrable_sensor_ids: list[str] = field(default_factory=list)
     # {label: {days_earned, days_total, amount, amount_per_day}} — e.g. GloBird
     # ZEROHERO's credit. Empty for plans without a conditional credit.

@@ -10,7 +10,7 @@ import aiohttp
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import DOMAIN, PLAN_ID_TO_KEY, CONF_DISTRIBUTOR
+from .const import DOMAIN, PLAN_ID_TO_KEY, CONF_DISTRIBUTOR, CONF_DEFERRABLE_LOAD_SENSORS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -110,28 +110,29 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
         "grid_options": {"columns": "full"},
     }]
 
-    boost_tiles = []
+    # Tunable settings (numeric overrides) and control switches both go on the
+    # separate "Settings" view below, not "Battery Plan" — keeps the operational/
+    # monitoring view free of things you set once and forget, per user request
+    # 2026-07-29 ("move the configuration stuff into a new page").
+    tuning_tiles = []
     if entry.data.get("has_battery"):
         min_export = eid(f"{entry.entry_id}_min_export_price")
         if min_export:
-            boost_tiles.append({
+            tuning_tiles.append({
                 "type": "tile", "entity": min_export, "name": "Min export price",
                 "features": [{"type": "numeric-input"}],
             })
-    for sensor_id in entry.data.get("deferrable_load_sensors", []) or []:
+    deferrable_sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or []
+    for sensor_id in deferrable_sensors:
         boost = eid(f"{entry.entry_id}_deferrable_override_{sensor_id}")
         if boost:
-            boost_tiles.append({
+            tuning_tiles.append({
                 "type": "tile", "entity": boost, "features": [{"type": "numeric-input"}],
             })
 
-    status_tiles = []
     battery_control = eid(f"{entry.entry_id}_battery_control")
-    if battery_control:
-        status_tiles.append({
-            "type": "tile", "entity": battery_control, "name": "Battery control",
-            "state_content": ["state", "note"], "features": [{"type": "toggle"}],
-        })
+
+    status_tiles = []
     for label, key in (
         ("Now", "advisory_next_action"), ("SOC now", "advisory_soc_now"),
         ("Planned end", "advisory_planned_end_soc"), ("Plan net cost", "advisory_net_cost"),
@@ -141,11 +142,6 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
             status_tiles.append({"type": "tile", "entity": found, "name": label})
 
     sections = [{"column_span": 3, "cards": top_row}]
-    if boost_tiles:
-        sections.append({"column_span": 3, "cards": [{
-            "type": "grid", "columns": len(boost_tiles), "square": False,
-            "cards": boost_tiles, "grid_options": {"columns": "full"},
-        }]})
     if status_tiles:
         sections.append({"column_span": 3, "cards": [{
             "type": "grid", "columns": len(status_tiles), "square": False,
@@ -167,6 +163,49 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
         "header": {"layout": "responsive", "badges_position": "bottom", "badges_wrap": "wrap"},
         "cards": [], "sections": sections,
     })
+
+    # Settings view: control switches (battery + deferrable loads — the load-control
+    # card is genuinely dynamic, so it's included whenever any deferrable load is
+    # configured, whether or not a control switch has been assigned to one yet; its
+    # own empty state points the user at Reconfigure) plus tunable numeric overrides.
+    # Only added at all if there's something to put on it.
+    settings_cards = []
+    if battery_control:
+        settings_cards.append({
+            "type": "heading", "heading": "Control", "heading_style": "title",
+            "icon": "mdi:toggle-switch-outline", "grid_options": {"columns": "full"},
+        })
+        settings_cards.append({
+            "type": "grid", "columns": 1, "square": False,
+            "cards": [battery_control], "grid_options": {"columns": "full"},
+        })
+    if deferrable_sensors:
+        if not battery_control:
+            settings_cards.append({
+                "type": "heading", "heading": "Control", "heading_style": "title",
+                "icon": "mdi:toggle-switch-outline", "grid_options": {"columns": "full"},
+            })
+        settings_cards.append({
+            "type": "custom:grid-lens-load-control-card", "title": "Deferrable Loads",
+            "grid_options": {"columns": "full"},
+        })
+    if tuning_tiles:
+        settings_cards.append({
+            "type": "heading", "heading": "Tuning", "heading_style": "title",
+            "icon": "mdi:tune", "grid_options": {"columns": "full"},
+        })
+        settings_cards.append({
+            "type": "grid", "columns": len(tuning_tiles), "square": False,
+            "cards": tuning_tiles, "grid_options": {"columns": "full"},
+        })
+    if settings_cards:
+        views.append({
+            "path": "settings", "type": "sections", "icon": "mdi:cog",
+            "title": "Settings", "max_columns": 2, "dense_section_placement": False,
+            "header": {"layout": "responsive", "badges_position": "bottom", "badges_wrap": "wrap"},
+            "cards": [], "sections": [{"column_span": 2, "cards": settings_cards}],
+        })
+
     return views
 
 
@@ -204,7 +243,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260728q"
+    _CARD_VERSION = "20260729m"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -216,6 +255,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         f"/grid_lens/cards/grid-lens-price-chart-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-cash-chart-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flex-row-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-load-control-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-boost-tuning-card.js?v={_CARD_VERSION}",
     ]
     stale_urls = {
         "/grid_lens/cards/electricity-plan-comparison-card.js",
@@ -935,6 +976,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][f"{entry.entry_id}_deferrable_overrides"] = DeferrableOverrideStore(
         hass, entry.entry_id
     )
+
+    # GridLens-owned daily energy archive: captures per-day PV/import/export totals
+    # into HA Storage so long-horizon features never depend on the user's recorder
+    # retention (backfills from long-term statistics, then appends nightly).
+    try:
+        from homeassistant.helpers.event import async_track_time_change
+
+        from .daily_archive import DailyEnergyArchive
+        _archive = DailyEnergyArchive(hass, entry)
+        hass.data[DOMAIN][f"{entry.entry_id}_daily_archive"] = _archive
+        entry.async_create_background_task(
+            hass, _archive.async_backfill(), name="grid_lens_daily_archive_backfill"
+        )
+        # 00:20 local: late enough that the recorder has compiled yesterday's last
+        # daily-statistics bucket, early enough to be ready for morning planning.
+        entry.async_on_unload(
+            async_track_time_change(
+                hass,
+                lambda now: entry.async_create_background_task(
+                    hass, _archive.async_daily_tick(now), name="grid_lens_daily_archive_tick"
+                ),
+                hour=0,
+                minute=20,
+                second=0,
+            )
+        )
+    except Exception as _arch_err:  # noqa: BLE001
+        _LOGGER.warning("Daily energy archive setup failed: %s", _arch_err)
 
     # Advisory mode (forecast-fed planning, read-only). Independent coordinator so it
     # never disturbs the manual plan-comparison flow. Best-effort — failures don't block.

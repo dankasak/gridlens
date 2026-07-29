@@ -154,6 +154,13 @@ class GridLensDeferrableOverrideNumber(NumberEntity):
         if self._store is not None:
             self._attr_native_value = await self._store.async_get(self._sensor_id)
 
+    @property
+    def extra_state_attributes(self) -> dict:
+        # Real state attribute (unlike unique_id, which is registry-only and invisible
+        # to the frontend) so Lovelace cards can auto-discover boost entities by
+        # fingerprint — see grid-lens-boost-tuning-card.js's _resolveBoosts().
+        return {"deferrable_sensor_id": self._sensor_id}
+
     async def async_set_native_value(self, value: float) -> None:
         if self._store is not None:
             await self._store.async_set(self._sensor_id, value)

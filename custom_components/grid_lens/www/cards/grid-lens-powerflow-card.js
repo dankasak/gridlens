@@ -14,6 +14,12 @@
  * unmatched keeps the dashed ring + mdi placeholder. `deferrable_icons` maps a
  * load name onto a built-in key or a URL of your own when the name doesn't say.
  *
+ * A deferrable load configured with its own battery/EV SOC sensor (GridLens
+ * integration config: "battery/EV SOC sensor" on the device_power step) shows a
+ * percentage next to its kW value, same as the home battery. Both the home
+ * battery's soc_entity and a deferrable load's soc_entity get a small clickable
+ * history-chart badge that opens HA's more-info dialog for that sensor.
+ *
  * Config (all optional):
  *   type: custom:grid-lens-powerflow-card
  *   solar_power_entity, load_power_entity, grid_power_entity,
@@ -26,7 +32,8 @@
  *     from (its `trajectory` attribute — the LP optimizer's own schedule); null auto-discovers
  *   icons: { solar, battery, home, grid, ev, water_heater }  // URLs; omit/null = placeholder
  *   deferrable_icons: { "Smart Load 01": water_heater }      // load name -> icon key or URL
- *   max_height: 420   // fixed height (px) for the diagram; set 0/null for natural (aspect-ratio) height
+ *   max_height: 420   // cap (px) on the diagram's height; natural aspect-ratio height below it
+ *     (narrow/mobile screens render shorter, with no letterbox band). Set 0/null for no cap.
  *   max_width: null   // cap (px) on how wide the card grows; set 0/null to fill its container
  *   icon_scale: 1.0   // multiplier on node/icon size (1.5 = 50% bigger); viewBox grows to fit
  *   font_scale: 1.0   // multiplier on label text size, independent of icon_scale
@@ -43,6 +50,7 @@
  * each other, both visibly smaller than a 9kW solar ball, regardless of how each node's own
  * hardware happens to be rated.
  */
+import { HOT_WATER_RE } from './grid-lens-chart-common.js?v=20260729d';
 
 const _bgCache = new Map();
 
@@ -88,7 +96,7 @@ const MIN_KW = 0.05; // below this, treat a flow as idle (no animation)
 // name when the friendly name doesn't). First match wins — keep the specific patterns first.
 // `key` indexes into config.icons; `mdi` is the placeholder used when that icon is unset.
 const DEFER_ICON_RULES = [
-  { re: /(hot[\s_-]*water|water[\s_-]*heat|\bhws\b|boiler|immersion)/i, key: 'water_heater', mdi: 'mdi:water-boiler' },
+  { re: HOT_WATER_RE, key: 'water_heater', mdi: 'mdi:water-boiler' },
   { re: /(\bevse?\b|electric[\s_-]*vehicle|wallbox|\bcharger\b|\bcar\b)/i, key: 'ev', mdi: 'mdi:ev-station' },
 ];
 
@@ -114,6 +122,28 @@ class GridLensPowerFlowCard extends HTMLElement {
     // fresh every render from real elapsed time against this epoch, so a freshly-recreated
     // element seeks to where it should be rather than snapping back to its fixed stagger point.
     this._epoch = performance.now();
+    // Rendered host width (px), fed by the ResizeObserver below. 0 until first observed;
+    // the layout/font logic treats 0 as "unknown" and renders the desktop geometry.
+    this._hostW = 0;
+  }
+
+  // The diagram is one uniformly-scaled SVG viewBox, so CSS alone can't keep labels legible
+  // when a narrow (mobile) column shrinks the whole drawing — the card has to know its
+  // rendered width and re-derive layout density + font units from it (see render()).
+  connectedCallback() {
+    if (!this._ro) {
+      this._ro = new ResizeObserver((entries) => {
+        const w = entries[0].contentRect.width;
+        // Only re-render on meaningful width moves — innerHTML rebuilds restart the SMIL
+        // ball animations' elements, so jittery observer callbacks shouldn't churn them.
+        if (Math.abs(w - this._hostW) > 8) { this._hostW = w; this.render(); }
+      });
+    }
+    this._ro.observe(this);
+  }
+
+  disconnectedCallback() {
+    if (this._ro) this._ro.disconnect();
   }
 
   setConfig(config) {
@@ -162,10 +192,13 @@ class GridLensPowerFlowCard extends HTMLElement {
         price_source_entity: null,
         // Type-1 deferrable loads (simple on/off appliances), shown as their own nodes off
         // Home with live power. By default (null) the card AUTO-DISCOVERS them from a GridLens
-        // sensor's `deferrable_loads` attribute (name + auto-resolved power_entity + switch),
-        // so no hand-config is needed. Set an explicit array of { name, power_entity,
-        // switch_entity? } to override, or [] to hide the row. deferrable_source_entity pins
-        // which GridLens sensor to read (else the card finds the first one exposing the attr).
+        // sensor's `deferrable_loads` attribute (name + auto-resolved power_entity + switch +
+        // soc_entity), so no hand-config is needed. Set an explicit array of { name,
+        // power_entity, switch_entity?, soc_entity? } to override, or [] to hide the row.
+        // soc_entity is a battery/EV state-of-charge sensor (%) — most relevant for an EV
+        // charger — shown next to the load's kW value with a history-chart link, same as the
+        // home battery's soc_entity. deferrable_source_entity pins which GridLens sensor to
+        // read (else the card finds the first one exposing the attr).
         deferrable_loads: null,
         deferrable_source_entity: null,
         // Icon override per deferrable load, keyed by load name (case-insensitive). The value
@@ -176,7 +209,7 @@ class GridLensPowerFlowCard extends HTMLElement {
         // is already represented as a deferrable load (its own switch/plug) to avoid drawing
         // it twice.
         show_ev: true,
-        max_height: 420, // fixed height (px); set null/0 for natural (aspect-ratio) height
+        max_height: 420, // height cap (px); aspect-ratio height below it; null/0 for no cap
         max_width: null, // fixed width (px); set null/0 to fill the card's container
         icon_scale: 1.0, // multiplier on node/icon size (1.5 = 50% bigger); viewBox grows to fit
         font_scale: 1.0, // multiplier on label text size, independent of icon_scale
@@ -248,6 +281,7 @@ class GridLensPowerFlowCard extends HTMLElement {
     for (const ld of loads) {
       if (ld && ld.power_entity) watch.push(ld.power_entity);
       if (ld && ld.switch_entity) watch.push(ld.switch_entity);
+      if (ld && ld.soc_entity) watch.push(ld.soc_entity);
     }
     // The price trajectory can refresh (new LP optimizer run) without the dispatch sensor's
     // own state string changing (e.g. still "charge"), so watch its generated_at attribute too.
@@ -311,7 +345,16 @@ class GridLensPowerFlowCard extends HTMLElement {
   _flows() {
     const c = this._config;
     const solarKw = this._toKw(this._solarEntity());
-    const loadKw = this._toKw(c.load_power_entity);
+    // Home shows the base household load only — the whole-home load sensor already includes
+    // every deferrable device wired through it, and those are drawn as their own nodes below
+    // Home (_bottomActors), so leaving them in would double-count that power. Matches the
+    // Power Chart card's own Home-load definition (grid-lens-chart-common.js: "'Load' here
+    // means the same thing the forecast side means by it — whole-home load minus deferrable
+    // devices"). Clamped to >= 0 since the whole-home meter and each device's own power
+    // sensor sample independently and can transiently disagree.
+    const deferKw = this._resolveDeferLoads()
+      .reduce((sum, ld) => sum + this._toKw(ld.power_entity), 0);
+    const loadKw = Math.max(0, this._toKw(c.load_power_entity) - deferKw);
     const gridKw = this._toKw(c.grid_power_entity);       // >0 import, <0 export
     const battKw = this._toKw(c.battery_power_entity);    // >0 charge, <0 discharge
     const evKw = this._toKw(c.ev_power_entity);
@@ -362,26 +405,40 @@ class GridLensPowerFlowCard extends HTMLElement {
   _fs() {
     const c = this._config;
     const scale = (c.icon_scale || 1) * (c.font_scale || 1);
+    // _fontBoost (set per-render from measured width) counter-scales the viewBox shrink on
+    // narrow screens so labels land at roughly their designed on-screen pixel size. It applies
+    // to the explicit px overrides too — those express an intended *rendered* size, which is
+    // exactly what the boost preserves. 1 on desktop, so wide layouts are untouched.
+    const boost = this._fontBoost || 1;
     return {
-      name: c.name_font_size != null ? +c.name_font_size : +(12 * scale).toFixed(1),
-      val: c.value_font_size != null ? +c.value_font_size : +(14 * scale).toFixed(1),
+      name: (c.name_font_size != null ? +c.name_font_size : 12 * scale) * boost,
+      val: (c.value_font_size != null ? +c.value_font_size : 14 * scale) * boost,
     };
   }
 
   // Splits a node value on '\n' into stacked <tspan> lines (e.g. battery's "Discharging"
   // on its own line above the kW/SOC figures); single-line values render unchanged.
-  _valueLines(a) {
+  _valueLines(a, lx) {
     const lines = String(a.value).split('\n');
     if (lines.length === 1) return lines[0];
     const lh = this._fs().val + 2;
-    return lines.map((line, i) => `<tspan x="${a.cx}" dy="${i === 0 ? 0 : lh}">${line}</tspan>`).join('');
+    return lines.map((line, i) => `<tspan x="${lx}" dy="${i === 0 ? 0 : lh}">${line}</tspan>`).join('');
   }
 
   // Generic node renderer, driven by a descriptor { cx, cy, r, colorVar, imgKey, icon,
-  // name, value, dim }. Used for every node (sources, hub, and the radial actors) so the
-  // layout can be fully computed instead of hardcoded per node.
+  // name, value, dim, historyEntity? }. Used for every node (sources, hub, and the radial
+  // actors) so the layout can be fully computed instead of hardcoded per node.
+  // historyEntity (currently: the home battery's soc_entity, and a deferrable load's own
+  // soc_entity) draws a small clickable chart badge on the ring that opens HA's more-info
+  // dialog for that sensor — the default view for a plain sensor already shows its history
+  // graph, so this is a one-tap path to "show me this SOC's history" without a separate
+  // history-panel navigation.
   _pnode(a) {
     const fs = this._fs();
+    // Labels centre under the node by default; a.labelAnchor 'start'/'end' hangs them off the
+    // node's inner edge instead (compact mode's corner sources — see render()).
+    const anchor = a.labelAnchor || 'middle';
+    const lx = anchor === 'start' ? a.cx - a.r : anchor === 'end' ? a.cx + a.r : a.cx;
     const nameY = a.cy + a.r + fs.name + 2;
     const valY = nameY + fs.val + 3;
     const dataUrl = a.imgKey ? this._imgData[a.imgKey] : null;
@@ -396,13 +453,32 @@ class GridLensPowerFlowCard extends HTMLElement {
              <ha-icon icon="${a.icon || 'mdi:help-circle-outline'}"></ha-icon>
            </div>
          </foreignObject>`;
+    let badge = '';
+    if (a.historyEntity) {
+      const bx = a.cx + a.r * 0.68, by = a.cy + a.r * 0.68;
+      const br = Math.max(8, a.r * 0.32);
+      // data-history-entity + a post-render addEventListener (see render()) rather than an
+      // inline onclick="..." attribute — HA's frontend CSP blocks inline event-handler
+      // attributes (cursor:pointer still shows since that's CSS, not script, which is why
+      // the badge looked clickable but silently did nothing until this was fixed).
+      badge = `
+        <g class="history-badge" data-history-entity="${a.historyEntity}" style="--nc: var(${a.colorVar})">
+          <circle cx="${bx}" cy="${by}" r="${br}" class="history-badge-bg"/>
+          <foreignObject x="${bx - br}" y="${by - br}" width="${br * 2}" height="${br * 2}">
+            <div xmlns="http://www.w3.org/1999/xhtml" class="history-badge-icon" style="--mdc-icon-size:${(br * 1.1).toFixed(1)}px">
+              <ha-icon icon="mdi:chart-line"></ha-icon>
+            </div>
+          </foreignObject>
+        </g>`;
+    }
     return `
       <g class="node${a.dim ? ' dim' : ''}">
         <circle class="ring ${hasImage ? '' : 'placeholder'}" cx="${a.cx}" cy="${a.cy}" r="${a.r}"
                 style="--nc: var(${a.colorVar})"/>
         ${inner}
-        <text x="${a.cx}" y="${nameY}" text-anchor="middle" class="node-name" style="font-size:${fs.name}px; fill:var(${a.colorVar})">${a.name}</text>
-        <text x="${a.cx}" y="${valY}" text-anchor="middle" class="node-value" style="font-size:${fs.val}px; fill:var(${a.colorVar})">${this._valueLines(a)}</text>
+        ${badge}
+        <text x="${lx}" y="${nameY}" text-anchor="${anchor}" class="node-name" style="font-size:${fs.name.toFixed(1)}px; fill:var(${a.colorVar})">${a.name}</text>
+        <text x="${lx}" y="${valY}" text-anchor="${anchor}" class="node-value" style="font-size:${fs.val.toFixed(1)}px; fill:var(${a.colorVar})">${this._valueLines(a, lx)}</text>
       </g>`;
   }
 
@@ -506,7 +582,27 @@ class GridLensPowerFlowCard extends HTMLElement {
     if (!Array.isArray(attr)) return [];
     return attr
       .filter((d) => d && d.power_entity)
-      .map((d) => ({ name: d.name, power_entity: d.power_entity, switch_entity: d.switch_entity || null }));
+      .map((d) => ({
+        name: d.name, power_entity: d.power_entity, switch_entity: d.switch_entity || null,
+        soc_entity: d.soc_entity || null,
+      }));
+  }
+
+  // Reads a sensor's numeric state as-is (for percentage-valued sensors like SOC, which
+  // aren't power/energy so _toKw's W->kW conversion doesn't apply). NaN if unset/non-numeric.
+  _pct(eid) {
+    const st = eid && this._hass && this._hass.states[eid];
+    if (!st) return NaN;
+    return parseFloat(st.state);
+  }
+
+  // Opens HA's more-info dialog for an entity (its default view already includes a history
+  // graph for a plain sensor) — used by the small history badge on SOC-bearing nodes.
+  _openMoreInfo(entityId) {
+    if (!entityId) return;
+    this.dispatchEvent(new CustomEvent('hass-more-info', {
+      detail: { entityId }, bubbles: true, composed: true,
+    }));
   }
 
   // Which icon a deferrable load draws with: an explicit deferrable_icons entry wins,
@@ -534,14 +630,14 @@ class GridLensPowerFlowCard extends HTMLElement {
   // on an even radial arc below the Home hub. Generic in the count: 1 item sits straight down,
   // N items fan out symmetrically, and the arc radius is grown so nodes never overlap. Returns
   // positioned actor descriptors (the same shape _pnode/_spoke consume).
-  _bottomActors(f, conn, hub) {
+  _bottomActors(f, conn, hub, geo) {
     const scale = this._config.icon_scale || 1;
     const maxKw = this._maxKw();
     const actors = [{
       baseR: 30, colorVar: '--c-battery', imgKey: 'battery', icon: 'mdi:battery',
       name: 'Battery', value: conn.battery.label,
       active: conn.battery.active, reverse: conn.battery.reverse, kw: conn.battery.kw, dim: false,
-      maxKw,
+      maxKw, historyEntity: this._config.soc_entity || null,
     }];
     if (this._config.show_ev !== false) {
       actors.push({
@@ -567,20 +663,27 @@ class GridLensPowerFlowCard extends HTMLElement {
       }
       const ic = this._deferIcon(ld);
       const colorVar = ic.imgKey === 'water_heater' ? '--c-hotwater' : `--c-def${(defColorIdx++ % 4) + 1}`;
+      // Loads with their own configured battery/EV SOC sensor (most commonly an EV charger)
+      // show a percentage next to their kW value, same treatment as the home battery.
+      const socPct = this._pct(ld.soc_entity);
+      const soc = isNaN(socPct) ? '' : ` · ${socPct.toFixed(0)}%`;
       actors.push({
         baseR: 26, colorVar, imgKey: ic.imgKey, icon: ic.mdi,
-        name: ld.name || `Load ${i + 1}`, value: `${kw.toFixed(2)} kW`,
+        name: ld.name || `Load ${i + 1}`, value: `${kw.toFixed(2)} kW${soc}`,
         active: on && kw > MIN_KW, reverse: true, kw, dim: !on,
-        maxKw,
+        maxKw, historyEntity: ld.soc_entity || null,
       });
     });
 
     const M = actors.length;
     const maxR = Math.max(...actors.map((a) => a.baseR * scale));
     // Even angular spread, centred straight-down (phi=0); wider fan for more items.
-    const spanDeg = M <= 1 ? 0 : Math.min(170, 52 * (M - 1));
+    // geo carries the width-aware density (see render()): on a narrow screen the fan
+    // tightens (shorter clearance, slightly narrower per-item angle) so less of the
+    // scarce viewBox is inter-node whitespace — the overlap guard below still wins.
+    const spanDeg = M <= 1 ? 0 : Math.min(170, geo.spanPer * (M - 1));
     const span = (spanDeg * Math.PI) / 180;
-    let R = 140 + maxR; // base clearance from the hub centre
+    let R = geo.clearance + maxR; // base clearance from the hub centre
     if (M > 1) {
       const dphi = span / (M - 1);
       R = Math.max(R, (2 * maxR + 18) / (2 * Math.sin(dphi / 2))); // guarantee no overlap
@@ -599,11 +702,6 @@ class GridLensPowerFlowCard extends HTMLElement {
     const f = this._flows();
     const conn = this._connectors(f);
     const maxH = this._config.max_height;
-    // An explicit height (not max-height on an auto-height, aspect-locked SVG — that
-    // combination is unreliable across browsers and was observed not to shrink the
-    // rendered box at all). The viewBox still scales/letterboxes to fit via the
-    // default preserveAspectRatio, so the diagram itself isn't distorted or cropped.
-    const heightRule = maxH ? `height: ${maxH}px;` : 'height: auto;';
     const maxW = this._config.max_width;
     // max-width (not an explicit width) so the card still shrinks responsively on
     // narrow/mobile screens — it only caps how wide it grows on a big desktop. Unlike
@@ -628,7 +726,10 @@ class GridLensPowerFlowCard extends HTMLElement {
         :host(.dark) {
           --c-solar:#b8960a; --c-grid:#a78bfa; --c-battery:#4ade80; --c-ev:#fbbf24;
           --c-hotwater:#cbd5e1;
-          --c-def1:#fb7185; --c-def2:#2dd4bf; --c-def3:#a78bfa; --c-def4:#facc15;
+          /* c-def3 was #a78bfa — an exact duplicate of --c-grid above, found while unifying
+             this palette with the power chart card's --defer3 (grid-lens-chart-common.js).
+             #8b5cf6 keeps the same violet identity while actually being distinguishable. */
+          --c-def1:#fb7185; --c-def2:#2dd4bf; --c-def3:#8b5cf6; --c-def4:#facc15;
         }
         ha-card { ${widthRule} }
         .head { display:flex; align-items:center; gap:8px; padding:10px 14px 0; }
@@ -637,8 +738,16 @@ class GridLensPowerFlowCard extends HTMLElement {
           font-size:10px; font-weight:700; letter-spacing:.4px; padding:2px 7px;
           border-radius:20px; border:1px solid var(--divider-color); color:var(--secondary-text-color);
         }
-        svg { width:100%; ${heightRule} display:block; padding:2px 6px 6px; box-sizing:border-box; }
-        .ring { fill:var(--card-background-color); stroke:var(--divider-color); stroke-width:2; }
+        /* Height comes from an inline aspect-ratio on the <svg> (set per-render from the
+           computed viewBox) so the box always hugs the drawn diagram — no vertical letterbox
+           band on narrow screens. max_height turns into a cap (inline max-height) that only
+           bites on wide layouts, where it letterboxes horizontally exactly as the old fixed
+           height did, so desktop rendering is unchanged. */
+        svg { width:100%; height:auto; display:block; padding:2px 6px 6px; box-sizing:border-box; }
+        /* Ring strokes in the node's own palette colour (--nc, set inline per node) — same
+           treatment as the SOC history badge — falling back to the neutral divider grey for
+           anything that doesn't set one. */
+        .ring { fill:var(--card-background-color); stroke:var(--nc, var(--divider-color)); stroke-width:2; }
         .ring.placeholder { stroke-dasharray:4 4; }
         .placeholder-icon {
           width:100%; height:100%; display:flex; align-items:center; justify-content:center;
@@ -658,6 +767,14 @@ class GridLensPowerFlowCard extends HTMLElement {
         .ball { fill: var(--nc); filter: drop-shadow(0 0 4px var(--nc)); }
         .node .ring.placeholder ~ .node-value,
         .node .ring.placeholder ~ .node-name { opacity: .85; }
+        .history-badge { cursor: pointer; }
+        .history-badge-bg {
+          fill: var(--card-background-color); stroke: var(--nc); stroke-width: 1.5;
+        }
+        .history-badge-icon {
+          width:100%; height:100%; display:flex; align-items:center; justify-content:center;
+        }
+        .history-badge-icon ha-icon { color: var(--nc); }
         /* .node.dim opacity fade disabled 2026-07-28 for review — re-enable by
            reverting. dim is still computed/set per node as before, just
            not visually applied. */
@@ -666,7 +783,17 @@ class GridLensPowerFlowCard extends HTMLElement {
     `;
 
     const scale = this._config.icon_scale || 1;
-    const fs = this._fs();
+
+    // Width-aware density: the whole diagram is one uniformly-scaled viewBox, so on a narrow
+    // (mobile) column everything shrinks together and most of the scarce pixels go to
+    // inter-node whitespace. t ramps 0→1 as the measured card width drops 480→360px and pulls
+    // the layout tighter — node radii and font units are unchanged, so fitting the smaller
+    // viewBox to the same width renders everything proportionally larger. t stays 0 (exact
+    // desktop geometry) when the width is ≥480px or not yet known (first render happens
+    // before the ResizeObserver's initial callback).
+    const W = this._hostW || 0;
+    const t = W ? Math.max(0, Math.min(1, (480 - W) / 120)) : 0;
+    const lerp = (a, b) => a + (b - a) * t;
 
     // Home hub in the centre, sized the same as the peripheral nodes (not a bigger centrepiece)
     // so it reads as one of the flow's actors rather than dominating the diagram; Solar and Grid
@@ -677,17 +804,43 @@ class GridLensPowerFlowCard extends HTMLElement {
       name: 'Home', value: `${f.loadKw.toFixed(2)} kW`, dim: false,
     };
     const sharedMaxKw = this._maxKw();
+    const srcDx = lerp(160, 112); // top sources' offset from the hub centreline
+    // In compact mode the sources' labels anchor inward (toward the empty top-middle of the
+    // diagram) instead of centring under the node — an "Importing 12.34 kW" label centred on
+    // a corner node would otherwise overhang the tightened viewBox and get clipped.
+    const srcAnchor = t >= 0.5;
     const sources = [
-      { cx: 40, cy: 60, r: 30 * scale, colorVar: '--c-solar', imgKey: 'solar', icon: null,
+      { cx: hub.cx - srcDx, cy: 60, r: 30 * scale, colorVar: '--c-solar', imgKey: 'solar', icon: null,
         name: 'Solar', value: conn.solar.label, active: conn.solar.active, reverse: false, kw: conn.solar.kw, dim: false,
-        maxKw: sharedMaxKw },
-      { cx: 360, cy: 60, r: 30 * scale, colorVar: '--c-grid', imgKey: 'grid', icon: null,
+        maxKw: sharedMaxKw, labelAnchor: srcAnchor ? 'start' : null },
+      { cx: hub.cx + srcDx, cy: 60, r: 30 * scale, colorVar: '--c-grid', imgKey: 'grid', icon: null,
         name: 'Grid', value: conn.grid.label, active: conn.grid.active, reverse: conn.grid.reverse, kw: conn.grid.kw, dim: false,
-        maxKw: sharedMaxKw },
+        maxKw: sharedMaxKw, labelAnchor: srcAnchor ? 'end' : null },
     ];
     // Consumer group (Battery + deferrable loads + optional EV), spread evenly on a radial arc.
-    const actors = this._bottomActors(f, conn, hub);
+    const actors = this._bottomActors(f, conn, hub, {
+      clearance: lerp(140, 106), spanPer: lerp(52, 46),
+    });
     const peripherals = [...sources, ...actors];
+    const allNodes = [...peripherals, hub];
+
+    // Structural (circles-only) horizontal extent, known before fonts — used to derive the
+    // font boost that _fs() folds in: when the rendered px-per-viewBox-unit scale falls below
+    // 1 (narrow screens), labels are counter-scaled up so they land near their designed
+    // on-screen size instead of shrinking with the diagram. 12px here is the svg element's
+    // horizontal padding. Must be set before any _pnode/_valueLines call.
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxYc = -Infinity;
+    for (const a of allNodes) {
+      minX = Math.min(minX, a.cx - a.r);
+      maxX = Math.max(maxX, a.cx + a.r);
+      minY = Math.min(minY, a.cy - a.r);
+      maxYc = Math.max(maxYc, a.cy + a.r);
+    }
+    const pad = 10;
+    const structW = maxX - minX + 2 * pad;
+    const sPx = W ? (W - 12) / structW : 1;
+    this._fontBoost = sPx > 0 && sPx < 1 ? Math.min(1 / sPx, 1.4) : 1;
+    const fs = this._fs();
 
     // Spokes under nodes; hub drawn last-of-the-fixed so its icon sits above the spoke ends.
     const connectorsHtml = peripherals.map((a) => this._spoke(a, hub)).join('');
@@ -697,16 +850,15 @@ class GridLensPowerFlowCard extends HTMLElement {
     // Keeps the diagram framed for any actor count / icon_scale, even when nodes fall outside
     // the old fixed 400-wide box.
     const labelDrop = fs.name + fs.val + 8;
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const a of [...peripherals, hub]) {
-      minX = Math.min(minX, a.cx - a.r);
-      maxX = Math.max(maxX, a.cx + a.r);
-      minY = Math.min(minY, a.cy - a.r);
-      maxY = Math.max(maxY, a.cy + a.r + labelDrop);
-    }
-    const pad = 10;
+    const vbW = maxX - minX + 2 * pad;
+    const vbH = maxYc + labelDrop - minY + 2 * pad;
     const vb = `${(minX - pad).toFixed(1)} ${(minY - pad).toFixed(1)} ` +
-               `${(maxX - minX + 2 * pad).toFixed(1)} ${(maxY - minY + 2 * pad).toFixed(1)}`;
+               `${vbW.toFixed(1)} ${vbH.toFixed(1)}`;
+    // aspect-ratio makes the svg box hug the diagram (no vertical letterbox band on narrow
+    // screens); max_height caps growth on wide layouts, where the horizontal letterbox it
+    // produces matches the old fixed-height rendering exactly.
+    const svgSize = `aspect-ratio:${vbW.toFixed(1)}/${vbH.toFixed(1)};`
+      + (maxH ? `max-height:${maxH}px;` : '');
 
     this.shadowRoot.innerHTML = `
       ${styles}
@@ -715,12 +867,19 @@ class GridLensPowerFlowCard extends HTMLElement {
           <span class="title">Power Flow</span>
           <span class="badge">PROOF OF CONCEPT</span>
         </div>
-        <svg viewBox="${vb}">
+        <svg viewBox="${vb}" style="${svgSize}">
           ${connectorsHtml}
           ${nodesHtml}
         </svg>
       </ha-card>
     `;
+
+    this.shadowRoot.querySelectorAll('.history-badge').forEach((el) => {
+      el.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        this._openMoreInfo(el.getAttribute('data-history-entity'));
+      });
+    });
   }
 }
 

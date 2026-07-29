@@ -40,6 +40,7 @@ from .const import (
     CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_HOURS,
     CONF_DEFERRABLE_LOAD_SWITCHES,
+    CONF_DEFERRABLE_LOAD_SOC_SENSORS,
     CONF_CURRENT_PLAN,
     parse_hours_spec,
     CONF_GRIDLENS_EMAIL,
@@ -352,9 +353,14 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 switches_list = [
                     str(user_input.get(f"switch_{i}", "") or "") for i in range(len(selected))
                 ]
+                # Optional battery/EV SOC sensor per device ("" = none, e.g. a pool pump).
+                soc_list = [
+                    str(user_input.get(f"soc_{i}", "") or "") for i in range(len(selected))
+                ]
                 self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_HOURS] = hours_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
+                self._sensor_data[CONF_DEFERRABLE_LOAD_SOC_SENSORS] = soc_list
                 return await self.async_step_current_plan()
 
         schema_dict = {}
@@ -375,6 +381,13 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # unset for forecast-only devices (e.g. an ESS-managed port with no HA switch).
             schema_dict[vol.Optional(f"switch_{i}")] = selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="switch")
+            )
+            # Optional: a sensor.* entity reporting this device's own battery state of charge
+            # (%) — most relevant for an EV charger (the vehicle's SOC), shown on the Power
+            # Flow card the same way the home battery's SOC is. Leave unset for loads with no
+            # battery of their own (pool pump, hot water, etc).
+            schema_dict[vol.Optional(f"soc_{i}")] = selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="sensor")
             )
 
         return self.async_show_form(
@@ -756,6 +769,7 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         existing_max_kw = entry_data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
         existing_hours = entry_data.get(CONF_DEFERRABLE_LOAD_HOURS, [])
         existing_switches = entry_data.get(CONF_DEFERRABLE_LOAD_SWITCHES, [])
+        existing_soc = entry_data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, [])
         # Existing lists are keyed by position in the previously saved sensor
         # list; map by sensor_id so reordering/removing devices keeps defaults.
         prev_sensors = entry_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
@@ -765,6 +779,11 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             s: existing_switches[i]
             for i, s in enumerate(prev_sensors)
             if i < len(existing_switches) and existing_switches[i]
+        }
+        prev_soc = {
+            s: existing_soc[i]
+            for i, s in enumerate(prev_sensors)
+            if i < len(existing_soc) and existing_soc[i]
         }
 
         errors: dict[str, str] = {}
@@ -783,9 +802,13 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 switches_list = [
                     str(user_input.get(f"switch_{i}", "") or "") for i in range(len(selected))
                 ]
+                soc_list = [
+                    str(user_input.get(f"soc_{i}", "") or "") for i in range(len(selected))
+                ]
                 self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_HOURS] = hours_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
+                self._sensor_data[CONF_DEFERRABLE_LOAD_SOC_SENSORS] = soc_list
                 return await self.async_step_current_plan()
 
         schema_dict = {}
@@ -814,6 +837,16 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             )
             schema_dict[switch_key] = selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="switch")
+            )
+            # Optional battery/EV SOC sensor; pre-fill the previously saved one, same pattern
+            # as the control switch above.
+            prev_soc_sensor = prev_soc.get(sensor_id)
+            soc_key = (
+                vol.Optional(f"soc_{i}", default=prev_soc_sensor)
+                if prev_soc_sensor else vol.Optional(f"soc_{i}")
+            )
+            schema_dict[soc_key] = selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="sensor")
             )
 
         return self.async_show_form(

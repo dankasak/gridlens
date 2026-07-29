@@ -161,6 +161,12 @@ CONF_DEFERRABLE_LOAD_HOURS = "deferrable_load_hours"      # list of hour specs, 
 # switch = forecast-only, exactly like before this feature. EV/OCPP chargers with richer
 # control (charge-current setpoints) are a later, separate mechanism — not this switch list.
 CONF_DEFERRABLE_LOAD_SWITCHES = "deferrable_load_switches"  # list of switch IDs ("" = none)
+# Optional per-device battery/EV state-of-charge sensor (sensor.* entity, %), parallel to
+# sensors. Most relevant for an EV charger deferrable load (the vehicle's own SOC), but not
+# restricted to that — any deferrable load with its own battery can use it. Empty string =
+# not configured; the Power Flow card only shows a SOC figure + history link for devices
+# that have one set, same as it already does for the home battery's soc_entity.
+CONF_DEFERRABLE_LOAD_SOC_SENSORS = "deferrable_load_soc_sensors"  # list of sensor IDs ("" = none)
 
 
 def parse_hours_spec(spec: str | None) -> set[int] | None:

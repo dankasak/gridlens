@@ -13,7 +13,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import (
     DOMAIN, PLANS, METRICS, METRIC_INFO, PLAN_NAMES,
     CONF_DEFERRABLE_LOAD_SENSORS, CONF_DEFERRABLE_LOAD_MAX_KW,
-    CONF_DEFERRABLE_LOAD_SWITCHES,
+    CONF_DEFERRABLE_LOAD_SWITCHES, CONF_DEFERRABLE_LOAD_SOC_SENSORS,
 )
 from .entity_lookup import resolve_power_sensor, resolve_device_name
 from .plan_sensors import PlanMetricSensor
@@ -135,9 +135,11 @@ class CurrentPlanCostSensor(GridLensSensorBase):
         sensors = data.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or []
         max_kw = data.get(CONF_DEFERRABLE_LOAD_MAX_KW, []) or []
         switches = data.get(CONF_DEFERRABLE_LOAD_SWITCHES, []) or []
+        soc_sensors = data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, []) or []
         out: list[dict[str, Any]] = []
         for i, sensor_id in enumerate(sensors):
             sw = switches[i] if i < len(switches) else ""
+            soc = soc_sensors[i] if i < len(soc_sensors) else ""
             try:
                 power = resolve_power_sensor(self.hass, sensor_id, sw or None)
             except Exception:  # noqa: BLE001 — discovery is best-effort, never break the sensor
@@ -150,6 +152,9 @@ class CurrentPlanCostSensor(GridLensSensorBase):
                 "energy_entity": sensor_id,
                 "power_entity": power,
                 "switch_entity": sw or None,
+                # Battery/EV state-of-charge sensor, if the user configured one for this
+                # device (most relevant for an EV charger) — read by the Power Flow card.
+                "soc_entity": soc or None,
                 "max_kw": float(max_kw[i]) if i < len(max_kw) else None,
                 "controllable": bool(sw),
             })
