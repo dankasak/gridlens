@@ -14,7 +14,7 @@ from .const import DOMAIN, PLAN_ID_TO_KEY, CONF_DISTRIBUTOR, CONF_DEFERRABLE_LOA
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.SWITCH, Platform.NUMBER]
+PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.SWITCH, Platform.NUMBER, Platform.SELECT]
 
 _HISTORY_STORAGE_KEY = "grid_lens_plan_history"
 _HISTORY_STORAGE_VERSION = 1
@@ -114,14 +114,18 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
     # separate "Settings" view below, not "Battery Plan" — keeps the operational/
     # monitoring view free of things you set once and forget, per user request
     # 2026-07-29 ("move the configuration stuff into a new page").
-    tuning_tiles = []
+    # Min export price lives NEXT TO the battery-control switch in the Control section
+    # (not under Tuning) — user request 2026-07-30: it's the knob most often touched
+    # alongside that switch, so they sit together at the top of Settings.
+    control_tiles = []
     if entry.data.get("has_battery"):
         min_export = eid(f"{entry.entry_id}_min_export_price")
         if min_export:
-            tuning_tiles.append({
+            control_tiles.append({
                 "type": "tile", "entity": min_export, "name": "Min export price",
                 "features": [{"type": "numeric-input"}],
             })
+    tuning_tiles = []
     deferrable_sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or []
     for sensor_id in deferrable_sensors:
         boost = eid(f"{entry.entry_id}_deferrable_override_{sensor_id}")
@@ -176,8 +180,18 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
             "icon": "mdi:toggle-switch-outline", "grid_options": {"columns": "full"},
         })
         settings_cards.append({
-            "type": "grid", "columns": 1, "square": False,
-            "cards": [battery_control], "grid_options": {"columns": "full"},
+            "type": "grid", "columns": 2, "square": False,
+            "cards": [
+                # A real tile dict (the previous seed put the bare entity-id string in
+                # `cards`, which Lovelace doesn't accept — latent, since existing
+                # installs are never re-seeded), matching this install's live layout.
+                {
+                    "type": "tile", "entity": battery_control, "name": "Battery control",
+                    "state_content": ["state", "note"], "features": [{"type": "toggle"}],
+                },
+                *control_tiles,
+            ],
+            "grid_options": {"columns": "full"},
         })
     if deferrable_sensors:
         if not battery_control:
@@ -187,6 +201,16 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
             })
         settings_cards.append({
             "type": "custom:grid-lens-load-control-card", "title": "Deferrable Loads",
+            "grid_options": {"columns": "full"},
+        })
+        # Weekly gantt-style editor of when each deferrable load may run (per-weekday
+        # allowed hours, painted on a 7x24 grid; saved via grid_lens.set_deferrable_schedule).
+        settings_cards.append({
+            "type": "heading", "heading": "Schedules", "heading_style": "title",
+            "icon": "mdi:calendar-clock", "grid_options": {"columns": "full"},
+        })
+        settings_cards.append({
+            "type": "custom:grid-lens-defer-schedule-card", "title": "Allowed Run Times",
             "grid_options": {"columns": "full"},
         })
     if tuning_tiles:
@@ -243,7 +267,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260729m"
+    _CARD_VERSION = "20260730h"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -257,6 +281,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         f"/grid_lens/cards/grid-lens-flex-row-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-load-control-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-boost-tuning-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-defer-schedule-card.js?v={_CARD_VERSION}",
     ]
     stale_urls = {
         "/grid_lens/cards/electricity-plan-comparison-card.js",
@@ -977,6 +1002,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, entry.entry_id
     )
 
+    # Weekly per-weekday availability schedules for deferrable loads (edited on the
+    # dashboard schedule card; replaces the static hours config when set for a device).
+    # Preloaded here so sensor.py's sync attribute builder can read the cache.
+    from .deferrable_schedules import DeferrableScheduleStore
+    _sched_store = DeferrableScheduleStore(hass, entry.entry_id)
+    await _sched_store.async_load()
+    hass.data[DOMAIN][f"{entry.entry_id}_deferrable_schedules"] = _sched_store
+
     # GridLens-owned daily energy archive: captures per-day PV/import/export totals
     # into HA Storage so long-horizon features never depend on the user's recorder
     # retention (backfills from long-term statistics, then appends nightly).
@@ -1084,6 +1117,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(f"{entry.entry_id}_control", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_load_control", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_overrides", None)
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_schedules", None)
 
     return unload_ok
 

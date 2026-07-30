@@ -282,6 +282,13 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   const zero = (yMin < 0) ? `<line x1="${g.ml}" y1="${Y(0)}" x2="${g.w - g.mr}" y2="${Y(0)}" stroke="var(--axis)"/>` : '';
   let defs = '', paths = '';
   const base = Y(Math.max(yMin, 0));
+  // Two-pass render. Pass 1 collects each series' path geometry plus its "size"
+  // (Σ|v| ≈ the area its fill would cover). Pass 2 emits gradient fills back-to-front
+  // ordered LARGEST first, so a big series' wash sits behind the smaller ones and every
+  // blend stays visible instead of the last-drawn fill burying the rest. Pass 3 emits
+  // all line strokes in caller order, above every fill (a line must never be hidden
+  // under another series' wash).
+  const geo = [];
   series.forEach((s, si) => {
     const rp = raw[si];
     if (!rp.length) return;
@@ -304,13 +311,16 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
     } else {
       d = smoothPath(pts);
     }
-    if (s.area) {
-      const gid = 'g' + si;
-      defs += gradDef(gid, s.color, 0.48);
-      paths += `<path d="${d} L${rightX.toFixed(1)},${base.toFixed(1)} L${pts[0][0].toFixed(1)},${base.toFixed(1)} Z" fill="url(#${gid})"/>`;
-    }
-    paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.actual ? 1.75 : 2.5}" opacity="${s.actual ? 0.9 : 1}" stroke-linejoin="round" stroke-linecap="round" ${s.dash ? 'stroke-dasharray="5 4"' : ''}/>`;
+    geo.push({ s, si, d, pts, rightX, mag: rp.reduce((a, p) => a + Math.abs(p.v), 0) });
   });
+  for (const g2 of geo.filter((x) => x.s.area).sort((a, b) => b.mag - a.mag)) {
+    const gid = 'g' + g2.si;
+    defs += gradDef(gid, g2.s.color, 0.42);
+    paths += `<path d="${g2.d} L${g2.rightX.toFixed(1)},${base.toFixed(1)} L${g2.pts[0][0].toFixed(1)},${base.toFixed(1)} Z" fill="url(#${gid})"/>`;
+  }
+  for (const { s, d } of geo) {
+    paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.actual ? 1.75 : 2.5}" opacity="${s.actual ? 0.9 : 1}" stroke-linejoin="round" stroke-linecap="round" ${s.dash ? 'stroke-dasharray="5 4"' : ''}/>`;
+  }
   // preserveAspectRatio="none": a line/area chart has no inherent aspect ratio to
   // protect (x is time, y is an independent unit) — stretching to exactly fill
   // whatever box CSS gives it is correct here. Without this, a caller that pins an
@@ -345,7 +355,13 @@ export const STYLE = `
        defer/battery/grid dark hues below — not a distinguishability issue). --buy/--sell
        are for the Price chart's import/export *rate* lines only (two genuinely separate
        rates, not a flow) — the power chart plots one signed net --gridflow line instead. */
-    --solar:#9c8208; --load:#db2777; --gridflow:#8b7cf6; --battery:#22c55e;
+    /* --load is a neutral ink (black / near-white by theme), NOT a hue — user request
+       2026-07-30: the aggregate-load line's old pink-red (#db2777) clashed with the EV
+       charger's --defer1 red on the power chart. A neutral is maximally distinct from
+       every categorical hue, so it sits outside the validated hue rotation by design
+       (same reasoning as --hotwater/--idle). No cross-card drift: the powerflow card
+       has no load hue token (its Home node isn't hue-coded). */
+    --solar:#9c8208; --load:#000000; --gridflow:#8b7cf6; --battery:#22c55e;
     --buy:#e11d48; --sell:#0d9488; --cum:#2563eb;
     /* defer1-4 and hotwater are the SAME hex values as the Power Flow card's own
        --c-def1-4/--c-hotwater (grid-lens-powerflow-card.js), so a device reads as the same
@@ -361,7 +377,7 @@ export const STYLE = `
   :host(.dark) {
     --predicted:#60a5fa; --actual:#fb923c; --charge:#60a5fa; --discharge:#fb923c;
     --fit:rgba(251,191,36,.22); --good:#10b981;
-    --solar:#b8960a; --load:#f472b6; --gridflow:#a78bfa; --battery:#4ade80;
+    --solar:#b8960a; --load:#f1f5f9; --gridflow:#a78bfa; --battery:#4ade80;
     --buy:#fb7185; --sell:#2dd4bf; --cum:#60a5fa;
     /* --defer3 deliberately differs from the Power Flow card's own dark --c-def3 (#a78bfa) —
        that value duplicates --c-grid in that card's own dark palette (a pre-existing bug,

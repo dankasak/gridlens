@@ -32,6 +32,8 @@ from .plan_calculator import PlanCalculator
 _LOGGER = logging.getLogger(__name__)
 
 SERVICE_CALCULATE_PERIOD = "calculate_period"
+SERVICE_SET_DEFERRABLE_SCHEDULE = "set_deferrable_schedule"
+SERVICE_CLEAR_DEFERRABLE_SCHEDULE = "clear_deferrable_schedule"
 
 
 async def async_setup_services(hass: HomeAssistant, entry) -> None:
@@ -85,13 +87,62 @@ async def async_setup_services(hass: HomeAssistant, entry) -> None:
         
         _LOGGER.warning("Plan calculation completed successfully")
     
-    # Register service
+    async def _write_schedule(sensor_id: str | None, days) -> None:
+        """Shared validate-and-persist for the two schedule services. `sensor_id` is
+        the device's configured energy sensor (the canonical device key, same as the
+        boost-override store); `days` is 7 rows (Monday first) of 24 hour values,
+        1 = allowed to run, or None to clear back to the static config spec."""
+        store = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_deferrable_schedules")
+        if store is None:
+            raise HomeAssistantError("Grid Lens schedule store is not available")
+        if not sensor_id:
+            raise HomeAssistantError("sensor_id is required")
+        configured = entry.data.get("deferrable_load_sensors", []) or []
+        if sensor_id not in configured:
+            raise HomeAssistantError(
+                f"{sensor_id} is not a configured deferrable load "
+                f"(configured: {', '.join(configured) or 'none'})"
+            )
+        try:
+            await store.async_set(sensor_id, days)
+        except ValueError as err:
+            raise HomeAssistantError(f"Invalid schedule grid: {err}")
+        _LOGGER.warning(
+            "Deferrable weekly schedule %s for %s",
+            "saved" if days is not None else "cleared", sensor_id,
+        )
+        # Rewrite the coordinator entities' state now (no recalculation) so the cost
+        # sensor's `deferrable_loads` attribute — which the schedule card reads —
+        # reflects this save immediately. Without this the attribute snapshot stays
+        # stale until the next (manual) coordinator refresh and the card would appear
+        # to lose the save on its next repaint.
+        coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+        if coordinator is not None:
+            coordinator.async_update_listeners()
+
+    async def handle_set_deferrable_schedule(call: ServiceCall) -> None:
+        """Persist a deferrable device's weekly (7x24 per-weekday) availability grid —
+        called by the schedule editor card."""
+        await _write_schedule(call.data.get("sensor_id"), call.data.get("days"))
+
+    async def handle_clear_deferrable_schedule(call: ServiceCall) -> None:
+        """Remove a device's stored weekly schedule — it reverts to the static
+        availability-hours spec from the integration config."""
+        await _write_schedule(call.data.get("sensor_id"), None)
+
+    # Register services
     hass.services.async_register(
         DOMAIN,
         SERVICE_CALCULATE_PERIOD,
         handle_calculate_period,
     )
-    
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_DEFERRABLE_SCHEDULE, handle_set_deferrable_schedule
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_CLEAR_DEFERRABLE_SCHEDULE, handle_clear_deferrable_schedule
+    )
+
     _LOGGER.info(f"Registered service: {DOMAIN}.{SERVICE_CALCULATE_PERIOD}")
 
 

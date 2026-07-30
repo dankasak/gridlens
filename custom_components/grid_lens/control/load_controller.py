@@ -65,6 +65,12 @@ class DeferrableLoadController:
         self._changed_at: Optional[datetime] = None
         self._note = "not_started"
 
+        # Manual override: None = auto (plan-driven), True = forced on, False = forced
+        # off. While set, apply() does nothing at all — no plan-driven flips AND no
+        # drift re-assert: an override is "GridLens, hands off; set it to X and leave
+        # it", so a human at the physical switch always wins afterwards.
+        self._override: Optional[bool] = None
+
     # ------------------------------------------------------------------ policy
     def on_threshold_w(self) -> float:
         """Planned power (W) at/above which this slot counts as 'device on'."""
@@ -92,6 +98,10 @@ class DeferrableLoadController:
         re-assert (want == commanded but the hardware has moved) is NOT debounced — it
         restores the state we already intend, so there's no chatter risk.
         """
+        if self._override is not None:
+            self._note = f"override_{'on' if self._override else 'off'}"
+            return
+
         want_on = self.desired_on(planned_w)
 
         # First tick: establish a known state regardless of debounce.
@@ -119,6 +129,40 @@ class DeferrableLoadController:
             await self._command(want_on, now, reset_timer=False)
         else:
             self._note = f"holding_{'on' if self._commanded else 'off'}"
+
+    # ------------------------------------------------------------------ manual override
+    @property
+    def override(self) -> Optional[bool]:
+        return self._override
+
+    async def set_override(
+        self, mode: Optional[bool], now: datetime, *, actuate: bool = True
+    ) -> None:
+        """Set (or clear) the manual override.
+
+        ``mode`` True/False = force on/off: issue ONE immediate command (no debounce — a
+        direct user action, not a chattering plan signal), then stop driving the load
+        until the override is cleared. ``mode`` None = restore GridLens control: the next
+        plan-driven ``apply`` re-establishes state immediately (the first-tick path, which
+        also skips debounce — "restore control" means act on the plan now).
+
+        ``actuate=False`` restores a persisted override across an HA restart without
+        touching the hardware (the leave-as-is deadman discipline).
+        """
+        self._override = mode
+        if mode is None:
+            # Force a clean re-establish on the next apply() — debounce-free by design.
+            self._commanded = None
+            self._note = "override_cleared"
+            return
+        if actuate:
+            _LOGGER.warning(
+                "Manual override for %s: forcing %s (%s)",
+                self.name, "on" if mode else "off", self.switch_entity_id,
+            )
+            await self._command(mode, now)
+        else:
+            self._note = f"override_{'on' if mode else 'off'}_restored"
 
     async def _command(self, want_on: bool, now: datetime, *, reset_timer: bool = True) -> bool:
         service = "turn_on" if want_on else "turn_off"
@@ -150,5 +194,8 @@ class DeferrableLoadController:
             "on_threshold_w": round(self.on_threshold_w(), 1),
             "commanded": ("on" if self._commanded else "off") if self._commanded is not None else "unknown",
             "changed_at": self._changed_at.isoformat() if self._changed_at else None,
+            "override": (
+                ("on" if self._override else "off") if self._override is not None else "auto"
+            ),
             "note": self._note,
         }

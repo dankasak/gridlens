@@ -13,7 +13,7 @@
  */
 import {
   GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor,
-} from './grid-lens-chart-common.js?v=20260729d';
+} from './grid-lens-chart-common.js?v=20260730f';
 
 class GridLensPowerChartCard extends GridLensChartCardBase {
   get title() { return 'Power — measured & forecast (kW)'; }
@@ -79,7 +79,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
   _legendHtml() {
     const dnames = this._deferNames || [];
     const deferLegend = dnames.map((nm, i) =>
-      `<span><i style="border-top:2px dashed ${this._deferColor(i)}"></i>${esc(nm)}</span>`).join('');
+      `<span><i style="border-top:2px solid ${this._deferColor(i)}"></i>${esc(nm)}</span>`).join('');
     return `
       <span><span class="swatch" style="background:var(--solar)"></span>Solar</span>
       <span><span class="swatch" style="background:var(--load)"></span>Load</span>
@@ -100,26 +100,32 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     const actualDefer = this._actualEnergy.defer || [];
     return {
       kwScale,
+      // area: true on every series, planned AND measured — each gets a gradient wash
+      // down to the x-axis; multiLineChart draws the washes back-to-front by series
+      // size (largest behind) so they all stay visible. A measured series' wash only
+      // spans t0→now (its data boundary), so left of "now" the planned + measured
+      // washes of the same colour overlap and read as a deeper tint of that colour —
+      // acceptable, and the user explicitly asked for history to be filled too.
       series: [
         { key: 'solar_kwh', color: 'var(--solar)', area: true, scale: kwScale },
-        { key: 'load_kwh', color: 'var(--load)', scale: kwScale },
+        { key: 'load_kwh', color: 'var(--load)', area: true, scale: kwScale },
         { calc: (row) => this._gridNet(row), color: 'var(--gridflow)', area: true, scale: kwScale },
-        { key: 'battery_kwh', color: 'var(--battery)', scale: kwScale },
+        { key: 'battery_kwh', color: 'var(--battery)', area: true, scale: kwScale },
         // step: true — a deferrable device's planned power is piecewise-constant (off, or on
         // at ~max_kw for a slot), not a smooth ramp. Without it smoothPath's cubic spline
         // curves gradually up from 0 toward the turn-on slot instead of holding flat at 0
         // until the device actually switches on. See stepPath()'s own comment.
-        ...dnames.map((nm, i) => ({ key: `defer_${i}`, color: this._deferColor(i), dash: true, scale: kwScale, step: true })),
-        { points: this._actualEnergy.solar, color: 'var(--solar)', actual: true },
-        { points: this._actualEnergy.load, color: 'var(--load)', actual: true },
-        { points: this._actualEnergy.grid, color: 'var(--gridflow)', actual: true },
-        { points: this._actualEnergy.battery, color: 'var(--battery)', actual: true },
+        ...dnames.map((nm, i) => ({ key: `defer_${i}`, color: this._deferColor(i), area: true, scale: kwScale, step: true })),
+        { points: this._actualEnergy.solar, color: 'var(--solar)', actual: true, area: true },
+        { points: this._actualEnergy.load, color: 'var(--load)', actual: true, area: true },
+        { points: this._actualEnergy.grid, color: 'var(--gridflow)', actual: true, area: true },
+        { points: this._actualEnergy.battery, color: 'var(--battery)', actual: true, area: true },
         // step: true here too — a real deferrable appliance (EV charger, hot water element)
         // switches on/off in seconds on the hardware side, but HA's history API only samples
         // on significant_changes_only, so two sparse readings (last "off", first "on") would
         // otherwise get smoothPath'd into the exact same diagonal-ramp artifact as the
         // forecast series above, just drawn from real sensor data instead of planned data.
-        ...dnames.map((nm, i) => ({ points: actualDefer[i], color: this._deferColor(i), actual: true, dash: true, step: true })),
+        ...dnames.map((nm, i) => ({ points: actualDefer[i], color: this._deferColor(i), actual: true, area: true, step: true })),
       ],
     };
   }

@@ -1,3 +1,40 @@
+set_deferrable_schedule:
+  name: Set Deferrable Load Weekly Schedule
+  description: >
+    Save a deferrable load's weekly availability schedule — 7 day rows (Monday first),
+    each with 48 half-hour values (or 24 hourly values, which expand to half-hours)
+    where 1 means the device is allowed to run in that local half-hour. A saved
+    schedule replaces the static availability-hours setting from the integration
+    config for that device. Normally called by the Grid Lens schedule card.
+  fields:
+    sensor_id:
+      name: Device energy sensor
+      description: The deferrable device's configured energy sensor entity id (its canonical key).
+      required: true
+      example: "sensor.ev_charger_energy"
+      selector:
+        text:
+    days:
+      name: Weekly grid
+      description: 7 lists (Monday first) of 48 half-hour values (0 = blocked, 1 = allowed).
+      required: true
+      selector:
+        object:
+
+clear_deferrable_schedule:
+  name: Clear Deferrable Load Weekly Schedule
+  description: >
+    Remove a deferrable load's saved weekly schedule so it reverts to the static
+    availability-hours setting from the integration config.
+  fields:
+    sensor_id:
+      name: Device energy sensor
+      description: The deferrable device's configured energy sensor entity id.
+      required: true
+      example: "sensor.ev_charger_energy"
+      selector:
+        text:
+
 calculate_period:
   name: Calculate Plan Data for Period
   description: Calculate and populate all plan sensors for a specified date range. This will run optimization for each plan and create hourly data you can graph.

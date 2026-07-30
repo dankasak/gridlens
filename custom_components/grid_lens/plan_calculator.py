@@ -16,6 +16,7 @@ from .retailer_plans import (
     build_conditional_credits, RetailerPlan, PlanFromData,
 )
 from .const import (
+    DOMAIN,
     CONF_ENERGY_SENSOR,
     CONF_SOLAR_SENSOR,
     CONF_GRID_EXPORT_SENSOR,
@@ -1421,8 +1422,24 @@ class PlanCalculator:
                 )
                 allowed_hours = None
 
+            # Stored weekly schedule (7x24 per-weekday grid from the dashboard schedule
+            # card) beats the static hours spec for this device when present.
+            week = None
+            sched_store = self.hass.data.get(DOMAIN, {}).get(
+                f"{self.entry.entry_id}_deferrable_schedules"
+            )
+            if sched_store is not None:
+                try:
+                    week = await sched_store.async_get(sensor_id)
+                except Exception:  # noqa: BLE001 — a broken store must not kill the calc
+                    week = None
+
             daily_kwh = sensor_total / days
-            window_capacity = len(allowed_hours or range(24)) * max_kw
+            if week is not None:
+                from .schedule_grid import max_daily_hours
+                window_capacity = max_daily_hours(week) * max_kw
+            else:
+                window_capacity = len(allowed_hours or range(24)) * max_kw
             if daily_kwh > window_capacity:
                 _LOGGER.warning(
                     "Deferrable %s needs %.1f kWh/day but its availability window "
@@ -1437,11 +1454,13 @@ class PlanCalculator:
                 'daily_kwh': daily_kwh,
                 'max_kw': max_kw,
                 'allowed_hours': allowed_hours,
+                'week': week,
             })
             _LOGGER.warning(
                 "Deferrable sensor %s (%s): %.2f kWh/day, max %.1f kW, hours %s",
                 sensor_id, name, daily_kwh, max_kw,
-                "all" if allowed_hours is None else sorted(allowed_hours),
+                "weekly schedule" if week is not None
+                else ("all" if allowed_hours is None else sorted(allowed_hours)),
             )
 
         combined_list = [
@@ -2263,11 +2282,13 @@ class PlanCalculator:
         hourly_export_rates = []
         local_hods = []  # local hour-of-day per LP hour, for availability masks
         demand_window_mask = [] if demand_predicate else None
+        local_dows: list[int] = []  # weekday per LP hour (0=Mon), for weekly schedules
         for hour_idx in range(T):
             local_dt = (start_time + timedelta(hours=hour_idx)).astimezone(tz)
             hourly_import_rates.append(plan.get_import_rate(local_dt))
             hourly_export_rates.append(plan.get_export_rate(local_dt))
             local_hods.append(local_dt.hour)
+            local_dows.append(local_dt.weekday())
             if demand_predicate:
                 demand_window_mask.append(1 if demand_predicate(local_dt) else 0)
 
@@ -2282,17 +2303,28 @@ class PlanCalculator:
         # price tranches. A no-op ([]) for a plan without one.
         conditional_credits = build_conditional_credits(plan, start_time, T)
 
-        # Translate each device's allowed local hours into a per-LP-hour mask so
-        # the optimizer only schedules it when it is actually available (e.g. an
-        # EV that is plugged in overnight cannot soak up midday solar).
+        # Translate each device's availability into a per-LP-hour mask so the
+        # optimizer only schedules it when it is actually available (e.g. an
+        # EV that is plugged in overnight cannot soak up midday solar). A stored
+        # weekly schedule (per-weekday half-hour grid) wins over the static hours
+        # spec; at this LP's hourly resolution a half-allowed hour becomes a
+        # fractional mask (0.5), capping the device at half its hourly energy.
+        from .schedule_grid import hour_fraction
         lp_deferrable_loads = []
         for dev in (deferrable_loads or []):
+            week = dev.get('week')
             allowed = dev.get('allowed_hours')
             lp_dev = dict(dev)
-            lp_dev['hour_mask'] = (
-                None if allowed is None
-                else [1 if hod in allowed else 0 for hod in local_hods]
-            )
+            if week is not None:
+                lp_dev['hour_mask'] = [
+                    hour_fraction(week, local_dows[t], local_hods[t])
+                    for t in range(T)
+                ]
+            else:
+                lp_dev['hour_mask'] = (
+                    None if allowed is None
+                    else [1 if hod in allowed else 0 for hod in local_hods]
+                )
             lp_deferrable_loads.append(lp_dev)
 
         # Run LP optimiser in a thread pool so the event loop stays responsive.

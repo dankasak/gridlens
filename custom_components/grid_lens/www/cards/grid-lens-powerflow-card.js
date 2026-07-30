@@ -31,6 +31,10 @@
  *   price_source_entity: null  // GridLens dispatch sensor to read the current buy/sell rate
  *     from (its `trajectory` attribute — the LP optimizer's own schedule); null auto-discovers
  *   icons: { solar, battery, home, grid, ev, water_heater }  // URLs; omit/null = placeholder
+ *   icons_active: { solar }        // animated (APNG) URL shown while that node's `active` is true
+ *   icons_idle_active: { solar }   // animated (APNG) URL shown while that node's `active` is false
+ *     — both optional, keyed like `icons`; unset keys keep today's static-only behavior. Assets
+ *       must ship with a real alpha channel already (no stripWhiteBg pass — see _pnode()).
  *   deferrable_icons: { "Smart Load 01": water_heater }      // load name -> icon key or URL
  *   max_height: 420   // cap (px) on the diagram's height; natural aspect-ratio height below it
  *     (narrow/mobile screens render shorter, with no letterbox band). Set 0/null for no cap.
@@ -50,7 +54,7 @@
  * each other, both visibly smaller than a 9kW solar ball, regardless of how each node's own
  * hardware happens to be rated.
  */
-import { HOT_WATER_RE } from './grid-lens-chart-common.js?v=20260729d';
+import { HOT_WATER_RE } from './grid-lens-chart-common.js?v=20260730f';
 
 const _bgCache = new Map();
 
@@ -112,6 +116,10 @@ class GridLensPowerFlowCard extends HTMLElement {
     this._hass = null;
     this._dark = false;
     this._imgData = {};   // key -> resolved data URL (or null once we know there's no source)
+    // Animated variants (icons_active / icons_idle_active) skip stripWhiteBg entirely — they're
+    // generated with a real alpha channel, so the raw URL is used as-is. See _kickOffImageLoads().
+    this._imgActive = {};      // key -> raw URL, shown while a.active is true
+    this._imgIdleActive = {};  // key -> raw URL, shown while a.active is false
     this._pending = new Set();
     // HA's own Energy Dashboard prefs (.storage/energy) — undefined until fetched, then either
     // a resolved solar live-power entity id or null if none is configured. See _solarEntity().
@@ -147,16 +155,33 @@ class GridLensPowerFlowCard extends HTMLElement {
   }
 
   setConfig(config) {
+    // Cache-buster for the built-in icon assets. Icon files are replaced UNDER THE SAME
+    // NAME (e.g. a regenerated grid-lens-solar-active.apng), and without a version query
+    // the browser keeps serving its cached copy of the old artwork indefinitely — bump
+    // this whenever any bundled icon's content changes. User-configured icon URLs are
+    // used verbatim (their cache lifecycle is the user's own).
+    const ICON_V = '?v=20260730h';
     const icons = Object.assign(
       {
-        solar: '/grid_lens/icons/grid-lens-solar.png',
-        battery: '/grid_lens/icons/grid-lens-battery.jpg',
-        home: '/grid_lens/icons/grid-lens-home.jpg',
-        grid: '/grid_lens/icons/grid-lens-grid.jpg',
-        ev: '/grid_lens/icons/grid-lens-ev-charger.jpg',
-        water_heater: '/grid_lens/icons/grid-lens-water-heater.jpg',
+        solar: `/grid_lens/icons/grid-lens-solar.png${ICON_V}`,
+        battery: `/grid_lens/icons/grid-lens-battery.jpg${ICON_V}`,
+        home: `/grid_lens/icons/grid-lens-home.jpg${ICON_V}`,
+        grid: `/grid_lens/icons/grid-lens-grid.jpg${ICON_V}`,
+        ev: `/grid_lens/icons/grid-lens-ev-charger.jpg${ICON_V}`,
+        water_heater: `/grid_lens/icons/grid-lens-water-heater.jpg${ICON_V}`,
       },
       (config && config.icons) || {}
+    );
+    // Animated counterparts for a node's active/idle state (bypass stripWhiteBg — generated
+    // pre-transparent). Keyed identically to `icons`; unset keys keep today's static-only
+    // behavior. See _kickOffImageLoads()/_pnode().
+    const iconsActive = Object.assign(
+      { solar: `/grid_lens/icons/grid-lens-solar-active.apng${ICON_V}` },
+      (config && config.icons_active) || {}
+    );
+    const iconsIdleActive = Object.assign(
+      { solar: `/grid_lens/icons/grid-lens-solar-inactive.apng${ICON_V}` },
+      (config && config.icons_idle_active) || {}
     );
     // Per-load icon overrides given as a URL are registered under a synthetic `defer:<name>`
     // key so they go through the same preload/chroma-key path as the built-in icons. Values
@@ -227,6 +252,8 @@ class GridLensPowerFlowCard extends HTMLElement {
       config
     );
     this._config.icons = icons;
+    this._config.icons_active = iconsActive;
+    this._config.icons_idle_active = iconsIdleActive;
     this._kickOffImageLoads();
     this._sig = '';
     this.render();
@@ -243,6 +270,16 @@ class GridLensPowerFlowCard extends HTMLElement {
         this._pending.delete(key);
         this.render();
       });
+    }
+    // Animated variants: no chroma-key/canvas pass needed (pre-transparent), so the raw URL
+    // is used directly — no preload promise/caching dance required, unlike stripWhiteBg above.
+    for (const [key, src] of Object.entries(this._config.icons_active || {})) {
+      if (!src || this._imgActive[key] !== undefined) continue;
+      this._imgActive[key] = src;
+    }
+    for (const [key, src] of Object.entries(this._config.icons_idle_active || {})) {
+      if (!src || this._imgIdleActive[key] !== undefined) continue;
+      this._imgIdleActive[key] = src;
     }
   }
 
@@ -441,7 +478,13 @@ class GridLensPowerFlowCard extends HTMLElement {
     const lx = anchor === 'start' ? a.cx - a.r : anchor === 'end' ? a.cx + a.r : a.cx;
     const nameY = a.cy + a.r + fs.name + 2;
     const valY = nameY + fs.val + 3;
-    const dataUrl = a.imgKey ? this._imgData[a.imgKey] : null;
+    // Animated active/idle variants win over the static default when configured for this key —
+    // a node with neither set (every built-in except solar, today) is byte-identical to before.
+    const dataUrl = a.imgKey
+      ? (a.active && this._imgActive[a.imgKey])
+        || (!a.active && this._imgIdleActive[a.imgKey])
+        || this._imgData[a.imgKey]
+      : null;
     const hasImage = !!dataUrl;
     const clipId = `pf-clip-${Math.round(a.cx)}-${Math.round(a.cy)}`;
     const inner = hasImage

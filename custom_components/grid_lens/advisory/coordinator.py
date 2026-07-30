@@ -254,30 +254,51 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             for h in range(len(load_hod))
         ]
 
-    def _deferrable_for_horizon(self, bundle) -> list:
+    async def _deferrable_for_horizon(self, bundle) -> list:
         """Build the optimizer's per-device deferrable dicts for THIS horizon: device
-        daily_kwh/max_kw + a per-slot availability mask from the hours config."""
-        from ..const import parse_hours_spec
+        daily_kwh/max_kw + a per-slot availability mask.
 
+        The mask comes from the device's stored weekly schedule (7x24 per-weekday grid,
+        edited on the dashboard schedule card) when one exists — read fresh from the
+        shared store every tick, so a schedule edit takes effect within one advisory
+        cycle. Devices with no stored schedule fall back to the static hours config
+        spec (same hours every day), unchanged from before the schedule feature."""
+        from ..const import parse_hours_spec
+        from ..schedule_grid import slot_allowed, week_from_hours
+
+        store = self.hass.data.get(DOMAIN, {}).get(
+            f"{self.entry.entry_id}_deferrable_schedules"
+        )
         hours_cfg = self._cfg("deferrable_load_hours", []) or []
         out = []
         for i, dev in enumerate(self._deferrable_params or []):
             daily, maxkw = dev.get("daily_kwh", 0.0), dev.get("max_kw", 0.0)
             if daily <= 0 or maxkw <= 0:
                 continue
-            spec = hours_cfg[i] if i < len(hours_cfg) else "all"
-            try:
-                allowed = parse_hours_spec(spec)
-            except Exception:  # noqa: BLE001
-                allowed = None
+            week = None
+            if store is not None:
+                try:
+                    week = await store.async_get(dev.get("sensor_id", ""))
+                except Exception:  # noqa: BLE001 — a broken store must not kill planning
+                    week = None
+            if week is None:
+                spec = hours_cfg[i] if i < len(hours_cfg) else "all"
+                try:
+                    allowed = parse_hours_spec(spec)
+                except Exception:  # noqa: BLE001
+                    allowed = None
+                week = None if allowed is None else week_from_hours(allowed)
             mask = None
-            if allowed is not None:
-                mask = [
-                    1 if dt_util.as_local(
+            if week is not None:
+                mask = []
+                for j in range(bundle.slots):
+                    local = dt_util.as_local(
                         bundle.start + timedelta(minutes=j * bundle.slot_minutes)
-                    ).hour in allowed else 0
-                    for j in range(bundle.slots)
-                ]
+                    )
+                    mask.append(
+                        1 if slot_allowed(week, local.weekday(), local.hour, local.minute)
+                        else 0
+                    )
             out.append({"daily_kwh": daily, "max_kw": maxkw, "hour_mask": mask,
                         "name": dev.get("name"), "sensor_id": dev.get("sensor_id")})
         return out
@@ -483,9 +504,10 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             float(self._cfg("min_export_price", 0.0)),
         )
         min_export_price = cents / 100.0
+        deferrable_loads = await self._deferrable_for_horizon(bundle)
         result = AdvisoryPlanner(optimizer, min_export_price=min_export_price).plan(
             bundle, initial_soc_percent=soc,
-            deferrable_loads=self._deferrable_for_horizon(bundle),
+            deferrable_loads=deferrable_loads,
             import_caps=import_caps,
             export_caps=export_caps,
             conditional_credits=conditional_credits,

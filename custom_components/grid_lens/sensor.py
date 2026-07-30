@@ -14,7 +14,9 @@ from .const import (
     DOMAIN, PLANS, METRICS, METRIC_INFO, PLAN_NAMES,
     CONF_DEFERRABLE_LOAD_SENSORS, CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_SWITCHES, CONF_DEFERRABLE_LOAD_SOC_SENSORS,
+    CONF_DEFERRABLE_LOAD_HOURS, parse_hours_spec,
 )
+from .schedule_grid import week_from_hours
 from .entity_lookup import resolve_power_sensor, resolve_device_name
 from .plan_sensors import PlanMetricSensor
 
@@ -136,6 +138,10 @@ class CurrentPlanCostSensor(GridLensSensorBase):
         max_kw = data.get(CONF_DEFERRABLE_LOAD_MAX_KW, []) or []
         switches = data.get(CONF_DEFERRABLE_LOAD_SWITCHES, []) or []
         soc_sensors = data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, []) or []
+        hours_cfg = data.get(CONF_DEFERRABLE_LOAD_HOURS, []) or []
+        sched_store = self.hass.data.get(DOMAIN, {}).get(
+            f"{self._entry.entry_id}_deferrable_schedules"
+        )
         out: list[dict[str, Any]] = []
         for i, sensor_id in enumerate(sensors):
             sw = switches[i] if i < len(switches) else ""
@@ -144,6 +150,16 @@ class CurrentPlanCostSensor(GridLensSensorBase):
                 power = resolve_power_sensor(self.hass, sensor_id, sw or None)
             except Exception:  # noqa: BLE001 — discovery is best-effort, never break the sensor
                 power = None
+            # Weekly availability: the stored per-weekday grid if the user saved one on
+            # the schedule card, else a grid seeded from the static hours config — the
+            # schedule card reads this to render/edit without a second discovery path.
+            schedule = sched_store.cached(sensor_id) if sched_store is not None else None
+            try:
+                default_week = week_from_hours(
+                    parse_hours_spec(hours_cfg[i] if i < len(hours_cfg) else None)
+                )
+            except Exception:  # noqa: BLE001 — a bad config spec falls back to all-allowed
+                default_week = week_from_hours(None)
             dashboard_names = getattr(self.coordinator, "energy_dashboard_names", None)
             out.append({
                 "name": resolve_device_name(
@@ -157,6 +173,10 @@ class CurrentPlanCostSensor(GridLensSensorBase):
                 "soc_entity": soc or None,
                 "max_kw": float(max_kw[i]) if i < len(max_kw) else None,
                 "controllable": bool(sw),
+                # 7x24 grids (Monday first): the user-saved weekly schedule (null when
+                # none saved) and the config-derived default it would revert to.
+                "schedule": schedule,
+                "default_schedule": default_week,
             })
         return out
 

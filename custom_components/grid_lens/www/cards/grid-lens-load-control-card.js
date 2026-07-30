@@ -1,10 +1,13 @@
 /*
  * Grid Lens Deferrable Load Control Card
  *
- * One toggle per configured deferrable-load control switch (GridLensDeferrableLoadSwitch —
- * see switch.py), auto-discovered so this card needs zero editing as loads are added,
- * removed, or reconfigured on any install — including a fresh install with none configured
- * yet, which renders a helpful empty state rather than a blank card.
+ * One row per configured deferrable-load control switch (GridLensDeferrableLoadSwitch —
+ * see switch.py), each with a single segmented control: Off now / On now (manual
+ * override — force the appliance and stop GridLens driving it) and Auto (GridLens
+ * schedules the load: clears the override and engages the per-device enable switch).
+ * Auto-discovered, so this card needs zero editing as loads are added, removed, or
+ * reconfigured on any install — including a fresh install with none configured yet,
+ * which renders a helpful empty state rather than a blank card.
  *
  * Auto-discovery fingerprint: a `switch.*` entity whose attributes carry both `switch`
  * (the physical appliance switch it drives) and `on_threshold_w` — the exact shape of
@@ -19,7 +22,7 @@
  *   title: Deferrable Loads          (optional)
  *   switches: [switch.foo_control]   (optional — explicit override of auto-discovery)
  */
-import { STYLE, esc } from './grid-lens-chart-common.js?v=20260729d';
+import { STYLE, esc } from './grid-lens-chart-common.js?v=20260730f';
 
 function friendlyNote(note) {
   if (!note) return '';
@@ -43,6 +46,22 @@ class GridLensLoadControlCard extends HTMLElement {
   }
 
   getCardSize() { return 2; }
+
+  // The manual-override selector paired with a control switch: a select.* entity whose
+  // `switch` attribute names the same physical appliance switch (see select.py's
+  // GridLensLoadOverrideSelect — the shared `switch` value is the deliberate join key,
+  // so no naming convention or per-install config is assumed).
+  _overrideSelectFor(controlEid) {
+    const hass = this._hass;
+    const phys = (hass.states[controlEid].attributes || {}).switch;
+    if (!phys) return null;
+    for (const eid of Object.keys(hass.states)) {
+      if (!eid.startsWith('select.')) continue;
+      const a = hass.states[eid].attributes || {};
+      if (a.switch === phys && 'override' in a) return eid;
+    }
+    return null;
+  }
 
   // Explicit override wins; otherwise scan every switch.* entity for the load-controller
   // attribute fingerprint (see file header) rather than assuming a fixed naming scheme —
@@ -75,7 +94,9 @@ class GridLensLoadControlCard extends HTMLElement {
     const switches = this._resolveSwitches();
     const sig = switches.map((eid) => {
       const st = hass.states[eid];
-      return `${eid}=${st.state}|${(st.attributes || {}).note}|${(st.attributes || {}).commanded}`;
+      const sel = this._overrideSelectFor(eid);
+      const selState = sel && hass.states[sel] ? hass.states[sel].state : '';
+      return `${eid}=${st.state}|${(st.attributes || {}).note}|${(st.attributes || {}).commanded}|${sel}=${selState}`;
     }).join(',');
     if (sig !== this._sig) { this._sig = sig; this._switches = switches; this._paint(); }
   }
@@ -99,6 +120,14 @@ class GridLensLoadControlCard extends HTMLElement {
         .sw.on { background: var(--good); }
         .sw.on::after { transform: translateX(18px); }
         .sw.unavail { opacity: .45; cursor: default; }
+        .ovr { display: flex; gap: 0; flex: 0 0 auto; border: 1px solid var(--border);
+               border-radius: 9px; overflow: hidden; }
+        .ovr button { font-size: 10.5px; font-weight: 600; padding: 4px 9px; border: none;
+               background: transparent; color: var(--ink2); cursor: pointer;
+               font-family: inherit; border-left: 1px solid var(--border); }
+        .ovr button:first-child { border-left: none; }
+        .ovr button.active { background: var(--good); color: #fff; }
+        .ovr button.active.off { background: var(--buy); }
       </style>
       <div class="card"><div class="body"></div></div>
     `;
@@ -130,6 +159,25 @@ class GridLensLoadControlCard extends HTMLElement {
       const note = friendlyNote(a.note);
       const isErr = (a.note || '').startsWith('command_error');
       const meta = `${on ? 'Controlling' : 'Not controlling'} · ${esc(a.switch || '')}${note ? ' · ' + esc(note) : ''}`;
+      // ONE segmented control per load: Off now / On now force the appliance
+      // immediately and stop GridLens driving it; Auto = "GridLens controls this load"
+      // — it BOTH clears any override AND turns on the per-device enable switch (the
+      // old fourth control, a separate toggle, was merged into Auto 2026-07-30: two
+      // side-by-side "does GridLens drive this" affordances read as duplicates). Auto
+      // only highlights when control is genuinely active (override cleared AND enable
+      // switch on — e.g. entitlement can refuse the enable), so the button reflects
+      // reality, not just the last click. The enable switch entity itself still exists
+      // for automations / a "hands-off without forcing a state" escape hatch.
+      const sel = this._overrideSelectFor(eid);
+      const cur = sel && hass.states[sel] ? hass.states[sel].state : null;
+      const ovr = sel ? `
+          <div class="ovr" data-sel="${esc(sel)}" data-ctl="${esc(eid)}" title="Manual override">
+            <button data-opt="Force Off" class="${cur === 'Force Off' ? 'active off' : ''}">Off now</button>
+            <button data-opt="Force On" class="${cur === 'Force On' ? 'active' : ''}">On now</button>
+            <button data-opt="Auto" class="${cur === 'Auto' && on ? 'active' : ''}"
+              title="Grid Lens schedules this load">Auto</button>
+          </div>` : `
+          <div class="sw ${on ? 'on' : ''}" data-eid="${esc(eid)}" title="${on ? 'Turn off' : 'Turn on'}"></div>`;
       return `
         <div class="row" data-eid="${esc(eid)}">
           <ha-icon class="icon" icon="mdi:power-plug"></ha-icon>
@@ -137,16 +185,32 @@ class GridLensLoadControlCard extends HTMLElement {
             <div class="name">${esc(a.name || eid)}</div>
             <div class="meta${isErr ? ' err' : ''}">${meta}</div>
           </div>
-          <div class="sw ${on ? 'on' : ''}" data-eid="${esc(eid)}" title="${on ? 'Turn off' : 'Turn on'}"></div>
+          ${ovr}
         </div>`;
     }).join('');
 
     body.innerHTML = header + `<div class="rows">${rows}</div>`;
 
+    // Fallback rows only (no override select found — older integration build).
     body.querySelectorAll('.sw').forEach((el) => {
       el.addEventListener('click', () => {
         const eid = el.getAttribute('data-eid');
         this._hass.callService('switch', 'toggle', { entity_id: eid });
+      });
+    });
+    body.querySelectorAll('.ovr button').forEach((el) => {
+      el.addEventListener('click', () => {
+        const grp = el.closest('.ovr');
+        const sel = grp.getAttribute('data-sel');
+        const opt = el.getAttribute('data-opt');
+        this._hass.callService('select', 'select_option', { entity_id: sel, option: opt });
+        if (opt === 'Auto') {
+          // Auto means "GridLens controls it" — also engage the per-device enable
+          // switch, which the merged-away toggle used to do.
+          this._hass.callService('switch', 'turn_on', {
+            entity_id: grp.getAttribute('data-ctl'),
+          });
+        }
       });
     });
   }

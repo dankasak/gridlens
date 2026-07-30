@@ -209,7 +209,11 @@ def consolidate_deferrable_schedule(
             t1 = min(t0 + slots_per_day, T)
             eligible = [
                 t for t in range(t0, t1)
-                if (mask[t] if mask else True) and t not in protected
+                # Only fully-available slots are eligible for consolidation — a
+                # fractionally-masked slot (half-hour schedule at hourly LP
+                # resolution) has a tighter per-slot cap than cap_kwh, so moving a
+                # full slot's energy into it would overfill; leave those as solved.
+                if (float(mask[t]) >= 1.0 if mask else True) and t not in protected
             ]
             _front_load_device_day(schedule, i, eligible, cap_kwh)
 
@@ -285,7 +289,9 @@ class BatteryOptimizer:
         deferrable_loads is a list of per-device dicts, each with:
           'daily_kwh': float  — energy the device must consume per day
           'max_kw':    float  — maximum power draw per hour for that device
-          'hour_mask': optional list[int] of length T (1 = device available at
+          'hour_mask': optional list of length T, values 0..1 (1 = device fully
+          available that slot; fractional values scale the slot's energy cap, e.g.
+          0.5 from a half-hour weekly schedule consumed at hourly resolution;
                        that LP hour, 0 = unavailable).  Missing/None = always
                        available.  Built by the caller from local hour-of-day.
 
@@ -628,8 +634,11 @@ class BatteryOptimizer:
             # (max_kw × dt), and forced to 0 in slots the device is unavailable.
             mask = dev.get('hour_mask')
             if mask:
+                # Mask entries may be fractional (a half-hour-resolution weekly
+                # schedule at this LP's hourly resolution: 0.5 = available for half
+                # the hour → half the hourly energy cap), so scale rather than gate.
                 for t in range(T):
-                    ub[(5+i)*T+t] = dev['max_kw'] * dt if mask[t] else 0.0
+                    ub[(5+i)*T+t] = dev['max_kw'] * dt * float(mask[t])
             else:
                 ub[(5+i)*T:(5+i)*T+T] = dev['max_kw'] * dt
         for cb2 in credit_blocks:
@@ -695,8 +704,10 @@ class BatteryOptimizer:
             for d in range(n_days):
                 t0 = d * slots_per_day
                 t1 = min(t0 + slots_per_day, T)
+                # Fraction-aware: a 0.5-masked slot contributes half a slot of
+                # deliverable capacity (see the ub scaling above).
                 avail_slots = (
-                    sum(1 for t in range(t0, t1) if mask[t]) if mask else (t1 - t0)
+                    sum(float(mask[t]) for t in range(t0, t1)) if mask else (t1 - t0)
                 )
                 target = dev['daily_kwh'] * (t1 - t0) / slots_per_day
                 target = min(target, avail_slots * dev['max_kw'] * dt)

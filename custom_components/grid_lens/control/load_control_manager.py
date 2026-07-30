@@ -174,6 +174,35 @@ class LoadControlManager:
     def is_enabled(self, index: int) -> bool:
         return bool(self._enabled.get(index, False))
 
+    # ------------------------------------------------------------------ manual override
+    def get_override(self, index: int):
+        """'on' / 'off' while a manual override is active for the device, else None."""
+        c = self.controllers.get(index)
+        if c is None or c.override is None:
+            return None
+        return "on" if c.override else "off"
+
+    async def set_override(self, index: int, mode, *, actuate: bool = True) -> bool:
+        """Set (mode='on'/'off') or clear (mode=None) a device's manual override.
+
+        Deliberately NOT gated on the device's enable switch or on entitlement: a
+        forced on/off is a direct user command — morally identical to the user toggling
+        the appliance's own switch entity, which they can always do — and it must work
+        precisely when GridLens control is active so the controller stops fighting it
+        (plan re-assert would otherwise flip the switch right back). Clearing returns
+        the device to whatever the enable switch + plan dictate; if it's enabled, state
+        re-establishes on an immediate tick rather than waiting up to 5 minutes.
+        """
+        c = self.controllers.get(index)
+        if c is None:
+            return False
+        want = None if mode is None else (mode == "on")
+        await c.set_override(want, dt_util.now(), actuate=actuate)
+        self._notify(index)
+        if want is None and actuate and self._enabled.get(index, False):
+            await self._tick_device(index, dt_util.now())
+        return True
+
     # ------------------------------------------------------------------ timer
     def _ensure_timer(self) -> None:
         if self._cancel_timer is not None:
