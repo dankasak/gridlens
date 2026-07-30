@@ -160,7 +160,7 @@ class GridLensPowerFlowCard extends HTMLElement {
     // the browser keeps serving its cached copy of the old artwork indefinitely — bump
     // this whenever any bundled icon's content changes. User-configured icon URLs are
     // used verbatim (their cache lifecycle is the user's own).
-    const ICON_V = '?v=20260730h';
+    const ICON_V = '?v=20260730p';
     const icons = Object.assign(
       {
         solar: `/grid_lens/icons/grid-lens-solar.png${ICON_V}`,
@@ -176,7 +176,11 @@ class GridLensPowerFlowCard extends HTMLElement {
     // pre-transparent). Keyed identically to `icons`; unset keys keep today's static-only
     // behavior. See _kickOffImageLoads()/_pnode().
     const iconsActive = Object.assign(
-      { solar: `/grid_lens/icons/grid-lens-solar-active.apng${ICON_V}` },
+      {
+        solar: `/grid_lens/icons/grid-lens-solar-active.apng${ICON_V}`,
+        grid: `/grid_lens/icons/grid-lens-grid-active.apng${ICON_V}`,
+        water_heater: `/grid_lens/icons/grid-lens-water-heater-active.apng${ICON_V}`,
+      },
       (config && config.icons_active) || {}
     );
     const iconsIdleActive = Object.assign(
