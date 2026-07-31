@@ -1,28 +1,41 @@
 /*
  * Grid Lens Deferrable Load Control Card
  *
- * One row per configured deferrable-load control switch (GridLensDeferrableLoadSwitch —
- * see switch.py), each with a single segmented control: Off now / On now (manual
- * override — force the appliance and stop GridLens driving it) and Auto (GridLens
- * schedules the load: clears the override and engages the per-device enable switch).
- * Auto-discovered, so this card needs zero editing as loads are added, removed, or
- * reconfigured on any install — including a fresh install with none configured yet,
- * which renders a helpful empty state rather than a blank card.
+ * One row per configured deferrable load (controllable or not), each with:
+ *   - a Today Boost kWh input (GridLensDeferrableOverrideNumber — see number.py),
+ *     merged in from the formerly-separate Boost Tuning card/tiles 2026-07-31;
+ *   - Greedy Consumption / Greedy Respects Schedule toggles, when the device has a
+ *     control switch configured;
+ *   - a single segmented control: Off now / On now (manual override — force the
+ *     appliance and stop GridLens driving it) and Auto (GridLens schedules the load).
+ * A device with no control switch configured still gets a row (boost + name/meta), but
+ * the segmented control renders disabled with a tooltip explaining why — previously
+ * such devices were invisible on this card entirely, which read as "load control isn't
+ * working" rather than "this device just isn't wired for control yet".
  *
- * Auto-discovery fingerprint: a `switch.*` entity whose attributes carry both `switch`
- * (the physical appliance switch it drives) and `on_threshold_w` — the exact shape of
- * GridLensDeferrableLoadSwitch.status() (switch.py) and DeferrableLoadController.status()
- * (control/load_controller.py). This is unique among GridLens switches — the battery
- * control switch's attributes (control/manager.py status()) carry neither key — so no
- * explicit entity list is required. An explicit `switches:` config list still overrides,
- * for anyone who wants to hand-pick/order a subset.
+ * Auto-discovered from the `deferrable_loads` attribute published by the GridLens cost
+ * sensor (sensor.py's _build_deferrable_loads — same source `grid-lens-defer-schedule-
+ * card.js`/the old boost-tuning-card used), so this card needs zero editing as loads are
+ * added, removed, or reconfigured on any install — including a fresh install with none
+ * configured yet, which renders a helpful empty state rather than a blank card.
+ *
+ * Per-device entity resolution, all joined on the device's `switch_entity`/`energy_entity`
+ * (never a naming convention — installs vary in retailer/hardware/device count, per the
+ * project's generic-design rule):
+ *   - control switch: `switch.*` with `switch === switch_entity` and `on_threshold_w` in
+ *     attrs (GridLensDeferrableLoadSwitch / DeferrableLoadController.status()).
+ *   - override select: `select.*` with `switch === switch_entity` and `override` in attrs
+ *     (GridLensLoadOverrideSelect).
+ *   - greedy toggles: `switch.*` with `switch === switch_entity` and `role === 'greedy'` /
+ *     `'greedy_schedule'` (GridLensDeferrableGreedySwitch / …ScheduleSwitch).
+ *   - boost number: `number.*` with `deferrable_sensor_id === energy_entity`
+ *     (GridLensDeferrableOverrideNumber).
  *
  * Config:
  *   type: custom:grid-lens-load-control-card
  *   title: Deferrable Loads          (optional)
- *   switches: [switch.foo_control]   (optional — explicit override of auto-discovery)
  */
-import { STYLE, esc } from './grid-lens-chart-common.js?v=20260730f';
+import { STYLE, esc } from './grid-lens-chart-common.js?v=20260731a';
 
 function friendlyNote(note) {
   if (!note) return '';
@@ -45,15 +58,38 @@ class GridLensLoadControlCard extends HTMLElement {
     this._renderShell();
   }
 
-  getCardSize() { return 2; }
+  getCardSize() { return Math.max(2, (this._rows || []).length + 1); }
+
+  // Canonical device list — every configured deferrable load, controllable or not (same
+  // source as grid-lens-defer-schedule-card.js / the old boost-tuning-card).
+  _resolveDevices() {
+    const hass = this._hass;
+    if (!hass) return [];
+    for (const eid of Object.keys(hass.states)) {
+      if (!eid.startsWith('sensor.')) continue;
+      const a = hass.states[eid].attributes;
+      if (a && Array.isArray(a.deferrable_loads)) return a.deferrable_loads;
+    }
+    return [];
+  }
+
+  _controlSwitchFor(phys) {
+    const hass = this._hass;
+    if (!phys) return null;
+    for (const eid of Object.keys(hass.states)) {
+      if (!eid.startsWith('switch.')) continue;
+      const a = hass.states[eid].attributes || {};
+      if (a.switch === phys && 'on_threshold_w' in a) return eid;
+    }
+    return null;
+  }
 
   // The manual-override selector paired with a control switch: a select.* entity whose
   // `switch` attribute names the same physical appliance switch (see select.py's
   // GridLensLoadOverrideSelect — the shared `switch` value is the deliberate join key,
   // so no naming convention or per-install config is assumed).
-  _overrideSelectFor(controlEid) {
+  _overrideSelectFor(phys) {
     const hass = this._hass;
-    const phys = (hass.states[controlEid].attributes || {}).switch;
     if (!phys) return null;
     for (const eid of Object.keys(hass.states)) {
       if (!eid.startsWith('select.')) continue;
@@ -63,27 +99,50 @@ class GridLensLoadControlCard extends HTMLElement {
     return null;
   }
 
-  // Explicit override wins; otherwise scan every switch.* entity for the load-controller
-  // attribute fingerprint (see file header) rather than assuming a fixed naming scheme —
-  // installs vary in retailer/hardware/device count, per the project's generic-design rule.
-  _resolveSwitches() {
+  // Greedy Consumption's two per-device toggles (GridLensDeferrableGreedySwitch /
+  // GridLensDeferrableGreedyScheduleSwitch — see switch.py): same `switch` join key as
+  // the override select above, disambiguated by `role` since both otherwise carry an
+  // identically-shaped attribute set.
+  _greedySwitchFor(phys, role) {
     const hass = this._hass;
-    if (!hass) return [];
-    if (Array.isArray(this._config.switches) && this._config.switches.length) {
-      return this._config.switches.filter((eid) => hass.states[eid]);
-    }
-    const found = [];
+    if (!phys) return null;
     for (const eid of Object.keys(hass.states)) {
       if (!eid.startsWith('switch.')) continue;
       const a = hass.states[eid].attributes || {};
-      if ('on_threshold_w' in a && 'switch' in a) found.push(eid);
+      if (a.switch === phys && a.role === role) return eid;
     }
-    found.sort((a, b) => {
-      const na = (hass.states[a].attributes.name || a);
-      const nb = (hass.states[b].attributes.name || b);
-      return na.localeCompare(nb);
+    return null;
+  }
+
+  // Today Boost override (GridLensDeferrableOverrideNumber — see number.py), joined on
+  // the device's energy sensor rather than the control switch, since a boost target is
+  // meaningful even for a forecast-only device with no switch at all.
+  _boostFor(energyEntity) {
+    const hass = this._hass;
+    if (!energyEntity) return null;
+    for (const eid of Object.keys(hass.states)) {
+      if (!eid.startsWith('number.')) continue;
+      const a = hass.states[eid].attributes || {};
+      if (a.deferrable_sensor_id === energyEntity) return eid;
+    }
+    return null;
+  }
+
+  _resolveRows() {
+    const devices = this._resolveDevices();
+    const rows = devices.map((d) => {
+      const phys = d.switch_entity || null;
+      return {
+        device: d,
+        controlEid: this._controlSwitchFor(phys),
+        selEid: this._overrideSelectFor(phys),
+        gEid: this._greedySwitchFor(phys, 'greedy'),
+        gsEid: this._greedySwitchFor(phys, 'greedy_schedule'),
+        boostEid: this._boostFor(d.energy_entity),
+      };
     });
-    return found;
+    rows.sort((r1, r2) => (r1.device.name || '').localeCompare(r2.device.name || ''));
+    return rows;
   }
 
   set hass(hass) {
@@ -91,24 +150,34 @@ class GridLensLoadControlCard extends HTMLElement {
     const dark = !!(hass.themes && hass.themes.darkMode);
     if (dark !== this._dark) { this._dark = dark; this.classList.toggle('dark', dark); }
 
-    const switches = this._resolveSwitches();
-    const sig = switches.map((eid) => {
-      const st = hass.states[eid];
-      const sel = this._overrideSelectFor(eid);
-      const selState = sel && hass.states[sel] ? hass.states[sel].state : '';
-      return `${eid}=${st.state}|${(st.attributes || {}).note}|${(st.attributes || {}).commanded}|${sel}=${selState}`;
+    const rows = this._resolveRows();
+    const sig = rows.map((r) => {
+      const c = r.controlEid && hass.states[r.controlEid];
+      const s = r.selEid && hass.states[r.selEid];
+      const g = r.gEid && hass.states[r.gEid];
+      const gs = r.gsEid && hass.states[r.gsEid];
+      const b = r.boostEid && hass.states[r.boostEid];
+      return [
+        r.device.energy_entity,
+        c ? `${c.state}|${(c.attributes || {}).note}` : '',
+        s ? s.state : '',
+        g ? g.state : '',
+        gs ? gs.state : '',
+        b ? b.state : '',
+      ].join('~');
     }).join(',');
-    if (sig !== this._sig) { this._sig = sig; this._switches = switches; this._paint(); }
+    if (sig !== this._sig) { this._sig = sig; this._rows = rows; this._paint(); }
   }
 
   _renderShell() {
     this.shadowRoot.innerHTML = `
       <style>${STYLE}
         .rows { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
-        .row { display: flex; align-items: center; gap: 12px; padding: 9px 2px; border-bottom: 1px solid var(--border); }
+        .row { display: flex; align-items: center; gap: 10px; padding: 9px 2px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
         .row:last-child { border-bottom: none; }
         .row .icon { color: var(--ink2); flex: 0 0 auto; }
-        .row .info { flex: 1 1 auto; min-width: 0; }
+        .row .icon.dim { opacity: .4; }
+        .row .info { flex: 1 1 120px; min-width: 0; }
         .row .name { font-size: 13.5px; font-weight: 550; color: var(--ink); }
         .row .meta { font-size: 11px; color: var(--ink2); margin-top: 1px; }
         .row .meta.err { color: var(--buy); }
@@ -128,6 +197,21 @@ class GridLensLoadControlCard extends HTMLElement {
         .ovr button:first-child { border-left: none; }
         .ovr button.active { background: var(--good); color: #fff; }
         .ovr button.active.off { background: var(--buy); }
+        .ovr.disabled { cursor: not-allowed; }
+        .ovr.disabled button { opacity: .4; cursor: not-allowed; }
+        .greedy { display: flex; gap: 4px; flex: 0 0 auto; }
+        .greedy .gbtn { display: flex; align-items: center; justify-content: center;
+               width: 26px; height: 26px; border-radius: 7px; border: 1px solid var(--border);
+               background: transparent; color: var(--ink2); cursor: pointer; }
+        .greedy .gbtn.on { background: var(--good); color: #fff; border-color: var(--good); }
+        .greedy .gbtn ha-icon { --mdc-icon-size: 15px; }
+        .boost { display: flex; align-items: center; gap: 3px; flex: 0 0 auto;
+               border: 1px solid var(--border); border-radius: 7px; padding: 3px 7px; }
+        .boost.active { border-color: var(--good); }
+        .boost-input { width: 42px; border: none; background: transparent; color: var(--ink);
+               font-size: 12px; font-family: inherit; text-align: right; }
+        .boost-input::-webkit-outer-spin-button, .boost-input::-webkit-inner-spin-button { margin: 0; }
+        .boost-unit { font-size: 10px; color: var(--ink2); }
       </style>
       <div class="card"><div class="body"></div></div>
     `;
@@ -137,59 +221,115 @@ class GridLensLoadControlCard extends HTMLElement {
     const body = this.shadowRoot && this.shadowRoot.querySelector('.body');
     if (!body) return;
     const hass = this._hass;
-    const switches = this._switches || [];
+    const rows = this._rows || [];
 
     const header = `
       <div class="hd">
         <div class="title">${esc(this._config.title)}</div>
-        ${switches.length ? `<div class="sub">${switches.length} configured</div>` : ''}
+        ${rows.length ? `<div class="sub">${rows.length} configured</div>` : ''}
       </div>`;
 
-    if (!switches.length) {
-      body.innerHTML = header +
-        `<div class="waiting">No deferrable loads have a control switch assigned yet.<br>
-         <span class="sub">Assign one via the Grid Lens integration's Reconfigure flow to enable control.</span></div>`;
+    if (!rows.length) {
+      body.innerHTML = header + `<div class="waiting">No deferrable loads configured yet.</div>`;
       return;
     }
 
-    const rows = switches.map((eid) => {
-      const st = hass.states[eid];
-      const a = st.attributes || {};
-      const on = st.state === 'on';
+    const rowsHtml = rows.map((r) => {
+      const d = r.device;
+      const controlSt = r.controlEid ? hass.states[r.controlEid] : null;
+      const on = controlSt ? controlSt.state === 'on' : false;
+      const a = controlSt ? (controlSt.attributes || {}) : {};
       const note = friendlyNote(a.note);
       const isErr = (a.note || '').startsWith('command_error');
-      const meta = `${on ? 'Controlling' : 'Not controlling'} · ${esc(a.switch || '')}${note ? ' · ' + esc(note) : ''}`;
-      // ONE segmented control per load: Off now / On now force the appliance
-      // immediately and stop GridLens driving it; Auto = "GridLens controls this load"
-      // — it BOTH clears any override AND turns on the per-device enable switch (the
-      // old fourth control, a separate toggle, was merged into Auto 2026-07-30: two
-      // side-by-side "does GridLens drive this" affordances read as duplicates). Auto
-      // only highlights when control is genuinely active (override cleared AND enable
-      // switch on — e.g. entitlement can refuse the enable), so the button reflects
-      // reality, not just the last click. The enable switch entity itself still exists
-      // for automations / a "hands-off without forcing a state" escape hatch.
-      const sel = this._overrideSelectFor(eid);
-      const cur = sel && hass.states[sel] ? hass.states[sel].state : null;
-      const ovr = sel ? `
-          <div class="ovr" data-sel="${esc(sel)}" data-ctl="${esc(eid)}" title="Manual override">
+      const meta = d.controllable
+        ? `${on ? 'Controlling' : 'Not controlling'} · ${esc(d.switch_entity || '')}${note ? ' · ' + esc(note) : ''}`
+        : 'Forecast only — no control switch configured';
+
+      // Control area: a fully-wired device gets the real segmented control (or a plain
+      // toggle fallback if the override select hasn't appeared yet); a device with no
+      // switch configured at all gets the same-shaped control, disabled, with a tooltip
+      // explaining why — so "no control" reads as a configuration gap, not a bug.
+      let controlHtml;
+      if (!d.controllable) {
+        controlHtml = `
+          <div class="ovr disabled" title="Full control has not yet been configured — assign a switch via the Grid Lens integration's Reconfigure flow to enable Off now / On now / Auto.">
+            <button disabled>Off now</button>
+            <button disabled>On now</button>
+            <button disabled>Auto</button>
+          </div>`;
+      } else if (r.selEid) {
+        const cur = hass.states[r.selEid] ? hass.states[r.selEid].state : null;
+        controlHtml = `
+          <div class="ovr" data-sel="${esc(r.selEid)}" data-ctl="${esc(r.controlEid)}" title="Manual override">
             <button data-opt="Force Off" class="${cur === 'Force Off' ? 'active off' : ''}">Off now</button>
             <button data-opt="Force On" class="${cur === 'Force On' ? 'active' : ''}">On now</button>
             <button data-opt="Auto" class="${cur === 'Auto' && on ? 'active' : ''}"
               title="Grid Lens schedules this load">Auto</button>
-          </div>` : `
-          <div class="sw ${on ? 'on' : ''}" data-eid="${esc(eid)}" title="${on ? 'Turn off' : 'Turn on'}"></div>`;
+          </div>`;
+      } else if (r.controlEid) {
+        controlHtml = `<div class="sw ${on ? 'on' : ''}" data-eid="${esc(r.controlEid)}" title="${on ? 'Turn off' : 'Turn on'}"></div>`;
+      } else {
+        // controllable per config, but the control entities haven't appeared yet (a
+        // startup race) — same disabled placeholder, self-heals on the next repaint.
+        controlHtml = `
+          <div class="ovr disabled" title="Control entities are still loading…">
+            <button disabled>Off now</button><button disabled>On now</button><button disabled>Auto</button>
+          </div>`;
+      }
+
+      // Greedy Consumption's two per-device toggles (see switch.py) — opportunistic
+      // "on" whenever import is free or export is being wasted, on top of Auto/plan
+      // control. Only meaningful (and only created) for a controllable device.
+      let greedyHtml = '';
+      if (r.controlEid && r.gEid) {
+        const gOn = hass.states[r.gEid] && hass.states[r.gEid].state === 'on';
+        const gsOn = r.gsEid && hass.states[r.gsEid] && hass.states[r.gsEid].state === 'on';
+        greedyHtml = `
+          <div class="greedy">
+            <div class="gbtn${gOn ? ' on' : ''}" data-eid="${esc(r.gEid)}"
+                 title="Greedy Consumption: turn on whenever import is free or export is being wasted">
+              <ha-icon icon="mdi:leaf"></ha-icon>
+            </div>
+            ${r.gsEid ? `
+            <div class="gbtn${gsOn ? ' on' : ''}" data-eid="${esc(r.gsEid)}"
+                 title="Greedy Respects Schedule: only greedy-fire inside this load's own availability window">
+              <ha-icon icon="mdi:calendar-clock"></ha-icon>
+            </div>` : ''}
+          </div>`;
+      }
+
+      // Today Boost override (merged in from the old boost-tuning-card 2026-07-31) —
+      // shown for every device that has one, controllable or not.
+      let boostHtml = '';
+      if (r.boostEid && hass.states[r.boostEid]) {
+        const bst = hass.states[r.boostEid];
+        const ba = bst.attributes || {};
+        const val = parseFloat(bst.state);
+        const shown = Number.isFinite(val) ? val : 0;
+        const active = shown > 0;
+        boostHtml = `
+          <div class="boost${active ? ' active' : ''}" title="Today's kWh target override — 0 uses the 14-day historical average">
+            <input type="number" class="boost-input" data-eid="${esc(r.boostEid)}"
+              min="${ba.min ?? 0}" max="${ba.max ?? 999}" step="${ba.step ?? 0.5}"
+              value="${shown}">
+            <span class="boost-unit">kWh</span>
+          </div>`;
+      }
+
       return `
-        <div class="row" data-eid="${esc(eid)}">
-          <ha-icon class="icon" icon="mdi:power-plug"></ha-icon>
+        <div class="row" data-eid="${esc(r.controlEid || d.energy_entity)}">
+          <ha-icon class="icon${d.controllable ? '' : ' dim'}" icon="mdi:power-plug"></ha-icon>
           <div class="info">
-            <div class="name">${esc(a.name || eid)}</div>
+            <div class="name">${esc(d.name || d.energy_entity)}</div>
             <div class="meta${isErr ? ' err' : ''}">${meta}</div>
           </div>
-          ${ovr}
+          ${boostHtml}
+          ${greedyHtml}
+          ${controlHtml}
         </div>`;
     }).join('');
 
-    body.innerHTML = header + `<div class="rows">${rows}</div>`;
+    body.innerHTML = header + `<div class="rows">${rowsHtml}</div>`;
 
     // Fallback rows only (no override select found — older integration build).
     body.querySelectorAll('.sw').forEach((el) => {
@@ -198,7 +338,13 @@ class GridLensLoadControlCard extends HTMLElement {
         this._hass.callService('switch', 'toggle', { entity_id: eid });
       });
     });
-    body.querySelectorAll('.ovr button').forEach((el) => {
+    body.querySelectorAll('.gbtn').forEach((el) => {
+      el.addEventListener('click', () => {
+        const eid = el.getAttribute('data-eid');
+        this._hass.callService('switch', 'toggle', { entity_id: eid });
+      });
+    });
+    body.querySelectorAll('.ovr button:not([disabled])').forEach((el) => {
       el.addEventListener('click', () => {
         const grp = el.closest('.ovr');
         const sel = grp.getAttribute('data-sel');
@@ -213,6 +359,16 @@ class GridLensLoadControlCard extends HTMLElement {
         }
       });
     });
+    body.querySelectorAll('.boost-input').forEach((el) => {
+      const commit = () => {
+        const eid = el.getAttribute('data-eid');
+        let v = parseFloat(el.value);
+        if (!Number.isFinite(v) || v < 0) v = 0;
+        this._hass.callService('number', 'set_value', { entity_id: eid, value: v });
+      };
+      el.addEventListener('change', commit);
+      el.addEventListener('keydown', (e) => { if (e.key === 'Enter') el.blur(); });
+    });
   }
 }
 
@@ -221,5 +377,5 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: 'grid-lens-load-control-card',
   name: 'Grid Lens Load Control',
-  description: 'Toggle control on/off for each configured deferrable load, auto-discovered.',
+  description: 'Per-device deferrable load control, Greedy Consumption, and Today Boost target, auto-discovered.',
 });

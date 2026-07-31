@@ -13,7 +13,7 @@
  */
 import {
   GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor,
-} from './grid-lens-chart-common.js?v=20260730f';
+} from './grid-lens-chart-common.js?v=20260731a';
 
 class GridLensPowerChartCard extends GridLensChartCardBase {
   get title() { return 'Power — measured & forecast (kW)'; }

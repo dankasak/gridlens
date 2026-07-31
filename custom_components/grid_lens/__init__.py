@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 
+from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
@@ -125,14 +126,10 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
                 "type": "tile", "entity": min_export, "name": "Min export price",
                 "features": [{"type": "numeric-input"}],
             })
-    tuning_tiles = []
+    # Today Boost tiles used to live here as their own "Tuning" section — merged into
+    # grid-lens-load-control-card's per-device rows 2026-07-31 (user request: "move the
+    # boost control into this same settings area"), so nothing further is seeded for it.
     deferrable_sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or []
-    for sensor_id in deferrable_sensors:
-        boost = eid(f"{entry.entry_id}_deferrable_override_{sensor_id}")
-        if boost:
-            tuning_tiles.append({
-                "type": "tile", "entity": boost, "features": [{"type": "numeric-input"}],
-            })
 
     battery_control = eid(f"{entry.entry_id}_battery_control")
 
@@ -213,15 +210,34 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
             "type": "custom:grid-lens-defer-schedule-card", "title": "Allowed Run Times",
             "grid_options": {"columns": "full"},
         })
-    if tuning_tiles:
-        settings_cards.append({
-            "type": "heading", "heading": "Tuning", "heading_style": "title",
-            "icon": "mdi:tune", "grid_options": {"columns": "full"},
-        })
-        settings_cards.append({
-            "type": "grid", "columns": len(tuning_tiles), "square": False,
-            "cards": tuning_tiles, "grid_options": {"columns": "full"},
-        })
+    # "Add / reconfigure a device" link, at the BOTTOM (user request 2026-07-31 — a
+    # top-of-page button read as too prominent). Structural config (which HA entities are
+    # your solar/battery/deferrable-load sensors and switches, adding a new device) still
+    # has to go through HA's config_flow/options_flow (it's what creates the config entry
+    # data everything else here reads), which lives on a different screen (Settings >
+    # Devices & Services) than this dashboard. Rather than trying to fold that
+    # live-reactive-vs-form-submit mismatch into one screen (config_flow has no
+    # instant-apply, which is exactly why min_export_price/overrides/boost/greedy were
+    # deliberately moved OFF config_flow onto dashboard entities in the first place — see
+    # the checklist), a one-click link keeps setup and tuning one click apart instead of
+    # requiring the user to remember/hunt for the separate screen. `/config/integrations/
+    # integration/{domain}` is a stable HA frontend route that filters straight to this
+    # integration's entries, independent of entry_id/instance-specific naming. Appended
+    # unconditionally (even with nothing else configured yet) so a fresh install still
+    # gets a minimal Settings view pointing the user at where to go configure something.
+    settings_cards.append({
+        "type": "heading", "heading": "Setup", "heading_style": "title",
+        "icon": "mdi:cog-outline", "grid_options": {"columns": "full"},
+    })
+    settings_cards.append({
+        "type": "button", "name": "Reconfigure Grid Lens", "icon": "mdi:tune-variant",
+        "show_state": False,
+        "tap_action": {
+            "action": "navigate",
+            "navigation_path": "/config/integrations/integration/grid_lens",
+        },
+        "grid_options": {"columns": "full"},
+    })
     if settings_cards:
         views.append({
             "path": "settings", "type": "sections", "icon": "mdi:cog",
@@ -267,7 +283,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260730p"
+    _CARD_VERSION = "20260731c"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -846,7 +862,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     elif _r.status == 402:
                         _body = await _r.text()
                         _LOGGER.warning("API /plans returned %s: %s", _r.status, _body[:200])
-                        self.hass.components.persistent_notification.async_create(
+                        persistent_notification.async_create(
+                            self.hass,
                             "Your Grid Lens subscription has ended and the dashboard cannot show plan data. "
                             "Please resubscribe at **gridlens.au/pricing** or reconfigure the integration "
                             "to restore your original plan.",
@@ -1169,7 +1186,8 @@ class GridLensCoordinator(DataUpdateCoordinator):
                     network_operators = _resp.get("network_operators", {})
                 elif _r.status == 402:
                     _LOGGER.warning("Coordinator: API /plans returned 402 (subscription ended)")
-                    self.hass.components.persistent_notification.async_create(
+                    persistent_notification.async_create(
+                        self.hass,
                         "Your Grid Lens subscription has ended and the dashboard cannot show plan data. "
                         "Please resubscribe at **gridlens.au/pricing** or reconfigure the integration "
                         "to restore your original plan.",

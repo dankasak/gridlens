@@ -13,7 +13,7 @@
  */
 import {
   GW, GML, GMR, GridLensChartCardBase, xAxisTicks, fmtHour, actionLabel, fmtPct, fmtC, execMode,
-} from './grid-lens-chart-common.js?v=20260730f';
+} from './grid-lens-chart-common.js?v=20260731a';
 
 class GridLensDispatchChartCard extends GridLensChartCardBase {
   get title() { return 'Planned dispatch'; }
@@ -68,7 +68,7 @@ class GridLensDispatchChartCard extends GridLensChartCardBase {
     });
     let xt = xAxisTicks(X, t0, t1, g.h - g.mb);
     const nowX = X(Math.min(Date.now(), t1));
-    xt += `<line x1="${nowX}" y1="${g.mt}" x2="${nowX}" y2="${g.h - g.mb}" stroke="var(--axis)" stroke-width="1" stroke-dasharray="2 3"/>`;
+    xt += `<line x1="${nowX}" y1="${g.mt}" x2="${nowX}" y2="${g.h - g.mb}" stroke="var(--now-line)" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.65"/>`;
 
     return `<svg viewBox="0 0 ${g.w} ${g.h}" class="chart-svg" role="img" aria-label="Planned battery dispatch by hour">
       ${shade}

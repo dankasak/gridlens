@@ -24,6 +24,19 @@ is SOC-guardrail- and inverter-HAL-specific):
   missed tick has more real-world consequence than reverting an inverter mode, so nothing
   here ever forces a load off on shutdown/stale-plan; a stopped loop just leaves the last
   commanded state in place.
+* **Greedy Consumption** (opt-in per device, off by default) — a real-time safety-net on
+  top of the LP's plan: turn the device on any time energy is genuinely free right now,
+  regardless of what the plan scheduled for this slot. Two conditions (either is enough):
+  the current import price is free (a plan's $0 window), or the household is currently
+  exporting at least as much power as this device draws while the export price is $0 (so
+  running it can't create new grid import — it only claims otherwise-worthless export).
+  Folds into the same ``want_on`` computed each tick, so it's subject to the same
+  debounce/transition-economy machinery as a plan-driven flip — no separate code path,
+  no separate chatter risk. Optionally gated to the device's own configured availability
+  window/weekly schedule (``greedy_respects_schedule``); off by default, since greedy is
+  meant to be opportunistic ("don't leave free energy on the table"). Like everything
+  else here, greedy is completely suppressed while a manual override is active — a human
+  at the physical switch always wins.
 """
 from __future__ import annotations
 
@@ -71,6 +84,13 @@ class DeferrableLoadController:
         # it", so a human at the physical switch always wins afterwards.
         self._override: Optional[bool] = None
 
+        # Greedy Consumption: opt-in real-time override of the plan (see module
+        # docstring). Both default OFF — greedy never activates on a fresh install/entity
+        # restore, and "respects schedule" defaults to the more opportunistic behaviour
+        # (ignore the schedule) unless the user asks for the stricter one.
+        self._greedy_enabled = False
+        self._greedy_respects_schedule = False
+
     # ------------------------------------------------------------------ policy
     def on_threshold_w(self) -> float:
         """Planned power (W) at/above which this slot counts as 'device on'."""
@@ -78,6 +98,36 @@ class DeferrableLoadController:
 
     def desired_on(self, planned_w: float) -> bool:
         return planned_w >= self.on_threshold_w()
+
+    def _greedy_wants_on(
+        self,
+        import_rate: Optional[float],
+        export_rate: Optional[float],
+        grid_power_w: Optional[float],
+        schedule_allows: Optional[bool],
+    ) -> bool:
+        """True if Greedy Consumption says "on" right now, independent of the plan.
+
+        Uses ``self.max_w`` (the device's real full configured draw) — NOT
+        ``on_threshold_w()``'s 50%-of-max fractional floor, which is a different concept
+        (mapping the LP's continuous per-slot allocation to a binary switch state). The
+        greedy condition is specifically "would not create new grid import", which needs
+        the device's actual full draw. Missing/unknown inputs (a sensor is unavailable,
+        a rate is unknown) fail closed — greedy contributes nothing rather than guessing.
+        """
+        if not self._greedy_enabled:
+            return False
+        if self._greedy_respects_schedule and schedule_allows is False:
+            return False
+        if import_rate is not None and import_rate <= 0.0:
+            return True
+        if export_rate is not None and export_rate <= 0.0 and grid_power_w is not None:
+            # Sign convention: positive = importing, negative = exporting (see
+            # CONF_GRID_POWER_SENSOR). exporting_w is the magnitude of current export.
+            exporting_w = max(0.0, -grid_power_w)
+            if self.max_w > 0.0 and exporting_w >= self.max_w:
+                return True
+        return False
 
     def _actual_state(self) -> Optional[bool]:
         st = self.hass.states.get(self.switch_entity_id)
@@ -91,10 +141,22 @@ class DeferrableLoadController:
         return None  # unavailable / unknown
 
     # ------------------------------------------------------------------ tick
-    async def apply(self, planned_w: float, now: datetime) -> None:
-        """Reconcile the switch toward the plan for this tick.
+    async def apply(
+        self,
+        planned_w: float,
+        now: datetime,
+        *,
+        import_rate: Optional[float] = None,
+        export_rate: Optional[float] = None,
+        grid_power_w: Optional[float] = None,
+        schedule_allows: Optional[bool] = None,
+    ) -> None:
+        """Reconcile the switch toward the plan (plus Greedy Consumption, if enabled)
+        for this tick.
 
-        Debounce applies only to genuine plan-driven flips (want != commanded). A drift
+        Debounce applies to any genuine flip (want != commanded) — plan-driven or
+        greedy-triggered alike, both go through the same ``want_on`` below, so a
+        greedy "on" is exactly as chatter-protected as a plan-driven one. A drift
         re-assert (want == commanded but the hardware has moved) is NOT debounced — it
         restores the state we already intend, so there's no chatter risk.
         """
@@ -102,11 +164,13 @@ class DeferrableLoadController:
             self._note = f"override_{'on' if self._override else 'off'}"
             return
 
-        want_on = self.desired_on(planned_w)
+        greedy_on = self._greedy_wants_on(import_rate, export_rate, grid_power_w, schedule_allows)
+        want_on = greedy_on or self.desired_on(planned_w)
+        tag = "_greedy" if (want_on and greedy_on) else ""
 
         # First tick: establish a known state regardless of debounce.
         if self._commanded is None:
-            await self._command(want_on, now)
+            await self._command(want_on, now, tag=tag)
             return
 
         if want_on != self._commanded:
@@ -115,7 +179,7 @@ class DeferrableLoadController:
             if held < min_hold:
                 self._note = f"hold_{'on' if self._commanded else 'off'}_debounce"
                 return
-            await self._command(want_on, now)
+            await self._command(want_on, now, tag=tag)
             return
 
         # want_on == commanded: re-assert only if the hardware drifted from it (e.g. a
@@ -126,9 +190,9 @@ class DeferrableLoadController:
                 "Deferrable load %s drifted (hardware=%s, commanded=%s) — re-issuing",
                 self.name, "on" if actual else "off", "on" if self._commanded else "off",
             )
-            await self._command(want_on, now, reset_timer=False)
+            await self._command(want_on, now, reset_timer=False, tag=tag)
         else:
-            self._note = f"holding_{'on' if self._commanded else 'off'}"
+            self._note = f"holding_{'on' if self._commanded else 'off'}{tag}"
 
     # ------------------------------------------------------------------ manual override
     @property
@@ -164,7 +228,9 @@ class DeferrableLoadController:
         else:
             self._note = f"override_{'on' if mode else 'off'}_restored"
 
-    async def _command(self, want_on: bool, now: datetime, *, reset_timer: bool = True) -> bool:
+    async def _command(
+        self, want_on: bool, now: datetime, *, reset_timer: bool = True, tag: str = ""
+    ) -> bool:
         service = "turn_on" if want_on else "turn_off"
         try:
             await self.hass.services.async_call(
@@ -180,11 +246,27 @@ class DeferrableLoadController:
         self._commanded = want_on
         if reset_timer:
             self._changed_at = now
-        self._note = f"commanded_{'on' if want_on else 'off'}"
+        self._note = f"commanded_{'on' if want_on else 'off'}{tag}"
         _LOGGER.info(
-            "Deferrable load %s → %s (%s)", self.name, service, self.switch_entity_id
+            "Deferrable load %s → %s (%s)%s", self.name, service, self.switch_entity_id,
+            " [greedy]" if tag else "",
         )
         return True
+
+    # ------------------------------------------------------------------ greedy consumption
+    @property
+    def greedy(self) -> bool:
+        return self._greedy_enabled
+
+    @property
+    def greedy_respects_schedule(self) -> bool:
+        return self._greedy_respects_schedule
+
+    def set_greedy(self, enabled: bool) -> None:
+        self._greedy_enabled = bool(enabled)
+
+    def set_greedy_respects_schedule(self, enabled: bool) -> None:
+        self._greedy_respects_schedule = bool(enabled)
 
     def status(self) -> dict:
         return {
@@ -197,5 +279,7 @@ class DeferrableLoadController:
             "override": (
                 ("on" if self._override else "off") if self._override is not None else "auto"
             ),
+            "greedy": self._greedy_enabled,
+            "greedy_respects_schedule": self._greedy_respects_schedule,
             "note": self._note,
         }

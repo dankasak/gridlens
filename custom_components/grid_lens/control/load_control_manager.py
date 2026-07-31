@@ -29,9 +29,12 @@ from homeassistant.helpers.event import async_track_time_change
 from homeassistant.util import dt as dt_util
 
 from ..const import (
+    CONF_DEFERRABLE_LOAD_HOURS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_SWITCHES,
+    CONF_GRID_POWER_SENSOR,
+    DOMAIN,
 )
 from .executor import DispatchInterval
 from .load_controller import DeferrableLoadController
@@ -57,6 +60,16 @@ class LoadControlManager:
         sensors: list[str] = list(d.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or [])
         max_kw: list = list(d.get(CONF_DEFERRABLE_LOAD_MAX_KW, []) or [])
         switches: list = list(d.get(CONF_DEFERRABLE_LOAD_SWITCHES, []) or [])
+        # Retained for Greedy Consumption's schedule lookup (_schedule_allows_now):
+        # sensor_id is the schedule store's key, hours_cfg is the static fallback spec
+        # for devices with no stored weekly grid — same two sources
+        # advisory/coordinator.py._deferrable_for_horizon already reads.
+        self._sensor_ids = sensors
+        self._hours_cfg: list = list(d.get(CONF_DEFERRABLE_LOAD_HOURS, []) or [])
+        # Live signed grid power sensor (W, +import/-export) for Greedy Consumption's
+        # export-surplus condition. "" = not configured — that condition simply never
+        # fires (the import-price-free condition still works without it).
+        self._grid_power_sensor: str = d.get(CONF_GRID_POWER_SENSOR) or ""
 
         # One controller per device that has a control switch configured. Keyed by the
         # device's index in the deferrable lists, so DispatchInterval.deferrable_w[i] lines
@@ -251,24 +264,103 @@ class LoadControlManager:
     async def _tick_device(self, index: int, now: datetime) -> None:
         if self._plan is None or self._plan_is_stale(now):
             return  # leave as-is
-        planned_w = self._device_power_now(index, now)
+        controller = self.controllers[index]
+        current = self._current_interval(now)
+        planned_w = self._device_power_now(index, current)
+        schedule_allows = None
+        if controller.greedy_respects_schedule:
+            schedule_allows = await self._schedule_allows_now(index, now)
         try:
-            await self.controllers[index].apply(planned_w, now)
+            await controller.apply(
+                planned_w, now,
+                import_rate=current.import_rate if current else None,
+                export_rate=current.export_rate if current else None,
+                grid_power_w=self._read_grid_power_w(),
+                schedule_allows=schedule_allows,
+            )
         except Exception as err:  # noqa: BLE001 — a bad device tick must not kill the timer
             _LOGGER.error("Load control tick failed for %s: %s", self.controllers[index].name, err)
 
-    def _device_power_now(self, index: int, now: datetime) -> float:
-        """The planned power (W) for device ``index`` in the interval covering ``now``."""
+    def _current_interval(self, now: datetime) -> Optional[DispatchInterval]:
         current: Optional[DispatchInterval] = None
         for iv in self._plan or []:
             if iv.start <= now:
                 current = iv
             else:
                 break
+        return current
+
+    def _device_power_now(self, index: int, current: Optional[DispatchInterval]) -> float:
+        """The planned power (W) for device ``index`` in interval ``current`` (or 0.0 if none)."""
         if current is None:
             return 0.0
         dw = current.deferrable_w
         return float(dw[index]) if index < len(dw) else 0.0
+
+    def _read_grid_power_w(self) -> Optional[float]:
+        """Live signed grid power (W, +import/-export) for Greedy Consumption's
+        export-surplus condition. None if unconfigured/unavailable/unparseable — the
+        controller treats that as "unknown", never guessing a value."""
+        if not self._grid_power_sensor:
+            return None
+        st = self.hass.states.get(self._grid_power_sensor)
+        if st is None or st.state in ("unknown", "unavailable", None):
+            return None
+        try:
+            return float(st.state)
+        except (TypeError, ValueError):
+            return None
+
+    async def _schedule_allows_now(self, index: int, now: datetime) -> bool:
+        """Does device ``index``'s availability window/weekly schedule allow it to run
+        right now? Reused verbatim from advisory/coordinator.py._deferrable_for_horizon's
+        sourcing: the stored weekly grid (schedule editor) when set, else the static
+        deferrable_load_hours config spec. Both layers fail OPEN on malformed data
+        (schedule_grid.slot_allowed's own contract) — a broken store must never silently
+        pin a device off."""
+        from ..const import parse_hours_spec
+        from ..schedule_grid import slot_allowed, week_from_hours
+
+        store = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_deferrable_schedules")
+        sensor_id = self._sensor_ids[index] if index < len(self._sensor_ids) else ""
+        week = None
+        if store is not None:
+            try:
+                week = await store.async_get(sensor_id)
+            except Exception:  # noqa: BLE001 — a broken store must not block ticking
+                week = None
+        if week is None:
+            spec = self._hours_cfg[index] if index < len(self._hours_cfg) else "all"
+            try:
+                allowed = parse_hours_spec(spec)
+            except Exception:  # noqa: BLE001
+                allowed = None
+            week = week_from_hours(allowed)
+        local = dt_util.as_local(now)
+        return slot_allowed(week, local.weekday(), local.hour, local.minute)
+
+    # ------------------------------------------------------------------ greedy consumption
+    def is_greedy(self, index: int) -> bool:
+        c = self.controllers.get(index)
+        return bool(c.greedy) if c else False
+
+    async def set_greedy(self, index: int, enabled: bool) -> bool:
+        c = self.controllers.get(index)
+        if c is None:
+            return False
+        c.set_greedy(enabled)
+        return True
+
+    def is_greedy_respects_schedule(self, index: int) -> bool:
+        c = self.controllers.get(index)
+        return bool(c.greedy_respects_schedule) if c else False
+
+    async def set_greedy_respects_schedule(self, index: int, enabled: bool) -> bool:
+        c = self.controllers.get(index)
+        if c is None:
+            return False
+        c.set_greedy_respects_schedule(enabled)
+        return True
 
     def _plan_is_stale(self, now: datetime) -> bool:
         if self._plan_updated_at is None:

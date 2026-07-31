@@ -278,7 +278,7 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   }
   const xt = xAxisTicks(X, t0, t1, g.h - g.mb, 9);
   const nowX = X(Math.min(Date.now(), t1));
-  const now = `<line x1="${nowX}" y1="${g.mt}" x2="${nowX}" y2="${g.h - g.mb}" stroke="var(--axis)" stroke-dasharray="2 3"/>`;
+  const now = `<line x1="${nowX}" y1="${g.mt}" x2="${nowX}" y2="${g.h - g.mb}" stroke="var(--now-line)" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.65"/>`;
   const zero = (yMin < 0) ? `<line x1="${g.ml}" y1="${Y(0)}" x2="${g.w - g.mr}" y2="${Y(0)}" stroke="var(--axis)"/>` : '';
   let defs = '', paths = '';
   const base = Y(Math.max(yMin, 0));
@@ -344,6 +344,10 @@ export const STYLE = `
     --grid: var(--divider-color);
     --axis: var(--divider-color);
     --border: var(--divider-color);
+    /* primary-text-color tracks light/dark theme (near-black on light, near-white on
+       dark) so the "now" divider always contrasts against the card surface, unlike
+       --axis/--divider-color which is a subtle gray that barely reads in either theme. */
+    --now-line: var(--primary-text-color);
     --predicted:#2563eb; --actual:#ea580c; --charge:#2563eb; --discharge:#ea580c;
     --idle:#94918a; --fit:rgba(245,158,11,.20); --good:#059669;
     /* solar/gridflow/battery are shared with the Power Flow card's --c-solar/--c-grid/

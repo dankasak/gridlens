@@ -10,7 +10,7 @@
 import {
   GW, GML, GMR, GridLensChartCardBase,
   clampPct, esc, fmtPct, fmtC, fmtHour, smoothPath, gradDef, xAxisTicks, actionLabel, reasonFor, execMode,
-} from './grid-lens-chart-common.js?v=20260730f';
+} from './grid-lens-chart-common.js?v=20260731a';
 
 class GridLensSocChartCard extends GridLensChartCardBase {
   get title() { return 'SOC — planned vs measured'; }
@@ -64,7 +64,7 @@ class GridLensSocChartCard extends GridLensChartCardBase {
     }
 
     const nowX = X(Math.min(Date.now(), t1));
-    const nowLine = `<line x1="${nowX}" y1="${g.mt}" x2="${nowX}" y2="${g.h - g.mb}" stroke="var(--axis)" stroke-width="1" stroke-dasharray="2 3"/>` +
+    const nowLine = `<line x1="${nowX}" y1="${g.mt}" x2="${nowX}" y2="${g.h - g.mb}" stroke="var(--now-line)" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.65"/>` +
       `<text x="${nowX}" y="${g.mt - 1}" text-anchor="middle" font-size="9" fill="var(--muted)">now</text>`;
 
     return `<svg viewBox="0 0 ${g.w} ${g.h}" class="chart-svg" role="img" aria-label="Predicted versus actual state of charge">

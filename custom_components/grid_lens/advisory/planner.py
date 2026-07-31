@@ -121,6 +121,7 @@ class AdvisoryPlanner:
                     grid_charge_w=grid_charge_w,
                     export_w=export_w,
                     import_rate=step.get("import_rate"),
+                    export_rate=step.get("export_rate"),
                     deferrable_w=deferrable_w,
                 )
             )

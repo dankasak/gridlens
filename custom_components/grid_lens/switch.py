@@ -33,6 +33,12 @@ async def async_setup_entry(
             entities.append(
                 GridLensDeferrableLoadSwitch(load_mgr, entry, index, controller.name)
             )
+            entities.append(
+                GridLensDeferrableGreedySwitch(load_mgr, entry, index, controller.name)
+            )
+            entities.append(
+                GridLensDeferrableGreedyScheduleSwitch(load_mgr, entry, index, controller.name)
+            )
 
     if entities:
         async_add_entities(entities)
@@ -152,5 +158,114 @@ class GridLensDeferrableLoadSwitch(RestoreEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         await self._manager.disable(self._index)
+        self._attr_is_on = False
+        self.async_write_ha_state()
+
+
+class GridLensDeferrableGreedySwitch(RestoreEntity, SwitchEntity):
+    """ON = this device opportunistically turns on whenever import price is free or
+    export is being wasted (Greedy Consumption), on top of whatever Auto/plan control
+    already does. Defaults OFF (opt-in, same reasoning as the load-control enable switch).
+    Has no effect while a Force On/Off override is active (see select.py) — greedy only
+    applies in Auto/managed mode.
+
+    Deliberately does NOT wire a manager state-listener callback: LoadControlManager's
+    ``set_state_listener(index, cb)`` slot is one-callback-per-device-index and is already
+    claimed by GridLensDeferrableLoadSwitch (see ``_on_manager_change`` above) — attaching
+    here would silently overwrite that registration and break the enable switch's live sync.
+    Greedy is rarely toggled from anywhere except this entity itself, so skipping push-update
+    wiring is a deliberate, low-risk simplification rather than an oversight.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:leaf"
+
+    def __init__(self, manager, entry: ConfigEntry, index: int, device_name: str) -> None:
+        self._manager = manager
+        self._index = index
+        self._attr_name = f"{device_name} Greedy Consumption"
+        self._attr_unique_id = f"{entry.entry_id}_deferrable_greedy_{index}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_is_on = False
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        want_on = last is not None and last.state == "on"  # default OFF if no prior state
+        if want_on:
+            await self._manager.set_greedy(self._index, True)
+        self._attr_is_on = self._manager.is_greedy(self._index)
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        # `switch` is the same join key select.py's override selector and the load-control
+        # card already use to pair auxiliary entities with a device's physical appliance
+        # switch; `role` disambiguates this entity from GridLensDeferrableGreedyScheduleSwitch
+        # below, since both otherwise carry an identically-shaped `switch` attribute.
+        return {"switch": self._manager.controllers[self._index].switch_entity_id, "role": "greedy"}
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._manager.set_greedy(self._index, True)
+        self._attr_is_on = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._manager.set_greedy(self._index, False)
+        self._attr_is_on = False
+        self.async_write_ha_state()
+
+
+class GridLensDeferrableGreedyScheduleSwitch(RestoreEntity, SwitchEntity):
+    """ON = Greedy Consumption only fires during this device's own configured availability
+    window/weekly schedule; OFF = greedy can fire any time the price/export condition is
+    true, ignoring the schedule. Defaults OFF (greedy is opportunistic by default — don't
+    leave free energy on the table).
+
+    Same deliberate simplification as GridLensDeferrableGreedySwitch above: no manager
+    state-listener wiring, since that callback slot is already owned by
+    GridLensDeferrableLoadSwitch and this toggle is rarely changed from elsewhere.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:calendar-clock"
+
+    def __init__(self, manager, entry: ConfigEntry, index: int, device_name: str) -> None:
+        self._manager = manager
+        self._index = index
+        self._attr_name = f"{device_name} Greedy Respects Schedule"
+        self._attr_unique_id = f"{entry.entry_id}_deferrable_greedy_schedule_{index}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_is_on = False
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        want_on = last is not None and last.state == "on"  # default OFF if no prior state
+        if want_on:
+            await self._manager.set_greedy_respects_schedule(self._index, True)
+        self._attr_is_on = self._manager.is_greedy_respects_schedule(self._index)
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {"switch": self._manager.controllers[self._index].switch_entity_id,
+                "role": "greedy_schedule"}
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._manager.set_greedy_respects_schedule(self._index, True)
+        self._attr_is_on = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._manager.set_greedy_respects_schedule(self._index, False)
         self._attr_is_on = False
         self.async_write_ha_state()

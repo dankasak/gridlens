@@ -54,7 +54,7 @@
  * each other, both visibly smaller than a 9kW solar ball, regardless of how each node's own
  * hardware happens to be rated.
  */
-import { HOT_WATER_RE } from './grid-lens-chart-common.js?v=20260730f';
+import { HOT_WATER_RE } from './grid-lens-chart-common.js?v=20260731a';
 
 const _bgCache = new Map();
 

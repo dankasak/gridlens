@@ -1,6 +1,14 @@
 /*
  * Grid Lens Boost Tuning Card
  *
+ * DEPRECATED 2026-07-31: this card's function (per-device Today Boost kWh input) was
+ * merged into grid-lens-load-control-card.js's per-device rows, alongside that card's
+ * control/Greedy toggles, so boost tuning lives in one place instead of two separate
+ * dashboard sections. Kept registered (not deleted) in case another dashboard still
+ * references `custom:grid-lens-boost-tuning-card` directly — it still works standalone —
+ * but new dashboards should use grid-lens-load-control-card instead; this file receives
+ * no further feature work.
+ *
  * Auto-discovers all deferrable-load boost override number entities and renders each
  * as a real HA `tile` card with the numeric-input feature — same component "Min export
  * price" uses, so styling stays pixel-identical to native HA and free of any future

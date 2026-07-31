@@ -62,7 +62,10 @@ class DispatchInterval:
       covers most-but-not-all of a charge slot.
 
     ``import_rate`` is the slot's import price ($/kWh); ``None`` when unknown (treated as
-    non-free, preserving the material-share behaviour above).
+    non-free, preserving the material-share behaviour above). ``export_rate`` is the
+    slot's export price ($/kWh), same "None = unknown" convention; consumed by
+    ``LoadControlManager``'s Greedy Consumption feature (a deferrable load's real-time
+    "export is being wasted" condition), not by the battery executor itself.
 
     Symmetrically, ``export_w`` — NOT ``power_w`` — decides *how* to discharge (see
     ``_resolve_discharge``): a discharge that only covers house load gains nothing from
@@ -78,6 +81,7 @@ class DispatchInterval:
     grid_charge_w: float = 0.0
     export_w: float = 0.0
     import_rate: Optional[float] = None
+    export_rate: Optional[float] = None
     # Planned average power (W) for each configured deferrable device this slot, in the
     # same device order as CONF_DEFERRABLE_LOAD_SENSORS. Consumed by LoadControlManager to
     # decide each device's switch on/off (via its own ≥50%-of-max_kw threshold). The battery
