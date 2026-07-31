@@ -67,6 +67,15 @@ class ControlManager:
     def enabled(self) -> bool:
         return self._enabled
 
+    async def async_push_safety_floor(self) -> bool:
+        """Best-effort push of the hardware discharge floor. Deliberately independent
+        of entitlement and of whether control is enabled: this bounds how low ANY
+        discharge can go — including the inverter's own native/VPP logic, not just a
+        Grid Lens-issued force_discharge — so it's a pure safety configuration, not a
+        monetized actuation, and should land for every has_battery account regardless
+        of battery_control entitlement."""
+        return await self.controller.async_push_safety_floor()
+
     def set_state_listener(self, callback) -> None:
         """Registered by the switch entity; called (no args) whenever `_enabled` changes."""
         self._on_change = callback

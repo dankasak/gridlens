@@ -1069,11 +1069,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.warning("Advisory mode setup failed: %s", _adv_err)
 
     # Battery control manager (actuation). Created but INERT until the master switch is
-    # turned on — no battery writes on setup. Deadman restores native EMS on disable/stop.
+    # turned on — no charge/discharge writes on setup (the one exception is pushing the
+    # hardware safety floor below, which is a passive bound, not an actuation). Deadman
+    # restores native EMS on disable/stop.
     if entry.data.get("has_battery", False):
         try:
             from .control.manager import ControlManager
-            hass.data[DOMAIN][f"{entry.entry_id}_control"] = ControlManager(hass, entry)
+            _ctl_mgr = ControlManager(hass, entry)
+            hass.data[DOMAIN][f"{entry.entry_id}_control"] = _ctl_mgr
+            # Push the hardware discharge floor now rather than waiting for the first
+            # force_discharge() call — closes the window where a restart leaves the
+            # floor software-only. Best-effort: if the inverter's entity surface isn't
+            # up yet, the advisory coordinator's periodic tick retries this until it
+            # lands (see AdvisoryCoordinator._refresh_meta).
+            await _ctl_mgr.async_push_safety_floor()
         except Exception as _ctl_err:  # noqa: BLE001
             _LOGGER.warning("Battery control setup failed: %s", _ctl_err)
 

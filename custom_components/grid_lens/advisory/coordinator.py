@@ -139,11 +139,21 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             self._load_forecaster = HourOfDayLoadForecaster(vector)
         self._meta_refreshed = dt_util.utcnow()
 
+        # Retry the hardware discharge-floor push every tick until it lands — covers
+        # the case where async_setup_entry's one-shot attempt ran before the inverter's
+        # entity surface was up (e.g. the sigenergy2mqtt bridge hadn't published yet).
+        # Independent of entitlement below: it's a pure safety configuration, not a
+        # monetized actuation. Cheap no-op once already set (see
+        # BatteryController.async_push_safety_floor).
+        control_mgr = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_control")
+        if control_mgr is not None:
+            await control_mgr.async_push_safety_floor()
+
         # Both control managers share the same server-side `battery_control` entitlement
         # (product decision 2026-07-23 — no separate deferrable_control column yet). Poll
         # once and push to whichever managers exist for this entry.
         managers = [
-            self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_control"),
+            control_mgr,
             self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_load_control"),
         ]
         managers = [m for m in managers if m is not None]
@@ -215,9 +225,11 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             return []
 
     async def _apply_overrides(self, defs: list) -> list:
-        """Substitute today's per-device override (if set and unexpired) for the
-        historical daily_kwh average, so a dashboard "today boost" beats the 14-day
-        average for the rest of the local day (Feature 2). Note: only daily_kwh is
+        """Substitute each device's active override (if any) for the historical
+        daily_kwh average, so a dashboard "today boost" beats the 14-day average
+        (Feature 2). The override persists until the user clears it — it does not
+        auto-expire at midnight (see deferrable_overrides.py) — so a boost that's
+        still live when this runs stays live here too. Note: only daily_kwh is
         replaced — self._deferrable_load_hod (used to de-duplicate the base-load
         vector) intentionally still reflects real meter history, not the override,
         since that subtraction corrects for what the whole-home sensor already

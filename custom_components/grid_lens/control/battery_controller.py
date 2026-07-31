@@ -213,6 +213,22 @@ class BatteryController:
         except NotImplementedError:
             pass
 
+    async def async_push_safety_floor(self) -> bool:
+        """Best-effort, idempotent hardware-floor push — safe to call before any
+        discharge command has ever been issued (HA startup) or repeatedly on a
+        periodic retry (e.g. if the transport wasn't ready yet at startup). Unlike
+        the internal call inside ``force_discharge()``, this never lets a transport
+        error propagate: callers here aren't in the middle of an active command, so
+        there's nothing an exception should interrupt. Returns whether the floor is
+        (now, or already was) set."""
+        if self._hardware_floor_set or not self.cfg.push_hardware_floor:
+            return self._hardware_floor_set
+        try:
+            await self._ensure_hardware_floor()
+        except Exception as err:  # noqa: BLE001 — best-effort outside an active command
+            _LOGGER.debug("Hardware floor push not yet possible: %s", err)
+        return self._hardware_floor_set
+
     def _clamp_power(self, power_w: float, ceiling: Optional[float]) -> float:
         power_w = max(0.0, power_w)
         if ceiling is not None:
