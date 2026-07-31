@@ -18,10 +18,13 @@ from .const import (
     CONF_ENERGY_SENSOR,
     CONF_SOLAR_SENSOR,
     CONF_GRID_EXPORT_SENSOR,
+    CONF_GRID_POWER_SENSOR,
     CONF_IMPORT_PRICE_SENSOR,
     CONF_EXPORT_PRICE_SENSOR,
     CONF_DISTRIBUTOR,
     CONF_HAS_DEMAND_TARIFF,
+    CONF_HAS_CONTROLLED_LOAD_1,
+    CONF_HAS_CONTROLLED_LOAD_2,
     CONF_STATE,
     CONF_POSTCODE,
     CONF_HAS_BATTERY,
@@ -41,7 +44,9 @@ from .const import (
     CONF_DEFERRABLE_LOAD_HOURS,
     CONF_DEFERRABLE_LOAD_SWITCHES,
     CONF_DEFERRABLE_LOAD_SOC_SENSORS,
+    CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD,
     CONF_CURRENT_PLAN,
+    CONF_VPP_PROGRAM,
     parse_hours_spec,
     CONF_GRIDLENS_EMAIL,
     CONF_GRIDLENS_API_URL,
@@ -130,6 +135,7 @@ def _energy_schema(defaults: dict) -> vol.Schema:
         req(CONF_ENERGY_SENSOR): entity_sel(),
         opt(CONF_SOLAR_SENSOR): entity_sel(),
         opt(CONF_GRID_EXPORT_SENSOR): entity_sel(),
+        opt(CONF_GRID_POWER_SENSOR): entity_sel(),
         opt(CONF_IMPORT_PRICE_SENSOR): entity_sel(),
         opt(CONF_EXPORT_PRICE_SENSOR): entity_sel(),
     })
@@ -144,12 +150,15 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._state: str | None = None
         self._postcode: str | None = None
         self._distributor: str | None = None
+        self._has_cl1: bool = False
+        self._has_cl2: bool = False
         self._discovered: dict = {}
         self._device_options: list = []
         self._sensor_data: dict = {}
         self._email: str = ""
         self._api_url: str = GRIDLENS_DEFAULT_API_URL
         self._api_plans: list[dict] = []
+        self._api_vpp_programs: list[dict] = []
         self._api_key: str = ""
         self._ha_uuid: str = ""
 
@@ -187,7 +196,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.FlowResult:
         if user_input is not None:
             self._distributor = user_input[CONF_DISTRIBUTOR]
-            return await self.async_step_sensors()
+            return await self.async_step_controlled_load()
 
         distributors = DISTRIBUTORS.get(self._state, [])
         return self.async_show_form(
@@ -196,6 +205,30 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_DISTRIBUTOR): selector.SelectSelector(
                     selector.SelectSelectorConfig(options=distributors, mode=selector.SelectSelectorMode.DROPDOWN)
                 ),
+            }),
+        )
+
+    async def async_step_controlled_load(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.FlowResult:
+        """Ask whether the household's meter has Controlled Load 1/2 switched on.
+
+        Network/meter fact set by the DNSP, not the retail plan — same
+        self-declare pattern as CONF_HAS_DEMAND_TARIFF. Answered here (before
+        devices) so async_step_device_power below can offer the
+        wired_to_controlled_load dropdown only for registers the household
+        actually has.
+        """
+        if user_input is not None:
+            self._has_cl1 = user_input.get(CONF_HAS_CONTROLLED_LOAD_1, False)
+            self._has_cl2 = user_input.get(CONF_HAS_CONTROLLED_LOAD_2, False)
+            return await self.async_step_sensors()
+
+        return self.async_show_form(
+            step_id="controlled_load",
+            data_schema=vol.Schema({
+                vol.Optional(CONF_HAS_CONTROLLED_LOAD_1, default=False): selector.BooleanSelector(),
+                vol.Optional(CONF_HAS_CONTROLLED_LOAD_2, default=False): selector.BooleanSelector(),
             }),
         )
 
@@ -229,9 +262,12 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_STATE: self._state,
                     CONF_POSTCODE: self._postcode,
                     CONF_DISTRIBUTOR: self._distributor,
+                    CONF_HAS_CONTROLLED_LOAD_1: self._has_cl1,
+                    CONF_HAS_CONTROLLED_LOAD_2: self._has_cl2,
                     CONF_ENERGY_SENSOR: user_input.get(CONF_ENERGY_SENSOR),
                     CONF_SOLAR_SENSOR: user_input.get(CONF_SOLAR_SENSOR),
                     CONF_GRID_EXPORT_SENSOR: user_input.get(CONF_GRID_EXPORT_SENSOR),
+                    CONF_GRID_POWER_SENSOR: user_input.get(CONF_GRID_POWER_SENSOR),
                     CONF_IMPORT_PRICE_SENSOR: user_input.get(CONF_IMPORT_PRICE_SENSOR),
                     CONF_EXPORT_PRICE_SENSOR: user_input.get(CONF_EXPORT_PRICE_SENSOR),
                 }
@@ -357,11 +393,26 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 soc_list = [
                     str(user_input.get(f"soc_{i}", "") or "") for i in range(len(selected))
                 ]
+                # Optional Controlled Load register wiring per device ("" = not on CL).
+                # Only present in user_input at all when at least one CL register was
+                # offered (self._has_cl1/_has_cl2) — otherwise every device defaults "".
+                cl_list = [
+                    str(user_input.get(f"cl_{i}", "") or "") for i in range(len(selected))
+                ]
                 self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_HOURS] = hours_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_SOC_SENSORS] = soc_list
+                self._sensor_data[CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD] = cl_list
                 return await self.async_step_current_plan()
+
+        # Controlled Load register choices, gated on the flags collected in
+        # async_step_controlled_load. Offered per-device below only if non-empty.
+        cl_register_options = []
+        if self._has_cl1:
+            cl_register_options.append({"value": "controlled_load_1", "label": "Controlled Load 1"})
+        if self._has_cl2:
+            cl_register_options.append({"value": "controlled_load_2", "label": "Controlled Load 2"})
 
         schema_dict = {}
         device_lines = []
@@ -389,6 +440,21 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             schema_dict[vol.Optional(f"soc_{i}")] = selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="sensor")
             )
+            # Optional: which Controlled Load register (if any) this device is physically
+            # wired to. Only shown when the household declared at least one CL register in
+            # async_step_controlled_load.
+            # TODO: filter cl_register_options by which device types the network actually
+            # confirms for that register (NetworkIR.controlled_load_eligible_devices in the
+            # API's plan_transform.py / get_network_operators()) — no live network
+            # eligible-device lookup is wired into the config flow yet, so every configured
+            # register is offered regardless of this device's type.
+            if cl_register_options:
+                schema_dict[vol.Optional(f"cl_{i}", default="")] = selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[{"value": "", "label": "Not on controlled load"}] + cl_register_options,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                )
 
         return self.async_show_form(
             step_id="device_power",
@@ -418,9 +484,26 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except Exception:
                 errors["base"] = "cannot_connect"
 
+        # VPP bolt-on programs are independent of plan choice and this endpoint is
+        # public — a fetch failure shouldn't block plan setup, so it just leaves the
+        # dropdown at "None / not enrolled" rather than setting `errors`.
+        if not self._api_vpp_programs:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    resp = await session.get(
+                        f"{self._api_url}/vpp-programs/list",
+                        params={"state": self._state},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    )
+                    if resp.status == 200:
+                        self._api_vpp_programs = await resp.json()
+            except Exception as exc:
+                _LOGGER.warning("Could not fetch VPP program list: %s", exc)
+
         if user_input is not None and not errors:
             plan_id = user_input[CONF_CURRENT_PLAN]
             has_demand_tariff = user_input.get(CONF_HAS_DEMAND_TARIFF, False)
+            vpp_program = user_input.get(CONF_VPP_PROGRAM) or None
             try:
                 ha_uuid = str(uuid.UUID(await instance_id.async_get(self.hass)))
                 self._ha_uuid = ha_uuid
@@ -441,6 +524,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         self._sensor_data.update({
                             CONF_CURRENT_PLAN: plan_id,
                             CONF_HAS_DEMAND_TARIFF: has_demand_tariff,
+                            CONF_VPP_PROGRAM: vpp_program,
                             CONF_GRIDLENS_EMAIL: self._email,
                             CONF_GRIDLENS_API_URL: self._api_url,
                             CONF_GRIDLENS_API_KEY: self._api_key,
@@ -449,6 +533,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     elif resp.status == 409:
                         self._sensor_data[CONF_CURRENT_PLAN] = plan_id
                         self._sensor_data[CONF_HAS_DEMAND_TARIFF] = has_demand_tariff
+                        self._sensor_data[CONF_VPP_PROGRAM] = vpp_program
                         return await self.async_step_manual_key()
                     else:
                         errors["base"] = "cannot_connect"
@@ -458,6 +543,10 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         plan_options = [
             {"value": p["id"], "label": f"{p['retailer']} — {p['name']}"}
             for p in self._api_plans
+        ]
+        vpp_options = [{"value": "", "label": "None / not enrolled"}] + [
+            {"value": p["id"], "label": f"{p['retailer']} — {p['name']}"}
+            for p in self._api_vpp_programs
         ]
 
         return self.async_show_form(
@@ -470,6 +559,12 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     )
                 ),
                 vol.Optional(CONF_HAS_DEMAND_TARIFF, default=False): selector.BooleanSelector(),
+                vol.Optional(CONF_VPP_PROGRAM, default=""): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=vpp_options,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
             }),
             errors=errors,
         )
@@ -626,9 +721,42 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         self._sensor_data: dict = {}
         self._discovered: dict = {}
         self._device_options: list = []
+        self._has_cl1: bool = False
+        self._has_cl2: bool = False
 
     async def async_step_init(self, user_input=None):
-        return await self.async_step_sensors()
+        return await self.async_step_controlled_load()
+
+    async def async_step_controlled_load(self, user_input=None):
+        """Ask whether the household's meter has Controlled Load 1/2 switched on.
+
+        Network/meter fact set by the DNSP, not the retail plan — same
+        self-declare pattern as CONF_HAS_DEMAND_TARIFF. Answered here (before
+        devices) so async_step_device_power below can offer the
+        wired_to_controlled_load dropdown only for registers the household
+        actually has. Stored on self rather than self._sensor_data because
+        async_step_sensors below replaces self._sensor_data wholesale.
+        """
+        entry_data = self._config_entry.data
+
+        if user_input is not None:
+            self._has_cl1 = user_input.get(CONF_HAS_CONTROLLED_LOAD_1, False)
+            self._has_cl2 = user_input.get(CONF_HAS_CONTROLLED_LOAD_2, False)
+            return await self.async_step_sensors()
+
+        return self.async_show_form(
+            step_id="controlled_load",
+            data_schema=vol.Schema({
+                vol.Optional(
+                    CONF_HAS_CONTROLLED_LOAD_1,
+                    default=entry_data.get(CONF_HAS_CONTROLLED_LOAD_1, False),
+                ): selector.BooleanSelector(),
+                vol.Optional(
+                    CONF_HAS_CONTROLLED_LOAD_2,
+                    default=entry_data.get(CONF_HAS_CONTROLLED_LOAD_2, False),
+                ): selector.BooleanSelector(),
+            }),
+        )
 
     async def async_step_sensors(self, user_input=None):
         errors = {}
@@ -639,7 +767,7 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             # Merge: entry data takes precedence over fresh discovery (user may have overridden)
             merged = {**self._discovered}
             for key in (CONF_ENERGY_SENSOR, CONF_SOLAR_SENSOR, CONF_GRID_EXPORT_SENSOR,
-                        CONF_IMPORT_PRICE_SENSOR, CONF_EXPORT_PRICE_SENSOR):
+                        CONF_GRID_POWER_SENSOR, CONF_IMPORT_PRICE_SENSOR, CONF_EXPORT_PRICE_SENSOR):
                 if entry_data.get(key):
                     merged[key] = entry_data[key]
             self._discovered = merged
@@ -662,6 +790,11 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 self._sensor_data = {
                     k: v for k, v in {**entry_data, **user_input}.items()
                 }
+                # entry_data is spread first above, so without this the freshly
+                # answered controlled_load step would be silently clobbered back
+                # to its old saved value.
+                self._sensor_data[CONF_HAS_CONTROLLED_LOAD_1] = self._has_cl1
+                self._sensor_data[CONF_HAS_CONTROLLED_LOAD_2] = self._has_cl2
                 return await self.async_step_battery()
 
         discovered_count = sum(1 for k in (CONF_ENERGY_SENSOR, CONF_SOLAR_SENSOR, CONF_GRID_EXPORT_SENSOR) if self._discovered.get(k))
@@ -770,6 +903,7 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         existing_hours = entry_data.get(CONF_DEFERRABLE_LOAD_HOURS, [])
         existing_switches = entry_data.get(CONF_DEFERRABLE_LOAD_SWITCHES, [])
         existing_soc = entry_data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, [])
+        existing_cl = entry_data.get(CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD, [])
         # Existing lists are keyed by position in the previously saved sensor
         # list; map by sensor_id so reordering/removing devices keeps defaults.
         prev_sensors = entry_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
@@ -784,6 +918,11 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             s: existing_soc[i]
             for i, s in enumerate(prev_sensors)
             if i < len(existing_soc) and existing_soc[i]
+        }
+        prev_cl = {
+            s: existing_cl[i]
+            for i, s in enumerate(prev_sensors)
+            if i < len(existing_cl) and existing_cl[i]
         }
 
         errors: dict[str, str] = {}
@@ -805,11 +944,23 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 soc_list = [
                     str(user_input.get(f"soc_{i}", "") or "") for i in range(len(selected))
                 ]
+                cl_list = [
+                    str(user_input.get(f"cl_{i}", "") or "") for i in range(len(selected))
+                ]
                 self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_HOURS] = hours_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_SOC_SENSORS] = soc_list
+                self._sensor_data[CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD] = cl_list
                 return await self.async_step_current_plan()
+
+        # Controlled Load register choices, gated on the flags collected in
+        # async_step_controlled_load. Offered per-device below only if non-empty.
+        cl_register_options = []
+        if self._has_cl1:
+            cl_register_options.append({"value": "controlled_load_1", "label": "Controlled Load 1"})
+        if self._has_cl2:
+            cl_register_options.append({"value": "controlled_load_2", "label": "Controlled Load 2"})
 
         schema_dict = {}
         device_lines = []
@@ -848,6 +999,21 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             schema_dict[soc_key] = selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="sensor")
             )
+            # Optional Controlled Load register wiring; only shown when the household
+            # declared at least one CL register in async_step_controlled_load.
+            # TODO: filter cl_register_options by which device types the network actually
+            # confirms for that register (NetworkIR.controlled_load_eligible_devices in
+            # the API's plan_transform.py / get_network_operators()) — no live network
+            # eligible-device lookup is wired into the config flow yet.
+            if cl_register_options:
+                schema_dict[vol.Optional(f"cl_{i}", default=prev_cl.get(sensor_id, ""))] = (
+                    selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=[{"value": "", "label": "Not on controlled load"}] + cl_register_options,
+                            mode=selector.SelectSelectorMode.DROPDOWN,
+                        )
+                    )
+                )
 
         return self.async_show_form(
             step_id="device_power",
@@ -879,8 +1045,28 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         except Exception:
             pass
 
+        # VPP bolt-on programs are independent of plan choice and this endpoint is
+        # public — a fetch failure just leaves the dropdown at "None / not enrolled".
+        vpp_options = [{"value": "", "label": "None / not enrolled"}]
+        try:
+            async with aiohttp.ClientSession() as _s:
+                async with _s.get(
+                    f"{api_url}/vpp-programs/list",
+                    params={"state": state},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as _r:
+                    if _r.status == 200:
+                        vpp_meta = await _r.json()
+                        vpp_options += [
+                            {"value": p["id"], "label": f"{p['retailer']} — {p['name']}"}
+                            for p in vpp_meta
+                        ]
+        except Exception:
+            pass
+
         if user_input is not None:
             self._sensor_data = {**self._sensor_data, **user_input}
+            self._sensor_data[CONF_VPP_PROGRAM] = user_input.get(CONF_VPP_PROGRAM) or None
             return await self.async_step_api_key()
 
         current = entry_data.get(CONF_CURRENT_PLAN)
@@ -895,6 +1081,15 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 CONF_HAS_DEMAND_TARIFF,
                 default=entry_data.get(CONF_HAS_DEMAND_TARIFF, False),
             ): selector.BooleanSelector(),
+            vol.Optional(
+                CONF_VPP_PROGRAM,
+                default=entry_data.get(CONF_VPP_PROGRAM) or "",
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=vpp_options,
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            ),
         })
 
         return self.async_show_form(

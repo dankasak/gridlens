@@ -111,6 +111,13 @@ PLAN_ID_TO_KEY = {
 CONF_ENERGY_SENSOR = "energy_sensor"
 CONF_SOLAR_SENSOR = "solar_sensor"
 CONF_GRID_EXPORT_SENSOR = "grid_export_sensor"
+
+# Live signed grid power sensor (W). Positive = importing from the grid, negative =
+# exporting. Used by the deferrable-load "Greedy Consumption" feature to detect real-time
+# export surplus (see control/load_controller.py). Optional — the greedy feature's
+# export-surplus condition is simply unavailable without it (import-price-zero still
+# works). Not gated on has_battery: a battery-less household can use this too.
+CONF_GRID_POWER_SENSOR = "grid_power_sensor"
 CONF_IMPORT_PRICE_SENSOR = "import_price_sensor"
 CONF_EXPORT_PRICE_SENSOR = "export_price_sensor"
 CONF_DISTRIBUTOR = "distributor"
@@ -127,6 +134,14 @@ CONF_HAS_DEMAND_TARIFF = "has_demand_tariff"
 # window. NSW residential demand tariffs (e.g. Ausgrid) typically meter peak
 # demand on weekday afternoons/evenings; 15:00–21:00 is the common band.
 DEFAULT_DEMAND_WINDOW_HOURS = [15, 16, 17, 18, 19, 20]
+
+# Whether the customer's meter has Controlled Load 1 / 2 (CL1/CL2) switched on for
+# this connection. Same "DNSP/install-driven, user self-declares" pattern as
+# CONF_HAS_DEMAND_TARIFF — this is a network/meter fact set by the DNSP, not
+# something a retail plan or HA can infer, so the user tells us. Independently
+# per-register since a network may switch on CL1 but not CL2 (or vice versa).
+CONF_HAS_CONTROLLED_LOAD_1 = "has_controlled_load_1"
+CONF_HAS_CONTROLLED_LOAD_2 = "has_controlled_load_2"
 
 # Battery configuration
 CONF_HAS_BATTERY = "has_battery"
@@ -167,6 +182,20 @@ CONF_DEFERRABLE_LOAD_SWITCHES = "deferrable_load_switches"  # list of switch IDs
 # not configured; the Power Flow card only shows a SOC figure + history link for devices
 # that have one set, same as it already does for the home battery's soc_entity.
 CONF_DEFERRABLE_LOAD_SOC_SENSORS = "deferrable_load_soc_sensors"  # list of sensor IDs ("" = none)
+# Optional per-device Controlled Load register wiring, parallel to sensors. "" = not
+# wired to controlled load (default, same as today's behaviour). "controlled_load_1" /
+# "controlled_load_2" means this device's energy is physically switched via that DNSP
+# register rather than the general supply — only offered in the config flow when the
+# matching CONF_HAS_CONTROLLED_LOAD_1/_2 flag is on. Parsing/config plumbing only for
+# now; bill-splitting by register is not implemented yet (see retailer_plans.py).
+CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD = "deferrable_load_controlled_load"  # list of register IDs ("" = none)
+
+# VPP bolt-on program (e.g. AGL "Bring Your Own Battery") — a retailer-level credit
+# program layered on top of whatever plan the household is already on, independent
+# of CONF_CURRENT_PLAN. Nullable slug; "" / None means not enrolled. Fetched from
+# GET /vpp-programs/list, mirroring how CONF_CURRENT_PLAN's dropdown is populated
+# from /plans/list.
+CONF_VPP_PROGRAM = "vpp_program"
 
 
 def parse_hours_spec(spec: str | None) -> set[int] | None:

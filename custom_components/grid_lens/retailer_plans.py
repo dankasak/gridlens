@@ -28,6 +28,10 @@ class RetailerPlan(ABC):
         # are 0.03 kWh/hour or less, 6pm-9pm"). Raw API shape: {label, condition,
         # threshold_kwh, amount_per_day, window}. Base plans have none.
         self._conditional_credits: list = []
+        # Controlled Load rates: [{register, label, rate, note}], served under the
+        # plan JSON's own "controlled_load_rates" key. Deliberately separate from
+        # _import_rates — see PlanFromData.__init__ for why. Base plans have none.
+        self._controlled_load_rates: list = []
         # PEA support: set by PlanFromData when plan JSON includes a "pea" block.
         self.aemo_price_sensor: str | None = None
         self.bpea: float = 0.017
@@ -59,6 +63,16 @@ class RetailerPlan(ABC):
 
     def get_conditional_credits(self) -> list:
         return self._conditional_credits
+
+    def get_controlled_load_rate(self, register: str) -> dict | None:
+        """Simple linear lookup of this plan's rate for a CL register
+        ('controlled_load_1' | 'controlled_load_2'), or None if the plan
+        doesn't publish one. Data holder only — deliberately NOT wired into
+        get_import_rate/_match_rate_def (see _controlled_load_rates above)."""
+        for entry in self._controlled_load_rates:
+            if entry.get("register") == register:
+                return entry
+        return None
 
     def get_plan_info(self) -> Dict:
         return {
@@ -117,6 +131,17 @@ class PlanFromData(RetailerPlan):
         self._export_rates = plan_data.get("export_rates", [])
         self._strategy     = plan_data.get("strategy", "")
         self._conditional_credits = plan_data.get("conditional_credits") or []
+
+        # Controlled Load rates: served as their OWN top-level JSON key, deliberately
+        # never merged into self._import_rates. _match_rate_def/get_import_rate walk a
+        # single flat list with no register concept and no windowless-fallback path — a
+        # CL rate living there would need its own all-hours window to be matchable at
+        # all, and would silently win every general-usage lookup it sorts ahead of (see
+        # PlanControlledLoadRate's docstring in the API's app/plan_models.py, and
+        # VPP_AND_CONTROLLED_LOAD_DESIGN.md Part B, for the full bug-risk rationale).
+        # Parsing/holding only for now — no rate-matching or bill-splitting logic here;
+        # that's staged for plan_calculator.py once a CL-bearing plan exists.
+        self._controlled_load_rates = plan_data.get("controlled_load_rates") or []
 
         # Default feed_in_tariff: first non-null export rate that applies all hours.
         for r in self._export_rates:
@@ -343,20 +368,30 @@ class PlanFromData(RetailerPlan):
 
 def _prepare_plan_data(plan_id: str, plan_data: dict,
                        network_operators: dict | None) -> dict:
-    """Copy plan JSON with id defaulted and network-operator demand data merged
-    (only for plans with demand_charge_active, only where the plan JSON doesn't
-    already carry the fields)."""
+    """Copy plan JSON with id defaulted and network-operator demand/controlled-load
+    data merged in, only where the plan JSON doesn't already carry the fields.
+
+    Demand-charge fields are merged only for plans with demand_charge_active (a
+    plan-level flag). controlled_load has no plan-level flag equivalent — whether
+    it applies is gated by household config (CONF_HAS_CONTROLLED_LOAD_1/_2), not
+    anything the plan JSON declares — so it's merged unconditionally whenever the
+    network operator publishes one, same "only if not already present" behaviour.
+    """
     data = dict(plan_data)
     data.setdefault("id", plan_id)
-    if network_operators and data.get("flags", {}).get("demand_charge_active"):
+    if network_operators:
         network_key = data.get("network", "").lower()
         operator = network_operators.get(network_key) or {}
-        if operator:
+        if operator and data.get("flags", {}).get("demand_charge_active"):
             data.setdefault("charges", {})
             if "demand_charge_per_kw_per_day" not in data["charges"]:
                 data["charges"]["demand_charge_per_kw_per_day"] = operator.get("demand_charge_per_kw_per_day", 0.0)
             if "demand_window" not in data:
                 data["demand_window"] = operator.get("demand_window")
+        if operator and "controlled_load" not in data:
+            controlled_load = operator.get("controlled_load")
+            if controlled_load:
+                data["controlled_load"] = controlled_load
     return data
 
 
@@ -586,3 +621,56 @@ def build_conditional_credits(
                 "day_index": day_index,
             })
     return out
+
+
+class VppProgramFromData:
+    """Data holder for a VPP bolt-on program (e.g. AGL "Bring Your Own Battery",
+    Diamond WATTBANK) — a retailer-level credit program layered on top of
+    whatever plan the household is already on, independent of CONF_CURRENT_PLAN.
+    Parsed from one entry of the /vpp-programs API response's "programs" dict
+    (see app/plan_transform.py's serialize_vpp_program_ir for the exact JSON
+    shape this mirrors).
+
+    Not wired into any bill total yet — see VPP_AND_CONTROLLED_LOAD_DESIGN.md
+    Part A for the eventual calculation ("flat_credit is contracted, add to the
+    total; dispatch_credit is not knowable ahead of time, surface as a separate
+    'potential additional credit' line instead"). This class only holds and
+    exposes the data.
+    """
+
+    def __init__(self, program_id: str, data: dict) -> None:
+        self.id = data.get("id", program_id)
+        self.name = data.get("name", "")
+        self.retailer = data.get("retailer", "")
+        self.state = data.get("state", "")
+        self.signup_bonus = data.get("signup_bonus")            # one-off $, or None
+        self.establishment_fee = data.get("establishment_fee")  # one-off $, or None
+        self.flat_credit = data.get("flat_credit")               # {amount, period} | None
+        self.dispatch_credit = data.get("dispatch_credit")       # {rate_per_kwh, direction,
+                                                                  #  annual_cap_kwh, predictable,
+                                                                  #  window} | None
+        self.contract_type = data.get("contract_type")
+        self.battery_eligibility_note = data.get("battery_eligibility_note")
+        # [] = unrestricted (any plan from this retailer qualifies) — see
+        # VppProgramEligiblePlan's docstring in the API's app/plan_models.py.
+        self.eligible_plans = list(data.get("eligible_plans") or [])
+        self.notes = data.get("notes")
+        self.source_url = data.get("source_url")
+        self.last_verified = data.get("last_verified")
+
+    def applies_to_plan(self, plan_slug: str) -> bool:
+        """True if this program is unrestricted, or plan_slug is one of its
+        eligible_plans."""
+        return not self.eligible_plans or plan_slug in self.eligible_plans
+
+
+def vpp_programs_from_api_data(response: dict) -> dict[str, VppProgramFromData]:
+    """Parse a GET /vpp-programs response ({"state": ..., "programs":
+    {slug: program_json}}) into {slug: VppProgramFromData}.
+
+    Data holder only — nothing here computes a bill total; plan_calculator.py
+    and battery_optimizer.py don't consume this yet (see
+    VPP_AND_CONTROLLED_LOAD_DESIGN.md Part A).
+    """
+    programs = response.get("programs") or {}
+    return {slug: VppProgramFromData(slug, data) for slug, data in programs.items()}
