@@ -725,6 +725,20 @@ class GridLensCard extends HTMLElement {
             </div>`;
           }
 
+          // Controlled Load — device(s) wired to a CL register, priced separately
+          // at the plan's flat CL rate instead of the general import tiers above.
+          if (bi.controlled_load) {
+            rows += '<div class="bill-section-head">Controlled load</div>';
+            bi.controlled_load.lines.forEach(line => {
+              rows += `<div class="breakdown-row">
+                <div class="breakdown-label">${line.label}<br>
+                  <span style="font-size:11px;opacity:0.7">${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh</span>
+                </div>
+                <div class="breakdown-value">$${line.amount.toFixed(2)}</div>
+              </div>`;
+            });
+          }
+
           // VPP participation credit
           if (bi.vpp_credit) {
             rows += '<div class="bill-section-head bill-fit">VPP credit</div>';

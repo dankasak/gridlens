@@ -186,9 +186,39 @@ CONF_DEFERRABLE_LOAD_SOC_SENSORS = "deferrable_load_soc_sensors"  # list of sens
 # wired to controlled load (default, same as today's behaviour). "controlled_load_1" /
 # "controlled_load_2" means this device's energy is physically switched via that DNSP
 # register rather than the general supply — only offered in the config flow when the
-# matching CONF_HAS_CONTROLLED_LOAD_1/_2 flag is on. Parsing/config plumbing only for
-# now; bill-splitting by register is not implemented yet (see retailer_plans.py).
+# matching CONF_HAS_CONTROLLED_LOAD_1/_2 flag is on. Bill-splitting: plan_calculator.py
+# prices a CL-wired device's total kWh at the plan's controlled_load_rates entry (flat
+# rate — the schema has no time-window structure for CL, so no LP timing variable is
+# needed for pricing correctness) instead of the general import tariff.
 CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD = "deferrable_load_controlled_load"  # list of register IDs ("" = none)
+# Whether a CL-wired device's energy is CURRENTLY mixed into the household's main
+# energy_sensor reading and needs subtracting before CL-pricing it, vs already on a
+# genuinely separate register the main sensor never sees (the normal case — a real CL
+# circuit is wired separately from whatever an inverter's CT clamp monitors, so it was
+# never counted in the first place). Parallel to CONF_DEFERRABLE_LOAD_SENSORS; default
+# False (already separate) matches the common real case. Only consulted when the
+# matching device also has a CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD register set.
+CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE = "deferrable_load_cl_in_aggregate"  # list of bool
+
+# Declared/unmonitored deferrable loads — for a device with no HA-visible energy sensor
+# at all. This is the common case for a genuine Controlled Load circuit (wired separately
+# from whatever an inverter's CT clamp sees — a household would need to have deliberately
+# added a Shelly or similar on that specific circuit to monitor it, which is rare), but
+# also useful for any other unmonitored appliance. The user supplies an estimated average
+# daily kWh instead of pointing at a sensor; the LP barely notices the difference since
+# dispatch already runs off {daily_kwh, max_kw, allowed_hours}, not a raw sensor curve
+# (see plan_calculator.py's _get_deferrable_data / _get_declared_loads).
+# Fixed 2 slots — config-flow schemas are static (no native "add another" UX); covers the
+# realistic CL1+CL2 case. Unused slots have an empty name.
+DEFERRABLE_LOAD_DUMMY_SLOTS = 2
+CONF_DEFERRABLE_LOAD_DUMMY_NAMES = "deferrable_load_dummy_names"              # list of str ("" = unused slot)
+CONF_DEFERRABLE_LOAD_DUMMY_KWH = "deferrable_load_dummy_kwh"                  # list of float (estimated avg daily kWh)
+CONF_DEFERRABLE_LOAD_DUMMY_MAX_KW = "deferrable_load_dummy_max_kw"            # list of float
+CONF_DEFERRABLE_LOAD_DUMMY_HOURS = "deferrable_load_dummy_hours"              # list of hour specs
+CONF_DEFERRABLE_LOAD_DUMMY_CONTROLLED_LOAD = "deferrable_load_dummy_controlled_load"  # list of register IDs ("" = none)
+# Same meaning as CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE above, parallel to the dummy-load
+# lists instead of the sensor-backed ones.
+CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE = "deferrable_load_dummy_cl_in_aggregate"  # list of bool
 
 # VPP bolt-on program (e.g. AGL "Bring Your Own Battery") — a retailer-level credit
 # program layered on top of whatever plan the household is already on, independent

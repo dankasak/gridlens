@@ -45,6 +45,14 @@ from .const import (
     CONF_DEFERRABLE_LOAD_SWITCHES,
     CONF_DEFERRABLE_LOAD_SOC_SENSORS,
     CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD,
+    CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE,
+    DEFERRABLE_LOAD_DUMMY_SLOTS,
+    CONF_DEFERRABLE_LOAD_DUMMY_NAMES,
+    CONF_DEFERRABLE_LOAD_DUMMY_KWH,
+    CONF_DEFERRABLE_LOAD_DUMMY_MAX_KW,
+    CONF_DEFERRABLE_LOAD_DUMMY_HOURS,
+    CONF_DEFERRABLE_LOAD_DUMMY_CONTROLLED_LOAD,
+    CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE,
     CONF_CURRENT_PLAN,
     CONF_VPP_PROGRAM,
     parse_hours_spec,
@@ -370,7 +378,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Capture max power draw and availability hours for each selected deferrable load."""
         selected = self._sensor_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
         if not selected:
-            return await self.async_step_current_plan()
+            return await self.async_step_declared_loads()
 
         errors: dict[str, str] = {}
         if user_input is not None:
@@ -399,12 +407,19 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 cl_list = [
                     str(user_input.get(f"cl_{i}", "") or "") for i in range(len(selected))
                 ]
+                # Whether that device's energy is currently mixed into the main
+                # energy_sensor reading (needs subtracting before CL-pricing) — same
+                # gating as cl_list above.
+                in_agg_list = [
+                    bool(user_input.get(f"in_aggregate_{i}", False)) for i in range(len(selected))
+                ]
                 self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_HOURS] = hours_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_SOC_SENSORS] = soc_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD] = cl_list
-                return await self.async_step_current_plan()
+                self._sensor_data[CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE] = in_agg_list
+                return await self.async_step_declared_loads()
 
         # Controlled Load register choices, gated on the flags collected in
         # async_step_controlled_load. Offered per-device below only if non-empty.
@@ -455,11 +470,103 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         mode=selector.SelectSelectorMode.DROPDOWN,
                     )
                 )
+                # Whether this device's energy is currently mixed into the main
+                # energy_sensor reading (e.g. a general-circuit appliance being
+                # considered for a move to Controlled Load) vs already on a genuinely
+                # separate register the main sensor never sees (the normal case — a
+                # real CL circuit is wired separately from an inverter's CT clamp).
+                schema_dict[vol.Optional(f"in_aggregate_{i}", default=False)] = selector.BooleanSelector()
 
         return self.async_show_form(
             step_id="device_power",
             data_schema=vol.Schema(schema_dict),
             description_placeholders={"devices": "\n".join(device_lines)},
+            errors=errors,
+        )
+
+    async def async_step_declared_loads(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.FlowResult:
+        """Declare loads with no HA-visible energy sensor at all — the common case for
+        a genuine Controlled Load circuit (wired separately from whatever an inverter's
+        CT clamp monitors, so it normally can't be pointed at a sensor via the devices
+        step above; a household would need to have deliberately added a Shelly or
+        similar on that specific circuit). Estimated average daily kWh stands in for a
+        real sensor. Fixed DEFERRABLE_LOAD_DUMMY_SLOTS slots (config-flow schemas are
+        static — no native "add another" UX); a slot with a blank name is unused."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            names = [
+                str(user_input.get(f"name_{i}", "") or "").strip()
+                for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
+            ]
+            hours_list = [
+                str(user_input.get(f"hours_{i}", "all")).strip() or "all"
+                for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
+            ]
+            try:
+                for name, spec in zip(names, hours_list):
+                    if name:
+                        parse_hours_spec(spec)
+            except ValueError:
+                errors["base"] = "invalid_hours"
+            if not errors:
+                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_NAMES] = names
+                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_KWH] = [
+                    float(user_input.get(f"kwh_{i}", 0.0) or 0.0)
+                    for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
+                ]
+                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_MAX_KW] = [
+                    float(user_input.get(f"max_kw_{i}", 3.5))
+                    for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
+                ]
+                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_HOURS] = hours_list
+                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_CONTROLLED_LOAD] = [
+                    str(user_input.get(f"cl_{i}", "") or "")
+                    for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
+                ]
+                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE] = [
+                    bool(user_input.get(f"in_aggregate_{i}", False))
+                    for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
+                ]
+                return await self.async_step_current_plan()
+
+        cl_register_options = []
+        if self._has_cl1:
+            cl_register_options.append({"value": "controlled_load_1", "label": "Controlled Load 1"})
+        if self._has_cl2:
+            cl_register_options.append({"value": "controlled_load_2", "label": "Controlled Load 2"})
+
+        schema_dict = {}
+        for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS):
+            schema_dict[vol.Optional(f"name_{i}", default="")] = selector.TextSelector()
+            schema_dict[vol.Optional(f"kwh_{i}", default=0.0)] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.0, max=100.0, step=0.1,
+                    unit_of_measurement="kWh/day",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+            schema_dict[vol.Optional(f"max_kw_{i}", default=3.5)] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.1, max=100.0, step=0.1,
+                    unit_of_measurement="kW",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+            schema_dict[vol.Optional(f"hours_{i}", default="all")] = selector.TextSelector()
+            if cl_register_options:
+                schema_dict[vol.Optional(f"cl_{i}", default="")] = selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[{"value": "", "label": "Not on controlled load"}] + cl_register_options,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                )
+                schema_dict[vol.Optional(f"in_aggregate_{i}", default=False)] = selector.BooleanSelector()
+
+        return self.async_show_form(
+            step_id="declared_loads",
+            data_schema=vol.Schema(schema_dict),
             errors=errors,
         )
 
@@ -897,13 +1004,14 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         entry_data = self._config_entry.data
         selected = self._sensor_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
         if not selected:
-            return await self.async_step_current_plan()
+            return await self.async_step_declared_loads()
 
         existing_max_kw = entry_data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
         existing_hours = entry_data.get(CONF_DEFERRABLE_LOAD_HOURS, [])
         existing_switches = entry_data.get(CONF_DEFERRABLE_LOAD_SWITCHES, [])
         existing_soc = entry_data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, [])
         existing_cl = entry_data.get(CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD, [])
+        existing_in_agg = entry_data.get(CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE, [])
         # Existing lists are keyed by position in the previously saved sensor
         # list; map by sensor_id so reordering/removing devices keeps defaults.
         prev_sensors = entry_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
@@ -923,6 +1031,11 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             s: existing_cl[i]
             for i, s in enumerate(prev_sensors)
             if i < len(existing_cl) and existing_cl[i]
+        }
+        prev_in_agg = {
+            s: existing_in_agg[i]
+            for i, s in enumerate(prev_sensors)
+            if i < len(existing_in_agg)
         }
 
         errors: dict[str, str] = {}
@@ -947,12 +1060,16 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 cl_list = [
                     str(user_input.get(f"cl_{i}", "") or "") for i in range(len(selected))
                 ]
+                in_agg_list = [
+                    bool(user_input.get(f"in_aggregate_{i}", False)) for i in range(len(selected))
+                ]
                 self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_HOURS] = hours_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_SOC_SENSORS] = soc_list
                 self._sensor_data[CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD] = cl_list
-                return await self.async_step_current_plan()
+                self._sensor_data[CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE] = in_agg_list
+                return await self.async_step_declared_loads()
 
         # Controlled Load register choices, gated on the flags collected in
         # async_step_controlled_load. Offered per-device below only if non-empty.
@@ -1014,11 +1131,114 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                         )
                     )
                 )
+                schema_dict[vol.Optional(
+                    f"in_aggregate_{i}", default=prev_in_agg.get(sensor_id, False),
+                )] = selector.BooleanSelector()
 
         return self.async_show_form(
             step_id="device_power",
             data_schema=vol.Schema(schema_dict),
             description_placeholders={"devices": "\n".join(device_lines)},
+            errors=errors,
+        )
+
+    async def async_step_declared_loads(self, user_input=None):
+        """Declare loads with no HA-visible energy sensor at all — see the setup-flow
+        docstring on this same step name for the full rationale (genuine Controlled
+        Load circuits normally have none)."""
+        entry_data = self._config_entry.data
+        existing_names = entry_data.get(CONF_DEFERRABLE_LOAD_DUMMY_NAMES, [])
+        existing_kwh = entry_data.get(CONF_DEFERRABLE_LOAD_DUMMY_KWH, [])
+        existing_max_kw = entry_data.get(CONF_DEFERRABLE_LOAD_DUMMY_MAX_KW, [])
+        existing_hours = entry_data.get(CONF_DEFERRABLE_LOAD_DUMMY_HOURS, [])
+        existing_cl = entry_data.get(CONF_DEFERRABLE_LOAD_DUMMY_CONTROLLED_LOAD, [])
+        existing_in_agg = entry_data.get(CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE, [])
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            names = [
+                str(user_input.get(f"name_{i}", "") or "").strip()
+                for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
+            ]
+            hours_list = [
+                str(user_input.get(f"hours_{i}", "all")).strip() or "all"
+                for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
+            ]
+            try:
+                for name, spec in zip(names, hours_list):
+                    if name:
+                        parse_hours_spec(spec)
+            except ValueError:
+                errors["base"] = "invalid_hours"
+            if not errors:
+                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_NAMES] = names
+                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_KWH] = [
+                    float(user_input.get(f"kwh_{i}", 0.0) or 0.0)
+                    for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
+                ]
+                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_MAX_KW] = [
+                    float(user_input.get(f"max_kw_{i}", 3.5))
+                    for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
+                ]
+                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_HOURS] = hours_list
+                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_CONTROLLED_LOAD] = [
+                    str(user_input.get(f"cl_{i}", "") or "")
+                    for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
+                ]
+                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE] = [
+                    bool(user_input.get(f"in_aggregate_{i}", False))
+                    for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
+                ]
+                return await self.async_step_current_plan()
+
+        cl_register_options = []
+        if self._has_cl1:
+            cl_register_options.append({"value": "controlled_load_1", "label": "Controlled Load 1"})
+        if self._has_cl2:
+            cl_register_options.append({"value": "controlled_load_2", "label": "Controlled Load 2"})
+
+        schema_dict = {}
+        for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS):
+            schema_dict[vol.Optional(
+                f"name_{i}", default=existing_names[i] if i < len(existing_names) else "",
+            )] = selector.TextSelector()
+            schema_dict[vol.Optional(
+                f"kwh_{i}", default=existing_kwh[i] if i < len(existing_kwh) else 0.0,
+            )] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.0, max=100.0, step=0.1,
+                    unit_of_measurement="kWh/day",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+            schema_dict[vol.Optional(
+                f"max_kw_{i}", default=existing_max_kw[i] if i < len(existing_max_kw) else 3.5,
+            )] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.1, max=100.0, step=0.1,
+                    unit_of_measurement="kW",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+            schema_dict[vol.Optional(
+                f"hours_{i}", default=existing_hours[i] if i < len(existing_hours) else "all",
+            )] = selector.TextSelector()
+            if cl_register_options:
+                schema_dict[vol.Optional(
+                    f"cl_{i}", default=existing_cl[i] if i < len(existing_cl) else "",
+                )] = selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[{"value": "", "label": "Not on controlled load"}] + cl_register_options,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                )
+                schema_dict[vol.Optional(
+                    f"in_aggregate_{i}", default=existing_in_agg[i] if i < len(existing_in_agg) else False,
+                )] = selector.BooleanSelector()
+
+        return self.async_show_form(
+            step_id="declared_loads",
+            data_schema=vol.Schema(schema_dict),
             errors=errors,
         )
 

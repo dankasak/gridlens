@@ -142,7 +142,35 @@
           "cl_6": "Device 7 — controlled load register (optional)",
           "cl_7": "Device 8 — controlled load register (optional)",
           "cl_8": "Device 9 — controlled load register (optional)",
-          "cl_9": "Device 10 — controlled load register (optional)"
+          "cl_9": "Device 10 — controlled load register (optional)",
+          "in_aggregate_0": "Device 1 — already counted in main reading",
+          "in_aggregate_1": "Device 2 — already counted in main reading",
+          "in_aggregate_2": "Device 3 — already counted in main reading",
+          "in_aggregate_3": "Device 4 — already counted in main reading",
+          "in_aggregate_4": "Device 5 — already counted in main reading",
+          "in_aggregate_5": "Device 6 — already counted in main reading",
+          "in_aggregate_6": "Device 7 — already counted in main reading",
+          "in_aggregate_7": "Device 8 — already counted in main reading",
+          "in_aggregate_8": "Device 9 — already counted in main reading",
+          "in_aggregate_9": "Device 10 — already counted in main reading"
+        }
+      },
+      "declared_loads": {
+        "title": "Declared (Unmonitored) Loads",
+        "description": "For a device with no HA-visible energy sensor at all — the normal case for a genuine Controlled Load circuit, which is wired separately from whatever an inverter's CT clamp monitors, so it usually can't be pointed at a sensor via the previous step — declare it here instead with an estimated **average daily kWh**. Up to 2 slots; leave the name blank to skip a slot.\n\nIf you told us earlier you have a Controlled Load circuit, you can mark a declared load as wired to it. Turn on **already counted in main reading** only if this load's energy is currently mixed into your main energy sensor (e.g. a general-circuit appliance you're considering moving to Controlled Load) — leave it off for a load already on a genuinely separate register (the normal case), since your main sensor never saw it in the first place.",
+        "data": {
+          "name_0": "Load 1 — name",
+          "kwh_0": "Load 1 — estimated average daily kWh",
+          "max_kw_0": "Load 1 — max power",
+          "hours_0": "Load 1 — available hours",
+          "cl_0": "Load 1 — controlled load register (optional)",
+          "in_aggregate_0": "Load 1 — already counted in main reading",
+          "name_1": "Load 2 — name",
+          "kwh_1": "Load 2 — estimated average daily kWh",
+          "max_kw_1": "Load 2 — max power",
+          "hours_1": "Load 2 — available hours",
+          "cl_1": "Load 2 — controlled load register (optional)",
+          "in_aggregate_1": "Load 2 — already counted in main reading"
         }
       },
       "current_plan": {
@@ -298,7 +326,35 @@
           "cl_6": "Device 7 — controlled load register (optional)",
           "cl_7": "Device 8 — controlled load register (optional)",
           "cl_8": "Device 9 — controlled load register (optional)",
-          "cl_9": "Device 10 — controlled load register (optional)"
+          "cl_9": "Device 10 — controlled load register (optional)",
+          "in_aggregate_0": "Device 1 — already counted in main reading",
+          "in_aggregate_1": "Device 2 — already counted in main reading",
+          "in_aggregate_2": "Device 3 — already counted in main reading",
+          "in_aggregate_3": "Device 4 — already counted in main reading",
+          "in_aggregate_4": "Device 5 — already counted in main reading",
+          "in_aggregate_5": "Device 6 — already counted in main reading",
+          "in_aggregate_6": "Device 7 — already counted in main reading",
+          "in_aggregate_7": "Device 8 — already counted in main reading",
+          "in_aggregate_8": "Device 9 — already counted in main reading",
+          "in_aggregate_9": "Device 10 — already counted in main reading"
+        }
+      },
+      "declared_loads": {
+        "title": "Declared (Unmonitored) Loads",
+        "description": "For a device with no HA-visible energy sensor at all — the normal case for a genuine Controlled Load circuit, which is wired separately from whatever an inverter's CT clamp monitors, so it usually can't be pointed at a sensor via the previous step — declare it here instead with an estimated **average daily kWh**. Up to 2 slots; leave the name blank to skip a slot.\n\nIf you told us earlier you have a Controlled Load circuit, you can mark a declared load as wired to it. Turn on **already counted in main reading** only if this load's energy is currently mixed into your main energy sensor (e.g. a general-circuit appliance you're considering moving to Controlled Load) — leave it off for a load already on a genuinely separate register (the normal case), since your main sensor never saw it in the first place.",
+        "data": {
+          "name_0": "Load 1 — name",
+          "kwh_0": "Load 1 — estimated average daily kWh",
+          "max_kw_0": "Load 1 — max power",
+          "hours_0": "Load 1 — available hours",
+          "cl_0": "Load 1 — controlled load register (optional)",
+          "in_aggregate_0": "Load 1 — already counted in main reading",
+          "name_1": "Load 2 — name",
+          "kwh_1": "Load 2 — estimated average daily kWh",
+          "max_kw_1": "Load 2 — max power",
+          "hours_1": "Load 2 — available hours",
+          "cl_1": "Load 2 — controlled load register (optional)",
+          "in_aggregate_1": "Load 2 — already counted in main reading"
         }
       },
       "current_plan": {

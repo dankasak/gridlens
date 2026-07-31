@@ -36,6 +36,12 @@ from .const import (
     CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_HOURS,
     CONF_DEFERRABLE_LOAD_SWITCHES,
+    CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD,
+    CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE,
+    CONF_DEFERRABLE_LOAD_DUMMY_NAMES,
+    CONF_DEFERRABLE_LOAD_DUMMY_KWH,
+    CONF_DEFERRABLE_LOAD_DUMMY_CONTROLLED_LOAD,
+    CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE,
     CONF_HAS_DEMAND_TARIFF,
     DEFAULT_DEMAND_WINDOW_HOURS,
     POPULAR_EV_PLANS,
@@ -92,6 +98,17 @@ class PlanCalculator:
         self.deferrable_load_max_kw: list[float] = entry.data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
         self.deferrable_load_hours: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_HOURS, [])
         self.deferrable_load_switches: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_SWITCHES, [])
+        # Controlled Load register wiring, parallel to deferrable_load_sensors ("" = not
+        # CL-wired) — see _build_cl_devices for how this turns into a flat bill line.
+        self.deferrable_load_controlled_load: list[str] = entry.data.get(
+            CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD, [])
+        self.deferrable_load_cl_in_aggregate: list[bool] = entry.data.get(
+            CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE, [])
+        # Declared loads with no HA sensor at all (the normal case for a genuine
+        # Controlled Load circuit — see const.py's docstring on the CONF_*_DUMMY_*
+        # keys). Parsed once here; _build_cl_devices merges the CL-wired ones in
+        # with the sensor-backed devices above.
+        self.declared_loads: list[dict] = self._parse_declared_loads(entry)
         self.current_plan_override: str | None = entry.data.get("current_plan")
         
         # Initialize battery optimizer if battery is configured
@@ -135,6 +152,65 @@ class PlanCalculator:
                 self.plan_data, self.plan_history, self.network_operators,
                 self._history_period[0], self._history_period[1])
         return plans_from_api_data(self.plan_data, self.network_operators)
+
+    def _parse_declared_loads(self, entry: ConfigEntry) -> list[dict]:
+        """Parse the fixed-slot declared/unmonitored-load config into a list of
+        dicts, skipping any slot with a blank name (the "unused slot" convention —
+        see const.py's CONF_DEFERRABLE_LOAD_DUMMY_* docstring)."""
+        names = entry.data.get(CONF_DEFERRABLE_LOAD_DUMMY_NAMES, [])
+        kwh = entry.data.get(CONF_DEFERRABLE_LOAD_DUMMY_KWH, [])
+        cl = entry.data.get(CONF_DEFERRABLE_LOAD_DUMMY_CONTROLLED_LOAD, [])
+        in_agg = entry.data.get(CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE, [])
+        loads = []
+        for i, name in enumerate(names):
+            if not name:
+                continue
+            loads.append({
+                'name': name,
+                'daily_kwh': float(kwh[i]) if i < len(kwh) else 0.0,
+                'controlled_load': cl[i] if i < len(cl) else "",
+                'in_aggregate': bool(in_agg[i]) if i < len(in_agg) else False,
+            })
+        return loads
+
+    def _build_cl_devices(self, deferrable_loads: list[dict]) -> list[dict]:
+        """Combine sensor-backed and declared devices that are wired to a Controlled
+        Load register into one list, each with the total daily kWh _compute_bill_items
+        needs to price them (uniform whether the figure came from real sensor history
+        or a user estimate — the LP already treats both the same way; see
+        CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD's docstring for why no LP timing variable
+        is needed for CL pricing correctness).
+
+        Returns [{'name', 'register', 'daily_kwh', 'in_aggregate'}, ...].
+        """
+        by_sensor = {d['sensor_id']: d['daily_kwh'] for d in deferrable_loads}
+        devices = []
+        for i, sensor_id in enumerate(self.deferrable_load_sensors):
+            register = (
+                self.deferrable_load_controlled_load[i]
+                if i < len(self.deferrable_load_controlled_load) else ""
+            )
+            if not register:
+                continue
+            devices.append({
+                'name': resolve_device_name(self.hass, None, sensor_id) or sensor_id,
+                'register': register,
+                'daily_kwh': by_sensor.get(sensor_id, 0.0),
+                'in_aggregate': (
+                    bool(self.deferrable_load_cl_in_aggregate[i])
+                    if i < len(self.deferrable_load_cl_in_aggregate) else False
+                ),
+            })
+        for d in self.declared_loads:
+            if not d['controlled_load']:
+                continue
+            devices.append({
+                'name': d['name'],
+                'register': d['controlled_load'],
+                'daily_kwh': d['daily_kwh'],
+                'in_aggregate': d['in_aggregate'],
+            })
+        return devices
 
     async def _fetch_plan_history(self, start_date: datetime, end_date: datetime) -> None:
         """Fetch /plans/history for the analysis period. Best-effort: any
@@ -352,6 +428,17 @@ class PlanCalculator:
                         load['sensor_id'], load['daily_kwh'], load['max_kw'],
                         load['daily_kwh'] / load['max_kw'] if load['max_kw'] > 0 else 0,
                     )
+
+        # Controlled-Load-wired devices (sensor-backed or declared) — priced separately
+        # in _compute_bill_items, not part of the LP's normal deferrable dispatch (the
+        # LP's own timing choice doesn't affect a CL rate's dollar value, since it has
+        # no time-of-day structure; see _build_cl_devices).
+        cl_devices = self._build_cl_devices(deferrable_loads)
+        if cl_devices:
+            _LOGGER.warning(
+                "Controlled Load devices: %s",
+                ", ".join(f"{d['name']} ({d['register']}, {d['daily_kwh']:.2f} kWh/day)" for d in cl_devices),
+            )
 
         # Base load = true household demand minus deferrable loads.
         # The LP will re-optimise when to deliver the same total kWh per day.
@@ -573,6 +660,7 @@ class PlanCalculator:
                     opt_result=opt_result,
                     pea_result=pea_results.get(plan_key),
                     export_fine_data=export_fine_data,
+                    cl_devices=cl_devices,
                 )
 
             # Sync breakdown.total with bill_items.total for the current plan.
@@ -942,6 +1030,7 @@ class PlanCalculator:
         opt_result: dict = None,
         pea_result: dict = None,
         export_fine_data: list[dict] = None,
+        cl_devices: list[dict] = None,
     ) -> dict:
         """Return itemised bill breakdown matching Australian electricity bill format.
 
@@ -1128,6 +1217,50 @@ class PlanCalculator:
                     for rk, data in tier_data.items()
                 ], key=lambda x: x['rate_c'], reverse=True)
 
+        # Controlled Load: move any CL-wired device's energy out of general consumption
+        # and price it separately at this plan's flat CL rate. CL rates have no
+        # time-window structure (see ControlledLoadRateIR/get_controlled_load_rate) —
+        # unlike the tiered energy_lines above, WHEN the device drew that energy is
+        # irrelevant to its cost, so a flat total-kWh price is exact, not an
+        # approximation, regardless of the LP's own dispatch timing.
+        #
+        # The general-tier reduction below IS an approximation: a device's energy is
+        # only removed from usage_data/lp_schedule to begin with when it's genuinely on
+        # a separate register the main sensor never saw (the normal real case), so most
+        # of the time there's nothing to reduce here. The "in_aggregate" case (a
+        # hypothetical load currently mixed into the general reading, being evaluated
+        # for a move to CL) has no real per-hour shape to subtract precisely — so it's
+        # approximated as a uniform proportional reduction across every tier, rather
+        # than interval-precise.
+        cl_amount = 0.0
+        cl_kwh_in_aggregate = 0.0
+        cl_lines: list = []
+        for device in (cl_devices or []):
+            rate_info = plan.get_controlled_load_rate(device['register'])
+            if rate_info is None:
+                continue  # this plan doesn't itemise this register — leave it in general consumption
+            dev_kwh = device['daily_kwh'] * actual_days
+            dev_cost = dev_kwh * float(rate_info['rate'])
+            dev_supply = float(rate_info.get('daily_supply_charge') or 0.0) * actual_days
+            cl_lines.append({
+                'label': f"Controlled Load — {device['name']}",
+                'register': device['register'],
+                'rate_c': round(float(rate_info['rate']) * 100, 2),
+                'kwh': round(dev_kwh, 2),
+                'amount': round(dev_cost + dev_supply, 2),
+            })
+            cl_amount += dev_cost + dev_supply
+            if device.get('in_aggregate'):
+                cl_kwh_in_aggregate += dev_kwh
+        cl_amount = round(cl_amount, 2)
+
+        if cl_kwh_in_aggregate > 1e-9 and total_import_kwh > 1e-9:
+            keep_ratio = max(0.0, (total_import_kwh - cl_kwh_in_aggregate) / total_import_kwh)
+            for line in energy_lines:
+                line['kwh'] = round(line['kwh'] * keep_ratio, 2)
+                line['amount'] = round(line['amount'] * keep_ratio, 2)
+            total_import_kwh *= keep_ratio
+
         # FiT: priority order:
         #   1. Current plan with spot export (Amber-as-current): use actual sensor credit
         #   2. LP-optimised non-current plan: use solver's per-step export credit
@@ -1196,7 +1329,7 @@ class PlanCalculator:
 
         energy_charges = round(sum(line['amount'] for line in energy_lines), 2)
         gross_charges = round(
-            energy_charges + supply_amount + subscription_amount + demand_amount, 2)
+            energy_charges + supply_amount + subscription_amount + demand_amount + cl_amount, 2)
 
         # Price Efficiency Adjustment (Flow Power).
         # Use computed PEA from AEMO spot prices when available; no fallback estimate.
@@ -1253,6 +1386,7 @@ class PlanCalculator:
                 'amount': subscription_amount,
             } if subscription_amount else None,
             'demand': demand,
+            'controlled_load': {'lines': cl_lines, 'amount': cl_amount} if cl_lines else None,
             'fit': {
                 'rate_c': fit_rate_c,
                 'kwh': fit_eligible_kwh,
