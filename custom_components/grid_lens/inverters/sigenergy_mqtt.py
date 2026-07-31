@@ -262,6 +262,9 @@ class SigenergyMqttController(InverterController):
     async def set_backup_reserve(self, soc_pct: float) -> bool:
         return await self._set_number(self._e["backup_reserve"], max(0.0, min(100.0, soc_pct)))
 
+    async def get_discharge_floor(self) -> Optional[float]:
+        return self._float(self._e["discharge_floor"])
+
     async def set_discharge_floor(self, soc_pct: float) -> bool:
         """Hardware discharge cut-off — the inverter stops discharging at this SOC
         even if HA crashes while in a forced-discharge mode."""

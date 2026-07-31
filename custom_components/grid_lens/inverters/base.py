@@ -160,6 +160,14 @@ class InverterController(ABC):
         """Set the battery backup-reserve SOC (%). Returns False if unsupported."""
         return False
 
+    async def get_discharge_floor(self) -> Optional[float]:
+        """Return the current **hardware** discharge cut-off SOC (%), or None if
+        unreadable/unsupported. Used to avoid ever *lowering* a floor someone else
+        (installer, user, a prior config) already set more conservatively — see
+        BatteryController._ensure_hardware_floor.
+        """
+        return None
+
     async def set_discharge_floor(self, soc_pct: float) -> bool:
         """Set the **hardware** discharge cut-off SOC (%) — an inverter-enforced floor
         that holds even if HA crashes mid-discharge. Returns False if unsupported.

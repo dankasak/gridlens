@@ -206,6 +206,25 @@ class BatteryController:
     async def _ensure_hardware_floor(self) -> None:
         if not self.cfg.push_hardware_floor or self._hardware_floor_set:
             return
+
+        try:
+            current = await self.driver.get_discharge_floor()
+        except Exception as err:  # noqa: BLE001 — an unreadable floor must not block the push
+            _LOGGER.debug("Could not read current hardware discharge floor: %s", err)
+            current = None
+
+        if current is not None and current >= self.cfg.min_soc_pct:
+            # Already at least as conservative as our own configured floor — leave it.
+            # Never overwrite a value someone else (installer, user, a prior config) set
+            # higher than ours: a bug in our own push logic can then only fail to
+            # *tighten* a floor, never accidentally loosen one that was already safer.
+            self._hardware_floor_set = True
+            _LOGGER.info(
+                "Hardware discharge floor already %.1f%% (>= configured %.1f%%) — left as-is",
+                current, self.cfg.min_soc_pct,
+            )
+            return
+
         try:
             if await self.driver.set_discharge_floor(self.cfg.min_soc_pct):
                 self._hardware_floor_set = True
