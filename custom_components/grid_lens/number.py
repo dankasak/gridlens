@@ -118,15 +118,17 @@ class GridLensMinExportPriceNumber(RestoreEntity, NumberEntity):
 
 
 class GridLensDeferrableOverrideNumber(NumberEntity):
-    """Today-only override of one deferrable device's daily kWh target — e.g. "charge
-    the EV more today, I'm driving far". Beats the 14-day historical average
-    AdvisoryCoordinator would otherwise use for the rest of the local calendar day,
-    then reverts automatically (see deferrable_overrides.DeferrableOverrideStore).
+    """Override of one deferrable device's daily kWh target — e.g. "charge the EV
+    more today, I'm driving far". Beats the 14-day historical average
+    AdvisoryCoordinator would otherwise use, until explicitly cleared back to 0
+    (see deferrable_overrides.DeferrableOverrideStore) — it does NOT auto-revert
+    at midnight. A carried-over boost raises a persistent notification once per
+    day instead of silently reverting or silently running forever.
 
     Reads/writes through the shared DeferrableOverrideStore rather than RestoreEntity:
-    the store's own set_date expiry already decides whether a persisted value still
-    applies, so mirroring it through RestoreEntity would just be a second, potentially
-    inconsistent source of truth for the same question.
+    the store is the single source of truth for whether an override is set, so
+    mirroring it through RestoreEntity would just be a second, potentially
+    inconsistent copy of the same value.
     """
 
     _attr_has_entity_name = True
