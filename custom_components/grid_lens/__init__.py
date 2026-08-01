@@ -1077,6 +1077,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             from .control.manager import ControlManager
             _ctl_mgr = ControlManager(hass, entry)
             hass.data[DOMAIN][f"{entry.entry_id}_control"] = _ctl_mgr
+            # Restore user intent (persisted independently of the switch entity's own
+            # restore-state — see ControlManager.async_initialize()'s docstring) before
+            # the switch platform is forwarded, so its initial displayed state is
+            # already correct rather than defaulting off and flipping on moments later.
+            await _ctl_mgr.async_initialize()
             # Push the hardware discharge floor now rather than waiting for the first
             # force_discharge() call — closes the window where a restart leaves the
             # floor software-only. Best-effort: if the inverter's entity surface isn't
@@ -1122,10 +1127,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     # Deadman: if battery control is active, restore native EMS before tearing down.
+    # Uses async_prepare_for_reload(), NOT disable() — this fires on every reload
+    # regardless of user intent, so it must not clear the persisted "want enabled"
+    # flag (see ControlManager.async_initialize()'s docstring for the incident that
+    # caused when this used disable()).
     _mgr = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_control")
     if _mgr is not None:
         try:
-            await _mgr.disable()
+            await _mgr.async_prepare_for_reload()
         except Exception:  # noqa: BLE001
             pass
 

@@ -44,12 +44,21 @@ async def async_setup_entry(
         async_add_entities(entities)
 
 
-class GridLensBatteryControlSwitch(RestoreEntity, SwitchEntity):
+class GridLensBatteryControlSwitch(SwitchEntity):
     """ON = GridLens actuates the battery per the advisory plan (guardrailed).
 
-    Restores its last state across restarts and defaults ON, so control persists (an HA
-    restart doesn't silently stop optimising the battery). The HA-stop deadman still hands
-    back to native during the shutdown window; this re-engages on the next startup.
+    User intent persists across restarts and defaults ON, so control persists (an HA
+    restart doesn't silently stop optimising the battery) — but via ControlManager's own
+    Store (see async_initialize()), NOT this entity's RestoreEntity state. The manager
+    restores itself before this entity is even created (async_setup_entry calls
+    async_initialize() ahead of forwarding the switch platform), so by the time
+    async_added_to_hass runs here, `self._manager.enabled` already reflects the outcome —
+    this entity just displays it. (RestoreEntity was tried first and dropped: the reload
+    deadman always forces this switch to "off" before teardown, so its restored state
+    reflected transient reload timing rather than genuine user intent — see
+    ControlManager.async_initialize()'s docstring for the 2026-08-01 incident.) The
+    HA-stop deadman still hands back to native during the shutdown window; the manager
+    re-engages on the next startup from its own persisted intent.
     """
 
     _attr_has_entity_name = True
@@ -69,14 +78,6 @@ class GridLensBatteryControlSwitch(RestoreEntity, SwitchEntity):
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         self._manager.set_state_listener(self._on_manager_change)
-        last = await self.async_get_last_state()
-        want_on = True if last is None else (last.state == "on")  # default ON if no prior state
-        if want_on:
-            await self._manager.enable()
-        # Reflect what actually happened, not just what was requested — enable() refuses
-        # (and stays refused) until the account's battery-control entitlement is confirmed,
-        # so a restored/default "on" doesn't lie about the real state. If entitlement lands
-        # a bit later, _on_manager_change picks up the auto-retry in set_entitled().
         self._attr_is_on = self._manager.enabled
         self.async_write_ha_state()
 
