@@ -820,6 +820,17 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         self._has_cl2: bool = False
 
     async def async_step_init(self, user_input=None):
+        """Entry point for Configure — a menu so a quick task (pasting a new API
+        key after subscribing/re-subscribing) doesn't require walking the entire
+        reconfigure wizard from the top just to reach the field at the end."""
+        return self.async_show_menu(
+            step_id="init",
+            menu_options=["api_key", "full_reconfigure"],
+        )
+
+    async def async_step_full_reconfigure(self, user_input=None):
+        """The pre-existing full wizard, now reached via the menu above instead
+        of unconditionally."""
         return await self.async_step_controlled_load()
 
     async def async_step_controlled_load(self, user_input=None):
@@ -1314,7 +1325,13 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                     errors["base"] = "cannot_connect"
 
             if not errors:
-                new_data = {**self._sensor_data, CONF_GRIDLENS_API_KEY: new_key or current_key}
+                # Base on the entry's own current data, not just self._sensor_data —
+                # reached directly from the menu (the common case now), _sensor_data
+                # is still empty (only the full wizard path below populates it), and
+                # {**self._sensor_data, ...} alone would silently wipe every other
+                # setting on the entry down to just the new key.
+                new_data = {**self._config_entry.data, **self._sensor_data,
+                            CONF_GRIDLENS_API_KEY: new_key or current_key}
                 self.hass.config_entries.async_update_entry(self._config_entry, data=new_data)
                 return self.async_create_entry(title="", data={})
 

@@ -209,6 +209,13 @@
   },
   "options": {
     "step": {
+      "init": {
+        "title": "Grid Lens",
+        "menu_options": {
+          "api_key": "Update API key",
+          "full_reconfigure": "Reconfigure sensors, devices & plan"
+        }
+      },
       "controlled_load": {
         "title": "Controlled Load",
         "description": "Does your meter have a Controlled Load circuit switched by your network distributor? This is a network/meter fact, not a retail plan setting.",
