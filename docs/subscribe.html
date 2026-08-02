@@ -175,6 +175,13 @@
 
   if (flowId && callbackUrl) document.body.classList.add('ha-context');
 
+  // Deep link from the pricing page / the Power Flow card's paywall stub
+  // (?addon=1) pre-checks the add-on instead of making a visitor who already
+  // knows what they want re-discover the checkbox.
+  if (params.get('addon') === '1') {
+    document.getElementById('chk-addon').checked = true;
+  }
+
   document.getElementById('btn-subscribe').addEventListener('click', () => {
     const url = new URL('https://api.gridlens.au/billing/checkout');
     url.searchParams.set('email', email);

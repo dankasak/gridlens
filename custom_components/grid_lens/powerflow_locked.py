@@ -49,7 +49,7 @@ class GridLensPowerflowLockedCard extends HTMLElement {
         <h3>Unlock the Power Flow card</h3>
         <p>See your solar, battery, grid and every deferrable load as one live animated
            diagram — the same view GridLens uses to decide what to do next.</p>
-        <a class="cta" href="https://gridlens.au/pricing" target="_blank" rel="noopener">
+        <a class="cta" href="https://gridlens.au/subscribe.html?addon=1" target="_blank" rel="noopener">
           Unlock with Battery Control + Power Flow
         </a>
       </div>`;
