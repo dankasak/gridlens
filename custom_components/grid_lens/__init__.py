@@ -283,11 +283,13 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260802c"
+    _CARD_VERSION = "20260802d"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
-        f"/grid_lens/cards/grid-lens-powerflow-card.js?v={_CARD_VERSION}",
+        # Gated: served by PowerflowCardView (proxied from the API, entitlement-checked),
+        # not HA's static /grid_lens/cards/ tree — see that view's docstring.
+        f"/api/grid_lens/cards/grid-lens-powerflow-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-advisory-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-soc-chart-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-dispatch-chart-card.js?v={_CARD_VERSION}",
@@ -304,6 +306,10 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         "/grid_lens/cards/electricity-energy-flow-card.js",
         "/local/grid-lens/electricity-energy-flow-card.js",
         "/local/grid-lens/electricity-plan-comparison-card.js",
+        # The Power Flow card moved from a static file to a gated proxy URL
+        # (PowerflowCardView) 2026-08-02 — the base path itself changed, so the
+        # version-mismatch check below won't catch it; needs the explicit stale entry.
+        "/grid_lens/cards/grid-lens-powerflow-card.js",
     }
     try:
         lovelace_data = hass.data.get("lovelace")
@@ -934,6 +940,87 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             await send('complete', result)
             return resp
 
+    class PowerflowCardView(HomeAssistantView):
+        """Proxies the Power Flow card's JS from the API — gated on the install's
+        ApiKey.powerflow_card entitlement (see gridlens-api/app/cards.py's
+        GET /cards/powerflow). The browser never talks to the API directly and
+        never sees the API key; this view fetches server-to-server (using the
+        key stored in the config entry) and re-serves the result at a fixed,
+        stable URL so the Lovelace resource never has to change.
+
+        Caches per config entry for a TTL so a page reload / several open tabs
+        don't each trigger a fresh API round-trip. On a genuine network failure,
+        prefers re-serving a previously fetched REAL card over downgrading to
+        the paywall stub — an API/LXC outage should never nag a paying customer;
+        it should only ever fail toward "keeps showing what they already had".
+        The paywall stub (powerflow_locked.LOCKED_CARD_JS) is only served on an
+        explicit 401/402/403 (a real "not entitled" answer) or when nothing has
+        ever been fetched successfully for this entry.
+        """
+
+        url = "/api/grid_lens/cards/grid-lens-powerflow-card.js"
+        name = "api:grid_lens:powerflow_card"
+        requires_auth = False
+
+        _TTL_ENTITLED = 300   # seconds — a real subscription rarely lapses mid-session
+        _TTL_LOCKED = 60      # shorter — so upgrading is reflected reasonably promptly
+
+        def __init__(self, hass_instance):
+            self.hass = hass_instance
+            self._cache: dict[str, tuple] = {}  # entry_id -> (fetched_at, js_text, entitled)
+
+        async def get(self, request):
+            import time
+            from .const import CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL
+            from .powerflow_locked import LOCKED_CARD_JS
+
+            version = request.query.get("v", "")
+
+            def _serve(js: str, entitled: bool) -> web.Response:
+                text = js.replace("__CARD_VERSION__", version) if entitled else js
+                return web.Response(text=text, content_type="application/javascript")
+
+            entries = self.hass.config_entries.async_entries(DOMAIN)
+            entry = entries[0] if entries else None
+            if not entry:
+                return _serve(LOCKED_CARD_JS, False)
+
+            now = time.monotonic()
+            cached = self._cache.get(entry.entry_id)
+            if cached:
+                fetched_at, js_text, entitled = cached
+                ttl = self._TTL_ENTITLED if entitled else self._TTL_LOCKED
+                if now - fetched_at < ttl:
+                    return _serve(js_text, entitled)
+
+            api_key = entry.data.get(CONF_GRIDLENS_API_KEY, "")
+            api_url = entry.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
+            try:
+                session = async_get_clientsession(self.hass)
+                async with session.get(
+                    f"{api_url}/cards/powerflow",
+                    headers={"X-API-Key": api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 200:
+                        js_raw = await resp.text()
+                        self._cache[entry.entry_id] = (now, js_raw, True)
+                        return _serve(js_raw, True)
+                    if resp.status in (401, 402, 403):
+                        self._cache[entry.entry_id] = (now, LOCKED_CARD_JS, False)
+                        return _serve(LOCKED_CARD_JS, False)
+                    _LOGGER.warning(
+                        "Power Flow card: unexpected status %s from API", resp.status
+                    )
+            except Exception as err:  # noqa: BLE001 — network is best-effort here
+                _LOGGER.warning("Power Flow card: could not reach API (%s)", err)
+
+            # Network failure or an unexpected status: prefer stale-but-real over the
+            # paywall — never punish a paying customer for an outage on our end.
+            if cached and cached[2]:
+                return _serve(cached[1], True)
+            return _serve(LOCKED_CARD_JS, False)
+
     class SubscribeCallbackView(HomeAssistantView):
         """Receive subscription callback from gridlens.au and advance the config flow."""
 
@@ -988,6 +1075,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.http.register_view(PlanHistoryItemView(hass))
     hass.http.register_view(DiagnosticExportView(hass))
     hass.http.register_view(PlanStreamView(hass))
+    hass.http.register_view(PowerflowCardView(hass))
     hass.http.register_view(SubscribeCallbackView(hass))
 
     return True

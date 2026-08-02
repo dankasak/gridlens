@@ -361,7 +361,7 @@ convention, never a hardcoded entity id — so they work unmodified on any insta
 | Card | Shows |
 |---|---|
 | `grid-lens-card` | Full plan comparison (the Plan Comparison view). |
-| `grid-lens-powerflow-card` | Live radial energy flow: solar / grid / battery / home + one node per deferrable load, animated flow balls, live buy/sell price, greedy badges. |
+| `grid-lens-powerflow-card` | **Gated** — live radial energy flow: solar / grid / battery / home + one node per deferrable load, animated flow balls, live buy/sell price, greedy badges. Requires the Battery Control + Power Flow add-on; see §12. |
 | `grid-lens-power-chart-card` | Measured & forecast power (kW) — solar, load, signed grid, signed battery, per-device deferrable, plus free-energy shading. |
 | `grid-lens-price-chart-card` | Import/export rate trajectory. |
 | `grid-lens-soc-chart-card` | Battery SOC curve. |
@@ -387,6 +387,12 @@ Views: Plan Comparison, Battery Plan, Settings.
    reverts on the next restart. To ship a card change: bump `_CARD_VERSION`, run
    `sync-to-ha.sh`. If `grid-lens-chart-common.js` itself changed, **also bump its `?v=`
    sub-import string in every card that imports it** — ES modules cache by exact URL.
+3. **`grid-lens-powerflow-card.js` doesn't live here.** Its source of truth is
+   `gridlens-api/app/cards/grid-lens-powerflow-card.js` (private repo) — `sync-to-ha.sh`
+   never touches it. To ship a change to it: edit it in `gridlens-api`, push to `main` (the
+   self-hosted runner rebuilds/redeploys the API container automatically), then bump
+   `_CARD_VERSION` in the public repo and `sync-to-ha.sh` as usual so browsers fetch the new
+   version through the proxy. See §12 for why it's served this way.
 
 ---
 
@@ -420,6 +426,22 @@ tick. The switches are plain polled entities and are the only surface that track
   entitlement column. It **fails closed**: no actuation until the API confirms. Revoking it
   stops actuation immediately but *keeps user intent*, so a re-grant auto-resumes without
   the user re-toggling every switch.
+- **Battery Control + Power Flow add-on** (`ApiKey.battery_control` / `ApiKey.powerflow_card`,
+  granted/revoked together by one Stripe Price — `gridlens-api/app/billing.py`) — an optional
+  paid add-on on top of either the free or Pro plan-comparison tier; see `subscribe.html`.
+  **The Power Flow card itself is the gate, not just its data**: unlike every other card
+  (shipped free, source in the public repo), `grid-lens-powerflow-card.js`'s source of truth
+  lives in `gridlens-api/app/cards/`, served only via `GET /cards/powerflow`
+  (`gridlens-api/app/cards.py`), gated on `powerflow_card` — 402 if not entitled. The public
+  integration never ships this card's code at all. `custom_components/grid_lens/__init__.py`'s
+  `PowerflowCardView` proxies it: fetches server-to-server with the install's own API key
+  (the browser never sees the key), caches per config entry (5 min if entitled, 60 s if not,
+  so an upgrade is reflected reasonably promptly), and on a network failure **prefers
+  re-serving a stale-but-real cached copy over the paywall** — an API outage must never nag a
+  paying customer. Not entitled (or nothing ever fetched) serves
+  `powerflow_locked.LOCKED_CARD_JS`, a self-contained upsell stub registered under the *same*
+  custom-element tag (`grid-lens-powerflow-card`) so existing dashboard configs, including the
+  seeded one, don't need to know which variant they're getting.
 
 **HA → API calls must** use `async_get_clientsession(hass)` and send
 `User-Agent: GridLens-HA-Integration/1.0`. A raw `aiohttp.ClientSession()` gets 403 from
