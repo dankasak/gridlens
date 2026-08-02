@@ -20,6 +20,7 @@ from homeassistant.util import dt as dt_util
 
 from ..battery_optimizer import BatteryOptimizer
 from ..const import DOMAIN
+from ..schedule_grid import rolling_window_hours
 from .forecast import FlatLoadForecaster, ForecastProvider, HourOfDayLoadForecaster
 from .load_history import build_hour_of_day_load
 from .planner import AdvisoryPlanner
@@ -245,9 +246,40 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
                     "Deferrable override active for %s: %.1f kWh today (was %.1f historical)",
                     dev.get("name"), override, dev.get("daily_kwh", 0.0),
                 )
+                self._warn_if_unreachable(dev, override)
                 dev = {**dev, "daily_kwh": override}
             out.append(dev)
         return out
+
+    def _warn_if_unreachable(self, dev: dict, target_kwh: float) -> None:
+        """Log when a boost target can't fit the device's availability window.
+
+        The LP silently clamps a per-day target to what the window can deliver
+        (battery_optimizer's per-day equality), which reads as "the optimizer ignored
+        my boost". The optimizer reports its own clamp too, but only after a solve and
+        only for the horizon it happens to be planning; this fires at the moment the
+        override is applied, against the same rolling 24 hours the first day-chunk
+        covers, so the reason is in the log next to the override itself.
+        """
+        max_kw = float(dev.get("max_kw") or 0.0)
+        if max_kw <= 0:
+            return
+        week = dev.get("week")
+        if week is not None:
+            now = dt_util.now()
+            hours = rolling_window_hours(week, now.weekday(), now.hour, now.minute)
+        else:
+            allowed = dev.get("allowed_hours")
+            hours = 24.0 if allowed is None else float(len(set(allowed)))
+        capacity = hours * max_kw
+        if target_kwh - capacity > 1e-6:
+            _LOGGER.warning(
+                "Deferrable boost for %s (%.1f kWh) exceeds what its availability "
+                "window can deliver in the next 24h: %.1f allowed hours @ %.1f kW = "
+                "%.1f kWh. The optimizer will schedule %.1f kWh and drop the rest — "
+                "widen the device's weekly schedule for the full boost to apply.",
+                dev.get("name"), target_kwh, hours, max_kw, capacity, capacity,
+            )
 
     def _subtract_deferrable_from_load(self, load_hod: list[float]) -> list[float]:
         """Base load = whole-home load minus deferrable devices, per hour-of-day, floored 0.

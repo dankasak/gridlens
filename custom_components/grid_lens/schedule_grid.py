@@ -94,6 +94,34 @@ def max_daily_hours(week: list[list[int]]) -> float:
     return max((sum(1 for v in row if v) for row in week), default=0) / 2.0
 
 
+def rolling_window_hours(week, weekday: int, hour: int, minute: int = 0,
+                         span_slots: int = DAY_SLOTS) -> float:
+    """Allowed HOURS in the ``span_slots`` half-hours starting at a given local
+    weekday/time, wrapping around the week.
+
+    This — not ``max_daily_hours`` — is what actually bounds a *today* target: the
+    optimizer's day-chunks are anchored to the horizon start ("now"), not local
+    midnight, so the relevant window straddles two weekdays and excludes the part of
+    today that has already elapsed. A device allowed 00:00-09:00 + 21:00-24:00 has 12
+    allowed hours on any given day, but only 11.5 of them are still reachable in the
+    24 hours following 21:30 (see battery_optimizer's per-day target clamp).
+
+    Fails open (counts a slot as allowed) on a malformed grid, matching slot_allowed.
+    """
+    if not week:
+        return 0.0
+    start = weekday * DAY_SLOTS + hour * 2 + (1 if minute >= 30 else 0)
+    total = 0
+    for k in range(int(span_slots)):
+        d, s = divmod((start + k) % (WEEK_DAYS * DAY_SLOTS), DAY_SLOTS)
+        try:
+            allowed = bool(week[d][s])
+        except (IndexError, TypeError):
+            allowed = True
+        total += 1 if allowed else 0
+    return total / 2.0
+
+
 def read_week(data: dict, sensor_id: str):
     """The stored weekly grid for sensor_id, or None if unset/malformed."""
     entry = (data or {}).get(sensor_id)

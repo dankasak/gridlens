@@ -698,6 +698,13 @@ class BatteryOptimizer:
         # the advisory card's deferrable timeline showed both devices dumped to full
         # power right at the horizon's last slot, well after their real cheap window.
         daily_ub_specs: list[tuple[list[int], float]] = []
+        # The clamp below is silent to the caller by construction — the LP simply
+        # solves a smaller target — which makes a too-large daily_kwh (typically a
+        # dashboard "today boost") look like the optimizer ignored it. Record every
+        # clamp so it can be logged and returned instead. Keyed by device index: one
+        # notice per device, from the first full day-chunk that binds.
+        clamped: dict[int, dict] = {}
+        first_target: dict[int, float] = {}
         eq_row = 2 * T
         for i, dev in enumerate(deferrable_loads):
             mask = dev.get('hour_mask')
@@ -709,8 +716,22 @@ class BatteryOptimizer:
                 avail_slots = (
                     sum(float(mask[t]) for t in range(t0, t1)) if mask else (t1 - t0)
                 )
-                target = dev['daily_kwh'] * (t1 - t0) / slots_per_day
-                target = min(target, avail_slots * dev['max_kw'] * dt)
+                requested = dev['daily_kwh'] * (t1 - t0) / slots_per_day
+                deliverable = avail_slots * dev['max_kw'] * dt
+                target = min(requested, deliverable)
+                # Truncated chunks are a ≤ cap, not an equality (see above), so falling
+                # short there is by design and not worth reporting as a lost target.
+                if d not in truncated_days:
+                    first_target.setdefault(i, target)
+                    if requested - deliverable > 1e-6 and i not in clamped:
+                        clamped[i] = {
+                            'name': dev.get('name') or f"device {i}",
+                            'sensor_id': dev.get('sensor_id'),
+                            'requested_kwh': requested,
+                            'deliverable_kwh': deliverable,
+                            'available_hours': avail_slots * dt,
+                            'max_kw': dev['max_kw'],
+                        }
                 cols = [(5 + i) * T + t for t in range(t0, t1)]
                 if d in truncated_days:
                     daily_ub_specs.append((cols, target))
@@ -924,12 +945,30 @@ class BatteryOptimizer:
             total_import_cost = sum(r['import_cost'] for r in schedule)
             total_export_credit = sum(r['export_credit'] for r in schedule)
 
+        # Show the EFFECTIVE (post-clamp) target, not just the requested one — the
+        # unqualified requested figure made a window-clamped boost look like it had
+        # been applied in full.
         _LOGGER.warning(
             "%s solved %d hours, %d deferrable devices %s, status=%s",
             solver_label, T, N,
-            [(f"{d['daily_kwh']:.1f}kWh/d@{d['max_kw']}kW") for d in deferrable_loads],
+            [
+                f"{d['daily_kwh']:.1f}kWh/d@{d['max_kw']}kW"
+                if first_target.get(i, d['daily_kwh']) >= d['daily_kwh'] - 1e-6
+                else f"{d['daily_kwh']:.1f}→{first_target[i]:.1f}kWh/d@{d['max_kw']}kW"
+                for i, d in enumerate(deferrable_loads)
+            ],
             result.status,
         )
+        for c in clamped.values():
+            _LOGGER.warning(
+                "Deferrable '%s': daily target %.1f kWh exceeds what its availability "
+                "window can deliver in this 24h chunk — only %.1f kWh is schedulable "
+                "(%.1f allowed hours @ %.1f kW), so %.1f kWh is being dropped. Widen "
+                "the device's weekly schedule for a larger target to take effect.",
+                c['name'], c['requested_kwh'], c['deliverable_kwh'],
+                c['available_hours'], c['max_kw'],
+                c['requested_kwh'] - c['deliverable_kwh'],
+            )
         if min_export_price > 0:
             floored_hours = sum(1 for r in r_exp if r < min_export_price)
             _LOGGER.warning(
@@ -971,6 +1010,10 @@ class BatteryOptimizer:
             'final_soc_percent':   max(0.0, soc_vals[T-1]) / self.capacity_kwh * 100.0,
             'demand_peak_kw':      (max(0.0, x[P_idx]) if demand_active else None),
             'conditional_credits': conditional_credit_totals,
+            # Per-device notices where a daily target had to be reduced to what the
+            # device's availability window can physically deliver — surfaced on the
+            # dashboard so a boost that can't fit doesn't just silently do nothing.
+            'deferrable_clamped':  list(clamped.values()),
             'solver':              solver_label,
         }
 

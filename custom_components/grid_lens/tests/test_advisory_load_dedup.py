@@ -94,6 +94,15 @@ def _install_stubs() -> None:
     rp.build_rate_caps = lambda *a, **k: ([], [], {})
     rp.build_conditional_credits = lambda *a, **k: []
 
+    # schedule_grid has zero HA imports by design, so load the REAL module under the
+    # synthetic package rather than stubbing it — no behaviour worth faking here.
+    sg_spec = importlib.util.spec_from_file_location(
+        "gl.schedule_grid", os.path.join(_COMPONENT, "schedule_grid.py")
+    )
+    sg = importlib.util.module_from_spec(sg_spec)
+    sys.modules["gl.schedule_grid"] = sg
+    sg_spec.loader.exec_module(sg)
+
 
 def _load_coordinator():
     _install_stubs()

@@ -128,6 +128,36 @@ class GridLensLoadControlCard extends HTMLElement {
     return null;
   }
 
+  // Allowed HOURS in the 24 hours starting now, from a device's 7x48 half-hour weekly
+  // grid (Monday first). Mirrors schedule_grid.rolling_window_hours on the Python side:
+  // this — not "allowed hours per day" — is what bounds a Today Boost, because the
+  // optimizer's first day-chunk is anchored to "now", not local midnight, so it spans
+  // two weekdays and excludes the part of today already gone. Fails open (counts an
+  // unreadable slot as allowed), matching the Python helper.
+  _windowHours(week) {
+    if (!Array.isArray(week) || week.length !== 7) return 24;
+    const now = new Date();
+    const wd = (now.getDay() + 6) % 7;   // JS Sunday=0 → Python Monday=0
+    const start = wd * 48 + now.getHours() * 2 + (now.getMinutes() >= 30 ? 1 : 0);
+    let n = 0;
+    for (let k = 0; k < 48; k++) {
+      const idx = (start + k) % (7 * 48);
+      const row = week[Math.floor(idx / 48)];
+      const slot = row ? row[idx % 48] : undefined;
+      if (slot === undefined || slot) n++;
+    }
+    return n / 2;
+  }
+
+  // Most kWh this device can physically take in the next 24 h. A boost above this is
+  // silently clamped by the LP, so the card shows the ceiling rather than letting the
+  // user set a number that quietly does nothing.
+  _boostCeiling(d) {
+    const kw = parseFloat(d.max_kw);
+    if (!Number.isFinite(kw) || kw <= 0) return null;
+    return this._windowHours(d.schedule || d.default_schedule) * kw;
+  }
+
   _resolveRows() {
     const devices = this._resolveDevices();
     const rows = devices.map((d) => {
@@ -157,6 +187,7 @@ class GridLensLoadControlCard extends HTMLElement {
       const g = r.gEid && hass.states[r.gEid];
       const gs = r.gsEid && hass.states[r.gsEid];
       const b = r.boostEid && hass.states[r.boostEid];
+      const ceiling = this._boostCeiling(r.device);
       return [
         r.device.energy_entity,
         c ? `${c.state}|${(c.attributes || {}).note}` : '',
@@ -164,6 +195,9 @@ class GridLensLoadControlCard extends HTMLElement {
         g ? g.state : '',
         gs ? gs.state : '',
         b ? b.state : '',
+        // Time-dependent (the window rolls forward), so it belongs in the repaint
+        // signature — otherwise the ceiling hint goes stale as the day advances.
+        ceiling == null ? '' : ceiling.toFixed(1),
       ].join('~');
     }).join(',');
     if (sig !== this._sig) { this._sig = sig; this._rows = rows; this._paint(); }
@@ -208,6 +242,8 @@ class GridLensLoadControlCard extends HTMLElement {
         .boost { display: flex; align-items: center; gap: 3px; flex: 0 0 auto;
                border: 1px solid var(--border); border-radius: 7px; padding: 3px 7px; }
         .boost.active { border-color: var(--good); }
+        .boost.over { border-color: var(--buy); }
+        .boost-cap { font-size: 10px; font-weight: 600; color: var(--buy); white-space: nowrap; }
         .boost-input { width: 42px; border: none; background: transparent; color: var(--ink);
                font-size: 12px; font-family: inherit; text-align: right; }
         .boost-input::-webkit-outer-spin-button, .boost-input::-webkit-inner-spin-button { margin: 0; }
@@ -307,12 +343,24 @@ class GridLensLoadControlCard extends HTMLElement {
         const val = parseFloat(bst.state);
         const shown = Number.isFinite(val) ? val : 0;
         const active = shown > 0;
+        // A target above what the availability window can deliver is silently clamped
+        // by the optimizer, which reads as "my boost did nothing" — call it out here,
+        // at the input, rather than leaving it to the log.
+        const ceiling = this._boostCeiling(d);
+        const over = ceiling != null && shown > ceiling + 1e-6;
+        const tip = ceiling == null
+          ? "Today's kWh target override — 0 uses the 14-day historical average"
+          : `Today's kWh target override — 0 uses the 14-day historical average. `
+            + `At ${d.max_kw} kW, this load's schedule allows at most `
+            + `${ceiling.toFixed(1)} kWh over the next 24 h; anything above that `
+            + `cannot be scheduled.`;
         boostHtml = `
-          <div class="boost${active ? ' active' : ''}" title="Today's kWh target override — 0 uses the 14-day historical average">
+          <div class="boost${active ? ' active' : ''}${over ? ' over' : ''}" title="${esc(tip)}">
             <input type="number" class="boost-input" data-eid="${esc(r.boostEid)}"
               min="${ba.min ?? 0}" max="${ba.max ?? 999}" step="${ba.step ?? 0.5}"
               value="${shown}">
             <span class="boost-unit">kWh</span>
+            ${over ? `<span class="boost-cap">max ${ceiling.toFixed(1)}</span>` : ''}
           </div>`;
       }
 

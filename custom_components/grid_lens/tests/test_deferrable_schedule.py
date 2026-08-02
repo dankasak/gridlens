@@ -120,6 +120,45 @@ def test_max_daily_hours():
     assert sg.max_daily_hours([]) == 0.0
 
 
+def test_rolling_window_hours():
+    # A boost is bounded by the 24 h following "now", which straddles two weekdays —
+    # not by the best day's total (max_daily_hours), and not by a whole calendar day.
+    # Real-world shape that motivated this: an EV allowed 00:00-09:00 + 21:00-24:00 on
+    # weekends but most of the day on weekdays.
+    week = _full_week(0)
+    weekend = [1] * 18 + [0] * 24 + [1] * 6      # 00:00-09:00 + 21:00-24:00 = 12h
+    weekday = [1] * 32 + [0] * 13 + [1] * 3      # 00:00-16:00 + 22:30-24:00 = 17.5h
+    for d in range(5):
+        week[d] = list(weekday)
+    week[5] = list(weekend)
+    week[6] = list(weekend)
+
+    # Sat 21:30 → 5 slots tonight + 18 tomorrow morning + 1 at 21:00 Sun = 24 = 12.0 h.
+    # max_daily_hours would say 17.5 h, overstating the achievable target by ~50%.
+    assert sg.rolling_window_hours(week, 5, 21, 30) == 12.0
+    assert sg.max_daily_hours(week) == 17.5
+
+    # Sun 09:00 — the morning window has just closed, so only Sun 21:00-24:00 plus
+    # Mon 00:00-09:00 remain in the next 24 h.
+    assert sg.rolling_window_hours(week, 6, 9, 0) == 12.0
+    # Mon 09:00 — inside a wide weekday window: 09:00-16:00 (7h) + 22:30-24:00 (1.5h)
+    # + Tue 00:00-09:00 (9h).
+    assert sg.rolling_window_hours(week, 0, 9, 0) == 17.5
+
+    # Degenerate inputs: all-allowed is a full day, empty is nothing, and a malformed
+    # row fails open (counts as allowed) exactly like slot_allowed/hour_fraction.
+    assert sg.rolling_window_hours([[1] * 48] * 7, 3, 0, 0) == 24.0
+    assert sg.rolling_window_hours(_full_week(0), 3, 0, 0) == 0.0
+    assert sg.rolling_window_hours([], 3, 0, 0) == 0.0
+    assert sg.rolling_window_hours([[1] * 48] * 6 + [None], 6, 0, 0) == 24.0
+
+    # Wraps Sunday→Monday rather than running off the end of the grid:
+    # Sun 21:00-24:00 (3h) + Mon 00:00-16:00 (16h).
+    assert sg.rolling_window_hours(week, 6, 21, 0) == 19.0
+    # Sat 23:30: 0.5h tonight + Sun 00:00-09:00 (9h) + Sun 21:00-23:30 (2.5h).
+    assert sg.rolling_window_hours(week, 5, 23, 30) == 12.0
+
+
 def test_store_roundtrip_and_clear():
     week = _full_week(0)
     week[3][7] = 1
@@ -156,6 +195,7 @@ if __name__ == "__main__":
         ("slot_allowed_and_fail_open", test_slot_allowed_and_fail_open),
         ("hour_fraction", test_hour_fraction),
         ("max_daily_hours", test_max_daily_hours),
+        ("rolling_window_hours", test_rolling_window_hours),
         ("store_roundtrip_and_clear", test_store_roundtrip_and_clear),
         ("store_malformed_is_none_and_write_rejects", test_store_malformed_is_none_and_write_rejects),
     ]
