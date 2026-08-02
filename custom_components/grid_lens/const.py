@@ -169,7 +169,12 @@ CONF_INVERTER_TRANSPORT = "inverter_transport"
 # Deferrable loads
 CONF_DEFERRABLE_LOAD_SENSORS = "deferrable_load_sensors"  # list of sensor IDs
 CONF_DEFERRABLE_LOAD_MAX_KW = "deferrable_load_max_kw"    # list of max kW, parallel to sensors
-CONF_DEFERRABLE_LOAD_HOURS = "deferrable_load_hours"      # list of hour specs, parallel to sensors
+# Availability windows for a sensor-backed device are set on the dashboard's Deferrable
+# Loads weekly schedule card (deferrable_schedules.py), not in config — there used to be a
+# parallel static "deferrable_load_hours" config-flow field (comma-separated hours) that
+# seeded the LP's availability mask before the schedule card existed; removed 2026-08-02 as
+# redundant with the card, which now fully owns this. A device with no stored weekly
+# schedule yet is simply unrestricted (any hour) until the user paints one.
 # Optional per-device control switch (switch.* entity), parallel to sensors. A device with
 # a switch configured becomes a "type 1" controllable simple load: GridLens turns it on/off
 # per the optimized schedule (gated by its own default-OFF master switch). Empty string = no

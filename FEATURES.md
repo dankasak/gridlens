@@ -177,8 +177,11 @@ EV charger, hot water, pool pump. The optimiser is told each device's average da
 max kW, and when it's *allowed* to run; it decides *when*.
 
 **Config** (per device, parallel lists): `deferrable_load_sensors` (energy sensor — the join
-key), `..._max_kw`, `..._hours` (static availability spec), `..._switches` (control switch,
-`""` = forecast-only), `..._soc_sensors` (e.g. EV SOC).
+key), `..._max_kw`, `..._switches` (control switch, `""` = forecast-only), `..._soc_sensors`
+(e.g. EV SOC). Availability windows are **not** set here — see §8; a device is fully
+unrestricted (any hour) until the user paints a schedule on the dashboard card. (A static
+per-device `deferrable_load_hours` config-flow field used to seed this before the schedule
+card existed — removed 2026-08-02 as redundant with it.)
 
 **Daily kWh** comes from a 14-day historical average of the device's own energy sensor,
 overridable per-day (see Today Boost).
@@ -231,6 +234,21 @@ power when on) to follow the plan.
   "Hands off; set it to X and leave it."
 - Deliberately **decoupled** from the battery `ControlManager`: load control has zero
   brand-specific logic and must work on a house with no battery at all.
+
+**Card layout — every row the same shape.** `grid-lens-load-control-card.js` always
+renders the segmented Off now/On now/Auto control *and* all three Greedy buttons for
+every device, even one with no control switch configured at all — disabled and dimmed,
+with a tooltip explaining why, rather than omitted. Rows for a controllable and a
+forecast-only device line up identically instead of the row width jumping around
+depending on what's wired up.
+
+**Tooltips.** Every hint on this card (disabled-control reasons, Greedy button
+explanations, the boost ceiling note, sparkline bar dates) is a custom JS-delegated
+popup (`_initTooltip`/`data-tip` in `grid-lens-load-control-card.js`), not the native
+`title=""` attribute — shows in ~150 ms on hover instead of the browser's own ~1 s
+delay, and instantly on keyboard/touch focus (every `[data-tip]` element carries
+`tabindex="0"` so touch and keyboard can reach it, since native title tooltips are
+unreliable to trigger by tap).
 
 ---
 
@@ -294,8 +312,11 @@ and optionally gates Greedy Consumption.
 **Card:** `grid-lens-defer-schedule-card.js`. **Store:** `deferrable_schedules.py`.
 **Helpers:** `schedule_grid.py` (`slot_allowed`, `week_from_hours`, `rolling_window_hours`).
 
-**Fallback chain:** stored weekly grid → static `deferrable_load_hours` spec → all-allowed.
-Every layer **fails OPEN** — a malformed store must never silently pin a device off.
+**Fallback chain:** stored weekly grid → all-allowed. This is now the *only* place a
+sensor-backed device's availability window is set — the config-flow's old static
+`deferrable_load_hours` field (a comma-separated-hours text box per device, from before this
+card existed) was removed 2026-08-02 as redundant with it. Both layers **fail OPEN** — a
+malformed/missing store must never silently pin a device off, it just means unrestricted.
 
 **Gotcha:** the optimiser's first day-chunk is anchored to *now*, not local midnight, so it
 spans two weekdays. "Hours available in the next 24 h" (`rolling_window_hours`) is the right
@@ -310,6 +331,16 @@ tonight, not its usual 13". `number.*_<device>_today_boost`, 0 = use the 14-day 
 average.
 
 **Files:** `number.py`, `deferrable_overrides.py`, `override_expiry.py`.
+
+**History sparkline.** The Load Control card shows a 14-day daily-kWh bar sparkline next to
+each device's Today Boost input (including today, partial) plus the average of the completed
+days — the same 14-day window `load_history.py` averages for the optimizer's own default, so
+the number the sparkline centers on is the number Today Boost is overriding. Fetched
+client-side via the recorder's `recorder/statistics_during_period` WS call
+(`period: 'day', types: ['change']`), cached per device for 15 minutes
+(`grid-lens-load-control-card.js::_fetchHistory`/`_pollHistory`) — no new backend entity or
+config. A device with no recorder statistics yet (freshly added sensor) simply shows no
+sparkline rather than an error.
 
 **Behaviour**
 - Carryover is deliberate and bounded: a boost persists across the post-midnight slots the

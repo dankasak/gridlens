@@ -29,7 +29,6 @@ from homeassistant.helpers.event import async_track_time_change
 from homeassistant.util import dt as dt_util
 
 from ..const import (
-    CONF_DEFERRABLE_LOAD_HOURS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_SWITCHES,
@@ -68,11 +67,9 @@ class LoadControlManager:
         max_kw: list = list(d.get(CONF_DEFERRABLE_LOAD_MAX_KW, []) or [])
         switches: list = list(d.get(CONF_DEFERRABLE_LOAD_SWITCHES, []) or [])
         # Retained for Greedy Consumption's schedule lookup (_schedule_allows_now):
-        # sensor_id is the schedule store's key, hours_cfg is the static fallback spec
-        # for devices with no stored weekly grid — same two sources
-        # advisory/coordinator.py._deferrable_for_horizon already reads.
+        # sensor_id is the schedule store's key for a device's stored weekly grid —
+        # same source advisory/coordinator.py._deferrable_for_horizon already reads.
         self._sensor_ids = sensors
-        self._hours_cfg: list = list(d.get(CONF_DEFERRABLE_LOAD_HOURS, []) or [])
         # Live signed grid power sensor (W, +import/-export) for Greedy Consumption's
         # export-surplus condition. "" = not configured — that condition simply never
         # fires (the import-price-free condition still works without it).
@@ -383,13 +380,11 @@ class LoadControlManager:
             return None
 
     async def _schedule_allows_now(self, index: int, now: datetime) -> bool:
-        """Does device ``index``'s availability window/weekly schedule allow it to run
-        right now? Reused verbatim from advisory/coordinator.py._deferrable_for_horizon's
-        sourcing: the stored weekly grid (schedule editor) when set, else the static
-        deferrable_load_hours config spec. Both layers fail OPEN on malformed data
-        (schedule_grid.slot_allowed's own contract) — a broken store must never silently
-        pin a device off."""
-        from ..const import parse_hours_spec
+        """Does device ``index``'s stored weekly schedule (dashboard schedule editor)
+        allow it to run right now? Reused verbatim from
+        advisory/coordinator.py._deferrable_for_horizon's sourcing. No stored schedule
+        yet = unrestricted (schedule_grid.slot_allowed's own contract fails OPEN on a
+        malformed/missing grid) — a broken store must never silently pin a device off."""
         from ..schedule_grid import slot_allowed, week_from_hours
 
         store = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_deferrable_schedules")
@@ -401,12 +396,7 @@ class LoadControlManager:
             except Exception:  # noqa: BLE001 — a broken store must not block ticking
                 week = None
         if week is None:
-            spec = self._hours_cfg[index] if index < len(self._hours_cfg) else "all"
-            try:
-                allowed = parse_hours_spec(spec)
-            except Exception:  # noqa: BLE001
-                allowed = None
-            week = week_from_hours(allowed)
+            week = week_from_hours(None)
         local = dt_util.as_local(now)
         return slot_allowed(week, local.weekday(), local.hour, local.minute)
 

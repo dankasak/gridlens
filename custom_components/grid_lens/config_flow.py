@@ -41,7 +41,6 @@ from .const import (
     CONF_INVERTER_TRANSPORT,
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
-    CONF_DEFERRABLE_LOAD_HOURS,
     CONF_DEFERRABLE_LOAD_SWITCHES,
     CONF_DEFERRABLE_LOAD_SOC_SENSORS,
     CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD,
@@ -375,51 +374,42 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_device_power(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.FlowResult:
-        """Capture max power draw and availability hours for each selected deferrable load."""
+        """Capture max power draw for each selected deferrable load. Availability
+        windows are no longer set here — paint them on the Deferrable Loads dashboard
+        card's weekly schedule after setup (a device is unrestricted, any hour, until
+        you do)."""
         selected = self._sensor_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
         if not selected:
             return await self.async_step_declared_loads()
 
-        errors: dict[str, str] = {}
         if user_input is not None:
-            hours_list = [
-                str(user_input.get(f"hours_{i}", "all")).strip() or "all"
-                for i in range(len(selected))
+            max_kw_list = [float(user_input.get(f"max_kw_{i}", 3.5)) for i in range(len(selected))]
+            # Optional control switch per device ("" = forecast-only, no actuation).
+            switches_list = [
+                str(user_input.get(f"switch_{i}", "") or "") for i in range(len(selected))
             ]
-            try:
-                for spec in hours_list:
-                    parse_hours_spec(spec)
-            except ValueError:
-                errors["base"] = "invalid_hours"
-            if not errors:
-                max_kw_list = [float(user_input.get(f"max_kw_{i}", 3.5)) for i in range(len(selected))]
-                # Optional control switch per device ("" = forecast-only, no actuation).
-                switches_list = [
-                    str(user_input.get(f"switch_{i}", "") or "") for i in range(len(selected))
-                ]
-                # Optional battery/EV SOC sensor per device ("" = none, e.g. a pool pump).
-                soc_list = [
-                    str(user_input.get(f"soc_{i}", "") or "") for i in range(len(selected))
-                ]
-                # Optional Controlled Load register wiring per device ("" = not on CL).
-                # Only present in user_input at all when at least one CL register was
-                # offered (self._has_cl1/_has_cl2) — otherwise every device defaults "".
-                cl_list = [
-                    str(user_input.get(f"cl_{i}", "") or "") for i in range(len(selected))
-                ]
-                # Whether that device's energy is currently mixed into the main
-                # energy_sensor reading (needs subtracting before CL-pricing) — same
-                # gating as cl_list above.
-                in_agg_list = [
-                    bool(user_input.get(f"in_aggregate_{i}", False)) for i in range(len(selected))
-                ]
-                self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
-                self._sensor_data[CONF_DEFERRABLE_LOAD_HOURS] = hours_list
-                self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
-                self._sensor_data[CONF_DEFERRABLE_LOAD_SOC_SENSORS] = soc_list
-                self._sensor_data[CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD] = cl_list
-                self._sensor_data[CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE] = in_agg_list
-                return await self.async_step_declared_loads()
+            # Optional battery/EV SOC sensor per device ("" = none, e.g. a pool pump).
+            soc_list = [
+                str(user_input.get(f"soc_{i}", "") or "") for i in range(len(selected))
+            ]
+            # Optional Controlled Load register wiring per device ("" = not on CL).
+            # Only present in user_input at all when at least one CL register was
+            # offered (self._has_cl1/_has_cl2) — otherwise every device defaults "".
+            cl_list = [
+                str(user_input.get(f"cl_{i}", "") or "") for i in range(len(selected))
+            ]
+            # Whether that device's energy is currently mixed into the main
+            # energy_sensor reading (needs subtracting before CL-pricing) — same
+            # gating as cl_list above.
+            in_agg_list = [
+                bool(user_input.get(f"in_aggregate_{i}", False)) for i in range(len(selected))
+            ]
+            self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_SOC_SENSORS] = soc_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD] = cl_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE] = in_agg_list
+            return await self.async_step_declared_loads()
 
         # Controlled Load register choices, gated on the flags collected in
         # async_step_controlled_load. Offered per-device below only if non-empty.
@@ -442,7 +432,6 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     mode=selector.NumberSelectorMode.BOX,
                 )
             )
-            schema_dict[vol.Optional(f"hours_{i}", default="all")] = selector.TextSelector()
             # Optional: a switch.* entity GridLens turns on/off to actuate this load. Leave
             # unset for forecast-only devices (e.g. an ESS-managed port with no HA switch).
             schema_dict[vol.Optional(f"switch_{i}")] = selector.EntitySelector(
@@ -481,7 +470,6 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="device_power",
             data_schema=vol.Schema(schema_dict),
             description_placeholders={"devices": "\n".join(device_lines)},
-            errors=errors,
         )
 
     async def async_step_declared_loads(
@@ -1000,14 +988,15 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         )
 
     async def async_step_device_power(self, user_input=None):
-        """Capture max power draw and availability hours for each selected deferrable load."""
+        """Capture max power draw for each selected deferrable load. Availability
+        windows are no longer set here — paint them on the Deferrable Loads dashboard
+        card's weekly schedule (a device is unrestricted, any hour, until you do)."""
         entry_data = self._config_entry.data
         selected = self._sensor_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
         if not selected:
             return await self.async_step_declared_loads()
 
         existing_max_kw = entry_data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
-        existing_hours = entry_data.get(CONF_DEFERRABLE_LOAD_HOURS, [])
         existing_switches = entry_data.get(CONF_DEFERRABLE_LOAD_SWITCHES, [])
         existing_soc = entry_data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, [])
         existing_cl = entry_data.get(CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD, [])
@@ -1016,7 +1005,6 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         # list; map by sensor_id so reordering/removing devices keeps defaults.
         prev_sensors = entry_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
         prev_kw = {s: existing_max_kw[i] for i, s in enumerate(prev_sensors) if i < len(existing_max_kw)}
-        prev_hours = {s: existing_hours[i] for i, s in enumerate(prev_sensors) if i < len(existing_hours)}
         prev_switch = {
             s: existing_switches[i]
             for i, s in enumerate(prev_sensors)
@@ -1038,38 +1026,26 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             if i < len(existing_in_agg)
         }
 
-        errors: dict[str, str] = {}
         if user_input is not None:
-            hours_list = [
-                str(user_input.get(f"hours_{i}", "all")).strip() or "all"
-                for i in range(len(selected))
+            max_kw_list = [float(user_input.get(f"max_kw_{i}", 3.5)) for i in range(len(selected))]
+            switches_list = [
+                str(user_input.get(f"switch_{i}", "") or "") for i in range(len(selected))
             ]
-            try:
-                for spec in hours_list:
-                    parse_hours_spec(spec)
-            except ValueError:
-                errors["base"] = "invalid_hours"
-            if not errors:
-                max_kw_list = [float(user_input.get(f"max_kw_{i}", 3.5)) for i in range(len(selected))]
-                switches_list = [
-                    str(user_input.get(f"switch_{i}", "") or "") for i in range(len(selected))
-                ]
-                soc_list = [
-                    str(user_input.get(f"soc_{i}", "") or "") for i in range(len(selected))
-                ]
-                cl_list = [
-                    str(user_input.get(f"cl_{i}", "") or "") for i in range(len(selected))
-                ]
-                in_agg_list = [
-                    bool(user_input.get(f"in_aggregate_{i}", False)) for i in range(len(selected))
-                ]
-                self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
-                self._sensor_data[CONF_DEFERRABLE_LOAD_HOURS] = hours_list
-                self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
-                self._sensor_data[CONF_DEFERRABLE_LOAD_SOC_SENSORS] = soc_list
-                self._sensor_data[CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD] = cl_list
-                self._sensor_data[CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE] = in_agg_list
-                return await self.async_step_declared_loads()
+            soc_list = [
+                str(user_input.get(f"soc_{i}", "") or "") for i in range(len(selected))
+            ]
+            cl_list = [
+                str(user_input.get(f"cl_{i}", "") or "") for i in range(len(selected))
+            ]
+            in_agg_list = [
+                bool(user_input.get(f"in_aggregate_{i}", False)) for i in range(len(selected))
+            ]
+            self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_SOC_SENSORS] = soc_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD] = cl_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE] = in_agg_list
+            return await self.async_step_declared_loads()
 
         # Controlled Load register choices, gated on the flags collected in
         # async_step_controlled_load. Offered per-device below only if non-empty.
@@ -1092,9 +1068,6 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                     unit_of_measurement="kW",
                     mode=selector.NumberSelectorMode.BOX,
                 )
-            )
-            schema_dict[vol.Optional(f"hours_{i}", default=prev_hours.get(sensor_id, "all"))] = (
-                selector.TextSelector()
             )
             # Optional control switch; pre-fill the previously saved one (vol.Optional with
             # no default when unset, so the field renders empty rather than forcing a value).
@@ -1139,7 +1112,6 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             step_id="device_power",
             data_schema=vol.Schema(schema_dict),
             description_placeholders={"devices": "\n".join(device_lines)},
-            errors=errors,
         )
 
     async def async_step_declared_loads(self, user_input=None):

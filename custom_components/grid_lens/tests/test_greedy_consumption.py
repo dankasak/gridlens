@@ -432,7 +432,6 @@ def _mgr(extra_data=None, grid_power_sensor=""):
         "deferrable_load_sensors": ["sensor.pool"],
         "deferrable_load_max_kw": [2.0],
         "deferrable_load_switches": ["switch.pool"],
-        "deferrable_load_hours": ["9-17"],
     }
     if grid_power_sensor:
         data["grid_power_sensor"] = grid_power_sensor
@@ -477,29 +476,32 @@ def test_manager_no_grid_power_sensor_configured():
     assert m._read_grid_power_w() is None
 
 
-def test_manager_schedule_static_fallback():
-    # "9-17" -> allowed hours 9..16 inclusive (end-exclusive per parse_hours_spec).
+def test_manager_schedule_default_unrestricted():
+    # No stored weekly grid painted yet — the device is unrestricted (any hour) rather
+    # than falling back to a static config spec (that field was removed 2026-08-02; the
+    # dashboard schedule card is the only place an availability window is set now).
     m, _hass = _mgr()
+
+    async def go():
+        assert await m._schedule_allows_now(0, _T0) is True
+        assert await m._schedule_allows_now(0, _T0.replace(hour=20)) is True
+
+    _run_async(go)
+
+
+def test_manager_schedule_store_restricts_hours():
+    # A stored weekly grid (painted on the dashboard schedule card) is honored even
+    # though the no-schedule default is unrestricted — hours left off actually block.
+    week_9_to_17 = [[1 if 18 <= s < 34 else 0 for s in range(48)] for _ in range(7)]
+    m, hass = _mgr()
+    hass.data[DOMAIN] = {f"{m.entry.entry_id}_deferrable_schedules":
+                         FakeScheduleStore({"sensor.pool": week_9_to_17})}
 
     async def go():
         # _T0 is Friday 12:00 UTC-as-local -> inside 9-17.
         assert await m._schedule_allows_now(0, _T0) is True
         # 20:00 same day -> outside 9-17.
         assert await m._schedule_allows_now(0, _T0.replace(hour=20)) is False
-
-    _run_async(go)
-
-
-def test_manager_schedule_store_overrides_static_fallback():
-    # Static fallback would disallow 20:00, but a stored weekly grid (all-hours-on)
-    # takes priority over it.
-    week_all_on = [[1] * 48 for _ in range(7)]
-    m, hass = _mgr()
-    hass.data[DOMAIN] = {f"{m.entry.entry_id}_deferrable_schedules":
-                         FakeScheduleStore({"sensor.pool": week_all_on})}
-
-    async def go():
-        assert await m._schedule_allows_now(0, _T0.replace(hour=20)) is True
 
     _run_async(go)
 
@@ -648,8 +650,8 @@ if __name__ == "__main__":
         ("manager_set_greedy_roundtrip", test_manager_set_greedy_roundtrip),
         ("manager_reads_grid_power_sensor", test_manager_reads_grid_power_sensor),
         ("manager_no_grid_power_sensor_configured", test_manager_no_grid_power_sensor_configured),
-        ("manager_schedule_static_fallback", test_manager_schedule_static_fallback),
-        ("manager_schedule_store_overrides_static_fallback", test_manager_schedule_store_overrides_static_fallback),
+        ("manager_schedule_default_unrestricted", test_manager_schedule_default_unrestricted),
+        ("manager_schedule_store_restricts_hours", test_manager_schedule_store_restricts_hours),
         ("manager_forecast_free_kwh_counts_spilled_export", test_manager_forecast_free_kwh_counts_spilled_export),
         ("manager_forecast_free_kwh_ignores_paid_export", test_manager_forecast_free_kwh_ignores_paid_export),
         ("manager_forecast_free_kwh_counts_unused_free_import", test_manager_forecast_free_kwh_counts_unused_free_import),

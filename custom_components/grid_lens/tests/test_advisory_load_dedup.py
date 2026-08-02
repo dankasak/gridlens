@@ -79,7 +79,6 @@ def _install_stubs() -> None:
     opt.BatteryOptimizer = type("BatteryOptimizer", (), {})
     const = _mod("gl.const")
     const.DOMAIN = "grid_lens"
-    const.parse_hours_spec = lambda spec: None
     forecast = _mod("gl.advisory.forecast")
     forecast.FlatLoadForecaster = type("FlatLoadForecaster", (), {})
     forecast.ForecastProvider = type("ForecastProvider", (), {})

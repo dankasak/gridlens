@@ -2,6 +2,8 @@
  * Grid Lens Deferrable Load Control Card
  *
  * One row per configured deferrable load (controllable or not), each with:
+ *   - a 14-day daily-kWh sparkline (client-side recorder statistics fetch, no new
+ *     entity) so a user reaching for Today Boost can see what "typical" looks like;
  *   - a Today Boost kWh input (GridLensDeferrableOverrideNumber — see number.py),
  *     merged in from the formerly-separate Boost Tuning card/tiles 2026-07-31;
  *   - Greedy Consumption / Greedy Respects Schedule toggles, when the device has a
@@ -38,10 +40,20 @@
  */
 import { STYLE, esc } from './grid-lens-chart-common.js?v=20260802b';
 
+const HISTORY_DAYS = 14;
+const HISTORY_REFRESH_MS = 15 * 60000;
+
 function friendlyNote(note) {
   if (!note) return '';
   if (note.startsWith('command_error')) return 'Command error';
   return note.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase());
+}
+
+function localMidnightDaysAgo(n) {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - n);
+  return d;
 }
 
 class GridLensLoadControlCard extends HTMLElement {
@@ -52,6 +64,12 @@ class GridLensLoadControlCard extends HTMLElement {
     this._hass = null;
     this._sig = '';
     this._dark = false;
+    // Per-device daily-kWh history for the sparkline, keyed by energy_entity — fetched
+    // lazily and cached, since it's a stats query and not part of the live hass state
+    // (nothing pushes an update when a new day's statistic lands, so it's refreshed on a
+    // timer rather than on every hass tick).
+    this._historyCache = {};
+    this._historyPending = new Set();
   }
 
   setConfig(config) {
@@ -159,6 +177,50 @@ class GridLensLoadControlCard extends HTMLElement {
     return this._windowHours(d.schedule || d.default_schedule) * kw;
   }
 
+  // Daily kWh for the last HISTORY_DAYS days (today's bucket included, partial), from the
+  // recorder's own long-term "change" statistic for a total_increasing energy sensor — the
+  // exact mechanism advisory/load_history.py uses to build the optimizer's own 14-day
+  // average, so the sparkline shows the same number Today Boost is overriding rather than
+  // a second, possibly-disagreeing computation. Returns null (not []) on failure so the
+  // caller can tell "no data yet" apart from "queried, nothing came back".
+  async _fetchHistory(eid) {
+    try {
+      const res = await this._hass.callWS({
+        type: 'recorder/statistics_during_period',
+        start_time: localMidnightDaysAgo(HISTORY_DAYS - 1).toISOString(),
+        end_time: new Date().toISOString(),
+        statistic_ids: [eid],
+        period: 'day',
+        types: ['change'],
+      });
+      const rows = (res && res[eid]) || [];
+      return rows
+        .map((r) => ({ start: new Date(r.start), kwh: r.change == null ? null : Math.max(0, +r.change) }))
+        .filter((d) => d.kwh != null && !isNaN(d.start.getTime()));
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Kicks off (or reuses) a history fetch for every row's energy sensor. Cheap to call on
+  // every hass tick — a pending fetch or a cache entry younger than HISTORY_REFRESH_MS is a
+  // no-op — so it can just live at the top of the hass setter rather than needing its own
+  // scheduling.
+  _pollHistory(rows) {
+    for (const r of rows) {
+      const eid = r.device.energy_entity;
+      if (!eid || this._historyPending.has(eid)) continue;
+      const cached = this._historyCache[eid];
+      if (cached && Date.now() - cached.ts < HISTORY_REFRESH_MS) continue;
+      this._historyPending.add(eid);
+      this._fetchHistory(eid).then((days) => {
+        this._historyPending.delete(eid);
+        this._historyCache[eid] = { ts: Date.now(), days };
+        this._paint();
+      });
+    }
+  }
+
   _resolveRows() {
     const devices = this._resolveDevices();
     const rows = devices.map((d) => {
@@ -183,6 +245,7 @@ class GridLensLoadControlCard extends HTMLElement {
     if (dark !== this._dark) { this._dark = dark; this.classList.toggle('dark', dark); }
 
     const rows = this._resolveRows();
+    this._pollHistory(rows);
     const sig = rows.map((r) => {
       const c = r.controlEid && hass.states[r.controlEid];
       const s = r.selEid && hass.states[r.selEid];
@@ -259,6 +322,9 @@ class GridLensLoadControlCard extends HTMLElement {
                background: transparent; color: var(--ink2); cursor: pointer; }
         .greedy .gbtn.on { background: var(--good); color: #fff; border-color: var(--good); }
         .greedy .gbtn ha-icon { --mdc-icon-size: 15px; }
+        /* Always rendered, even for a non-controllable device — same disabled treatment as
+           .ovr.disabled, so every row keeps the same three-icon width and rows line up. */
+        .greedy .gbtn.disabled { opacity: .35; cursor: not-allowed; }
         .boost { display: flex; align-items: center; gap: 3px; flex: 0 0 auto;
                border: 1px solid var(--border); border-radius: 7px; padding: 3px 7px; }
         .boost.active { border-color: var(--good); }
@@ -268,9 +334,111 @@ class GridLensLoadControlCard extends HTMLElement {
                font-size: 12px; font-family: inherit; text-align: right; }
         .boost-input::-webkit-outer-spin-button, .boost-input::-webkit-inner-spin-button { margin: 0; }
         .boost-unit { font-size: 10px; color: var(--ink2); }
+        /* Daily-kWh sparkline: how much this device has actually drawn per day over the
+           last two weeks, so a user reaching for Today Boost has a number to react to
+           instead of guessing. Deliberately not colour-coded per device (unlike the
+           schedule/power-flow cards) — this is a single-series magnitude read, not an
+           identity to keep consistent across cards. */
+        .spark { display: flex; flex-direction: column; align-items: center; gap: 2px;
+                 flex: 0 0 auto; padding: 0 2px; }
+        .sbars { display: flex; align-items: flex-end; gap: 1.5px; height: 22px; }
+        .sbar { width: 4px; min-height: 1.5px; background: var(--ink2); opacity: .5;
+                border-radius: 1px 1px 0 0; }
+        .sbar.today { background: var(--ink); opacity: .85; }
+        .spark-avg { font-size: 9.5px; color: var(--ink2); white-space: nowrap; }
+        .spark-ph { width: 62px; height: 22px; }
+        /* Custom tooltip: a JS-delegated popup (see _initTooltip) standing in for the
+           native title="" tooltip everywhere on this card. Native title tooltips have a
+           long, browser-controlled show delay (~1s in Chrome) and are unreliable to
+           trigger on touch; this shows fast on hover and instantly on keyboard/touch
+           focus, and [data-tip] elements get tabindex so touch/keyboard can reach them. */
+        .card { position: relative; }
+        [data-tip] { outline: none; }
+        [data-tip]:focus-visible { box-shadow: 0 0 0 2px var(--good); border-radius: 4px; }
+        .tt-pop { position: absolute; left: 0; top: 0; transform: translate(-50%, calc(-100% - 8px));
+               background: var(--ink); color: var(--surface); font-size: 11px; font-weight: 500;
+               line-height: 1.4; padding: 6px 9px; border-radius: 7px; max-width: 230px;
+               white-space: normal; pointer-events: none; opacity: 0; visibility: hidden;
+               box-shadow: 0 4px 14px rgba(0,0,0,.28); z-index: 30; transition: opacity .08s ease; }
+        .tt-pop.show { opacity: 1; visibility: visible; }
       </style>
-      <div class="card"><div class="body"></div></div>
+      <div class="card"><div class="body"></div><div class="tt-pop"></div></div>
     `;
+    this._initTooltip();
+  }
+
+  // Fast, delegated replacement for native title="" tooltips (see the .tt-pop CSS above
+  // for why). Bound once on the shadow root — mouseover/mouseout/focusin/focusout all
+  // bubble, so a single pair of listeners covers every [data-tip] element this card ever
+  // renders, including rows repainted later by _paint(). TT_DELAY is the whole point of
+  // this: short enough that a tooltip actually appears before the pointer moves on,
+  // unlike the native browser default.
+  _initTooltip() {
+    if (this._ttBound) return;
+    this._ttBound = true;
+    const TT_DELAY = 150;
+    const root = this.shadowRoot;
+    let timer = null;
+    let shownFor = null;
+
+    const place = (el) => {
+      const card = root.querySelector('.card');
+      const pop = root.querySelector('.tt-pop');
+      if (!card || !pop) return;
+      const er = el.getBoundingClientRect();
+      const cr = card.getBoundingClientRect();
+      const anchorX = er.left - cr.left + er.width / 2;
+      pop.style.left = `${anchorX}px`;
+      pop.style.top = `${er.top - cr.top}px`;
+      pop.classList.add('show');
+      requestAnimationFrame(() => {
+        const pw = pop.offsetWidth;
+        const half = pw / 2;
+        let left = anchorX;
+        if (left - half < 4) left = 4 + half;
+        if (left + half > cr.width - 4) left = cr.width - 4 - half;
+        pop.style.left = `${left}px`;
+      });
+    };
+    const show = (el) => {
+      const text = el.getAttribute('data-tip');
+      const pop = root.querySelector('.tt-pop');
+      if (!text || !pop) return;
+      pop.textContent = text;
+      shownFor = el;
+      place(el);
+    };
+    const hide = (el) => {
+      if (el && shownFor !== el) return;
+      shownFor = null;
+      const pop = root.querySelector('.tt-pop');
+      if (pop) pop.classList.remove('show');
+    };
+    root.addEventListener('mouseover', (e) => {
+      const el = e.target.closest('[data-tip]');
+      if (!el || el === shownFor) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => show(el), TT_DELAY);
+    });
+    root.addEventListener('mouseout', (e) => {
+      const el = e.target.closest('[data-tip]');
+      if (!el) return;
+      clearTimeout(timer);
+      hide(el);
+    });
+    // Keyboard tab-focus and touch (many mobile browsers focus a tapped control before
+    // firing its click) — shown immediately, no delay, since focus is already a
+    // deliberate, discrete user action rather than an in-flight pointer move.
+    root.addEventListener('focusin', (e) => {
+      const el = e.target.closest('[data-tip]');
+      if (!el) return;
+      clearTimeout(timer);
+      show(el);
+    });
+    root.addEventListener('focusout', (e) => {
+      const el = e.target.closest('[data-tip]');
+      if (el) hide(el);
+    });
   }
 
   // One-line live greedy status from the control switch's attributes (see
@@ -307,6 +475,35 @@ class GridLensLoadControlCard extends HTMLElement {
         + `<span class="gbar"><span style="width:${pct.toFixed(0)}%"></span></span></div>`;
     }
     return `<div class="greedy-line">Greedy: armed, waiting for free energy</div>`;
+  }
+
+  // 14-day daily-kWh bar sparkline for a device's energy sensor — a quick visual answer
+  // to "what does this thing normally use per day?" right next to the Today Boost input
+  // it informs. Undefined cache entry = still loading (blank placeholder, no layout
+  // jump once data arrives); null `days` = the stats query failed or came back empty
+  // (sensor too new, no long-term stats yet) — rendered as nothing rather than an error,
+  // since a device without two weeks of history yet is a normal, expected state.
+  _sparklineHtml(eid) {
+    const entry = this._historyCache[eid];
+    if (!entry) return '<div class="spark-ph"></div>';
+    const days = entry.days;
+    if (!days || !days.length) return '';
+    const todayKey = new Date().toDateString();
+    const full = days.filter((d) => d.start.toDateString() !== todayKey);
+    const avg = full.length ? full.reduce((s, d) => s + d.kwh, 0) / full.length : null;
+    const max = Math.max(0.1, ...days.map((d) => d.kwh));
+    const bars = days.map((d) => {
+      const isToday = d.start.toDateString() === todayKey;
+      const h = Math.max(1.5, (d.kwh / max) * 22).toFixed(1);
+      const when = d.start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+      const label = `${when}: ${d.kwh.toFixed(1)} kWh${isToday ? ' (so far today)' : ''}`;
+      return `<div class="sbar${isToday ? ' today' : ''}" style="height:${h}px" tabindex="0" data-tip="${esc(label)}"></div>`;
+    }).join('');
+    return `
+      <div class="spark" tabindex="0" data-tip="Daily energy use, last ${days.length} days">
+        <div class="sbars">${bars}</div>
+        ${avg != null ? `<div class="spark-avg">avg ${avg.toFixed(1)} kWh/d</div>` : ''}
+      </div>`;
   }
 
   _paint() {
@@ -349,7 +546,7 @@ class GridLensLoadControlCard extends HTMLElement {
       let controlHtml;
       if (!d.controllable) {
         controlHtml = `
-          <div class="ovr disabled" title="Full control has not yet been configured — assign a switch via the Grid Lens integration's Reconfigure flow to enable Off now / On now / Auto.">
+          <div class="ovr disabled" tabindex="0" data-tip="Full control has not yet been configured — assign a switch via the Grid Lens integration's Reconfigure flow to enable Off now / On now / Auto.">
             <button disabled>Off now</button>
             <button disabled>On now</button>
             <button disabled>Auto</button>
@@ -357,50 +554,57 @@ class GridLensLoadControlCard extends HTMLElement {
       } else if (r.selEid) {
         const cur = hass.states[r.selEid] ? hass.states[r.selEid].state : null;
         controlHtml = `
-          <div class="ovr" data-sel="${esc(r.selEid)}" data-ctl="${esc(r.controlEid)}" title="Manual override">
+          <div class="ovr" data-sel="${esc(r.selEid)}" data-ctl="${esc(r.controlEid)}" data-tip="Manual override">
             <button data-opt="Force Off" class="${cur === 'Force Off' ? 'active off' : ''}">Off now</button>
             <button data-opt="Force On" class="${cur === 'Force On' ? 'active' : ''}">On now</button>
             <button data-opt="Auto" class="${cur === 'Auto' && on ? 'active' : ''}"
-              title="Grid Lens schedules this load">Auto</button>
+              data-tip="Grid Lens schedules this load">Auto</button>
           </div>`;
       } else if (r.controlEid) {
-        controlHtml = `<div class="sw ${on ? 'on' : ''}" data-eid="${esc(r.controlEid)}" title="${on ? 'Turn off' : 'Turn on'}"></div>`;
+        controlHtml = `<div class="sw ${on ? 'on' : ''}" data-eid="${esc(r.controlEid)}" tabindex="0" data-tip="${on ? 'Turn off' : 'Turn on'}"></div>`;
       } else {
         // controllable per config, but the control entities haven't appeared yet (a
         // startup race) — same disabled placeholder, self-heals on the next repaint.
         controlHtml = `
-          <div class="ovr disabled" title="Control entities are still loading…">
+          <div class="ovr disabled" tabindex="0" data-tip="Control entities are still loading…">
             <button disabled>Off now</button><button disabled>On now</button><button disabled>Auto</button>
           </div>`;
       }
 
       // Greedy Consumption's per-device toggles (see switch.py) — opportunistic "on"
       // whenever import is free, export is being wasted, or the plan forecasts a spill
-      // bigger than this load, on top of Auto/plan control. Only meaningful (and only
-      // created) for a controllable device.
-      let greedyHtml = '';
-      if (r.controlEid && r.gEid) {
-        const gOn = hass.states[r.gEid] && hass.states[r.gEid].state === 'on';
-        const gsOn = r.gsEid && hass.states[r.gsEid] && hass.states[r.gsEid].state === 'on';
-        const gfOn = r.gfEid && hass.states[r.gfEid] && hass.states[r.gfEid].state === 'on';
-        greedyHtml = `
-          <div class="greedy">
-            <div class="gbtn${gOn ? ' on' : ''}" data-eid="${esc(r.gEid)}"
-                 title="Greedy Consumption: turn on whenever import is free or export is being wasted">
-              <ha-icon icon="mdi:leaf"></ha-icon>
-            </div>
-            ${r.gsEid ? `
-            <div class="gbtn${gsOn ? ' on' : ''}" data-eid="${esc(r.gsEid)}"
-                 title="Greedy Respects Schedule: only greedy-fire inside this load's own availability window">
-              <ha-icon icon="mdi:calendar-clock"></ha-icon>
-            </div>` : ''}
-            ${r.gfEid ? `
-            <div class="gbtn${gfOn ? ' on' : ''}" data-eid="${esc(r.gfEid)}"
-                 title="Greedy Forecast Surplus: also start early when the plan forecasts more free energy going to waste than this load could use (needs Greedy Consumption on; may import briefly)">
-              <ha-icon icon="mdi:weather-sunny-alert"></ha-icon>
-            </div>` : ''}
-          </div>`;
-      }
+      // bigger than this load, on top of Auto/plan control. Always renders all three
+      // icons — disabled/dimmed with an explanatory tooltip when the device isn't
+      // controllable (or its switches haven't appeared yet) — so every row keeps the
+      // same shape and rows line up regardless of what's actually configured, the same
+      // treatment the control segment above already gets.
+      const greedyWhy = !d.controllable
+        ? "Only available once this load has a control switch — assign one via the Grid Lens integration's Reconfigure flow."
+        : 'Loading…';
+      const gBtn = (icon, eid, on2, label) => eid
+        ? `<div class="gbtn${on2 ? ' on' : ''}" data-eid="${esc(eid)}" tabindex="0" data-tip="${esc(label)}">
+             <ha-icon icon="${icon}"></ha-icon>
+           </div>`
+        : `<div class="gbtn disabled" tabindex="0" data-tip="${esc(greedyWhy)}">
+             <ha-icon icon="${icon}"></ha-icon>
+           </div>`;
+      const gOn = r.gEid && hass.states[r.gEid] && hass.states[r.gEid].state === 'on';
+      const gsOn = r.gsEid && hass.states[r.gsEid] && hass.states[r.gsEid].state === 'on';
+      const gfOn = r.gfEid && hass.states[r.gfEid] && hass.states[r.gfEid].state === 'on';
+      const greedyHtml = `
+        <div class="greedy">
+          ${gBtn('mdi:leaf', r.gEid, gOn,
+            'Greedy Consumption: turn on whenever import is free or export is being wasted')}
+          ${gBtn('mdi:calendar-clock', r.gsEid, gsOn,
+            "Greedy Respects Schedule: only greedy-fire inside this load's own availability window")}
+          ${gBtn('mdi:weather-sunny-alert', r.gfEid, gfOn,
+            'Greedy Forecast Surplus: also start early when the plan forecasts more free energy going to waste than this load could use (needs Greedy Consumption on; may import briefly)')}
+        </div>`;
+
+      // 14-day daily-kWh sparkline — shown for every device with an energy sensor
+      // (always true for a configured deferrable load today), so it sits right beside
+      // the boost input it's meant to inform.
+      const sparkHtml = this._sparklineHtml(d.energy_entity);
 
       // Today Boost override (merged in from the old boost-tuning-card 2026-07-31) —
       // shown for every device that has one, controllable or not.
@@ -423,7 +627,7 @@ class GridLensLoadControlCard extends HTMLElement {
             + `${ceiling.toFixed(1)} kWh over the next 24 h; anything above that `
             + `cannot be scheduled.`;
         boostHtml = `
-          <div class="boost${active ? ' active' : ''}${over ? ' over' : ''}" title="${esc(tip)}">
+          <div class="boost${active ? ' active' : ''}${over ? ' over' : ''}" tabindex="0" data-tip="${esc(tip)}">
             <input type="number" class="boost-input" data-eid="${esc(r.boostEid)}"
               min="${ba.min ?? 0}" max="${ba.max ?? 999}" step="${ba.step ?? 0.5}"
               value="${shown}">
@@ -440,6 +644,7 @@ class GridLensLoadControlCard extends HTMLElement {
             <div class="meta${isErr ? ' err' : ''}">${meta}</div>
             ${greedyLine}
           </div>
+          ${sparkHtml}
           ${boostHtml}
           ${greedyHtml}
           ${controlHtml}
@@ -455,7 +660,8 @@ class GridLensLoadControlCard extends HTMLElement {
         this._hass.callService('switch', 'toggle', { entity_id: eid });
       });
     });
-    body.querySelectorAll('.gbtn').forEach((el) => {
+    // [data-eid] excludes the always-rendered disabled placeholders (no entity to toggle).
+    body.querySelectorAll('.gbtn[data-eid]').forEach((el) => {
       el.addEventListener('click', () => {
         const eid = el.getAttribute('data-eid');
         this._hass.callService('switch', 'toggle', { entity_id: eid });

@@ -269,8 +269,7 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             now = dt_util.now()
             hours = rolling_window_hours(week, now.weekday(), now.hour, now.minute)
         else:
-            allowed = dev.get("allowed_hours")
-            hours = 24.0 if allowed is None else float(len(set(allowed)))
+            hours = 24.0
         capacity = hours * max_kw
         if target_kwh - capacity > 1e-6:
             _LOGGER.warning(
@@ -305,17 +304,16 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         The mask comes from the device's stored weekly schedule (7x24 per-weekday grid,
         edited on the dashboard schedule card) when one exists — read fresh from the
         shared store every tick, so a schedule edit takes effect within one advisory
-        cycle. Devices with no stored schedule fall back to the static hours config
-        spec (same hours every day), unchanged from before the schedule feature."""
-        from ..const import parse_hours_spec
-        from ..schedule_grid import slot_allowed, week_from_hours
+        cycle. A device with no stored schedule yet is unrestricted (no mask, available
+        every hour) until the user paints one — the schedule card is the only place
+        this is set (see const.py's note on the retired static hours config field)."""
+        from ..schedule_grid import slot_allowed
 
         store = self.hass.data.get(DOMAIN, {}).get(
             f"{self.entry.entry_id}_deferrable_schedules"
         )
-        hours_cfg = self._cfg("deferrable_load_hours", []) or []
         out = []
-        for i, dev in enumerate(self._deferrable_params or []):
+        for dev in (self._deferrable_params or []):
             daily, maxkw = dev.get("daily_kwh", 0.0), dev.get("max_kw", 0.0)
             if daily <= 0 or maxkw <= 0:
                 continue
@@ -325,13 +323,6 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
                     week = await store.async_get(dev.get("sensor_id", ""))
                 except Exception:  # noqa: BLE001 — a broken store must not kill planning
                     week = None
-            if week is None:
-                spec = hours_cfg[i] if i < len(hours_cfg) else "all"
-                try:
-                    allowed = parse_hours_spec(spec)
-                except Exception:  # noqa: BLE001
-                    allowed = None
-                week = None if allowed is None else week_from_hours(allowed)
             mask = None
             if week is not None:
                 mask = []

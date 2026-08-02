@@ -34,7 +34,6 @@ from .const import (
     CONF_MIN_EXPORT_PRICE,
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
-    CONF_DEFERRABLE_LOAD_HOURS,
     CONF_DEFERRABLE_LOAD_SWITCHES,
     CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD,
     CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE,
@@ -45,7 +44,6 @@ from .const import (
     CONF_HAS_DEMAND_TARIFF,
     DEFAULT_DEMAND_WINDOW_HOURS,
     POPULAR_EV_PLANS,
-    parse_hours_spec,
 )
 from .entity_lookup import resolve_device_name, async_get_energy_dashboard_names
 
@@ -96,7 +94,6 @@ class PlanCalculator:
 
         self.deferrable_load_sensors: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
         self.deferrable_load_max_kw: list[float] = entry.data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
-        self.deferrable_load_hours: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_HOURS, [])
         self.deferrable_load_switches: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_SWITCHES, [])
         # Controlled Load register wiring, parallel to deferrable_load_sensors ("" = not
         # CL-wired) — see _build_cl_devices for how this turns into a flat bill line.
@@ -1540,24 +1537,11 @@ class PlanCalculator:
                 else 3.5
             )
 
-            # Availability window (local hours the device can run, e.g. an EV
-            # that is only plugged in overnight).  None = any hour.
-            hours_spec = (
-                self.deferrable_load_hours[i]
-                if i < len(self.deferrable_load_hours)
-                else None
-            )
-            try:
-                allowed_hours = parse_hours_spec(hours_spec)
-            except ValueError as err:
-                _LOGGER.warning(
-                    "Invalid availability hours %r for %s (%s) — treating as 'all'",
-                    hours_spec, sensor_id, err,
-                )
-                allowed_hours = None
-
-            # Stored weekly schedule (7x24 per-weekday grid from the dashboard schedule
-            # card) beats the static hours spec for this device when present.
+            # Availability window: the device's stored weekly schedule (7x24
+            # per-weekday grid from the dashboard schedule card) when the user has
+            # painted one, else unrestricted (any hour) — the schedule card is the
+            # only place this is set now (see const.py's note on the retired static
+            # deferrable_load_hours config field).
             week = None
             sched_store = self.hass.data.get(DOMAIN, {}).get(
                 f"{self.entry.entry_id}_deferrable_schedules"
@@ -1573,7 +1557,7 @@ class PlanCalculator:
                 from .schedule_grid import max_daily_hours
                 window_capacity = max_daily_hours(week) * max_kw
             else:
-                window_capacity = len(allowed_hours or range(24)) * max_kw
+                window_capacity = 24 * max_kw
             if daily_kwh > window_capacity:
                 _LOGGER.warning(
                     "Deferrable %s needs %.1f kWh/day but its availability window "
@@ -1587,14 +1571,12 @@ class PlanCalculator:
                 'name': name,
                 'daily_kwh': daily_kwh,
                 'max_kw': max_kw,
-                'allowed_hours': allowed_hours,
                 'week': week,
             })
             _LOGGER.warning(
                 "Deferrable sensor %s (%s): %.2f kWh/day, max %.1f kW, hours %s",
                 sensor_id, name, daily_kwh, max_kw,
-                "weekly schedule" if week is not None
-                else ("all" if allowed_hours is None else sorted(allowed_hours)),
+                "weekly schedule" if week is not None else "all",
             )
 
         combined_list = [
@@ -2437,28 +2419,21 @@ class PlanCalculator:
         # price tranches. A no-op ([]) for a plan without one.
         conditional_credits = build_conditional_credits(plan, start_time, T)
 
-        # Translate each device's availability into a per-LP-hour mask so the
-        # optimizer only schedules it when it is actually available (e.g. an
-        # EV that is plugged in overnight cannot soak up midday solar). A stored
-        # weekly schedule (per-weekday half-hour grid) wins over the static hours
-        # spec; at this LP's hourly resolution a half-allowed hour becomes a
-        # fractional mask (0.5), capping the device at half its hourly energy.
+        # Translate each device's stored weekly schedule (per-weekday half-hour grid,
+        # painted on the dashboard schedule card) into a per-LP-hour mask so the
+        # optimizer only schedules it when it is actually available (e.g. an EV that
+        # is plugged in overnight cannot soak up midday solar). At this LP's hourly
+        # resolution a half-allowed hour becomes a fractional mask (0.5), capping the
+        # device at half its hourly energy. No stored schedule = no mask = unrestricted.
         from .schedule_grid import hour_fraction
         lp_deferrable_loads = []
         for dev in (deferrable_loads or []):
             week = dev.get('week')
-            allowed = dev.get('allowed_hours')
             lp_dev = dict(dev)
-            if week is not None:
-                lp_dev['hour_mask'] = [
-                    hour_fraction(week, local_dows[t], local_hods[t])
-                    for t in range(T)
-                ]
-            else:
-                lp_dev['hour_mask'] = (
-                    None if allowed is None
-                    else [1 if hod in allowed else 0 for hod in local_hods]
-                )
+            lp_dev['hour_mask'] = (
+                [hour_fraction(week, local_dows[t], local_hods[t]) for t in range(T)]
+                if week is not None else None
+            )
             lp_deferrable_loads.append(lp_dev)
 
         # Run LP optimiser in a thread pool so the event loop stays responsive.

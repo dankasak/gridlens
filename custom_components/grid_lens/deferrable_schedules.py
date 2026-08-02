@@ -8,9 +8,10 @@ and sensor.py's deferrable_loads attribute) — sharing the instance means a sch
 saved from the dashboard is visible on the coordinator's very next tick without a second
 Store object re-reading a possibly-stale copy from disk.
 
-A stored weekly grid replaces the device's static deferrable_load_hours config spec;
-devices with no stored grid keep the config-spec behaviour unchanged. Grid semantics and
-validation live in schedule_grid.py (zero HA imports, offline-testable).
+A device with no stored grid yet is fully unrestricted (any hour) — this store is now the
+only place a sensor-backed device's availability window is set (the static per-device
+deferrable_load_hours config-flow field this replaced was removed 2026-08-02). Grid
+semantics and validation live in schedule_grid.py (zero HA imports, offline-testable).
 """
 from __future__ import annotations
 

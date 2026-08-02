@@ -6,9 +6,12 @@ A device's weekly schedule is a 7x48 grid of 0/1: ``week[weekday][slot]`` where
 is a half-hour of the local day (slot 0 = 00:00-00:30, slot 47 = 23:30-24:00); 1 means
 the device is allowed to run in that half-hour. 7x24 hourly grids are accepted on input
 (each hour expands to its two half-hours) for compatibility, but the canonical stored
-form is always 48 slots. A stored weekly grid *replaces* the device's static
-``deferrable_load_hours`` config spec (which stays as the default seed for
-installs/devices that never touch the schedule editor).
+form is always 48 slots. A sensor-backed device with no stored grid yet is fully
+unrestricted (``week_from_hours(None)``) until the user paints one on the dashboard
+schedule card — that card is the only place a sensor-backed device's availability
+window is set (the static per-device ``deferrable_load_hours`` config-flow field this
+replaced was removed 2026-08-02). ``week_from_hours`` still accepts an explicit hours
+set for other callers (e.g. a declared/dummy load with no schedule card of its own).
 
 Storage shape (one dict per config entry, keyed by the device's energy sensor_id, same
 keying as DeferrableOverrideStore):
@@ -52,8 +55,9 @@ def normalize_week(raw) -> list[list[int]]:
 
 
 def week_from_hours(allowed_hours) -> list[list[int]]:
-    """Seed a weekly grid from a static hours set (``parse_hours_spec`` output) —
-    the same hours on every day. ``None`` (= "all") seeds a fully-allowed grid."""
+    """Build a weekly grid from a static hours set (``parse_hours_spec`` output) — the
+    same hours on every day. ``None`` (= "all") returns a fully-allowed grid; this is
+    how sensor-backed devices with no painted schedule get their default."""
     if allowed_hours is None:
         return [[1] * DAY_SLOTS for _ in range(WEEK_DAYS)]
     allowed = {int(h) for h in allowed_hours}
