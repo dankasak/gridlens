@@ -11,7 +11,8 @@ work-in-progress. This doc is the answer to "what does it do today, and where is
 > **Keep this in sync.** Any change that adds, removes, or materially alters a user-facing
 > feature — a new entity, a new config option, a new card, a changed default — updates this
 > doc **in the same change**. The public docs (`docs/docs.html`, `docs/index.html`) and the
-> video plan (`MARKETING_VIDEO_PLAN.md`) are both downstream of it.
+> video plan (`gridlens-api/MARKETING_VIDEO_PLAN.md` — private repo, moved 2026-08-02) are
+> both downstream of it.
 
 ---
 
