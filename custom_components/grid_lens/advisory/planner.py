@@ -122,6 +122,10 @@ class AdvisoryPlanner:
                     export_w=export_w,
                     import_rate=step.get("import_rate"),
                     export_rate=step.get("export_rate"),
+                    # Whole-slot grid export (PV spill + battery), not just the battery
+                    # share carried by export_w — Greedy Consumption's forecast-surplus
+                    # condition needs the total the plan expects to push out the meter.
+                    total_export_w=max(0.0, float(step.get("export_kwh", 0.0))) / dt_h * 1000.0,
                     deferrable_w=deferrable_w,
                 )
             )

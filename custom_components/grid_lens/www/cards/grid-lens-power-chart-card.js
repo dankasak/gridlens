@@ -13,7 +13,15 @@
  */
 import {
   GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor,
-} from './grid-lens-chart-common.js?v=20260731a';
+} from './grid-lens-chart-common.js?v=20260802b';
+
+// Free-energy shading (see _freeEnergyBands). CSS custom props rather than literals so
+// both bands follow the viewer's light/dark theme like every other colour on this card;
+// the values are set in extraStyle below. Deliberately NOT reusing --solar/--gridflow:
+// these are background washes behind those very lines, so they have to stay clearly
+// separable from them rather than echoing them.
+const FREE_SPILL = 'var(--free-spill)';
+const FREE_IMPORT = 'var(--free-import)';
 
 class GridLensPowerChartCard extends GridLensChartCardBase {
   get title() { return 'Power — measured & forecast (kW)'; }
@@ -35,7 +43,12 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     // chart itself rather than to the header/legend chrome above it.
     return (maxH ? `.chart-svg { height: ${maxH}px; }` : '')
       + (maxW ? ` .card { max-width: ${maxW}px; }` : '')
-      + ` .card { padding: 10px 16px; } .legend { margin: 0 0 4px; gap: 10px; }`;
+      + ` .card { padding: 10px 16px; } .legend { margin: 0 0 4px; gap: 10px; }`
+      // Free-energy band washes. Amber-ish for wasted surplus (it's a "you're throwing
+      // this away" warning) and teal for a free-import window (a good thing, and the
+      // same family this project's charts already use for sell/credit).
+      + ` :host { --free-spill:#f97316; --free-import:#0d9488; }`
+      + ` :host(.dark) { --free-spill:#fb923c; --free-import:#2dd4bf; }`;
   }
 
   // Matches the Power Flow card's own per-device colour assignment (a hot-water device gets
@@ -80,14 +93,74 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     const dnames = this._deferNames || [];
     const deferLegend = dnames.map((nm, i) =>
       `<span><i style="border-top:2px solid ${this._deferColor(i)}"></i>${esc(nm)}</span>`).join('');
+    // Only advertise the free-energy shading when there actually is some in view — on a
+    // plan with no $0 window and no spill the legend would otherwise carry two
+    // permanently-unused entries. Filtered to the selected view range for the same
+    // reason: Today and Full horizon can legitimately disagree about what's on screen.
+    const bands = this._visibleBands();
+    const hasSpill = bands.some((b) => b.kind === 'spill');
+    const hasFree = bands.some((b) => b.kind === 'free_import');
+    const bandLegend =
+      (hasSpill ? `<span><span class="swatch" style="background:${FREE_SPILL};opacity:.55"></span>Free energy wasted</span>` : '')
+      + (hasFree ? `<span><span class="swatch" style="background:${FREE_IMPORT};opacity:.55"></span>Free import window</span>` : '');
     return `
       <span><span class="swatch" style="background:var(--solar)"></span>Solar</span>
       <span><span class="swatch" style="background:var(--load)"></span>Load</span>
       <span><span class="swatch" style="background:var(--gridflow)"></span>Grid (+import / -export)</span>
       <span><span class="swatch" style="background:var(--battery)"></span>Battery (+charge / -discharge)</span>
       ${deferLegend}
+      ${bandLegend}
       <span style="color:var(--muted)">— thin = measured</span>
     `;
+  }
+
+  // Stretches of the plan where energy is free and the plan does not use all of it —
+  // exactly what Greedy Consumption's forecast-surplus condition sums up, drawn so a
+  // deferrable load starting "for no visible reason" is legible against the spill that
+  // caused it (see DeferrableLoadController's module docstring).
+  //
+  //   spill       — the plan exports into a $0 (or negative) export price: that energy
+  //                 is being given away. sell_kwh is already net of every load the plan
+  //                 schedules, so what's shaded is genuinely surplus.
+  //   free_import — import costs nothing this slot (a plan's $0 window), so anything
+  //                 running is running for free.
+  //
+  // Computed from the same trajectory rows the lines are drawn from, so it needs no
+  // extra entity and stays correct for any retailer/plan.
+  _visibleBands() {
+    const traj = this._traj || [];
+    if (!traj.length) return [];
+    const { t0, t1 } = this._timeScale();
+    return this._freeEnergyBands().filter((b) => b.t1 > t0 && b.t0 < t1);
+  }
+
+  _freeEnergyBands() {
+    const traj = this._traj || [];
+    if (!traj.length) return [];
+    const step = this._timeScale().step;
+    const out = [];
+    traj.forEach((row, i) => {
+      const t0 = new Date(row.start).getTime();
+      const t1 = i + 1 < traj.length ? new Date(traj[i + 1].start).getTime() : t0 + step;
+      const imp = row.import_rate != null ? +row.import_rate : null;
+      const exp = row.export_rate != null ? +row.export_rate : null;
+      if (imp != null && imp <= 1e-6) {
+        out.push({ t0, t1, kind: 'free_import', color: FREE_IMPORT, opacity: 0.14 });
+      } else if (exp != null && exp <= 1e-6 && (+row.sell_kwh || 0) > 1e-6) {
+        // `else if` so a slot that is both free to import and spilling is shaded once —
+        // free import is the stronger statement and wins.
+        out.push({ t0, t1, kind: 'spill', color: FREE_SPILL, opacity: 0.16 });
+      }
+    });
+    // Merge touching same-kind slots so a 5-hour spill is one rect, not 10 abutting ones
+    // whose translucent edges would otherwise band visibly against each other.
+    const merged = [];
+    for (const b of out) {
+      const prev = merged[merged.length - 1];
+      if (prev && prev.kind === b.kind && Math.abs(prev.t1 - b.t0) < 1000) prev.t1 = b.t1;
+      else merged.push({ ...b });
+    }
+    return merged;
   }
 
   // Net grid flow for a trajectory row: +import / -export, one line instead of two —
@@ -137,7 +210,10 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     // symmetric: true — grid/battery are signed (import/charge positive, export/discharge
     // negative), so the y-axis is forced to [-m, m] and 0 sits at the vertical centre
     // instead of hugging the bottom the way an all-positive chart would.
-    return multiLineChart(this._traj, this._timeScale(), series, { fmt: (v) => v.toFixed(1), height: 480, symmetric: true });
+    return multiLineChart(this._traj, this._timeScale(), series, {
+      fmt: (v) => v.toFixed(1), height: 480, symmetric: true,
+      bands: this._freeEnergyBands(),
+    });
   }
 
   _nearest(points, bestMs) {
@@ -185,7 +261,22 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       (this._deferNames || []).map((nm, i) => {
         const v = actualDefer[i] != null ? actualDefer[i] : (+best['defer_' + i] || 0) * kwScale;
         return v > 0.01 ? `<div><span class="k" style="color:${this._deferColor(i)}">${esc(nm)}</span> ${v.toFixed(2)} kW</div>` : '';
-      }).join('');
+      }).join('')
+      // Name the shaded band the cursor is sitting in, so the wash isn't just decoration.
+      + this._bandNote(best, kwScale);
+  }
+
+  _bandNote(row, kwScale) {
+    const imp = row.import_rate != null ? +row.import_rate : null;
+    const exp = row.export_rate != null ? +row.export_rate : null;
+    if (imp != null && imp <= 1e-6) {
+      return `<div style="font-size:11px;color:var(--free-import)">Free import window — anything running here is free</div>`;
+    }
+    if (exp != null && exp <= 1e-6 && (+row.sell_kwh || 0) > 1e-6) {
+      const kw = (+row.sell_kwh || 0) * kwScale;
+      return `<div style="font-size:11px;color:var(--free-spill)">Spilling ${kw.toFixed(2)} kW at $0 — free energy wasted</div>`;
+    }
+    return '';
   }
 }
 

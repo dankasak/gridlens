@@ -279,10 +279,149 @@ def test_status_reports_greedy_state():
     c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
     assert c.status()["greedy"] is False
     assert c.status()["greedy_respects_schedule"] is False
+    assert c.status()["greedy_forecast_surplus"] is False
     c.set_greedy(True)
     c.set_greedy_respects_schedule(True)
+    c.set_greedy_forecast_surplus(True)
     assert c.status()["greedy"] is True
     assert c.status()["greedy_respects_schedule"] is True
+    assert c.status()["greedy_forecast_surplus"] is True
+
+
+# --------------------------------------------------- forecast-surplus (controller level)
+async def _run_surplus_turns_on_when_waste_exceeds_need():
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
+    c.set_greedy(True)
+    c.set_greedy_forecast_surplus(True)
+    # Nothing is free right now (import priced, export priced, importing), but the plan
+    # forecasts 10 kWh wasted over 4 h vs this device's 2 kW * 4 h = 8 kWh need.
+    await c.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
+                  forecast_free_kwh=10.0, forecast_hours=4.0)
+    assert len(_turn_ons(hass)) == 1
+    assert c._note.endswith("_greedy")
+
+
+async def _run_surplus_insufficient_no_effect():
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
+    c.set_greedy(True)
+    c.set_greedy_forecast_surplus(True)
+    # 7 kWh forecast waste < 8 kWh the device would eat over the same 4 h -> not enough.
+    await c.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
+                  forecast_free_kwh=7.0, forecast_hours=4.0)
+    assert len(_turn_ons(hass)) == 0
+
+
+async def _run_surplus_needs_its_own_toggle():
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
+    c.set_greedy(True)  # master greedy on, forecast-surplus left OFF (default)
+    await c.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
+                  forecast_free_kwh=100.0, forecast_hours=4.0)
+    assert len(_turn_ons(hass)) == 0
+
+
+async def _run_surplus_needs_master_greedy():
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
+    c.set_greedy_forecast_surplus(True)  # but master greedy stays OFF
+    await c.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
+                  forecast_free_kwh=100.0, forecast_hours=4.0)
+    assert len(_turn_ons(hass)) == 0
+
+
+async def _run_surplus_missing_forecast_fails_closed():
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
+    c.set_greedy(True)
+    c.set_greedy_forecast_surplus(True)
+    await c.apply(0.0, _T0, import_rate=0.35, forecast_free_kwh=None, forecast_hours=4.0)
+    assert len(_turn_ons(hass)) == 0
+    # A covered span of 0 h can't justify anything either (bar would be 0 kWh).
+    await c.apply(0.0, _T0, import_rate=0.35, forecast_free_kwh=5.0, forecast_hours=0.0)
+    assert len(_turn_ons(hass)) == 0
+
+
+async def _run_surplus_respects_schedule():
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
+    c.set_greedy(True)
+    c.set_greedy_forecast_surplus(True)
+    c.set_greedy_respects_schedule(True)
+    await c.apply(0.0, _T0, import_rate=0.35, schedule_allows=False,
+                  forecast_free_kwh=100.0, forecast_hours=4.0)
+    assert len(_turn_ons(hass)) == 0
+
+
+async def _run_status_reports_greedy_reason():
+    """status() names WHICH condition fired — the whole point of the observability
+    layer, since a greedy "on" is otherwise indistinguishable from a plan-driven one."""
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0,
+                                 min_on_seconds=0, min_off_seconds=0)
+    c.set_greedy(True)
+    c.set_greedy_forecast_surplus(True)
+    assert c.status()["greedy_reason"] is None
+
+    await c.apply(0.0, _T0, import_rate=0.0)
+    assert c.status()["greedy_reason"] == "import_free"
+
+    await c.apply(0.0, _T0, import_rate=0.5, export_rate=0.0, grid_power_w=-3000.0)
+    assert c.status()["greedy_reason"] == "export_surplus"
+
+    await c.apply(0.0, _T0, import_rate=0.5, export_rate=0.05, grid_power_w=500.0,
+                  forecast_free_kwh=10.0, forecast_hours=4.0)
+    st = c.status()
+    assert st["greedy_reason"] == "forecast_surplus"
+    assert st["forecast_free_kwh"] == 10.0
+    assert st["forecast_needed_kwh"] == 8.0
+
+    # Nothing free and nothing forecast -> reason clears, but the figures still publish
+    # so the UI can show progress toward the bar.
+    await c.apply(0.0, _T0, import_rate=0.5, export_rate=0.05, grid_power_w=500.0,
+                  forecast_free_kwh=3.0, forecast_hours=4.0)
+    st = c.status()
+    assert st["greedy_reason"] is None
+    assert st["greedy_blocked"] is None
+    assert st["forecast_free_kwh"] == 3.0
+
+
+async def _run_status_reports_greedy_blocked():
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0,
+                                 min_on_seconds=0, min_off_seconds=0)
+    c.set_greedy(True)
+    c.set_greedy_respects_schedule(True)
+    await c.apply(0.0, _T0, import_rate=0.0, schedule_allows=False)
+    assert c.status()["greedy_blocked"] == "schedule"
+    assert c.status()["greedy_reason"] is None
+    # Back inside the window -> blocked clears and the reason appears.
+    await c.apply(0.0, _T0, import_rate=0.0, schedule_allows=True)
+    assert c.status()["greedy_blocked"] is None
+    assert c.status()["greedy_reason"] == "import_free"
+    # A manual override stops greedy being evaluated at all — the published reason must
+    # not go stale and keep claiming greedy is why the device is on.
+    await c.set_override(True, _T0)
+    await c.apply(0.0, _T0, import_rate=0.0)
+    assert c.status()["greedy_reason"] is None
+    assert c.status()["greedy_blocked"] == "override"
+
+
+def test_surplus_bar_scales_with_covered_span():
+    hass = FakeHass()
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
+    assert c.forecast_surplus_needed_kwh(4.0) == 8.0
+    assert c.forecast_surplus_needed_kwh(2.5) == 5.0
+    assert c.forecast_surplus_needed_kwh(0.0) == 0.0
 
 
 # ----------------------------------------------------------------- manager-level tests
@@ -365,6 +504,108 @@ def test_manager_schedule_store_overrides_static_fallback():
     _run_async(go)
 
 
+def _slots(specs, start=None, minutes=30):
+    """Build a plan of consecutive `minutes`-long slots from
+    (import_rate, export_rate, total_export_w[, deferrable_w]) tuples."""
+    t = start or _T0
+    out = []
+    for j, spec in enumerate(specs):
+        imp, exp, tot_exp = spec[0], spec[1], spec[2]
+        dev = spec[3] if len(spec) > 3 else 0.0
+        out.append(DispatchInterval(
+            start=t + timedelta(minutes=j * minutes), action=BatteryAction.SELF_USE,
+            import_rate=imp, export_rate=exp, total_export_w=tot_exp, deferrable_w=[dev],
+        ))
+    return out
+
+
+def test_manager_forecast_free_kwh_counts_spilled_export():
+    """8 half-hour slots (4 h) exporting 5 kW at a $0 export price -> 20 kWh wasted."""
+    m, _hass = _mgr()
+    m.set_plan(_slots([(0.3, 0.0, 5000.0)] * 8), updated_at=_T0)
+    kwh, hours = m._forecast_free_kwh(0, _T0)
+    assert abs(hours - 4.0) < 1e-6
+    assert abs(kwh - 20.0) < 1e-6
+
+
+def test_manager_forecast_free_kwh_ignores_paid_export():
+    """Same spill, but the export actually earns money -> nothing is being wasted."""
+    m, _hass = _mgr()
+    m.set_plan(_slots([(0.3, 0.08, 5000.0)] * 8), updated_at=_T0)
+    kwh, hours = m._forecast_free_kwh(0, _T0)
+    assert abs(hours - 4.0) < 1e-6
+    assert kwh == 0.0
+
+
+def test_manager_forecast_free_kwh_counts_unused_free_import():
+    """A free-import window the plan doesn't already use for this device counts as free
+    energy on the table; the half-hour it DOES schedule the device (2 kW = full draw)
+    contributes nothing."""
+    m, _hass = _mgr()  # device max_kw = 2.0
+    plan = _slots([(0.0, 0.4, 0.0)] * 7 + [(0.0, 0.4, 0.0, 2000.0)])
+    m.set_plan(plan, updated_at=_T0)
+    kwh, hours = m._forecast_free_kwh(0, _T0)
+    assert abs(hours - 4.0) < 1e-6
+    assert abs(kwh - 7.0) < 1e-6  # 7 slots * 0.5 h * 2 kW
+
+
+def test_manager_forecast_free_kwh_clips_to_lookahead_and_now():
+    """Only the part of the plan inside [now, now+4h) counts — earlier slots and slots
+    past the window are excluded, and the current slot counts only its remainder."""
+    m, _hass = _mgr()
+    # 12 slots (6 h) starting 1 h before "now": 5 h remain, window clips it to 4 h.
+    m.set_plan(_slots([(0.3, 0.0, 4000.0)] * 12, start=_T0 - timedelta(hours=1)),
+               updated_at=_T0)
+    kwh, hours = m._forecast_free_kwh(0, _T0)
+    assert abs(hours - 4.0) < 1e-6
+    assert abs(kwh - 16.0) < 1e-6
+
+
+def test_manager_forecast_free_kwh_short_horizon_fails_closed():
+    """Less than half the look-ahead left in the plan -> no judgement (None), rather than
+    a shrunken bar a trivial surplus could clear."""
+    m, _hass = _mgr()
+    m.set_plan(_slots([(0.3, 0.0, 9000.0)] * 3), updated_at=_T0)  # 1.5 h < 2 h
+    assert m._forecast_free_kwh(0, _T0) == (None, 0.0)
+
+
+def test_manager_forecast_free_kwh_no_plan():
+    m, _hass = _mgr()
+    assert m._forecast_free_kwh(0, _T0) == (None, 0.0)
+
+
+def test_manager_greedy_forecast_surplus_roundtrip():
+    m, _hass = _mgr()
+
+    async def go():
+        assert m.is_greedy_forecast_surplus(0) is False
+        assert await m.set_greedy_forecast_surplus(0, True) is True
+        assert m.is_greedy_forecast_surplus(0) is True
+        assert await m.set_greedy_forecast_surplus(99, True) is False
+        assert m.is_greedy_forecast_surplus(99) is False
+
+    _run_async(go)
+
+
+async def _run_manager_end_to_end_surplus_tick():
+    """Full integration: nothing is free right now (priced import, priced export, house
+    importing) and the plan wants the device off, but a forecast spill bigger than the
+    device could ever eat still starts it."""
+    m, hass = _mgr(grid_power_sensor="sensor.grid_power")
+    hass.states.set("sensor.grid_power", "500")  # importing
+    _NOW[0] = _T0
+    m.set_plan(_slots([(0.3, 0.0, 6000.0)] * 8, start=_T0 - timedelta(minutes=1)),
+               updated_at=_T0)
+    await m.set_entitled(True)
+    await m.enable(0)  # first tick establishes "off" (plan wants off, no greedy yet)
+    assert len(_turn_ons(hass)) == 0
+    await m.set_greedy(0, True)
+    await m.set_greedy_forecast_surplus(0, True)
+    later = _T0 + timedelta(minutes=16)  # past the 15-min min-off debounce
+    await m._tick_device(0, later)
+    assert len(_turn_ons(hass)) == 1
+
+
 async def _run_manager_end_to_end_greedy_tick():
     """Full integration: a device the LP wants OFF still gets switched on by a live
     free-import-price tick, once entitled/enabled/greedy are all set."""
@@ -395,12 +636,29 @@ if __name__ == "__main__":
         ("override_suppresses_greedy", lambda: _run_async(_run_override_suppresses_greedy)),
         ("greedy_honours_debounce", lambda: _run_async(_run_greedy_honours_debounce)),
         ("status_reports_greedy_state", test_status_reports_greedy_state),
+        ("surplus_turns_on_when_waste_exceeds_need", lambda: _run_async(_run_surplus_turns_on_when_waste_exceeds_need)),
+        ("surplus_insufficient_no_effect", lambda: _run_async(_run_surplus_insufficient_no_effect)),
+        ("surplus_needs_its_own_toggle", lambda: _run_async(_run_surplus_needs_its_own_toggle)),
+        ("surplus_needs_master_greedy", lambda: _run_async(_run_surplus_needs_master_greedy)),
+        ("surplus_missing_forecast_fails_closed", lambda: _run_async(_run_surplus_missing_forecast_fails_closed)),
+        ("surplus_respects_schedule", lambda: _run_async(_run_surplus_respects_schedule)),
+        ("surplus_bar_scales_with_covered_span", test_surplus_bar_scales_with_covered_span),
+        ("status_reports_greedy_reason", lambda: _run_async(_run_status_reports_greedy_reason)),
+        ("status_reports_greedy_blocked", lambda: _run_async(_run_status_reports_greedy_blocked)),
         ("manager_set_greedy_roundtrip", test_manager_set_greedy_roundtrip),
         ("manager_reads_grid_power_sensor", test_manager_reads_grid_power_sensor),
         ("manager_no_grid_power_sensor_configured", test_manager_no_grid_power_sensor_configured),
         ("manager_schedule_static_fallback", test_manager_schedule_static_fallback),
         ("manager_schedule_store_overrides_static_fallback", test_manager_schedule_store_overrides_static_fallback),
+        ("manager_forecast_free_kwh_counts_spilled_export", test_manager_forecast_free_kwh_counts_spilled_export),
+        ("manager_forecast_free_kwh_ignores_paid_export", test_manager_forecast_free_kwh_ignores_paid_export),
+        ("manager_forecast_free_kwh_counts_unused_free_import", test_manager_forecast_free_kwh_counts_unused_free_import),
+        ("manager_forecast_free_kwh_clips_to_lookahead_and_now", test_manager_forecast_free_kwh_clips_to_lookahead_and_now),
+        ("manager_forecast_free_kwh_short_horizon_fails_closed", test_manager_forecast_free_kwh_short_horizon_fails_closed),
+        ("manager_forecast_free_kwh_no_plan", test_manager_forecast_free_kwh_no_plan),
+        ("manager_greedy_forecast_surplus_roundtrip", test_manager_greedy_forecast_surplus_roundtrip),
         ("manager_end_to_end_greedy_tick", lambda: _run_async(_run_manager_end_to_end_greedy_tick)),
+        ("manager_end_to_end_surplus_tick", lambda: _run_async(_run_manager_end_to_end_surplus_tick)),
     ]
     passed = 0
     for name, fn in tests:

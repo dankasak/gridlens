@@ -41,6 +41,13 @@ from .load_controller import DeferrableLoadController
 
 _LOGGER = logging.getLogger(__name__)
 
+# How far ahead Greedy Consumption's forecast-surplus condition looks for free energy the
+# plan expects to waste (see DeferrableLoadController's module docstring). Long enough to
+# see past the "battery is still soaking everything up" morning shoulder into the real
+# afternoon spill, short enough that the forecast is still worth believing and that a
+# device started now is plausibly still running when the surplus lands.
+GREEDY_SURPLUS_LOOKAHEAD_HOURS = 4.0
+
 
 class LoadControlManager:
     def __init__(
@@ -270,6 +277,9 @@ class LoadControlManager:
         schedule_allows = None
         if controller.greedy_respects_schedule:
             schedule_allows = await self._schedule_allows_now(index, now)
+        free_kwh, free_hours = (None, 0.0)
+        if controller.greedy and controller.greedy_forecast_surplus:
+            free_kwh, free_hours = self._forecast_free_kwh(index, now)
         try:
             await controller.apply(
                 planned_w, now,
@@ -277,6 +287,8 @@ class LoadControlManager:
                 export_rate=current.export_rate if current else None,
                 grid_power_w=self._read_grid_power_w(),
                 schedule_allows=schedule_allows,
+                forecast_free_kwh=free_kwh,
+                forecast_hours=free_hours,
             )
         except Exception as err:  # noqa: BLE001 — a bad device tick must not kill the timer
             _LOGGER.error("Load control tick failed for %s: %s", self.controllers[index].name, err)
@@ -296,6 +308,65 @@ class LoadControlManager:
             return 0.0
         dw = current.deferrable_w
         return float(dw[index]) if index < len(dw) else 0.0
+
+    def _forecast_free_kwh(self, index: int, now: datetime) -> tuple[Optional[float], float]:
+        """Free energy (kWh) the plan expects to leave UNCLAIMED over the next
+        ``GREEDY_SURPLUS_LOOKAHEAD_HOURS``, plus the span (hours) actually covered.
+
+        Two sources, per the user-facing definition of "free energy" (solar or free grid
+        imports):
+
+        * **Spilled export** — a slot whose export rate is $0 (or negative) and that the
+          plan still exports into: that energy is being given away for nothing. Uses
+          ``total_export_w`` (whole-house export, PV spill included), NOT ``export_w``
+          (battery share only), and it's already net of every load the plan schedules in
+          that slot — so nothing is subtracted from it here.
+        * **Unused free-import window** — a slot whose import rate is $0: this device
+          could run flat out for free then. Only the part the plan does NOT already have
+          it running counts as unclaimed, hence the ``max_w - planned`` term.
+
+        Returns ``(None, 0.0)`` when there isn't enough forecast left to judge — less
+        than half the look-ahead window is covered by the plan. That's the same
+        fail-closed discipline as the other greedy inputs: a sliver of horizon tail would
+        otherwise shrink the controller's bar (which scales with the covered span) until
+        a trivial surplus cleared it.
+        """
+        plan = self._plan
+        controller = self.controllers.get(index)
+        if not plan or controller is None:
+            return None, 0.0
+        window_end = now + timedelta(hours=GREEDY_SURPLUS_LOOKAHEAD_HOURS)
+        total_kwh = 0.0
+        covered_h = 0.0
+        for pos, iv in enumerate(plan):
+            slot_end = self._slot_end(plan, pos)
+            o_start = max(iv.start, now)
+            o_end = min(slot_end, window_end)
+            if o_end <= o_start:
+                continue
+            hours = (o_end - o_start).total_seconds() / 3600.0
+            free_w = 0.0
+            if iv.export_rate is not None and iv.export_rate <= 0.0:
+                free_w += max(0.0, iv.total_export_w)
+            if iv.import_rate is not None and iv.import_rate <= 0.0:
+                planned_w = self._device_power_now(index, iv)
+                free_w += max(0.0, controller.max_w - max(0.0, planned_w))
+            total_kwh += free_w * hours / 1000.0
+            covered_h += hours
+        if covered_h < GREEDY_SURPLUS_LOOKAHEAD_HOURS / 2.0:
+            return None, 0.0
+        return total_kwh, covered_h
+
+    @staticmethod
+    def _slot_end(plan: list[DispatchInterval], pos: int) -> datetime:
+        """End of plan slot ``pos``. ``DispatchInterval`` carries only a start, so a
+        slot runs until the next one starts; the final slot reuses the previous gap (and
+        falls back to 30 min for a degenerate single-slot plan)."""
+        if pos + 1 < len(plan):
+            return plan[pos + 1].start
+        if pos > 0:
+            return plan[pos].start + (plan[pos].start - plan[pos - 1].start)
+        return plan[pos].start + timedelta(minutes=30)
 
     def _read_grid_power_w(self) -> Optional[float]:
         """Live signed grid power (W, +import/-export) for Greedy Consumption's
@@ -360,6 +431,17 @@ class LoadControlManager:
         if c is None:
             return False
         c.set_greedy_respects_schedule(enabled)
+        return True
+
+    def is_greedy_forecast_surplus(self, index: int) -> bool:
+        c = self.controllers.get(index)
+        return bool(c.greedy_forecast_surplus) if c else False
+
+    async def set_greedy_forecast_surplus(self, index: int, enabled: bool) -> bool:
+        c = self.controllers.get(index)
+        if c is None:
+            return False
+        c.set_greedy_forecast_surplus(enabled)
         return True
 
     def _plan_is_stale(self, now: datetime) -> bool:

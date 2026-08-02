@@ -27,7 +27,19 @@
         <ul>
           <li><a href="#sensors">Required sensors</a></li>
           <li><a href="#deferrable">Deferrable loads</a></li>
+          <li><a href="#schedules">Allowed run times</a></li>
+          <li><a href="#boost">Today Boost</a></li>
           <li><a href="#api-key">API key</a></li>
+        </ul>
+        <div class="section-title">Automation</div>
+        <ul>
+          <li><a href="#battery-control">Battery control</a></li>
+          <li><a href="#load-control">Load control</a></li>
+          <li><a href="#greedy">Greedy Consumption</a></li>
+          <li><a href="#observability">Seeing why it acted</a></li>
+        </ul>
+        <div class="section-title">Help</div>
+        <ul>
           <li><a href="#troubleshoot">Troubleshooting</a></li>
         </ul>
       </nav>
@@ -76,14 +88,13 @@
         </div>
 
         <h2 id="dashboard">View the dashboard</h2>
-        <p>Grid Lens adds a <strong>Grid Lens</strong> dashboard to your Home Assistant sidebar automatically. It shows:</p>
+        <p>Grid Lens adds a <strong>Grid Lens</strong> dashboard to your Home Assistant sidebar automatically — no cards to add, no YAML. It has three views:</p>
         <ul>
-          <li>Cost comparison across all modelled plans for a selected date range</li>
-          <li>Hour-by-hour optimal usage profile for each plan</li>
-          <li>Battery state-of-charge curves</li>
-          <li>Deferrable load scheduling recommendations</li>
-          <li>Estimated bill for the period</li>
+          <li><strong>Plan Comparison</strong> — cost across all modelled plans for a date range you choose, the optimal usage profile under each, and the estimated bill for the period.</li>
+          <li><strong>Battery Plan</strong> — live energy flow, forecast vs. measured power, the battery state-of-charge curve, and the planned dispatch timeline.</li>
+          <li><strong>Settings</strong> — deferrable load controls, allowed run times, and optimiser tuning.</li>
         </ul>
+        <p>The cards find their own entities, so they keep working as you add, remove, or reconfigure loads.</p>
 
         <h2 id="sensors">Required sensors</h2>
         <p>Grid Lens needs at least one of the following entity types, already configured in your Energy dashboard:</p>
@@ -102,6 +113,76 @@
         <p>A deferrable load is electricity usage you can shift to a cheaper time of day — for example an EV charger, pool pump, or hot water system.</p>
         <p>To include a deferrable load in the optimisation, you need a sensor that measures its consumption. Grid Lens will model what each plan would cost if you shifted that load to its cheapest window.</p>
         <p>Configure deferrable loads under <strong>Settings → Devices &amp; Services → Grid Lens → Configure</strong> after setup.</p>
+
+        <h2 id="schedules">Allowed run times</h2>
+        <p>Each deferrable load has a weekly schedule — a per-weekday, half-hourly grid of when that appliance is <strong>allowed</strong> to run. Grid Lens picks the cheapest half-hours <em>inside</em> your rules; it never runs a load outside them.</p>
+        <p>Edit it on the <strong>Allowed Run Times</strong> card on the Grid Lens dashboard by painting hours with the mouse. A pool pump might be daytime-only; an EV charger might be unrestricted.</p>
+        <div class="note">
+          <strong>Note:</strong> the optimiser plans forward from <em>now</em>, not from midnight, so its first day spans two weekdays. Anywhere Grid Lens shows you "hours available", it means the next 24 hours — not a calendar day.
+        </div>
+
+        <h2 id="boost">Today Boost</h2>
+        <p>Grid Lens learns how much energy each deferrable load needs per day from its own sensor, averaged over the last 14 days. When today isn't typical — a long drive tomorrow, guests staying — override it with <strong>Today Boost</strong> on the Deferrable Loads card.</p>
+        <p>Set the kWh you actually need today; 0 means "use the historical average". The plan re-solves around it immediately.</p>
+        <p>If you ask for more than the load's allowed window can physically deliver, the card shows you that ceiling rather than silently ignoring the excess.</p>
+
+        <h2 id="battery-control">Battery control</h2>
+        <p>Comparison and planning are read-only. Battery control is the optional step where Grid Lens actually operates your inverter to follow the plan it found.</p>
+        <p>Turn on the <strong>Battery Control</strong> switch. From then on, every five minutes Grid Lens reconciles your battery against the current plan — charging from solar, charging from the grid during genuinely free or cheap windows, holding, or discharging into expensive periods.</p>
+        <ul>
+          <li>Your configured minimum and maximum state-of-charge are always respected.</li>
+          <li>If you've told Grid Lens not to grid-charge, it will only ever charge from solar surplus.</li>
+          <li>The <strong>Minimum Export Price</strong> setting lets you say "below this feed-in rate, don't bother selling" — the optimiser will prefer storing the energy or spending it on a deferrable load instead.</li>
+        </ul>
+        <div class="note">
+          <strong>Failure behaviour:</strong> if Home Assistant restarts, the plan goes stale, or you turn the switch off, Grid Lens hands the battery straight back to your inverter's own energy management system. It never leaves your battery stuck in a forced mode.
+        </div>
+        <p>Battery control is brand-agnostic by design. <strong>Sigenergy</strong> is supported today; more inverter drivers are being added.</p>
+
+        <h2 id="load-control">Load control</h2>
+        <p>Grid Lens can also switch simple on/off appliances — anything exposed to Home Assistant as a <code>switch</code> entity that draws roughly a fixed power when running (a pool pump, a smart-plug-fed charger, a resistive heater).</p>
+        <p>Assign a control switch to a deferrable load via <strong>Grid Lens → Configure</strong>. Each controllable load then gets its own controls on the Deferrable Loads card:</p>
+        <table class="compare-table">
+          <thead><tr><th>Control</th><th>Default</th><th>What it does</th></tr></thead>
+          <tbody>
+            <tr><td>Control switch</td><td>Off</td><td>Master opt-in — Grid Lens drives this appliance per the plan.</td></tr>
+            <tr><td>On now / Off now</td><td>—</td><td>Manual override. Forces the appliance and stops Grid Lens driving it entirely, until you choose Auto.</td></tr>
+            <tr><td>Auto</td><td>—</td><td>Hands control back to the plan.</td></tr>
+          </tbody>
+        </table>
+        <div class="note">
+          <strong>Everything is off by default.</strong> A fresh install never touches an appliance until you explicitly enable control for it. And Grid Lens will never force a running appliance off because <em>it</em> had a problem — if it loses its plan or Home Assistant restarts, it stops driving the load and leaves it exactly as it is.
+        </div>
+
+        <h2 id="greedy">Greedy Consumption</h2>
+        <p>On most solar homes there are hours every day when your battery is full, your panels are still producing, and the surplus goes to the grid for a feed-in tariff of almost nothing. That's free energy leaving the house.</p>
+        <p><strong>Greedy Consumption</strong> lets a load opportunistically run whenever energy is genuinely free, regardless of what the plan scheduled for that moment. Enable it per appliance. There are three triggers:</p>
+        <table class="compare-table">
+          <thead><tr><th>Trigger</th><th>Fires when</th><th>Can it cost money?</th></tr></thead>
+          <tbody>
+            <tr><td>Free import</td><td>Your plan's import price for this window is zero.</td><td class="check">No</td></tr>
+            <tr><td>Export surplus</td><td>Your feed-in price is zero <em>and</em> you're already exporting at least as much as this appliance draws — so running it can't create new grid import.</td><td class="check">No</td></tr>
+            <tr><td>Forecast surplus</td><td>Over the next few hours the plan expects to spill more free energy than this appliance could use running flat out for that entire window.</td><td>Yes — briefly</td></tr>
+          </tbody>
+        </table>
+        <p>The first two only fire once free energy is <em>already</em> flowing. That's often too late: mid-morning your battery absorbs every spare watt, so nothing looks free, even though the plan already knows the afternoon will spill far more than the appliance could ever consume. By the time surplus export actually appears, hours of run-time are gone.</p>
+        <p><strong>Forecast surplus</strong> fixes that by starting the load early. It's a separate opt-in because it's the one trigger that can draw a little priced grid power in the moment, in exchange for capturing a much larger forecast spill — on a house with a battery, that gap gets refilled by energy that would otherwise have been exported for nothing.</p>
+        <p>The bar is deliberately high: it only fires when the plan would still be wasting free energy <em>even with this appliance running continuously for the whole look-ahead window</em>. A little spare solar never trips it.</p>
+        <div class="note">
+          <strong>Optional guardrails:</strong> <em>Greedy Respects Schedule</em> confines greedy to the appliance's own allowed run times. And a manual override always wins — greedy is suppressed entirely while you have a load forced On or Off.
+        </div>
+        <h3>Setting up the export-surplus trigger</h3>
+        <p>The <em>export surplus</em> trigger needs a <strong>live signed grid power sensor</strong> — positive when importing, negative when exporting — configured as <code>grid_power_sensor</code> under <strong>Grid Lens → Configure</strong>. Without it that one trigger simply never fires; the other two still work.</p>
+        <p>Note this is a <em>power</em> (W) sensor, not one of the cumulative kWh sensors from your Energy dashboard.</p>
+
+        <h2 id="observability">Seeing why it acted</h2>
+        <p>Anything that acts on your house should be able to explain itself. Every automated decision Grid Lens makes is visible on the dashboard:</p>
+        <ul>
+          <li><strong>Deferrable Loads card</strong> — per appliance: whether Grid Lens is controlling it, which greedy trigger is currently holding it on, or why greedy is blocked. When the forecast-surplus trigger is armed, a progress bar shows how close it is to firing.</li>
+          <li><strong>Power Flow card</strong> — a badge appears on an appliance while <em>greedy</em>, rather than the plan, is the reason it's running. Hover it for the numbers behind the decision.</li>
+          <li><strong>Power Chart card</strong> — free-energy shading. <span style="color:#c2410c"><strong>Orange</strong></span> marks periods where the plan expects to spill energy it can't sell; <span style="color:#0d9488"><strong>teal</strong></span> marks free import windows. Hover a band for the detail.</li>
+          <li><strong>Entity attributes</strong> — every Grid Lens switch exposes its full decision state for use in your own automations and templates.</li>
+        </ul>
 
         <h2 id="api-key">API key</h2>
         <p>The free plan requires no API key — Grid Lens registers your installation automatically and grants access to model your current plan.</p>

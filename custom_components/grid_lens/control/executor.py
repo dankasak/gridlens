@@ -82,6 +82,13 @@ class DispatchInterval:
     export_w: float = 0.0
     import_rate: Optional[float] = None
     export_rate: Optional[float] = None
+    # TOTAL planned grid export for the slot (W), from every source — surplus PV that
+    # nothing absorbs as well as battery discharge. Distinct from ``export_w`` above,
+    # which is only the *battery's* share of a DISCHARGE slot (and is 0 on a pure
+    # solar-spill slot). Consumed by Greedy Consumption's forecast-surplus condition to
+    # measure how much free energy the plan expects to throw away; the battery executor
+    # never reads it.
+    total_export_w: float = 0.0
     # Planned average power (W) for each configured deferrable device this slot, in the
     # same device order as CONF_DEFERRABLE_LOAD_SENSORS. Consumed by LoadControlManager to
     # decide each device's switch on/off (via its own ≥50%-of-max_kw threshold). The battery

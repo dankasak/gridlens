@@ -27,7 +27,8 @@
  *   - override select: `select.*` with `switch === switch_entity` and `override` in attrs
  *     (GridLensLoadOverrideSelect).
  *   - greedy toggles: `switch.*` with `switch === switch_entity` and `role === 'greedy'` /
- *     `'greedy_schedule'` (GridLensDeferrableGreedySwitch / …ScheduleSwitch).
+ *     `'greedy_schedule'` / `'greedy_surplus'` (GridLensDeferrableGreedySwitch /
+ *     …ScheduleSwitch / …SurplusSwitch).
  *   - boost number: `number.*` with `deferrable_sensor_id === energy_entity`
  *     (GridLensDeferrableOverrideNumber).
  *
@@ -35,7 +36,7 @@
  *   type: custom:grid-lens-load-control-card
  *   title: Deferrable Loads          (optional)
  */
-import { STYLE, esc } from './grid-lens-chart-common.js?v=20260731a';
+import { STYLE, esc } from './grid-lens-chart-common.js?v=20260802b';
 
 function friendlyNote(note) {
   if (!note) return '';
@@ -168,6 +169,7 @@ class GridLensLoadControlCard extends HTMLElement {
         selEid: this._overrideSelectFor(phys),
         gEid: this._greedySwitchFor(phys, 'greedy'),
         gsEid: this._greedySwitchFor(phys, 'greedy_schedule'),
+        gfEid: this._greedySwitchFor(phys, 'greedy_surplus'),
         boostEid: this._boostFor(d.energy_entity),
       };
     });
@@ -186,14 +188,21 @@ class GridLensLoadControlCard extends HTMLElement {
       const s = r.selEid && hass.states[r.selEid];
       const g = r.gEid && hass.states[r.gEid];
       const gs = r.gsEid && hass.states[r.gsEid];
+      const gf = r.gfEid && hass.states[r.gfEid];
       const b = r.boostEid && hass.states[r.boostEid];
       const ceiling = this._boostCeiling(r.device);
       return [
         r.device.energy_entity,
-        c ? `${c.state}|${(c.attributes || {}).note}` : '',
+        // greedy_reason / forecast_free_kwh live in the control switch's ATTRIBUTES and
+        // move while its state stays "on", so they need to be in the signature or the
+        // greedy status line would freeze at whatever it said on the last state change.
+        c ? [c.state, (c.attributes || {}).note, (c.attributes || {}).greedy_reason,
+             (c.attributes || {}).greedy_blocked,
+             (c.attributes || {}).forecast_free_kwh].join('|') : '',
         s ? s.state : '',
         g ? g.state : '',
         gs ? gs.state : '',
+        gf ? gf.state : '',
         b ? b.state : '',
         // Time-dependent (the window rolls forward), so it belongs in the repaint
         // signature — otherwise the ceiling hint goes stale as the day advances.
@@ -215,6 +224,17 @@ class GridLensLoadControlCard extends HTMLElement {
         .row .name { font-size: 13.5px; font-weight: 550; color: var(--ink); }
         .row .meta { font-size: 11px; color: var(--ink2); margin-top: 1px; }
         .row .meta.err { color: var(--buy); }
+        /* Greedy status line — same size as .meta but muted further, so it reads as a
+           sub-note of the row rather than competing with the control state above it.
+           Turns the accent colour only when greedy is actually the reason the load is on. */
+        .row .greedy-line { font-size: 11px; color: var(--ink2); opacity: .8; margin-top: 1px;
+                            display: flex; align-items: center; gap: 6px; }
+        .row .greedy-line.active { color: var(--good); opacity: 1; }
+        /* Progress toward the forecast-surplus trigger: the bar is the point — a number
+           pair alone doesn't convey "nearly there" at a glance. */
+        .gbar { flex: 0 0 auto; width: 42px; height: 4px; border-radius: 2px;
+                background: var(--border); overflow: hidden; }
+        .gbar > span { display: block; height: 100%; background: var(--good); }
         .sw { position: relative; flex: 0 0 auto; width: 40px; height: 22px; border-radius: 12px;
               background: var(--border); cursor: pointer; transition: background .15s ease; }
         .sw::after { content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
@@ -253,6 +273,42 @@ class GridLensLoadControlCard extends HTMLElement {
     `;
   }
 
+  // One-line live greedy status from the control switch's attributes (see
+  // DeferrableLoadController.status()). Three states worth showing, in priority order:
+  // greedy is holding the device on (and why); greedy is armed but blocked; or the
+  // forecast-surplus condition is armed and tracking, in which case we show progress
+  // toward its bar rather than a silent boolean that flips with no warning. Empty when
+  // greedy is off entirely — no point adding a line that just says "nothing".
+  _greedyLine(a) {
+    if (!a || !a.greedy) return '';
+    const reason = a.greedy_reason;
+    if (reason) {
+      const label = {
+        import_free: 'On — import is free right now',
+        export_surplus: 'On — running on surplus export',
+        forecast_surplus: 'On — forecast surplus',
+      }[reason] || `On — ${esc(reason)}`;
+      const nums = (reason === 'forecast_surplus' && a.forecast_free_kwh != null)
+        ? ` (${(+a.forecast_free_kwh).toFixed(1)} of ${(+a.forecast_needed_kwh).toFixed(1)} kWh)`
+        : '';
+      return `<div class="greedy-line active">Greedy: ${label}${nums}</div>`;
+    }
+    if (a.greedy_blocked) {
+      const why = a.greedy_blocked === 'override'
+        ? 'suppressed by a manual override'
+        : 'outside this load\'s availability window';
+      return `<div class="greedy-line">Greedy: armed, ${why}</div>`;
+    }
+    if (a.greedy_forecast_surplus && a.forecast_free_kwh != null && a.forecast_needed_kwh) {
+      const have = +a.forecast_free_kwh, need = +a.forecast_needed_kwh;
+      const pct = Math.max(0, Math.min(100, (have / need) * 100));
+      return `<div class="greedy-line">Greedy: armed · forecast surplus `
+        + `${have.toFixed(1)} / ${need.toFixed(1)} kWh`
+        + `<span class="gbar"><span style="width:${pct.toFixed(0)}%"></span></span></div>`;
+    }
+    return `<div class="greedy-line">Greedy: armed, waiting for free energy</div>`;
+  }
+
   _paint() {
     const body = this.shadowRoot && this.shadowRoot.querySelector('.body');
     if (!body) return;
@@ -280,6 +336,11 @@ class GridLensLoadControlCard extends HTMLElement {
       const meta = d.controllable
         ? `${on ? 'Controlling' : 'Not controlling'} · ${esc(d.switch_entity || '')}${note ? ' · ' + esc(note) : ''}`
         : 'Forecast only — no control switch configured';
+      // Second meta line: the live greedy story. Answers "is greedy doing anything right
+      // now, and if not, how close is it?" — the boolean toggles above only say it's
+      // armed. Rendered off the control switch's own attributes (the controller's
+      // status()), so it needs no extra entity lookup.
+      const greedyLine = this._greedyLine(a);
 
       // Control area: a fully-wired device gets the real segmented control (or a plain
       // toggle fallback if the override select hasn't appeared yet); a device with no
@@ -313,13 +374,15 @@ class GridLensLoadControlCard extends HTMLElement {
           </div>`;
       }
 
-      // Greedy Consumption's two per-device toggles (see switch.py) — opportunistic
-      // "on" whenever import is free or export is being wasted, on top of Auto/plan
-      // control. Only meaningful (and only created) for a controllable device.
+      // Greedy Consumption's per-device toggles (see switch.py) — opportunistic "on"
+      // whenever import is free, export is being wasted, or the plan forecasts a spill
+      // bigger than this load, on top of Auto/plan control. Only meaningful (and only
+      // created) for a controllable device.
       let greedyHtml = '';
       if (r.controlEid && r.gEid) {
         const gOn = hass.states[r.gEid] && hass.states[r.gEid].state === 'on';
         const gsOn = r.gsEid && hass.states[r.gsEid] && hass.states[r.gsEid].state === 'on';
+        const gfOn = r.gfEid && hass.states[r.gfEid] && hass.states[r.gfEid].state === 'on';
         greedyHtml = `
           <div class="greedy">
             <div class="gbtn${gOn ? ' on' : ''}" data-eid="${esc(r.gEid)}"
@@ -330,6 +393,11 @@ class GridLensLoadControlCard extends HTMLElement {
             <div class="gbtn${gsOn ? ' on' : ''}" data-eid="${esc(r.gsEid)}"
                  title="Greedy Respects Schedule: only greedy-fire inside this load's own availability window">
               <ha-icon icon="mdi:calendar-clock"></ha-icon>
+            </div>` : ''}
+            ${r.gfEid ? `
+            <div class="gbtn${gfOn ? ' on' : ''}" data-eid="${esc(r.gfEid)}"
+                 title="Greedy Forecast Surplus: also start early when the plan forecasts more free energy going to waste than this load could use (needs Greedy Consumption on; may import briefly)">
+              <ha-icon icon="mdi:weather-sunny-alert"></ha-icon>
             </div>` : ''}
           </div>`;
       }
@@ -370,6 +438,7 @@ class GridLensLoadControlCard extends HTMLElement {
           <div class="info">
             <div class="name">${esc(d.name || d.energy_entity)}</div>
             <div class="meta${isErr ? ' err' : ''}">${meta}</div>
+            ${greedyLine}
           </div>
           ${boostHtml}
           ${greedyHtml}

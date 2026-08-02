@@ -37,6 +37,24 @@ is SOC-guardrail- and inverter-HAL-specific):
   meant to be opportunistic ("don't leave free energy on the table"). Like everything
   else here, greedy is completely suppressed while a manual override is active — a human
   at the physical switch always wins.
+* **Forecast surplus** (``greedy_forecast_surplus``, a third opt-in on top of greedy, off
+  by default) — a *forward-looking* third greedy condition. The two conditions above are
+  strictly instantaneous: they only fire once free energy is already flowing. On a
+  solar+battery house that systematically fires late — mid-morning the battery soaks up
+  every spare watt, so live export is ~0 and neither condition is true, yet the plan
+  already knows that this afternoon far more energy will spill to a $0 export than this
+  device could ever eat. By the time export actually shows up, hours of run-time have
+  been wasted. So: if the plan forecasts that, over the look-ahead window, *more* free
+  energy will be thrown away than this device could consume running flat out for that
+  whole window, run it now.
+
+  This one is a genuine bet and is therefore separately opt-in: unlike the other two it
+  CAN create real, priced grid import in the moment, in exchange for capturing a much
+  larger forecast spill. The mechanism that makes it pay is the battery — running now
+  draws the battery down (or leaves it lower), and that hole is refilled by surplus that
+  would otherwise have been exported for nothing. The "could run flat out for the whole
+  window and still spill" threshold is what keeps it honest: a marginal, uncertain
+  surplus never trips it.
 """
 from __future__ import annotations
 
@@ -90,6 +108,21 @@ class DeferrableLoadController:
         # (ignore the schedule) unless the user asks for the stricter one.
         self._greedy_enabled = False
         self._greedy_respects_schedule = False
+        # Forecast-surplus greedy condition (see module docstring). Also default OFF, and
+        # additionally gated behind _greedy_enabled — it's a third greedy condition, not a
+        # parallel feature, so the master greedy switch still turns everything off.
+        self._greedy_forecast_surplus = False
+
+        # Observability only — never read by any decision, only published by status()
+        # (and from there onto the control switch's attributes, the Load Control card and
+        # the Power Flow card). Which greedy condition fired on the last evaluated tick,
+        # why greedy was blocked if it was, and the forecast-surplus figures behind the
+        # third condition so the UI can show progress toward the bar rather than just a
+        # boolean that flips with no warning.
+        self._greedy_reason: Optional[str] = None
+        self._greedy_blocked: Optional[str] = None
+        self._greedy_free_kwh: Optional[float] = None
+        self._greedy_needed_kwh: Optional[float] = None
 
     # ------------------------------------------------------------------ policy
     def on_threshold_w(self) -> float:
@@ -105,6 +138,8 @@ class DeferrableLoadController:
         export_rate: Optional[float],
         grid_power_w: Optional[float],
         schedule_allows: Optional[bool],
+        forecast_free_kwh: Optional[float] = None,
+        forecast_hours: Optional[float] = None,
     ) -> bool:
         """True if Greedy Consumption says "on" right now, independent of the plan.
 
@@ -114,20 +149,69 @@ class DeferrableLoadController:
         greedy condition is specifically "would not create new grid import", which needs
         the device's actual full draw. Missing/unknown inputs (a sensor is unavailable,
         a rate is unknown) fail closed — greedy contributes nothing rather than guessing.
+
+        Side effect, deliberately: records WHICH condition fired in ``_greedy_reason``
+        (and the forecast figures behind the third one) for ``status()`` to publish. A
+        greedy "on" is otherwise indistinguishable from a plan-driven one in the UI —
+        "why is my pool pump running?" is the whole observability question here.
         """
+        self._greedy_free_kwh = forecast_free_kwh
+        self._greedy_needed_kwh = (
+            self.forecast_surplus_needed_kwh(forecast_hours) if forecast_hours else None
+        )
+        self._greedy_reason = None
+        self._greedy_blocked = None
         if not self._greedy_enabled:
             return False
         if self._greedy_respects_schedule and schedule_allows is False:
+            self._greedy_blocked = "schedule"
             return False
         if import_rate is not None and import_rate <= 0.0:
+            self._greedy_reason = "import_free"
             return True
         if export_rate is not None and export_rate <= 0.0 and grid_power_w is not None:
             # Sign convention: positive = importing, negative = exporting (see
             # CONF_GRID_POWER_SENSOR). exporting_w is the magnitude of current export.
             exporting_w = max(0.0, -grid_power_w)
             if self.max_w > 0.0 and exporting_w >= self.max_w:
+                self._greedy_reason = "export_surplus"
                 return True
+        if self._forecast_surplus_wants_on(forecast_free_kwh, forecast_hours):
+            self._greedy_reason = "forecast_surplus"
+            return True
         return False
+
+    def forecast_surplus_needed_kwh(self, hours: float) -> float:
+        """Free energy (kWh) that must be forecast wasted over ``hours`` before the
+        forecast-surplus condition fires: exactly what this device would consume running
+        flat out for that whole window.
+
+        Deliberately the *full* window rather than some fraction of it. The condition is
+        allowed to spend real money right now, so the bar is "even with this device
+        running continuously from now to the end of the window, the plan still throws
+        free energy away" — not "there's a bit of spare solar around".
+        """
+        return max(0.0, self.max_w) / 1000.0 * max(0.0, hours)
+
+    def _forecast_surplus_wants_on(
+        self, forecast_free_kwh: Optional[float], forecast_hours: Optional[float]
+    ) -> bool:
+        """Third greedy condition: the plan forecasts more free energy going to waste
+        over the look-ahead than this device could possibly absorb (see module docstring).
+
+        ``forecast_free_kwh`` is computed by ``LoadControlManager`` from the live plan
+        (free energy the plan itself does NOT already allocate to this device);
+        ``forecast_hours`` is the span it actually covered, which can be shorter than the
+        nominal look-ahead near the end of the plan horizon — so the bar scales down with
+        it rather than becoming unreachable. Fails closed on missing inputs, like the
+        other two conditions.
+        """
+        if not self._greedy_forecast_surplus:
+            return False
+        if forecast_free_kwh is None or not forecast_hours or forecast_hours <= 0.0:
+            return False
+        needed = self.forecast_surplus_needed_kwh(forecast_hours)
+        return needed > 0.0 and forecast_free_kwh >= needed
 
     def _actual_state(self) -> Optional[bool]:
         st = self.hass.states.get(self.switch_entity_id)
@@ -150,6 +234,8 @@ class DeferrableLoadController:
         export_rate: Optional[float] = None,
         grid_power_w: Optional[float] = None,
         schedule_allows: Optional[bool] = None,
+        forecast_free_kwh: Optional[float] = None,
+        forecast_hours: Optional[float] = None,
     ) -> None:
         """Reconcile the switch toward the plan (plus Greedy Consumption, if enabled)
         for this tick.
@@ -162,9 +248,19 @@ class DeferrableLoadController:
         """
         if self._override is not None:
             self._note = f"override_{'on' if self._override else 'off'}"
+            # Greedy isn't evaluated at all under an override — clear the published
+            # reason so the UI can't keep showing a stale "running because X" for a
+            # device a human has since taken manual control of.
+            self._greedy_reason = None
+            self._greedy_blocked = "override"
+            self._greedy_free_kwh = None
+            self._greedy_needed_kwh = None
             return
 
-        greedy_on = self._greedy_wants_on(import_rate, export_rate, grid_power_w, schedule_allows)
+        greedy_on = self._greedy_wants_on(
+            import_rate, export_rate, grid_power_w, schedule_allows,
+            forecast_free_kwh, forecast_hours,
+        )
         want_on = greedy_on or self.desired_on(planned_w)
         tag = "_greedy" if (want_on and greedy_on) else ""
 
@@ -268,6 +364,13 @@ class DeferrableLoadController:
     def set_greedy_respects_schedule(self, enabled: bool) -> None:
         self._greedy_respects_schedule = bool(enabled)
 
+    @property
+    def greedy_forecast_surplus(self) -> bool:
+        return self._greedy_forecast_surplus
+
+    def set_greedy_forecast_surplus(self, enabled: bool) -> None:
+        self._greedy_forecast_surplus = bool(enabled)
+
     def status(self) -> dict:
         return {
             "name": self.name,
@@ -281,5 +384,23 @@ class DeferrableLoadController:
             ),
             "greedy": self._greedy_enabled,
             "greedy_respects_schedule": self._greedy_respects_schedule,
+            "greedy_forecast_surplus": self._greedy_forecast_surplus,
+            # --- greedy observability (see the attributes' comment in __init__) ---
+            # Which condition is holding the device on right now (None = greedy isn't the
+            # reason it's on; the plan is, or it's off).
+            "greedy_reason": self._greedy_reason,
+            # Why greedy couldn't fire, when it couldn't: "schedule" (outside the device's
+            # availability window with Respects Schedule on) or "override" (a human has
+            # Force On/Off set). None = greedy was free to fire and simply didn't match.
+            "greedy_blocked": self._greedy_blocked,
+            # Forecast-surplus progress: free energy the plan expects to waste over the
+            # look-ahead vs the bar it has to clear. Both None unless the forecast-surplus
+            # toggle is on (the manager only computes it then).
+            "forecast_free_kwh": (
+                round(self._greedy_free_kwh, 2) if self._greedy_free_kwh is not None else None
+            ),
+            "forecast_needed_kwh": (
+                round(self._greedy_needed_kwh, 2) if self._greedy_needed_kwh is not None else None
+            ),
             "note": self._note,
         }

@@ -54,7 +54,7 @@
  * each other, both visibly smaller than a 9kW solar ball, regardless of how each node's own
  * hardware happens to be rated.
  */
-import { HOT_WATER_RE } from './grid-lens-chart-common.js?v=20260731a';
+import { HOT_WATER_RE, esc } from './grid-lens-chart-common.js?v=20260802b';
 
 const _bgCache = new Map();
 
@@ -330,9 +330,18 @@ class GridLensPowerFlowCard extends HTMLElement {
     const priceSt = priceEid && hass.states[priceEid];
     const priceSig = priceSt ? `${priceSt.state}@${(priceSt.attributes || {}).generated_at || ''}` : '';
     // Include the resolved load identity so a reconfigure (set of loads changes) re-renders.
+    // Greedy state lives in the control switch's ATTRIBUTES, which move on the control
+    // tick while the switch's own state string stays "on" — so it needs its own term or
+    // the badge wouldn't appear (or clear) until something else in `watch` happened to
+    // change.
+    const greedySig = loads.map((l) => {
+      const eid = this._controlSwitchFor(l.switch_entity);
+      const a = eid && hass.states[eid] ? (hass.states[eid].attributes || {}) : {};
+      return `${a.greedy_reason || ''}:${a.forecast_free_kwh != null ? a.forecast_free_kwh : ''}`;
+    }).join(',');
     const sig = watch.map((e) => (hass.states[e] ? hass.states[e].state : '')).join('|')
       + '#' + loads.map((l) => l.power_entity).join(',')
-      + '#' + priceSig;
+      + '#' + priceSig + '#' + greedySig;
     if (sig !== this._sig) { this._sig = sig; this.render(); }
   }
 
@@ -518,12 +527,30 @@ class GridLensPowerFlowCard extends HTMLElement {
           </foreignObject>
         </g>`;
     }
+    // Greedy "why is this on?" badge — top-right, opposite corner to the history badge
+    // above so a device with an SOC sensor can carry both without them colliding.
+    let gbadge = '';
+    if (a.greedyBadge) {
+      const gx = a.cx + a.r * 0.68, gy = a.cy - a.r * 0.68;
+      const gr = Math.max(8, a.r * 0.32);
+      gbadge = `
+        <g class="greedy-badge">
+          <title>${esc(a.greedyBadge.title)}</title>
+          <circle cx="${gx}" cy="${gy}" r="${gr}" class="greedy-badge-bg"/>
+          <foreignObject x="${gx - gr}" y="${gy - gr}" width="${gr * 2}" height="${gr * 2}">
+            <div xmlns="http://www.w3.org/1999/xhtml" class="greedy-badge-icon" style="--mdc-icon-size:${(gr * 1.1).toFixed(1)}px">
+              <ha-icon icon="${a.greedyBadge.icon}"></ha-icon>
+            </div>
+          </foreignObject>
+        </g>`;
+    }
     return `
       <g class="node${a.dim ? ' dim' : ''}">
         <circle class="ring ${hasImage ? '' : 'placeholder'}" cx="${a.cx}" cy="${a.cy}" r="${a.r}"
                 style="--nc: var(${a.colorVar})"/>
         ${inner}
         ${badge}
+        ${gbadge}
         <text x="${lx}" y="${nameY}" text-anchor="${anchor}" class="node-name" style="font-size:${fs.name.toFixed(1)}px; fill:var(${a.colorVar})">${a.name}</text>
         <text x="${lx}" y="${valY}" text-anchor="${anchor}" class="node-value" style="font-size:${fs.val.toFixed(1)}px; fill:var(${a.colorVar})">${this._valueLines(a, lx)}</text>
       </g>`;
@@ -611,6 +638,57 @@ class GridLensPowerFlowCard extends HTMLElement {
   // `deferrable_loads` attribute the GridLens integration publishes (auto-discovered power
   // sensors), from the pinned source entity or the first sensor exposing it. Only loads with
   // a real power_entity are drawable.
+  // GridLens's control switch for a physical appliance switch: a `switch.*` carrying
+  // `switch === <the appliance switch>` plus `on_threshold_w` (DeferrableLoadController
+  // .status(), published by GridLensDeferrableLoadSwitch). Same attribute-fingerprint
+  // join grid-lens-load-control-card.js uses — never a naming convention.
+  //
+  // Deliberately read from this switch and NOT from the `deferrable_loads` sensor
+  // attribute: that sensor is a CoordinatorEntity tied to the plan-comparison run, so
+  // its attributes only refresh when a new comparison lands, whereas greedy flips on the
+  // 5-minute control tick. The switch is a plain polled entity, so it's the only surface
+  // that actually tracks greedy live.
+  _controlSwitchFor(phys) {
+    const hass = this._hass;
+    if (!phys || !hass) return null;
+    for (const eid of Object.keys(hass.states)) {
+      if (!eid.startsWith('switch.')) continue;
+      const a = hass.states[eid].attributes || {};
+      if (a.switch === phys && 'on_threshold_w' in a) return eid;
+    }
+    return null;
+  }
+
+  // "Why is this load running?" badge, shown only while Greedy Consumption — not the LP
+  // plan — is what's holding the device on. Answers the question the feature creates:
+  // the plan says off, the appliance is on, and nothing in the UI said why.
+  //
+  // The forecast-surplus reason gets its own icon (matching its own switch's) because
+  // it's the genuinely surprising one — the other two fire on energy that is visibly
+  // free right now, this one starts ahead of a spill that hasn't arrived yet, so its
+  // tooltip carries the kWh figures that justified the call.
+  _greedyBadge(ld) {
+    const eid = this._controlSwitchFor(ld && ld.switch_entity);
+    const a = eid && this._hass.states[eid] ? (this._hass.states[eid].attributes || {}) : null;
+    if (!a || !a.greedy_reason) return null;
+    if (a.greedy_reason === 'forecast_surplus') {
+      const have = a.forecast_free_kwh, need = a.forecast_needed_kwh;
+      const nums = (have != null && need != null)
+        ? ` (${(+have).toFixed(1)} kWh free vs ${(+need).toFixed(1)} kWh this load could use)`
+        : '';
+      return {
+        icon: 'mdi:weather-sunny-alert',
+        title: `Started early: the plan forecasts more free energy going to waste than this load can absorb${nums}`,
+      };
+    }
+    return {
+      icon: 'mdi:leaf',
+      title: a.greedy_reason === 'import_free'
+        ? 'Running because importing is free right now'
+        : 'Running on exported surplus that would otherwise be given away',
+    };
+  }
+
   _resolveDeferLoads() {
     const c = this._config;
     if (Array.isArray(c.deferrable_loads)) return c.deferrable_loads;
@@ -719,6 +797,7 @@ class GridLensPowerFlowCard extends HTMLElement {
         name: ld.name || `Load ${i + 1}`, value: `${kw.toFixed(2)} kW${soc}`,
         active: on && kw > MIN_KW, reverse: true, kw, dim: !on,
         maxKw, historyEntity: ld.soc_entity || null,
+        greedyBadge: this._greedyBadge(ld),
       });
     });
 
@@ -769,6 +848,7 @@ class GridLensPowerFlowCard extends HTMLElement {
           --c-hotwater:#94a3b8;
           --c-home: var(--primary-text-color);
           --c-def1:#e11d48; --c-def2:#0d9488; --c-def3:#7c3aed; --c-def4:#ca8a04;
+          --pf-greedy:#16a34a;
         }
         :host(.dark) {
           --c-solar:#b8960a; --c-grid:#a78bfa; --c-battery:#4ade80; --c-ev:#fbbf24;
@@ -777,6 +857,7 @@ class GridLensPowerFlowCard extends HTMLElement {
              this palette with the power chart card's --defer3 (grid-lens-chart-common.js).
              #8b5cf6 keeps the same violet identity while actually being distinguishable. */
           --c-def1:#fb7185; --c-def2:#2dd4bf; --c-def3:#8b5cf6; --c-def4:#facc15;
+          --pf-greedy:#4ade80;
         }
         ha-card { ${widthRule} }
         .head { display:flex; align-items:center; gap:8px; padding:10px 14px 0; }
@@ -822,6 +903,17 @@ class GridLensPowerFlowCard extends HTMLElement {
           width:100%; height:100%; display:flex; align-items:center; justify-content:center;
         }
         .history-badge-icon ha-icon { color: var(--nc); }
+        /* Greedy "why is this on?" badge. Deliberately NOT the node's own --nc colour:
+           it isn't a property of the device, it's GridLens saying "I overrode the plan
+           here", so it carries one consistent accent across every load. Green reads as
+           "free energy", matching the leaf on the Greedy switch itself. */
+        .greedy-badge-bg {
+          fill: var(--card-background-color); stroke: var(--pf-greedy); stroke-width: 1.5;
+        }
+        .greedy-badge-icon {
+          width:100%; height:100%; display:flex; align-items:center; justify-content:center;
+        }
+        .greedy-badge-icon ha-icon { color: var(--pf-greedy); }
         /* .node.dim opacity fade disabled 2026-07-28 for review — re-enable by
            reverting. dim is still computed/set per node as before, just
            not visually applied. */

@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Grid Lens — Energy Plan Comparison for Home Assistant</title>
-  <meta name="description" content="Compare every electricity plan in your state using your actual usage data. Privacy-focused, runs locally in Home Assistant.">
+  <title>Grid Lens — Energy Plan Comparison &amp; Battery Optimisation for Home Assistant</title>
+  <meta name="description" content="Compare every electricity plan against your real usage, then let Grid Lens run your battery and shiftable loads on the cheapest schedule it can find. Runs locally in Home Assistant.">
   <link rel="icon" href="/img/grid_lens.jpg">
   <link rel="stylesheet" href="style.css">
 </head>
@@ -13,8 +13,8 @@
 <section class="hero">
   <div class="container">
     <div class="section-label">Home Assistant Integration</div>
-    <h1>Find the energy plan that actually fits your home</h1>
-    <p>Grid Lens models every available plan against your real usage data — solar, battery, EV, and all — entirely inside your Home Assistant instance.</p>
+    <h1>Find the cheapest way to run your home — then actually run it</h1>
+    <p>Grid Lens models every available plan against your real usage data — solar, battery, EV, and all — entirely inside your Home Assistant instance. Then it can operate your battery and shiftable loads on the plan it found.</p>
     <div class="hero-actions">
       <a href="/pricing.html" class="btn btn-primary btn-lg">Get started free</a>
       <a href="/docs.html" class="btn btn-outline btn-lg">How it works</a>
@@ -53,6 +53,40 @@
 
 <section>
   <div class="container">
+    <div class="section-label">Beyond comparison</div>
+    <h2>It doesn't just tell you — it does it</h2>
+    <p style="max-width: 46rem; margin-bottom: 2rem; color: #444;">
+      Knowing the cheapest plan is only half the saving. The other half is running your house
+      the way that plan rewards. Grid Lens plans 72 hours ahead against forecast solar and
+      real prices, then optionally takes the wheel.
+    </p>
+    <div class="feature-grid">
+      <div class="feature-card">
+        <div class="icon">🔌</div>
+        <h3>Battery control</h3>
+        <p>Charges, holds, and discharges your battery to follow the optimised plan — respecting your SOC limits, and handing straight back to your inverter's own EMS if anything goes stale.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🗓️</div>
+        <h3>Load scheduling</h3>
+        <p>Paint the hours each appliance is <em>allowed</em> to run, per weekday. Grid Lens picks the cheapest half-hours inside your rules — and you can override any load to On, Off, or Auto at any time.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🍃</div>
+        <h3>Never waste free energy</h3>
+        <p>When your battery is full and the surplus is heading out at a near-zero feed-in tariff, Greedy Consumption spends it instead — and can start a load <em>ahead</em> of a forecast spill rather than waiting for it.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🔍</div>
+        <h3>Always explains itself</h3>
+        <p>Every automated action is visible on the dashboard: which rule fired, why, and how close the next one is. No black box deciding things about your house.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="container">
     <div class="section-label">How it works</div>
     <h2>Up and running in minutes</h2>
     <div class="steps">
@@ -81,7 +115,14 @@
         <div class="step-num">4</div>
         <div class="step-body">
           <h3>View your dashboard</h3>
-          <p>A custom Home Assistant dashboard shows optimal usage, cost estimates, and bill projections for each plan over any date range you choose.</p>
+          <p>A custom Home Assistant dashboard is added to your sidebar automatically — live energy flow, forecast vs. actual power, optimal usage, cost estimates, and bill projections for each plan over any date range you choose. No cards to configure, no YAML.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">5</div>
+        <div class="step-body">
+          <h3>Hand over the controls (optional)</h3>
+          <p>Everything automated is opt-in and off by default. Turn on battery control, or control for an individual appliance, whenever you're ready — and take it back with one switch.</p>
         </div>
       </div>
     </div>

@@ -39,6 +39,9 @@ async def async_setup_entry(
             entities.append(
                 GridLensDeferrableGreedyScheduleSwitch(load_mgr, entry, index, controller.name)
             )
+            entities.append(
+                GridLensDeferrableGreedySurplusSwitch(load_mgr, entry, index, controller.name)
+            )
 
     if entities:
         async_add_entities(entities)
@@ -268,5 +271,59 @@ class GridLensDeferrableGreedyScheduleSwitch(RestoreEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         await self._manager.set_greedy_respects_schedule(self._index, False)
+        self._attr_is_on = False
+        self.async_write_ha_state()
+
+
+class GridLensDeferrableGreedySurplusSwitch(RestoreEntity, SwitchEntity):
+    """ON = Greedy Consumption may ALSO fire on forecast surplus: start this device now
+    when the plan says more free energy will be thrown away over the next few hours than
+    the device could consume running flat out for that whole window.
+
+    Separate from the master Greedy switch (and requires it) because this is the one
+    greedy condition that can genuinely cost money in the moment — the other two only
+    fire on energy that is already free right now, this one starts early to catch a spill
+    that hasn't arrived yet. Defaults OFF, like every other load-control opt-in.
+
+    Same deliberate simplification as the two greedy switches above: no manager
+    state-listener wiring (that slot is owned by GridLensDeferrableLoadSwitch).
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:weather-sunny-alert"
+
+    def __init__(self, manager, entry: ConfigEntry, index: int, device_name: str) -> None:
+        self._manager = manager
+        self._index = index
+        self._attr_name = f"{device_name} Greedy Forecast Surplus"
+        self._attr_unique_id = f"{entry.entry_id}_deferrable_greedy_surplus_{index}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_is_on = False
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        want_on = last is not None and last.state == "on"  # default OFF if no prior state
+        if want_on:
+            await self._manager.set_greedy_forecast_surplus(self._index, True)
+        self._attr_is_on = self._manager.is_greedy_forecast_surplus(self._index)
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {"switch": self._manager.controllers[self._index].switch_entity_id,
+                "role": "greedy_surplus"}
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._manager.set_greedy_forecast_surplus(self._index, True)
+        self._attr_is_on = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._manager.set_greedy_forecast_surplus(self._index, False)
         self._attr_is_on = False
         self.async_write_ha_state()

@@ -276,6 +276,22 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
     grid += `<line x1="${g.ml}" y1="${y}" x2="${g.w - g.mr}" y2="${y}" stroke="var(--grid)"/>`;
     grid += `<text x="${g.ml - 5}" y="${y + 3}" text-anchor="end" font-size="9" fill="var(--muted)">${fmt(v)}</text>`;
   }
+  // Optional shaded time bands drawn UNDER everything (grid lines included), from
+  // opts.bands = [{ t0, t1, color, opacity? }] in epoch-ms. Used to mark stretches the
+  // plan itself flags as special — currently "free energy the plan expects to waste"
+  // (see grid-lens-power-chart-card). Clipped to the visible window and skipped when
+  // they'd collapse to nothing, so a caller can hand over the whole trajectory's worth
+  // of bands regardless of which view range is selected.
+  let bands = '';
+  for (const b of (opts.bands || [])) {
+    const bs = Math.max(b.t0, t0), be = Math.min(b.t1, t1);
+    if (!(be > bs)) continue;
+    const x0 = X(bs), x1 = X(be);
+    if (x1 - x0 < 0.5) continue;
+    bands += `<rect x="${x0.toFixed(1)}" y="${g.mt}" width="${(x1 - x0).toFixed(1)}"`
+      + ` height="${(g.h - g.mb - g.mt).toFixed(1)}" fill="${b.color}"`
+      + ` opacity="${b.opacity != null ? b.opacity : 0.16}"/>`;
+  }
   const xt = xAxisTicks(X, t0, t1, g.h - g.mb, 9);
   const nowX = X(Math.min(Date.now(), t1));
   const now = `<line x1="${nowX}" y1="${g.mt}" x2="${nowX}" y2="${g.h - g.mb}" stroke="var(--now-line)" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.65"/>`;
@@ -327,7 +343,7 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // explicit CSS height (e.g. grid-lens-power-chart-card's max_height) whose aspect
   // ratio doesn't match the viewBox gets letterboxed: the default "xMidYMid meet"
   // scales uniformly and pads the mismatch as empty space above/below the plot.
-  return `<svg viewBox="0 0 ${g.w} ${g.h}" preserveAspectRatio="none" class="chart-svg" role="img"><defs>${defs}</defs>${grid}${zero}${xt}${now}${paths}`
+  return `<svg viewBox="0 0 ${g.w} ${g.h}" preserveAspectRatio="none" class="chart-svg" role="img"><defs>${defs}</defs>${bands}${grid}${zero}${xt}${now}${paths}`
     + `<line class="xhair" x1="0" x2="0" y1="${g.mt}" y2="${g.h - g.mb}" stroke="var(--ink2)" stroke-width="1" opacity="0"/></svg>`;
 }
 
