@@ -175,12 +175,90 @@ CONF_DEFERRABLE_LOAD_MAX_KW = "deferrable_load_max_kw"    # list of max kW, para
 # seeded the LP's availability mask before the schedule card existed; removed 2026-08-02 as
 # redundant with the card, which now fully owns this. A device with no stored weekly
 # schedule yet is simply unrestricted (any hour) until the user paints one.
-# Optional per-device control switch (switch.* entity), parallel to sensors. A device with
-# a switch configured becomes a "type 1" controllable simple load: GridLens turns it on/off
-# per the optimized schedule (gated by its own default-OFF master switch). Empty string = no
-# switch = forecast-only, exactly like before this feature. EV/OCPP chargers with richer
-# control (charge-current setpoints) are a later, separate mechanism — not this switch list.
-CONF_DEFERRABLE_LOAD_SWITCHES = "deferrable_load_switches"  # list of switch IDs ("" = none)
+# Optional per-device control entity (switch.* OR climate.* entity), parallel to sensors.
+# A device with one configured becomes a "type 1" controllable simple load: GridLens turns
+# it on/off per the optimized schedule (gated by its own default-OFF master switch). Empty
+# string = no control entity = forecast-only, exactly like before this feature. A climate.*
+# entity (aircon) is turned on/off via climate.turn_on/turn_off (or climate.set_hvac_mode,
+# see CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE below, for an entity that doesn't support those
+# services) — GridLens only ever decides on/off timing, never hvac_mode/temperature.
+# EV/OCPP chargers with richer control (charge-current setpoints) are a later, separate
+# mechanism — not this list. Name kept as "switches" for config-data backward compatibility
+# even though a climate.* id is equally valid here.
+CONF_DEFERRABLE_LOAD_SWITCHES = "deferrable_load_switches"  # list of entity IDs ("" = none)
+# Optional per-device hvac_mode to command when turning a climate.*-controlled device "on",
+# parallel to CONF_DEFERRABLE_LOAD_SWITCHES. Only consulted for a climate.* control entity
+# that doesn't declare ClimateEntityFeature.TURN_ON/TURN_OFF support (most do — see
+# control/load_controller.py._actuate()); "" = auto-pick the entity's first non-"off"
+# hvac_modes entry. Meaningless (ignored) for a switch.* control entity or a forecast-only
+# device.
+CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE = "deferrable_load_climate_on_mode"  # list of str ("" = auto)
+
+# --- Modulating ("type 2") deferrable loads — EV chargers with a current/power setpoint ---
+# The mechanism the CONF_DEFERRABLE_LOAD_SWITCHES comment above defers to. A device with a
+# setpoint entity configured is driven by *how much* power it may draw, continuously, rather
+# than on/off — which is what the LP actually solves for anyway (def_i is a continuous
+# 0..max_kw variable; the on/off controller quantises it away at a 50% threshold).
+#
+# Deliberately NOT an OCPP-specific driver. Every HA charger integration worth supporting
+# exposes the same shape — a number.* entity carrying a charging-current limit in amps:
+#   OCPP (lbbrhzn/ocpp)  number.*_maximum_current          (A, min 0, step 1)
+#   Easee                number.*_dynamic_charger_limit    (A)
+#   Wallbox              number.*_maximum_charging_current (A)
+#   Zaptec / go-e / openEVSE / Tesla / Sigenergy AC charger — same idea, different names.
+# So the config is "point GridLens at that number entity", and any integration matching the
+# shape works with no GridLens change. "" = not a modulating load (on/off or forecast-only).
+CONF_DEFERRABLE_LOAD_SETPOINT = "deferrable_load_setpoint"  # list of number.* IDs ("" = none)
+# What the setpoint entity's value MEANS. "" = auto: read the entity's own
+# unit_of_measurement (A → current, W/kW → power), falling back to amps, which is what
+# every charger integration listed above uses. Explicit values: "a" | "w" | "kw" — needed
+# only for an integration that publishes no unit at all.
+CONF_DEFERRABLE_LOAD_SETPOINT_UNIT = "deferrable_load_setpoint_unit"  # list of "" | "a" | "w" | "kw"
+# Phases the setpoint's amps figure applies across, for the A ↔ W conversion
+# (W = amps × voltage × phases). 0 = auto-derive from this device's configured max_kw and
+# the setpoint entity's own max value, which is right far more often than a guess: a 7.4 kW
+# single-phase charger advertises max 32 A, a 22 kW three-phase one also advertises 32 A —
+# only max_kw distinguishes them. Ignored for a W/kW setpoint.
+CONF_DEFERRABLE_LOAD_PHASES = "deferrable_load_phases"  # list of int (0 = auto, else 1/2/3)
+# Nominal per-phase supply voltage for that conversion. 0 = DEFAULT_SUPPLY_VOLTAGE below.
+# Only a scaling constant — a 5% voltage error is a 5% power error, well inside the slack
+# the min-current floor and write deadband already carry.
+CONF_DEFERRABLE_LOAD_VOLTAGE = "deferrable_load_voltage"  # list of float (0 = default)
+# Minimum current the load can actually be given (A). An EV must not be offered below 6 A
+# (IEC 61851 duty-cycle floor) — commanding 3 A doesn't charge slowly, it makes the car
+# refuse or fault. So the physically feasible set is {0} ∪ [min, max], NOT [0, max], and
+# a sub-minimum LP allocation has to resolve to either "off" or "min", never to itself.
+# 0 = DEFAULT_MIN_CHARGE_CURRENT_A. Set 0.1 for a genuinely continuous load (a resistive
+# heater on a dimmer) that has no such floor.
+CONF_DEFERRABLE_LOAD_MIN_CURRENT = "deferrable_load_min_current"  # list of float A (0 = default)
+# Optional entity reporting whether the EV is actually plugged in / the charger is able to
+# deliver — a binary_sensor.*, or OCPP's own sensor.*_status (ChargePointStatus vocabulary).
+# "" = unknown, and unknown means "assume available": GridLens never withholds charging
+# because it couldn't confirm a plug. See MODULATING_PLUGGED_STATES / _UNPLUGGED_STATES.
+CONF_DEFERRABLE_LOAD_PLUG_SENSOR = "deferrable_load_plug_sensor"  # list of entity IDs ("" = none)
+
+# Default per-phase supply voltage for amps ↔ watts. 230 V is the IEC/EU/AU nominal
+# (AU is nominally 230 V +10%/−6% since AS 60038, though real suburban supply often sits
+# nearer 240 V). Only used when a device has no CONF_DEFERRABLE_LOAD_VOLTAGE override and
+# no live voltage sensor was discovered.
+DEFAULT_SUPPLY_VOLTAGE = 230.0
+# IEC 61851 minimum EV charging current. Below this an EV will refuse to draw at all.
+DEFAULT_MIN_CHARGE_CURRENT_A = 6.0
+# How often the fast modulation loop re-evaluates a modulating load's current setpoint.
+# The 5-minute plan tick is far too coarse to track a passing cloud — solar-following is
+# the whole reason to modulate rather than switch. 30 s is fast enough to follow real PV
+# and slow enough that a cloud-edge oscillation doesn't turn into a write storm (the
+# controller's own deadband + min-write-interval carry the rest of that load).
+MODULATION_INTERVAL_SECONDS = 30
+# Charger status strings that mean "nothing is connected / can't deliver". Matched
+# case-insensitively against a CONF_DEFERRABLE_LOAD_PLUG_SENSOR state. Everything else —
+# including any state we don't recognise — counts as plugged, per the fail-open rule above.
+# Vocabulary: OCPP 1.6 ChargePointStatus + the usual binary_sensor renderings.
+MODULATING_UNPLUGGED_STATES = frozenset(
+    {"available", "unavailable", "faulted", "reserved", "off", "false", "disconnected",
+     "not_connected", "unplugged", "no_vehicle", "idle"}
+)
+
 # Optional per-device battery/EV state-of-charge sensor (sensor.* entity, %), parallel to
 # sensors. Most relevant for an EV charger deferrable load (the vehicle's own SOC), but not
 # restricted to that — any deferrable load with its own battery can use it. Empty string =
@@ -224,6 +302,40 @@ CONF_DEFERRABLE_LOAD_DUMMY_CONTROLLED_LOAD = "deferrable_load_dummy_controlled_l
 # Same meaning as CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE above, parallel to the dummy-load
 # lists instead of the sensor-backed ones.
 CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE = "deferrable_load_dummy_cl_in_aggregate"  # list of bool
+
+# Estimated (sensor-less, controllable) deferrable loads — a device with no HA-visible
+# energy sensor AND no way to add one (no feedback path at all, e.g. an IR-blaster-driven
+# aircon), but WHICH GridLens can still turn on/off via a switch.*/climate.* control
+# entity. Distinct from CONF_DEFERRABLE_LOAD_DUMMY_* above: dummy/declared loads are
+# forecast-only (no control entity, LP/plan-comparison modelling only — the Controlled
+# Load nomination mechanism, see VPP_CONTROLLED_LOAD_HANDOFF.md) and are NOT extended by
+# this feature. An estimated load gets a real synthetic energy sensor
+# (GridLensEstimatedEnergySensor, sensor.py) that GridLens creates and maintains itself —
+# integrating a running kWh total from an estimated power draw while the control entity
+# reads "on" — then splices that sensor's entity_id into CONF_DEFERRABLE_LOAD_SENSORS (see
+# __init__.py._ensure_load_estimators) so every existing sensor-backed code path
+# (plan_calculator, LoadControlManager, advisory/coordinator, the schedule card, Today
+# Boost, Greedy Consumption) treats it exactly like a device with a real meter — zero
+# changes needed there. Fixed 3 slots, same static-config-flow-schema reasoning as
+# DEFERRABLE_LOAD_DUMMY_SLOTS above.
+DEFERRABLE_LOAD_ESTIMATED_SLOTS = 3
+CONF_DEFERRABLE_LOAD_EST_NAMES = "deferrable_load_est_names"      # list of str ("" = unused slot)
+CONF_DEFERRABLE_LOAD_EST_CONTROL = "deferrable_load_est_control"  # list of switch.*/climate.* IDs
+CONF_DEFERRABLE_LOAD_EST_KW = "deferrable_load_est_kw"            # list of float (manual seed kW)
+# Whether load_estimation.LoadEstimator should refine deferrable_load_est_kw's seed value
+# from real on/off transitions of the control entity (see load_estimation.py). False =
+# stay on the manual seed forever — a legitimate choice if the household has no whole-house
+# load power sensor configured (CONF_LOAD_POWER_SENSOR) or doesn't trust the inference.
+CONF_DEFERRABLE_LOAD_EST_AUTO = "deferrable_load_est_auto"        # list of bool
+
+# Live whole-house load power sensor (W or kW; positive = consuming). Backend counterpart
+# of the Power Flow card's own `load_power_entity` YAML option (grid-lens-powerflow-card.js)
+# — same concept, same kind of entity a user would already have picked for that card —
+# promoted to an integration-level config field because load_estimation.LoadEstimator runs
+# server-side (a background HA listener/timer), not in the browser. Optional: only consulted
+# when at least one CONF_DEFERRABLE_LOAD_EST_AUTO slot is True; unset = auto-refine simply
+# never fires (fails open, logs once), same discipline as CONF_GRID_POWER_SENSOR.
+CONF_LOAD_POWER_SENSOR = "load_power_sensor"
 
 # VPP bolt-on program (e.g. AGL "Bring Your Own Battery") — a retailer-level credit
 # program layered on top of whatever plan the household is already on, independent

@@ -196,11 +196,59 @@ EV charger, hot water, pool pump. The optimiser is told each device's average da
 max kW, and when it's *allowed* to run; it decides *when*.
 
 **Config** (per device, parallel lists): `deferrable_load_sensors` (energy sensor — the join
-key), `..._max_kw`, `..._switches` (control switch, `""` = forecast-only), `..._soc_sensors`
-(e.g. EV SOC). Availability windows are **not** set here — see §8; a device is fully
-unrestricted (any hour) until the user paints a schedule on the dashboard card. (A static
-per-device `deferrable_load_hours` config-flow field used to seed this before the schedule
-card existed — removed 2026-08-02 as redundant with it.)
+key), `..._max_kw`, `..._switches` (control entity, `""` = forecast-only — see below),
+`..._soc_sensors` (e.g. EV SOC). Availability windows are **not** set here — see §8; a device
+is fully unrestricted (any hour) until the user paints a schedule on the dashboard card. (A
+static per-device `deferrable_load_hours` config-flow field used to seed this before the
+schedule card existed — removed 2026-08-02 as redundant with it.)
+
+**Control entity can be `switch.*` OR `climate.*`** (added 2026-08-02, for aircon). Despite
+the config key's name, `..._switches` accepts either domain — `control/load_controller.py`
+picks the actuation mechanism from the entity_id's own domain, so every other consumer
+(`switch.py`'s per-device Control/Greedy switches, `select.py`'s override, the schedule card)
+stays domain-agnostic. See §6 for how a climate entity is actually driven.
+
+**Or a `number.*` current setpoint** — a *modulating* device (added 2026-08-03, for EV
+chargers). Config: `deferrable_load_setpoint` plus `..._setpoint_unit`, `..._phases`,
+`..._voltage`, `..._min_current`, `..._plug_sensor`. A device with a setpoint entity is
+driven by *how much* power it may draw rather than on/off. See §6a.
+
+**Estimated (unmonitored, controllable) loads** — a third device category, for a control
+entity with no energy feedback path at all and no way to add one (the canonical case: an
+IR-blaster-driven aircon, `climate.daikin_ac` on this install — no ECHONET/Modbus/etc
+telemetry, just IR commands out). Config: `deferrable_load_est_names` /
+`..._est_control` / `..._est_kw` (manual seed) / `..._est_auto` (opt-in to refine the seed
+from real usage), fixed 3 slots, plus one entry-wide `load_power_sensor` (whole-house load
+power — the backend counterpart of the Power Flow card's own `load_power_entity` card
+option). GridLens builds a real synthetic energy sensor for each configured slot
+(`GridLensEstimatedEnergySensor`, `sensor.py`) and splices its entity_id straight into
+`deferrable_load_sensors` at setup (`__init__.py._ensure_load_estimators`, before anything
+else reads `entry.data`) — so every other deferrable-load feature (LP dispatch, control, the
+schedule card, Today Boost, Greedy Consumption) treats it exactly like a device with a real
+meter, no separate code path. The number itself comes from `load_estimation.py`'s
+`LoadEstimator`: it watches the control entity for an off→on transition, samples the house
+load power sensor just before and ~3 minutes after (long enough for a compressor to spin up),
+and folds a plausible delta into an EMA-smoothed power estimate — discarding the sample if
+another configured deferrable device changed state during the window (can't attribute the
+delta) or if the delta is outside a sane floor/ceiling. Learns from *any* on/off transition
+(manual, climate_scheduler, Force On), not just ones GridLens itself commanded, so it
+bootstraps from ordinary use. Distinct from "declared/dummy" loads below — those stay
+forecast-only by design (the Controlled Load nomination mechanism) and were **not** extended
+by this feature.
+
+**Power-only inference for the Power Flow card** (added 2026-08-02) — fully automatic, no
+config beyond `load_power_sensor` (same field as above). The Power Flow card drops any
+deferrable-load node with no live `power_entity`, and `entity_lookup.resolve_power_sensor()`
+can only find one if a `device_class: power` sibling sensor exists on the device — which
+ECHONET Lite aircons never have (only a cumulative `device_class: energy` counter). So at
+setup, `_ensure_load_estimators`'s second pass scans every deferrable device with a control
+entity and no resolvable `power_entity` (sensor-backed **or** an estimated load from the
+first pass) and builds it a power-only `LoadEstimator` (`track_energy=False` — the real
+accumulation, where one exists, already comes from the device's own sensor; this instance
+exists purely to back `GridLensEstimatedPowerSensor`, a live-W reading = the estimate while
+"on", 0 while "off"). `sensor.py._build_deferrable_loads()` falls back to it as `power_entity`
+whenever the real lookup finds nothing. A device with a real power sensor already, or with no
+control entity at all (forecast-only), is left untouched.
 
 **Daily kWh** comes from a 14-day historical average of the device's own energy sensor,
 overridable per-day (see Today Boost).
@@ -224,7 +272,20 @@ like "Hot Water" actually lives, so it wins over the raw registry name.
 ## 6. Deferrable load control (layer 3)
 
 **What it does.** Switches a simple on/off appliance ("type 1" load — draws roughly a fixed
-power when on) to follow the plan.
+power when on) to follow the plan. Includes aircon: a `climate.*` entity is a valid control
+entity, not just `switch.*` (added 2026-08-02).
+
+**Climate entities (aircon).** "On"/"off" is the hvac_mode, not a native switch state —
+anything other than `off` counts as on. Actuation prefers `climate.turn_on`/`climate.turn_off`
+(both device families this integration ships against — ECHONET Lite and SmartIR/Broadlink —
+support these), falling back to `climate.set_hvac_mode` for a climate integration that doesn't
+declare `TURN_ON`/`TURN_OFF` support, using either a per-device configured hvac mode
+(`deferrable_load_climate_on_mode`) or the entity's own first non-"off" `hvac_modes` entry.
+GridLens deliberately never touches hvac_mode or target temperature beyond deciding on/off —
+comfort settings stay under the user's own control (or e.g. `climate_scheduler`'s). **Gotcha:**
+if something else also drives on/off on the same climate entity (a schedule, the user),
+GridLens's plan and that other driver can fight — no arbitration is attempted, same as two
+people fighting over one switch.
 
 **Entities per controllable device**
 | Entity | Default | Purpose |
@@ -271,6 +332,96 @@ unreliable to trigger by tap).
 
 ---
 
+## 6a. Modulating load control — EV chargers (layer 3)
+
+**What it does.** Drives a load that accepts a *continuous* power/current setpoint — an EV
+charger — by deciding how many amps it may draw, re-evaluated every **30 seconds**. This is
+"type 2" control, alongside §6's type-1 on/off.
+
+**Why it's a better fit than on/off.** The LP already solves `def_i` as a continuous
+`0..max_kw` variable. The on/off controller throws that resolution away at a 50% threshold
+(`desired_on()`); a modulating controller consumes the optimiser's actual answer.
+
+**The abstraction is a `number.*` setpoint, not an OCPP driver.** Every charger integration
+worth supporting exposes the same shape — a number entity carrying a charging-current limit
+in amps: OCPP (`lbbrhzn/ocpp`) `number.*_maximum_current` (A, min 0, step 1), Easee's dynamic
+charger limit, Wallbox's max charging current, Zaptec, go-e, openEVSE, Tesla's charging amps,
+Sigenergy's AC-charger output current. Config is "point GridLens at that number entity", so
+any integration matching the shape works with **no GridLens change**. A `switch.*` may be
+configured alongside it (turned on before ramping up, off after commanding 0); the common
+case is a setpoint alone, since writing 0 A stops delivery.
+
+**Entities:** all of §6's, plus `number.*_<device>_max_current` — a user ceiling on the
+current GridLens may command. Defaults to the hardware max (unrestricted out of the box);
+`RestoreEntity`, because it's durable user intent with no deadman that clears it.
+
+**Files:** `control/modulating_controller.py` (`ModulatingLoadController`, a subclass of
+`DeferrableLoadController` so override/greedy/debounce behaviour is shared, not forked),
+`control/load_control_manager.py` (the fast loop).
+
+**Two loops, deliberately.** The existing 5-minute tick still runs `apply()` — it evaluates
+the greedy conditions and sets intent. A second `async_track_time_interval` at
+`MODULATION_INTERVAL_SECONDS` (30 s) calls `modulate()`. It starts **only when an enabled
+device is actually modulating** — a household with no charger never gains a 30-second timer.
+5 minutes is far too coarse to track a passing cloud, and solar-following is the whole reason
+to modulate rather than switch.
+
+**Target power** (`LoadControlManager._modulation_target_w`):
+`target = max(plan_w, surplus_w)`, where `surplus_w` is the continuous generalisation of
+Greedy Consumption — `current export + what this device is already drawing`, i.e. how much it
+could pull without creating new import. A free-import window targets the full cap. The
+surplus term is gated on the same greedy toggles and schedule check as §7, and **fails closed**:
+no `grid_power_sensor`, unknown rate, or unavailable entity and the term contributes nothing,
+leaving pure plan-following.
+
+**⚠ The 6 A floor is the subtle part.** An EV's feasible set is `{0} ∪ [min, max]`, **not**
+`[0, max]` — IEC 61851 forbids offering below 6 A, and commanding 3 A doesn't charge slowly,
+it makes the car refuse or fault. So a sub-minimum allocation must resolve to *either* off or
+min, never to itself. The controller snaps, with **hysteresis**: below `min_w` while off stays
+off; below `min_w` while already charging holds at `min_w` down to `0.6 × min_w` before
+dropping to 0. A cut-off EV can take 30+ s to re-handshake, so an unnecessary stop at a cloud
+edge is expensive.
+
+**The LP is deliberately *not* told this** (2026-08-03 decision). It keeps its continuous
+variable; `min_kw` is plumbed through `plan_calculator._deferrable_min_kw` → the per-device
+dicts → `battery_optimizer`, where it is **reserved and currently ignored**. Modelling
+`{0} ∪ [min, max]` properly needs a binary per slot per device (~144 per charger over a 72 h
+horizon) on a solve that already always falls back to scipy because the HiGHS path is broken.
+The plumbing is there so it can be switched on behind a flag once solve time is measured. The
+practical cost of the gap is small: a linear objective already prefers running flat out in the
+cheapest slots.
+
+**Write economy is a safety property, not tidiness.** These setpoints go over the wire as
+OCPP `SetChargingProfile` calls or cloud API writes to Easee/Wallbox/Zaptec. A 30-second loop
+with no throttle is a write storm against someone's charger. Hence a `write_deadband_a`
+(0.5 A, converted to the setpoint's own unit) and a `min_write_interval_s` (20 s) — both
+bypassed when the target is 0 or crosses the on/off boundary, which always writes immediately.
+
+**Unit handling.** `watts = amps × voltage × phases`. The unit is inferred from the setpoint
+entity's own `unit_of_measurement` (resolved lazily — at construction the charger integration
+may not have published state yet), overridable per device. Phases auto-derive from
+`max_kw ÷ (native_max_a × voltage)`, clamped 1–3: a 7.4 kW single-phase charger and a 22 kW
+three-phase one both advertise 32 A, and only `max_kw` distinguishes them.
+
+**Plug detection fails OPEN.** `deferrable_load_plug_sensor` is optional; a state in
+`MODULATING_UNPLUGGED_STATES` (OCPP `ChargePointStatus` vocabulary plus the usual
+binary_sensor renderings) commands 0. Unconfigured, unavailable, or unrecognised means
+"assume plugged" — GridLens must never withhold charging because it couldn't confirm a plug.
+
+**Gotcha — the join key.** A switchless charger has `switch_entity_id == ""`. Every auxiliary
+entity (greedy switches, override select) and the Load Control card pair themselves to a
+device by matching a published `switch` attribute, so an empty string would make every
+switchless charger on an install collide. `DeferrableLoadController.join_key` exists for
+exactly this: the subclass falls back to the setpoint entity id. Use it, never
+`switch_entity_id`, for anything user-facing.
+
+**⚠ Untested on real hardware.** The dev rig has no modulating charger — only an on/off smart
+plug — so everything above is verified against stubs only (`tests/test_modulating_load_control.py`).
+Phase auto-derivation, companion-switch ordering, and each vendor's step/rounding semantics
+have never met a real charger.
+
+---
+
 ## 7. Greedy Consumption
 
 **What it does.** A real-time safety net *on top of* the plan: turn a load on whenever
@@ -284,6 +435,17 @@ path, no separate chatter risk. All are suppressed entirely under a manual overr
 | 1 | **Free import** | This slot's import rate is $0 (a plan's free window). | No |
 | 2 | **Export surplus** | Export price is $0 **and** the house is currently exporting at least as much as this device draws — so running it can't create new import. | No |
 | 3 | **Forecast surplus** | Over a 4 h look-ahead, the plan expects to waste **more free energy than this device could consume running flat out for that whole window**. | **Yes** |
+
+**Condition 2's bar is lower for a modulating load** (§6a). An on/off load has to clear
+`max_w` — all-or-nothing, so turning it on when only part of its draw is covered would create
+real import. A modulating load can absorb *any* surplus, so its bar is `min_w` instead. That's
+the single hook `_export_surplus_threshold_w()` exists for; the on/off behaviour is unchanged.
+
+**Condition 3 on a modulating load targets the full envelope** (`cap_w`), not a metered
+surplus — it's forward-looking, so there's no live figure to meter against, and its bar is
+already "even running flat out for the whole window the plan still spills". `greedy_reason`
+is the only record that it fired (it's evaluated on the 5-min tick, not the 30-s one), which
+is why that property is public and read by `_modulation_target_w`.
 
 **Why #3 exists.** #1 and #2 are strictly instantaneous — they only fire once free energy is
 already flowing. On a solar+battery house that fires late: mid-morning the battery soaks up
@@ -422,8 +584,8 @@ that?" has to be answerable from the dashboard alone.
 | Surface | Answers |
 |---|---|
 | `switch.*_battery_control` attributes | Applied action/power, last tick, plan age, degraded state, note. |
-| `switch.*_<device>_control` attributes | Commanded state, threshold, override, all three greedy toggles, **`greedy_reason`**, **`greedy_blocked`**, **`forecast_free_kwh` / `forecast_needed_kwh`**, note. |
-| **Load Control card** | Per row: control state, and a live greedy line — the firing reason, or why it's blocked, or a **progress bar toward the forecast-surplus bar** (`6.2 / 8.0 kWh`) while it's armed and tracking. |
+| `switch.*_<device>_control` attributes | Commanded state, threshold, override, all three greedy toggles, **`greedy_reason`**, **`greedy_blocked`**, **`forecast_free_kwh` / `forecast_needed_kwh`**, note. Modulating devices add `control_type`, `setpoint_entity`, `min_w`/`cap_w`, `commanded_w`/`commanded_setpoint`, `plugged_in`, `last_write`, `modulation_source`. |
+| **Load Control card** | Per row: control state, and a live greedy line — the firing reason, or why it's blocked, or a **progress bar toward the forecast-surplus bar** (`6.2 / 8.0 kWh`) while it's armed and tracking. For a modulating device (§6a): live amps + kW, the max-current ceiling input, and a one-line "why" — `modulation_source` (plan / surplus / override / off) and `plugged_in`. "Why is my car charging at 8 A right now?" must be answerable from the row. |
 | **Power Flow card** | A badge on a load node while *greedy*, not the plan, is holding it on — leaf for the two instantaneous reasons, sun-alert for forecast surplus, with the kWh figures in the tooltip. |
 | **Power Chart card** | Free-energy time bands: **orange = free energy being wasted** (plan exports into a ≤$0 export price), **teal = free import window**. Legend appears only when a band is in view; the crosshair tooltip names the band. |
 | `ha core logs` | Every optimiser run logs horizon, device count, solver status, credits, caps, export floor. |
@@ -498,9 +660,13 @@ custom_components/grid_lens/
 ├── schedule_grid.py         7x48 grid helpers (slot_allowed, week_from_hours)
 ├── deferrable_schedules.py  schedule Store
 ├── deferrable_overrides.py  boost Store
+├── load_estimation.py       LoadEstimator + EstimateStore — synthetic energy sensor for an
+│                            unmonitored controllable load (aircon w/ no feedback), §5
+├── load_estimate_math.py    pure sample-accept/EMA/integration logic behind LoadEstimator
 ├── entity_lookup.py         device name / power sensor auto-discovery
 ├── advisory/                forecast → LP → dispatch plan + sensors
 ├── control/                 executor, battery + load control managers, controllers
+│   └── modulating_controller.py  type-2 EV-charger current setpoint control, §6a
 ├── inverters/               HAL: base.py contract, sigenergy_mqtt.py driver
 ├── tests/                   offline suites (no HA/scipy needed — `python3 tests/<f>.py`)
 └── www/cards/               all Lovelace cards + grid-lens-chart-common.js

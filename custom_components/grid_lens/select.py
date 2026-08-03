@@ -86,7 +86,7 @@ class GridLensLoadOverrideSelect(RestoreEntity, SelectEntity):
         # physical switch entity_id), so no install-specific config is needed.
         return {
             "name": self._controller.name,
-            "switch": self._controller.switch_entity_id,
+            "switch": self._controller.join_key,
             "override": self._manager.get_override(self._index) or "auto",
         }
 

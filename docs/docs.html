@@ -35,6 +35,7 @@
         <ul>
           <li><a href="#battery-control">Battery control</a></li>
           <li><a href="#load-control">Load control</a></li>
+          <li><a href="#ev-chargers">EV chargers</a></li>
           <li><a href="#greedy">Greedy Consumption</a></li>
           <li><a href="#observability">Seeing why it acted</a></li>
         </ul>
@@ -110,9 +111,10 @@
         </table>
 
         <h2 id="deferrable">Deferrable loads</h2>
-        <p>A deferrable load is electricity usage you can shift to a cheaper time of day — for example an EV charger, pool pump, or hot water system.</p>
+        <p>A deferrable load is electricity usage you can shift to a cheaper time of day — for example an EV charger, pool pump, hot water system, or air conditioner.</p>
         <p>To include a deferrable load in the optimisation, you need a sensor that measures its consumption. Grid Lens will model what each plan would cost if you shifted that load to its cheapest window.</p>
         <p>Configure deferrable loads under <strong>Settings → Devices &amp; Services → Grid Lens → Configure</strong> after setup.</p>
+        <p>No consumption sensor at all for a controllable appliance (common for an IR-remote-controlled aircon)? Grid Lens can estimate one for you — see <strong>Estimated loads</strong> under <a href="#load-control">Load control</a> below.</p>
 
         <h2 id="schedules">Allowed run times</h2>
         <p>Each deferrable load has a weekly schedule — a per-weekday, half-hourly grid of when that appliance is <strong>allowed</strong> to run. Grid Lens picks the cheapest half-hours <em>inside</em> your rules; it never runs a load outside them.</p>
@@ -141,8 +143,9 @@
         <p>Battery control is brand-agnostic by design. <strong>Sigenergy</strong> is supported today; more inverter drivers are being added.</p>
 
         <h2 id="load-control">Load control</h2>
-        <p>Grid Lens can also switch simple on/off appliances — anything exposed to Home Assistant as a <code>switch</code> entity that draws roughly a fixed power when running (a pool pump, a smart-plug-fed charger, a resistive heater).</p>
-        <p>Assign a control switch to a deferrable load via <strong>Grid Lens → Configure</strong>. Each controllable load then gets its own controls on the Deferrable Loads card:</p>
+        <p>Grid Lens can also switch simple on/off appliances — anything exposed to Home Assistant as a <code>switch</code> entity that draws roughly a fixed power when running (a pool pump, a smart-plug-fed charger, a resistive heater) — <strong>or as a <code>climate</code> entity</strong>, so an air conditioner works the same way. Grid Lens only ever decides when it runs, never its mode or target temperature — those stay under your own control.</p>
+        <p>An EV charger that accepts a charging-current limit is handled differently, and better — see <a href="#ev-chargers">EV chargers</a> below.</p>
+        <p>Assign a control switch (or climate entity) to a deferrable load via <strong>Grid Lens → Configure</strong>. Each controllable load then gets its own controls on the Deferrable Loads card:</p>
         <table class="compare-table">
           <thead><tr><th>Control</th><th>Default</th><th>What it does</th></tr></thead>
           <tbody>
@@ -153,6 +156,32 @@
         </table>
         <div class="note">
           <strong>Everything is off by default.</strong> A fresh install never touches an appliance until you explicitly enable control for it. And Grid Lens will never force a running appliance off because <em>it</em> had a problem — if it loses its plan or Home Assistant restarts, it stops driving the load and leaves it exactly as it is.
+        </div>
+
+        <h3 id="ev-chargers">EV chargers — variable charging current</h3>
+        <p>An EV charger is not really an on/off appliance. Most can be told <em>how many amps</em> to deliver, and Grid Lens will use that: instead of slamming the charger fully on or fully off, it dials the charging current up and down to match what the plan wants and what your solar is actually producing right now.</p>
+        <p>This works with any charger integration that exposes a charging-current limit as a Home Assistant <code>number</code> entity — which is essentially all of them. Known-good shapes include <strong>OCPP</strong> (<code>number.…_maximum_current</code>), <strong>Easee</strong>, <strong>Wallbox</strong>, <strong>Zaptec</strong>, <strong>go-e</strong>, <strong>openEVSE</strong>, <strong>Tesla</strong> and <strong>Sigenergy</strong>. Point Grid Lens at that entity under <strong>Grid Lens → Configure</strong> and it takes over from there; there's no per-brand setup.</p>
+        <table class="compare-table">
+          <thead><tr><th>Setting</th><th>Default</th><th>What it does</th></tr></thead>
+          <tbody>
+            <tr><td>Charging current entity</td><td>—</td><td>The charger's current-limit <code>number</code> entity. Leave it empty to keep plain on/off control.</td></tr>
+            <tr><td>Units / phases / voltage</td><td>Auto</td><td>Detected from the entity itself. Only set these if auto-detection gets it wrong.</td></tr>
+            <tr><td>Minimum current</td><td>6 A</td><td>The lowest current your car will accept. Rarely needs changing.</td></tr>
+            <tr><td>Plugged-in sensor</td><td>—</td><td>Optional. Lets Grid Lens stop commanding a charger with no car attached.</td></tr>
+            <tr><td>Max Current</td><td>Charger maximum</td><td>Your own ceiling — "never charge above 10 A", whatever the plan wants.</td></tr>
+          </tbody>
+        </table>
+        <p>With <strong>Greedy Consumption</strong> switched on, a modulating charger does something an on/off one can't: it tracks your surplus continuously, every 30 seconds, ramping the current to absorb exactly what you're exporting. An on/off appliance has to wait until the whole of its draw is covered before it can switch on at all. For live surplus tracking you'll also need a <strong>grid power sensor</strong> configured — without one, the charger simply follows the optimiser's plan instead.</p>
+        <div class="note">
+          <strong>Why 6 amps matters.</strong> An electric car can't charge below about 6 A — offer it less and it won't charge slowly, it will refuse outright. So Grid Lens never commands an in-between current: it either charges at 6 A or more, or not at all. It also holds on a little past the point where it would otherwise stop, because a car that gets cut off can take half a minute to start again — better to ride out a passing cloud than restart the session.
+        </div>
+
+        <h3 id="estimated-loads">Estimated loads</h3>
+        <p>Some controllable appliances have no way to report their energy use at all — the classic case is an air conditioner driven by an infrared blaster, which can only send commands, never read anything back. You can still add these under <strong>Grid Lens → Configure → Estimated loads</strong>: give it a name, its control entity, and a rough estimate of its power draw in kW.</p>
+        <p>Turn on <strong>auto-refine</strong> and point Grid Lens at a whole-house load power sensor, and it will quietly improve that estimate over time: whenever the appliance switches on, it compares your house's power draw just before and a few minutes after (long enough for a compressor to spin up) and folds a plausible reading into a running estimate. It learns from ordinary use — you don't need to do anything for it to collect data — and discards anything that looks unreliable (another controlled device changing state at the same time, an implausible jump). Leave auto-refine off, or skip the load power sensor, and it simply stays on your manual estimate.</p>
+        <p>Once configured, an estimated load behaves exactly like any other deferrable load — it gets its own schedule, Today Boost, Greedy Consumption, and all the same controls above.</p>
+        <div class="note">
+          <strong>Also fixes the Power Flow card for devices with no live power sensor</strong> — even ones that already have a real energy meter. Some devices (many ECHONET Lite air conditioners, for example) only report a running energy total, never an instant wattage, and the Power Flow card needs a live number to draw a node. The moment you set the whole-house load power sensor above, Grid Lens automatically builds one for every controllable device that's missing it — nothing else to configure.
         </div>
 
         <h2 id="greedy">Greedy Consumption</h2>

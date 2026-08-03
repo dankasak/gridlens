@@ -211,7 +211,7 @@ class GridLensDeferrableGreedySwitch(RestoreEntity, SwitchEntity):
         # card already use to pair auxiliary entities with a device's physical appliance
         # switch; `role` disambiguates this entity from GridLensDeferrableGreedyScheduleSwitch
         # below, since both otherwise carry an identically-shaped `switch` attribute.
-        return {"switch": self._manager.controllers[self._index].switch_entity_id, "role": "greedy"}
+        return {"switch": self._manager.controllers[self._index].join_key, "role": "greedy"}
 
     async def async_turn_on(self, **kwargs) -> None:
         await self._manager.set_greedy(self._index, True)
@@ -261,7 +261,7 @@ class GridLensDeferrableGreedyScheduleSwitch(RestoreEntity, SwitchEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        return {"switch": self._manager.controllers[self._index].switch_entity_id,
+        return {"switch": self._manager.controllers[self._index].join_key,
                 "role": "greedy_schedule"}
 
     async def async_turn_on(self, **kwargs) -> None:
@@ -315,7 +315,7 @@ class GridLensDeferrableGreedySurplusSwitch(RestoreEntity, SwitchEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        return {"switch": self._manager.controllers[self._index].switch_entity_id,
+        return {"switch": self._manager.controllers[self._index].join_key,
                 "role": "greedy_surplus"}
 
     async def async_turn_on(self, **kwargs) -> None:

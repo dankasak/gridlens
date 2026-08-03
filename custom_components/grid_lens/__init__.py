@@ -283,7 +283,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260802d"
+    _CARD_VERSION = "20260803a"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -1089,11 +1089,223 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
     await hass.config_entries.async_reload(entry.entry_id)
 
 
+async def _ensure_load_estimators(hass: HomeAssistant, entry: ConfigEntry) -> tuple[dict, dict]:
+    """Two related pieces of automatic LoadEstimator wiring, both run once here at the
+    top of async_setup_entry (see the ordering note below):
+
+    1. **"Estimated load" slots** (CONF_DEFERRABLE_LOAD_EST_*) — a device with a control
+       entity but no energy sensor at all (e.g. an IR-blaster aircon). Splices a synthetic
+       energy sensor into the normal sensor-backed CONF_DEFERRABLE_LOAD_SENSORS lists so
+       the rest of the system treats it exactly like a device with a real meter.
+    2. **Power-only inference** (added 2026-08-02, no config beyond CONF_LOAD_POWER_SENSOR
+       needed) — for EVERY deferrable device with a control entity but no live
+       power_entity resolvable by entity_lookup.resolve_power_sensor() — the common case
+       for a device whose only telemetry is a cumulative energy counter (e.g. an ECHONET
+       Lite aircon's measured_cumulative_power_consumption, device_class energy not
+       power) — builds a power-only LoadEstimator (track_energy=False; the real
+       accumulation already comes from the device's own sensor, this is ONLY for a live
+       W reading) so the Power Flow card, which silently drops any node with no
+       power_entity, can show it. Covers both sensor-backed devices AND the
+       estimated-load ones from step 1. Silently does nothing (per device) if
+       CONF_LOAD_POWER_SENSOR isn't configured — same fail-open discipline as every
+       other optional sensor in this integration.
+
+    Returns (energy_estimators, power_estimators):
+    - energy_estimators: {est_slot_index: LoadEstimator} — sensor.py wraps each in a
+      GridLensEstimatedEnergySensor.
+    - power_estimators: {sensor_id: LoadEstimator} — sensor.py wraps each in a
+      GridLensEstimatedPowerSensor, and _build_deferrable_loads() falls back to it as
+      the device's power_entity when resolve_power_sensor() finds nothing. An
+      estimated-load slot's estimator appears in BOTH dicts (the same LoadEstimator
+      instance — it has neither a real energy nor a real power sensor).
+
+    Must run before anything else in async_setup_entry reads entry.data
+    (GridLensCoordinator, LoadControlManager, PlanCalculator, AdvisoryCoordinator, and the
+    platform entities all do) and before the config-entry update listener is registered —
+    the async_update_entry call below (step 1 only) is a one-time, idempotent merge (a
+    no-op once a slot's sensor id is already present in CONF_DEFERRABLE_LOAD_SENSORS), and
+    with no listener registered yet it can't race a reload against this very setup call:
+    the merged entry.data is simply already correct by the time everything else below
+    reads it. See const.py's CONF_DEFERRABLE_LOAD_EST_* docstring for the design step 1
+    implements.
+    """
+    from homeassistant.helpers import entity_registry as er
+    from homeassistant.util import slugify
+
+    from .const import (
+        CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE,
+        CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE,
+        CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD,
+        CONF_DEFERRABLE_LOAD_EST_AUTO,
+        CONF_DEFERRABLE_LOAD_EST_CONTROL,
+        CONF_DEFERRABLE_LOAD_EST_KW,
+        CONF_DEFERRABLE_LOAD_EST_NAMES,
+        CONF_DEFERRABLE_LOAD_MAX_KW,
+        CONF_DEFERRABLE_LOAD_SOC_SENSORS,
+        CONF_DEFERRABLE_LOAD_SWITCHES,
+        CONF_LOAD_POWER_SENSOR,
+    )
+    from .entity_lookup import resolve_device_name, resolve_power_sensor
+    from .load_estimation import EstimateStore, LoadEstimator
+
+    load_power_sensor = entry.data.get(CONF_LOAD_POWER_SENSOR) or ""
+    ent_reg = er.async_get(hass)
+    store = EstimateStore(hass, entry.entry_id)
+
+    sensors = list(entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or [])
+    max_kw_list = list(entry.data.get(CONF_DEFERRABLE_LOAD_MAX_KW, []) or [])
+    switches_list = list(entry.data.get(CONF_DEFERRABLE_LOAD_SWITCHES, []) or [])
+    climate_mode_list = list(entry.data.get(CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE, []) or [])
+    soc_list = list(entry.data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, []) or [])
+    cl_list = list(entry.data.get(CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD, []) or [])
+    in_agg_list = list(entry.data.get(CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE, []) or [])
+    # Every parallel list must stay the same length as `sensors` — relied on throughout
+    # plan_calculator.py/LoadControlManager (index i always means "device i").
+    _pairs = (
+        (max_kw_list, 3.5), (switches_list, ""), (climate_mode_list, ""),
+        (soc_list, ""), (cl_list, ""), (in_agg_list, False),
+    )
+    for lst, fill in _pairs:
+        lst.extend([fill] * (len(sensors) - len(lst)))
+
+    # ------------------------------------------------------------ step 1: estimated loads
+    names = list(entry.data.get(CONF_DEFERRABLE_LOAD_EST_NAMES, []) or [])
+    controls = list(entry.data.get(CONF_DEFERRABLE_LOAD_EST_CONTROL, []) or [])
+    kws = list(entry.data.get(CONF_DEFERRABLE_LOAD_EST_KW, []) or [])
+    autos = list(entry.data.get(CONF_DEFERRABLE_LOAD_EST_AUTO, []) or [])
+    # Every control entity already known BEFORE constructing any estimator, so slot 0's
+    # "others" list correctly includes slot 1/2's control entities even though they're
+    # constructed later in the loop below.
+    all_control_entities = [c for c in controls if c] + [s for s in switches_list if s]
+
+    energy_estimators: dict[int, LoadEstimator] = {}
+    power_estimators: dict[str, LoadEstimator] = {}
+    changed = False
+    for i, raw_name in enumerate(names):
+        name = str(raw_name).strip()
+        if not name:
+            continue
+        control = str(controls[i]).strip() if i < len(controls) else ""
+        if not control:
+            _LOGGER.warning(
+                "Estimated deferrable load %r has no control entity configured — skipping",
+                name,
+            )
+            continue
+        seed_kw = float(kws[i]) if i < len(kws) and kws[i] not in (None, "") else 1.0
+        auto = bool(autos[i]) if i < len(autos) else False
+
+        unique_id = f"{entry.entry_id}_est_{i}"
+        reg_entry = ent_reg.async_get_or_create(
+            "sensor", DOMAIN, unique_id,
+            suggested_object_id=f"{slugify(name)}_estimated_consumption",
+            config_entry=entry,
+        )
+        sensor_id = reg_entry.entity_id
+        power_reg_entry = ent_reg.async_get_or_create(
+            "sensor", DOMAIN, f"{unique_id}_power",
+            suggested_object_id=f"{slugify(name)}_estimated_power",
+            config_entry=entry,
+        )
+
+        others = [e for e in all_control_entities if e != control]
+        estimator = LoadEstimator(
+            hass, store=store, store_key=unique_id, name=name,
+            control_entity_id=control, seed_kw=seed_kw, auto_refine=auto,
+            load_power_sensor=load_power_sensor, other_control_entity_ids=others,
+        )
+        # Metadata only (never read internally by LoadEstimator) — the power sensor
+        # entity sensor.py should wrap around this same estimator. See the class
+        # docstring's "power_sensor_entity_id" note.
+        estimator.power_unique_id = f"{unique_id}_power"
+        estimator.power_sensor_entity_id = power_reg_entry.entity_id
+        energy_estimators[i] = estimator
+        power_estimators[sensor_id] = estimator
+
+        if sensor_id not in sensors:
+            sensors.append(sensor_id)
+            max_kw_list.append(seed_kw)
+            switches_list.append(control)
+            climate_mode_list.append("")
+            soc_list.append("")
+            cl_list.append("")
+            in_agg_list.append(False)
+            changed = True
+
+    if changed:
+        hass.config_entries.async_update_entry(entry, data={
+            **entry.data,
+            CONF_DEFERRABLE_LOAD_SENSORS: sensors,
+            CONF_DEFERRABLE_LOAD_MAX_KW: max_kw_list,
+            CONF_DEFERRABLE_LOAD_SWITCHES: switches_list,
+            CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE: climate_mode_list,
+            CONF_DEFERRABLE_LOAD_SOC_SENSORS: soc_list,
+            CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD: cl_list,
+            CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE: in_agg_list,
+        })
+
+    # ------------------------------------------------------- step 2: power-only inference
+    # `switches_list` is now final (real devices + any estimated-load ones just spliced
+    # in above), so this "others" set covers the whole household.
+    if load_power_sensor:
+        all_control_entities_final = [s for s in switches_list if s]
+        for i, sensor_id in enumerate(sensors):
+            if sensor_id in power_estimators:
+                continue  # an estimated-load device — already covered in step 1
+            control = switches_list[i] if i < len(switches_list) else ""
+            if not control:
+                continue  # forecast-only device, nothing to actuate/watch transitions on
+            try:
+                existing_power = resolve_power_sensor(hass, sensor_id, control)
+            except Exception:  # noqa: BLE001 — discovery is best-effort
+                existing_power = None
+            if existing_power:
+                continue  # already has real live power telemetry — nothing to estimate
+            name = resolve_device_name(hass, control, sensor_id) or sensor_id
+            seed_kw = float(max_kw_list[i]) if i < len(max_kw_list) else 1.0
+            unique_id = f"{entry.entry_id}_pwr_{i}"
+            reg_entry = ent_reg.async_get_or_create(
+                "sensor", DOMAIN, unique_id,
+                suggested_object_id=f"{slugify(name)}_estimated_power",
+                config_entry=entry,
+            )
+            others = [e for e in all_control_entities_final if e != control]
+            estimator = LoadEstimator(
+                hass, store=store, store_key=unique_id, name=name,
+                control_entity_id=control, seed_kw=seed_kw, auto_refine=True,
+                load_power_sensor=load_power_sensor, other_control_entity_ids=others,
+                track_energy=False,
+            )
+            estimator.power_unique_id = unique_id
+            estimator.power_sensor_entity_id = reg_entry.entity_id
+            power_estimators[sensor_id] = estimator
+
+    # An estimated-load estimator is referenced from both dicts (same instance) —
+    # load/start each unique estimator exactly once.
+    unique_estimators: list[LoadEstimator] = []
+    seen = set()
+    for estimator in [*energy_estimators.values(), *power_estimators.values()]:
+        if id(estimator) not in seen:
+            seen.add(id(estimator))
+            unique_estimators.append(estimator)
+    for estimator in unique_estimators:
+        await estimator.async_load()
+        estimator.start()
+
+    return energy_estimators, power_estimators
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Grid Lens from a config entry."""
     _LOGGER.info("Setting up Grid Lens")
 
     hass.data.setdefault(DOMAIN, {})
+
+    # Must run first, before anything below reads entry.data and before the update
+    # listener is registered (see _ensure_load_estimators's own docstring for why).
+    _energy_estimators, _power_estimators = await _ensure_load_estimators(hass, entry)
+    hass.data[DOMAIN][f"{entry.entry_id}_load_estimators"] = _energy_estimators
+    hass.data[DOMAIN][f"{entry.entry_id}_power_estimators"] = _power_estimators
 
     coordinator = GridLensCoordinator(hass, entry)
     hass.data[DOMAIN][entry.entry_id] = coordinator
@@ -1179,10 +1391,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception as _ctl_err:  # noqa: BLE001
             _LOGGER.warning("Battery control setup failed: %s", _ctl_err)
 
-    # Deferrable-load control manager (actuation for simple on/off loads). Independent of
-    # has_battery — created whenever any deferrable device has a control switch configured.
-    # INERT until its per-device master switch is turned on (default OFF); no switch writes
-    # on setup. Deadman = leave loads as-is (never forces off).
+    # Deferrable-load control manager (actuation for on/off AND modulating loads). Independent
+    # of has_battery — created whenever any deferrable device has a control entity configured,
+    # which since the modulating-load feature means a control switch OR a current/power
+    # setpoint. has_controllable() is the single test for that: the manager builds one
+    # controller per device of either type into the same dict, so no separate setpoint check
+    # is needed here. INERT until its per-device master switch is turned on (default OFF); no
+    # switch or setpoint writes on setup. Deadman = leave loads as-is (never forces off).
     try:
         from .control.load_control_manager import LoadControlManager
         _load_mgr = LoadControlManager(hass, entry)
@@ -1234,6 +1449,22 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception:  # noqa: BLE001
             pass
 
+    # Stop each estimator's listeners/timers — nothing to actuate on teardown, this is
+    # just cancelling background work (unlike battery/load control, no deadman needed).
+    # An estimated-load estimator lives in both dicts (same instance) — stop each unique
+    # one exactly once.
+    _energy_ests = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_load_estimators", {})
+    _power_ests = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_power_estimators", {})
+    _seen_est_ids: set = set()
+    for _est in [*_energy_ests.values(), *_power_ests.values()]:
+        if id(_est) in _seen_est_ids:
+            continue
+        _seen_est_ids.add(id(_est))
+        try:
+            _est.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         hass.data[DOMAIN].pop(entry.entry_id)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_advisory", None)
@@ -1241,6 +1472,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(f"{entry.entry_id}_load_control", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_overrides", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_schedules", None)
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_load_estimators", None)
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_power_estimators", None)
 
     return unload_ok
 

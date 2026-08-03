@@ -1,10 +1,23 @@
 """DeferrableLoadController — actuates ONE simple on/off deferrable load (a ``switch.*``
-entity) from the optimizer's planned per-device power.
+OR ``climate.*`` entity) from the optimizer's planned per-device power.
 
 Scope: "type 1" loads — a plain switchable appliance that draws roughly a fixed power
-when on (pool pump, a smart-plug-fed EV cable, a resistive heater). GridLens decides
-on/off per interval and toggles the switch. Loads with richer control (OCPP EV chargers
-with charge-current setpoints) are a separate, later mechanism — not this controller.
+when on (pool pump, a smart-plug-fed EV cable, a resistive heater, an aircon unit).
+GridLens decides on/off per interval and toggles the entity. Loads with richer control
+(OCPP EV chargers with charge-current setpoints) are a separate, later mechanism — not
+this controller.
+
+**Climate entities** (aircon): "on"/"off" is the hvac_mode, not a native switch state —
+``_actual_state()`` treats any state other than "off" as on. Actuation prefers
+``climate.turn_on``/``climate.turn_off`` (both this integration's two shipped device
+families — ECHONET Lite and SmartIR/Broadlink — support these), falling back to
+``climate.set_hvac_mode`` for a climate integration that doesn't declare that support
+(see ``_actuate()``). GridLens deliberately never touches hvac_mode or target temperature
+beyond deciding on/off — comfort settings (mode, setpoint) stay under the user's own
+control (or e.g. the ``climate_scheduler`` integration's), same "type 1" philosophy as a
+plain switch. Note: if something else (a schedule, the user) also drives on/off on the
+same climate entity, GridLens's plan and that other driver can fight — no arbitration is
+attempted here, same as two humans fighting over one switch.
 
 Design mirrors the battery side's discipline without reusing ``BatteryController`` (which
 is SOC-guardrail- and inverter-HAL-specific):
@@ -66,6 +79,13 @@ from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
 
+# ClimateEntityFeature bit flags this module needs. Mirrored here (not imported from
+# homeassistant.components.climate) to keep this module light and importable in the
+# offline test harness, which doesn't stub that component — must stay in sync with HA
+# core's ClimateEntityFeature.TURN_ON / TURN_OFF.
+_CLIMATE_FEATURE_TURN_ON = 256
+_CLIMATE_FEATURE_TURN_OFF = 128
+
 
 class DeferrableLoadController:
     def __init__(
@@ -79,6 +99,7 @@ class DeferrableLoadController:
         min_off_seconds: float = 900.0,
         on_fraction: float = 0.5,
         on_floor_w: float = 50.0,
+        climate_on_mode: str = "",
     ) -> None:
         self.hass = hass
         self.name = name
@@ -88,6 +109,10 @@ class DeferrableLoadController:
         self.min_off = float(min_off_seconds)
         self.on_fraction = float(on_fraction)
         self.on_floor_w = float(on_floor_w)
+        # Only consulted for a climate.* entity that doesn't support climate.turn_on/off
+        # (see _actuate()) — the hvac_mode to command for "on". "" = auto-pick the
+        # entity's first non-"off" hvac_modes entry at actuation time.
+        self.climate_on_mode = climate_on_mode or ""
 
         # Last state WE commanded. None until the first tick — the real switch state at
         # startup is unknown / could be user-set, so the first tick always issues a command
@@ -123,6 +148,36 @@ class DeferrableLoadController:
         self._greedy_blocked: Optional[str] = None
         self._greedy_free_kwh: Optional[float] = None
         self._greedy_needed_kwh: Optional[float] = None
+
+    # ------------------------------------------------------------------ identity
+    @property
+    def join_key(self) -> str:
+        """The entity id cards and auxiliary entities fingerprint to pair themselves with
+        this device.
+
+        Every GridLens entity that hangs off a deferrable device — the greedy switches, the
+        override select, and the device's row on the Load Control card — finds its device by
+        matching a published ``switch`` attribute rather than by any naming convention
+        (FEATURES.md §10). For an on/off load that key is simply the control switch.
+
+        It exists as a property rather than a bare attribute read because a *modulating*
+        load may legitimately have no on/off entity at all (an OCPP charger stops by being
+        told 0 A), and an empty string is not a usable key: every switchless charger on an
+        install would collide on it, silently pairing one device's row with another's
+        entities. The subclass overrides this to fall back to the setpoint entity.
+        """
+        return self.switch_entity_id
+
+    @property
+    def greedy_reason(self) -> Optional[str]:
+        """Which greedy condition fired on the last evaluated tick, or None.
+
+        Published in ``status()`` for the UI, but also *read* by
+        ``LoadControlManager._modulation_target_w``: a modulating load has to turn the
+        forecast-surplus condition into an actual power target, and this is the only record
+        that it fired (the condition is expensive to evaluate and is computed once per
+        5-minute tick, not per 30-second modulation tick)."""
+        return self._greedy_reason
 
     # ------------------------------------------------------------------ policy
     def on_threshold_w(self) -> float:
@@ -173,13 +228,23 @@ class DeferrableLoadController:
             # Sign convention: positive = importing, negative = exporting (see
             # CONF_GRID_POWER_SENSOR). exporting_w is the magnitude of current export.
             exporting_w = max(0.0, -grid_power_w)
-            if self.max_w > 0.0 and exporting_w >= self.max_w:
+            if self.max_w > 0.0 and exporting_w >= self._export_surplus_threshold_w():
                 self._greedy_reason = "export_surplus"
                 return True
         if self._forecast_surplus_wants_on(forecast_free_kwh, forecast_hours):
             self._greedy_reason = "forecast_surplus"
             return True
         return False
+
+    def _export_surplus_threshold_w(self) -> float:
+        """Export (W) the house must already be spilling before greedy condition #2 fires.
+
+        For a binary load this is the device's full draw: it can only be all-on, so turning
+        it on with anything less already covered would create new priced grid import, which
+        is exactly what this condition promises never to do. Factored out as a hook purely so
+        a load that CAN modulate (``ModulatingLoadController``) can lower the bar to its own
+        minimum without duplicating ``_greedy_wants_on``."""
+        return self.max_w
 
     def forecast_surplus_needed_kwh(self, hours: float) -> float:
         """Free energy (kWh) that must be forecast wasted over ``hours`` before the
@@ -218,11 +283,18 @@ class DeferrableLoadController:
         if st is None:
             return None
         s = str(st.state).lower()
+        if s in ("unknown", "unavailable"):
+            return None
+        if self.switch_entity_id.startswith("climate."):
+            # A climate entity's state IS its hvac_mode — anything other than "off"
+            # counts as "on" (cool/heat/dry/fan_only/heat_cool/auto/...), unlike a
+            # switch's strict on/off vocabulary.
+            return s != "off"
         if s == "on":
             return True
         if s == "off":
             return False
-        return None  # unavailable / unknown
+        return None  # unrecognized state string
 
     # ------------------------------------------------------------------ tick
     async def apply(
@@ -327,15 +399,12 @@ class DeferrableLoadController:
     async def _command(
         self, want_on: bool, now: datetime, *, reset_timer: bool = True, tag: str = ""
     ) -> bool:
-        service = "turn_on" if want_on else "turn_off"
         try:
-            await self.hass.services.async_call(
-                "switch", service, {"entity_id": self.switch_entity_id}, blocking=True
-            )
+            label = await self._actuate(want_on)
         except Exception as err:  # noqa: BLE001 — a failed write must never kill the loop
             _LOGGER.error(
-                "Deferrable load %s: switch.%s(%s) failed: %s",
-                self.name, service, self.switch_entity_id, err,
+                "Deferrable load %s: command(%s, want_on=%s) failed: %s",
+                self.name, self.switch_entity_id, want_on, err,
             )
             self._note = f"command_error:{err}"
             return False
@@ -344,10 +413,53 @@ class DeferrableLoadController:
             self._changed_at = now
         self._note = f"commanded_{'on' if want_on else 'off'}{tag}"
         _LOGGER.info(
-            "Deferrable load %s → %s (%s)%s", self.name, service, self.switch_entity_id,
+            "Deferrable load %s → %s (%s)%s", self.name, label, self.switch_entity_id,
             " [greedy]" if tag else "",
         )
         return True
+
+    async def _actuate(self, want_on: bool) -> str:
+        """Issue the HA service call for ``want_on``. Returns a short label for the log
+        line. Raises on failure — ``_command`` (the only caller) turns that into a safe,
+        logged no-op; never propagates further."""
+        if not self.switch_entity_id.startswith("climate."):
+            service = "turn_on" if want_on else "turn_off"
+            await self.hass.services.async_call(
+                "switch", service, {"entity_id": self.switch_entity_id}, blocking=True
+            )
+            return f"switch.{service}"
+
+        if self._climate_supports_turn_on_off():
+            service = "turn_on" if want_on else "turn_off"
+            await self.hass.services.async_call(
+                "climate", service, {"entity_id": self.switch_entity_id}, blocking=True
+            )
+            return f"climate.{service}"
+
+        # Fallback for a climate integration that doesn't declare TURN_ON/TURN_OFF
+        # support (not every one does) — drive hvac_mode directly instead.
+        hvac_mode = "off" if not want_on else (self.climate_on_mode or self._default_on_mode())
+        await self.hass.services.async_call(
+            "climate", "set_hvac_mode",
+            {"entity_id": self.switch_entity_id, "hvac_mode": hvac_mode}, blocking=True,
+        )
+        return f"climate.set_hvac_mode({hvac_mode})"
+
+    def _climate_supports_turn_on_off(self) -> bool:
+        st = self.hass.states.get(self.switch_entity_id)
+        features = (st.attributes.get("supported_features", 0) or 0) if st else 0
+        return bool(features & _CLIMATE_FEATURE_TURN_ON) and bool(features & _CLIMATE_FEATURE_TURN_OFF)
+
+    def _default_on_mode(self) -> str:
+        """Best-guess "on" hvac_mode when neither turn_on support nor an explicit
+        ``climate_on_mode`` is available: the entity's own first non-"off" advertised
+        mode (HA convention lists the primary mode(s) before "off")."""
+        st = self.hass.states.get(self.switch_entity_id)
+        modes = (st.attributes.get("hvac_modes") if st else None) or []
+        for mode in modes:
+            if mode != "off":
+                return mode
+        return "heat_cool"
 
     # ------------------------------------------------------------------ greedy consumption
     @property
@@ -374,7 +486,12 @@ class DeferrableLoadController:
     def status(self) -> dict:
         return {
             "name": self.name,
-            "switch": self.switch_entity_id,
+            # How this device is driven, for consumers that must branch on it (the Load
+            # Control card, sensor.py's deferrable_loads attribute). Set here rather than
+            # only on the modulating subclass so the key is always present and a consumer
+            # never has to treat "absent" as a third case.
+            "control_type": "onoff",
+            "switch": self.join_key,
             "max_w": round(self.max_w, 1),
             "on_threshold_w": round(self.on_threshold_w(), 1),
             "commanded": ("on" if self._commanded else "off") if self._commanded is not None else "unknown",

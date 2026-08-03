@@ -35,6 +35,10 @@ from .const import (
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_SWITCHES,
+    CONF_DEFERRABLE_LOAD_SETPOINT,
+    CONF_DEFERRABLE_LOAD_MIN_CURRENT,
+    CONF_DEFERRABLE_LOAD_PHASES,
+    CONF_DEFERRABLE_LOAD_VOLTAGE,
     CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD,
     CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE,
     CONF_DEFERRABLE_LOAD_DUMMY_NAMES,
@@ -43,6 +47,8 @@ from .const import (
     CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE,
     CONF_HAS_DEMAND_TARIFF,
     DEFAULT_DEMAND_WINDOW_HOURS,
+    DEFAULT_MIN_CHARGE_CURRENT_A,
+    DEFAULT_SUPPLY_VOLTAGE,
     POPULAR_EV_PLANS,
 )
 from .entity_lookup import resolve_device_name, async_get_energy_dashboard_names
@@ -95,6 +101,14 @@ class PlanCalculator:
         self.deferrable_load_sensors: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
         self.deferrable_load_max_kw: list[float] = entry.data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
         self.deferrable_load_switches: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_SWITCHES, [])
+        # Modulating-load wiring, read only to derive each device's min_kw floor (below).
+        # Absent from every config entry saved before that feature, hence the `or []`.
+        self.deferrable_load_setpoint: list[str] = entry.data.get(
+            CONF_DEFERRABLE_LOAD_SETPOINT, []) or []
+        self.deferrable_load_min_current: list = entry.data.get(
+            CONF_DEFERRABLE_LOAD_MIN_CURRENT, []) or []
+        self.deferrable_load_phases: list = entry.data.get(CONF_DEFERRABLE_LOAD_PHASES, []) or []
+        self.deferrable_load_voltage: list = entry.data.get(CONF_DEFERRABLE_LOAD_VOLTAGE, []) or []
         # Controlled Load register wiring, parallel to deferrable_load_sensors ("" = not
         # CL-wired) — see _build_cl_devices for how this turns into a flat bill line.
         self.deferrable_load_controlled_load: list[str] = entry.data.get(
@@ -1477,6 +1491,49 @@ class PlanCalculator:
             by_hod[d['timestamp'].astimezone(tz).hour].append(d['value'])
         return {h: sum(v) / len(v) for h, v in by_hod.items() if v}
 
+    def _deferrable_min_kw(self, index: int) -> float:
+        """Lowest power device ``index`` can physically be given, kW. 0 = no floor.
+
+        Only a modulating load has one: an EV must not be offered below ~6 A (IEC 61851), so
+        its feasible set is ``{0} ∪ [min_kw, max_kw]`` rather than ``[0, max_kw]``.
+
+        **Reserved for a later semi-continuous constraint.** The LP still uses a plain
+        continuous ``0..max_kw`` variable and ignores this value entirely — enforcing the hole
+        in the feasible set would need a MILP binary per device per slot, which is a real
+        solve-time cost on a model that currently goes MILP only for conditional credits.
+        Today the floor is enforced downstream, in ``control/modulating_controller.py``, which
+        has to own the decision anyway (it is the only layer that sees live surplus). This is
+        plumbed through now so the constraint can be switched on without re-threading config
+        through three modules.
+
+        Uses the *configured* phase count only (0 → 1). The controller can do better — it
+        auto-derives phases from the setpoint entity's own max — but that needs a live entity
+        read, and understating a floor nothing yet reads is harmless.
+        """
+        setpoint = (
+            self.deferrable_load_setpoint[index]
+            if index < len(self.deferrable_load_setpoint) else ""
+        )
+        if not setpoint:
+            return 0.0
+        amps = (
+            float(self.deferrable_load_min_current[index])
+            if index < len(self.deferrable_load_min_current)
+            and self.deferrable_load_min_current[index]
+            else DEFAULT_MIN_CHARGE_CURRENT_A
+        )
+        volts = (
+            float(self.deferrable_load_voltage[index])
+            if index < len(self.deferrable_load_voltage) and self.deferrable_load_voltage[index]
+            else DEFAULT_SUPPLY_VOLTAGE
+        )
+        phases = (
+            int(self.deferrable_load_phases[index])
+            if index < len(self.deferrable_load_phases) and self.deferrable_load_phases[index]
+            else 1
+        )
+        return max(0.0, amps * volts * phases) / 1000.0
+
     async def _get_deferrable_data(
         self, start_time: datetime, end_time: datetime
     ) -> tuple[list[dict], list[dict], list[dict]]:
@@ -1571,6 +1628,7 @@ class PlanCalculator:
                 'name': name,
                 'daily_kwh': daily_kwh,
                 'max_kw': max_kw,
+                'min_kw': self._deferrable_min_kw(i),
                 'week': week,
             })
             _LOGGER.warning(

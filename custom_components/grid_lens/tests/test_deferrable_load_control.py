@@ -124,7 +124,7 @@ class FakeServices:
         if self.fail:
             raise RuntimeError("service boom")
         eid = data.get("entity_id")
-        self.calls.append((domain, service, eid))
+        self.calls.append((domain, service, eid, data))
 
 
 class FakeBus:
@@ -233,6 +233,62 @@ async def _run_command_error_is_safe():
     assert "command_error" in c._note
 
 
+# ----------------------------------------------------------------- climate-domain tests
+async def _run_climate_actual_state():
+    hass = FakeHass()
+    c = DeferrableLoadController(hass, name="AC", switch_entity_id="climate.ac", max_w=1500.0)
+    hass.states.set("climate.ac", "off")
+    assert c._actual_state() is False
+    hass.states.set("climate.ac", "cool")
+    assert c._actual_state() is True   # any non-off hvac_mode counts as on
+    hass.states.set("climate.ac", "fan_only")
+    assert c._actual_state() is True
+    hass.states.set("climate.ac", "unavailable")
+    assert c._actual_state() is None
+
+
+async def _run_climate_turn_on_off():
+    # supported_features 128|256 = TURN_OFF|TURN_ON — the ECHONET/SmartIR case.
+    hass = FakeHass()
+    hass.states.set("climate.ac", "off", {"supported_features": 384, "hvac_modes": ["off", "cool", "heat"]})
+    c = DeferrableLoadController(hass, name="AC", switch_entity_id="climate.ac", max_w=1500.0,
+                                 min_on_seconds=0, min_off_seconds=0)
+    await c.apply(1000.0, _T0)  # wants on
+    assert hass.services.calls[-1][:3] == ("climate", "turn_on", "climate.ac")
+    hass.states.set("climate.ac", "cool", {"supported_features": 384, "hvac_modes": ["off", "cool", "heat"]})
+    await c.apply(0.0, _T0 + timedelta(minutes=1))  # wants off
+    assert hass.services.calls[-1][:3] == ("climate", "turn_off", "climate.ac")
+
+
+async def _run_climate_fallback_hvac_mode():
+    # No TURN_ON/TURN_OFF feature bits — must fall back to set_hvac_mode.
+    hass = FakeHass()
+    hass.states.set("climate.ac2", "off",
+                    {"supported_features": 1, "hvac_modes": ["off", "heat_cool", "cool"]})
+    c = DeferrableLoadController(hass, name="AC2", switch_entity_id="climate.ac2", max_w=1500.0,
+                                 min_on_seconds=0, min_off_seconds=0)
+    await c.apply(1000.0, _T0)  # wants on -> auto-picks first non-"off" hvac_modes entry
+    call = hass.services.calls[-1]
+    assert call[:3] == ("climate", "set_hvac_mode", "climate.ac2")
+    assert call[3]["hvac_mode"] == "heat_cool"
+    hass.states.set("climate.ac2", "heat_cool",
+                    {"supported_features": 1, "hvac_modes": ["off", "heat_cool", "cool"]})
+    await c.apply(0.0, _T0 + timedelta(minutes=1))  # wants off
+    call = hass.services.calls[-1]
+    assert call[:3] == ("climate", "set_hvac_mode", "climate.ac2")
+    assert call[3]["hvac_mode"] == "off"
+
+
+async def _run_climate_configured_on_mode_wins():
+    hass = FakeHass()
+    hass.states.set("climate.ac3", "off",
+                    {"supported_features": 1, "hvac_modes": ["off", "heat_cool", "cool"]})
+    c = DeferrableLoadController(hass, name="AC3", switch_entity_id="climate.ac3", max_w=1500.0,
+                                 min_on_seconds=0, min_off_seconds=0, climate_on_mode="cool")
+    await c.apply(1000.0, _T0)
+    assert hass.services.calls[-1][3]["hvac_mode"] == "cool"  # configured mode beats auto-pick
+
+
 # ----------------------------------------------------------------- manager tests
 def _mgr(controllable=True):
     hass = FakeHass()
@@ -332,6 +388,10 @@ if __name__ == "__main__":
         ("debounce_min_off", lambda: _run_async(_run_debounce_min_off)),
         ("drift_reassert", lambda: _run_async(_run_drift_reassert)),
         ("command_error_is_safe", lambda: _run_async(_run_command_error_is_safe)),
+        ("climate_actual_state", lambda: _run_async(_run_climate_actual_state)),
+        ("climate_turn_on_off", lambda: _run_async(_run_climate_turn_on_off)),
+        ("climate_fallback_hvac_mode", lambda: _run_async(_run_climate_fallback_hvac_mode)),
+        ("climate_configured_on_mode_wins", lambda: _run_async(_run_climate_configured_on_mode_wins)),
         ("fail_closed_entitlement", lambda: _run_async(_run_fail_closed_entitlement)),
         ("enable_ticks_device", lambda: _run_async(_run_enable_ticks_device)),
         ("revoke_leaves_as_is_then_resumes", lambda: _run_async(_run_revoke_leaves_as_is_then_resumes)),

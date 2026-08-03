@@ -42,6 +42,13 @@ from .const import (
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_SWITCHES,
+    CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE,
+    CONF_DEFERRABLE_LOAD_SETPOINT,
+    CONF_DEFERRABLE_LOAD_SETPOINT_UNIT,
+    CONF_DEFERRABLE_LOAD_PHASES,
+    CONF_DEFERRABLE_LOAD_VOLTAGE,
+    CONF_DEFERRABLE_LOAD_MIN_CURRENT,
+    CONF_DEFERRABLE_LOAD_PLUG_SENSOR,
     CONF_DEFERRABLE_LOAD_SOC_SENSORS,
     CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD,
     CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE,
@@ -52,6 +59,12 @@ from .const import (
     CONF_DEFERRABLE_LOAD_DUMMY_HOURS,
     CONF_DEFERRABLE_LOAD_DUMMY_CONTROLLED_LOAD,
     CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE,
+    DEFERRABLE_LOAD_ESTIMATED_SLOTS,
+    CONF_DEFERRABLE_LOAD_EST_NAMES,
+    CONF_DEFERRABLE_LOAD_EST_CONTROL,
+    CONF_DEFERRABLE_LOAD_EST_KW,
+    CONF_DEFERRABLE_LOAD_EST_AUTO,
+    CONF_LOAD_POWER_SENSOR,
     CONF_CURRENT_PLAN,
     CONF_VPP_PROGRAM,
     parse_hours_spec,
@@ -399,9 +412,16 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             max_kw_list = [float(user_input.get(f"max_kw_{i}", 3.5)) for i in range(len(selected))]
-            # Optional control switch per device ("" = forecast-only, no actuation).
+            # Optional control entity per device — switch.* or climate.* (aircon); "" =
+            # forecast-only, no actuation.
             switches_list = [
                 str(user_input.get(f"switch_{i}", "") or "") for i in range(len(selected))
+            ]
+            # Only consulted for a climate.* control entity that doesn't support
+            # climate.turn_on/turn_off (see control/load_controller.py._actuate()); "" =
+            # auto-pick. Meaningless for a switch.* control entity.
+            climate_mode_list = [
+                str(user_input.get(f"climate_on_mode_{i}", "") or "") for i in range(len(selected))
             ]
             # Optional battery/EV SOC sensor per device ("" = none, e.g. a pool pump).
             soc_list = [
@@ -419,11 +439,43 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             in_agg_list = [
                 bool(user_input.get(f"in_aggregate_{i}", False)) for i in range(len(selected))
             ]
+            # Modulating ("type 2") control, per device — see const.py's
+            # CONF_DEFERRABLE_LOAD_SETPOINT block for the full rationale. A device is
+            # only modulating when setpoint_i is non-empty; every other field here is
+            # meaningless (and safely ignored) for an on/off or forecast-only device.
+            setpoint_list = [
+                str(user_input.get(f"setpoint_{i}", "") or "") for i in range(len(selected))
+            ]
+            setpoint_unit_list = [
+                str(user_input.get(f"setpoint_unit_{i}", "") or "") for i in range(len(selected))
+            ]
+            # Submitted by the SelectSelector below as the string "0"/"1"/"2"/"3" (its
+            # option values match the schema's own default type) — coerce to int for
+            # storage, matching CONF_DEFERRABLE_LOAD_PHASES's documented "list of int".
+            phases_list = [
+                int(user_input.get(f"phases_{i}", 0) or 0) for i in range(len(selected))
+            ]
+            voltage_list = [
+                float(user_input.get(f"voltage_{i}", 0.0) or 0.0) for i in range(len(selected))
+            ]
+            min_current_list = [
+                float(user_input.get(f"min_current_{i}", 0.0) or 0.0) for i in range(len(selected))
+            ]
+            plug_sensor_list = [
+                str(user_input.get(f"plug_sensor_{i}", "") or "") for i in range(len(selected))
+            ]
             self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
             self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE] = climate_mode_list
             self._sensor_data[CONF_DEFERRABLE_LOAD_SOC_SENSORS] = soc_list
             self._sensor_data[CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD] = cl_list
             self._sensor_data[CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE] = in_agg_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_SETPOINT] = setpoint_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_SETPOINT_UNIT] = setpoint_unit_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_PHASES] = phases_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_VOLTAGE] = voltage_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_MIN_CURRENT] = min_current_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_PLUG_SENSOR] = plug_sensor_list
             return await self.async_step_declared_loads()
 
         # Controlled Load register choices, gated on the flags collected in
@@ -436,10 +488,15 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         schema_dict = {}
         device_lines = []
+        name_placeholders: dict[str, str] = {}
         for i, sensor_id in enumerate(selected):
             state = self.hass.states.get(sensor_id)
             name = state.attributes.get("friendly_name", sensor_id) if state else sensor_id
             device_lines.append(f"{i + 1}. {name}")
+            # Substituted into each field's own label below (see strings.json's
+            # "{device_N_name} — ..." labels) so the form shows the actual device name
+            # instead of "Device N".
+            name_placeholders[f"device_{i}_name"] = name
             schema_dict[vol.Optional(f"max_kw_{i}", default=3.5)] = selector.NumberSelector(
                 selector.NumberSelectorConfig(
                     min=0.1, max=100.0, step=0.1,
@@ -447,10 +504,27 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     mode=selector.NumberSelectorMode.BOX,
                 )
             )
-            # Optional: a switch.* entity GridLens turns on/off to actuate this load. Leave
-            # unset for forecast-only devices (e.g. an ESS-managed port with no HA switch).
+            # Optional: a switch.* or climate.* (aircon) entity GridLens turns on/off to
+            # actuate this load. Leave unset for forecast-only devices (e.g. an
+            # ESS-managed port with no HA switch).
             schema_dict[vol.Optional(f"switch_{i}")] = selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="switch")
+                selector.EntitySelectorConfig(domain=["switch", "climate"])
+            )
+            # Only relevant if the control entity above is a climate.* one that doesn't
+            # support climate.turn_on/turn_off (most do) — which hvac_mode to command for
+            # "on". Ignored otherwise.
+            schema_dict[vol.Optional(f"climate_on_mode_{i}", default="")] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        {"value": "", "label": "Auto (turn_on / restore last mode)"},
+                        {"value": "cool", "label": "Cool"},
+                        {"value": "heat", "label": "Heat"},
+                        {"value": "heat_cool", "label": "Heat/Cool (auto)"},
+                        {"value": "dry", "label": "Dry"},
+                        {"value": "fan_only", "label": "Fan only"},
+                    ],
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
             )
             # Optional: a sensor.* entity reporting this device's own battery state of charge
             # (%) — most relevant for an EV charger (the vehicle's SOC), shown on the Power
@@ -458,6 +532,82 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # battery of their own (pool pump, hot water, etc).
             schema_dict[vol.Optional(f"soc_{i}")] = selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="sensor")
+            )
+            # --- Modulating ("type 2") control — see CONF_DEFERRABLE_LOAD_SETPOINT in
+            # const.py for the full rationale. Configuring a setpoint entity here turns
+            # this device from on/off into continuously-throttled: GridLens commands a
+            # charging-current/power limit on a 30 s tick instead of flipping the switch
+            # above. Not OCPP-specific — any integration exposing a current-limit number
+            # entity works (OCPP, Easee, Wallbox, Zaptec, go-e, openEVSE, Tesla and
+            # Sigenergy AC chargers are all examples of the same shape). Leave blank to
+            # keep this device on plain on/off control (via the switch above, or
+            # forecast-only if that's blank too) — every field below is then unused.
+            schema_dict[vol.Optional(f"setpoint_{i}")] = selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="number")
+            )
+            # What the setpoint entity's value means. "" = auto: read the entity's own
+            # unit_of_measurement (A → current, W/kW → power) — right for every
+            # integration listed above. Only needed for one that publishes no unit.
+            schema_dict[vol.Optional(f"setpoint_unit_{i}", default="")] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        {"value": "", "label": "Auto (detect from the entity)"},
+                        {"value": "a", "label": "Amps (A)"},
+                        {"value": "w", "label": "Watts (W)"},
+                        {"value": "kw", "label": "Kilowatts (kW)"},
+                    ],
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            )
+            # Phases the setpoint's amps figure applies across (W = amps × voltage ×
+            # phases). 0 = auto-derive from this device's max power above and the
+            # setpoint entity's own max value — right far more often than a guess, since
+            # a 7.4 kW single-phase charger and a 22 kW three-phase one can both
+            # advertise a 32 A ceiling; only max_kw tells them apart. Ignored for a
+            # W/kW setpoint. Option values are strings ("0".."3") to match what the
+            # frontend submits; coerced back to int on save.
+            schema_dict[vol.Optional(f"phases_{i}", default="0")] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        {"value": "0", "label": "Auto-detect"},
+                        {"value": "1", "label": "Single phase"},
+                        {"value": "2", "label": "Two phase"},
+                        {"value": "3", "label": "Three phase"},
+                    ],
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            )
+            # Nominal per-phase supply voltage for the amps↔watts conversion above. 0 =
+            # use the 230 V IEC/AU default (DEFAULT_SUPPLY_VOLTAGE) — allowed as an
+            # explicit value, not just a fallback, since most installs never need to
+            # touch this. A 5% voltage error is only a 5% power error, well inside the
+            # slack the min-current floor and write deadband already carry.
+            schema_dict[vol.Optional(f"voltage_{i}", default=0.0)] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.0, max=500.0, step=1,
+                    unit_of_measurement="V",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+            # Minimum current this device can actually be given (A). An EV must not be
+            # offered below ~6 A (IEC 61851 duty-cycle floor) — commanding less doesn't
+            # charge slowly, it makes the car refuse or fault. 0 = use the 6 A default
+            # (DEFAULT_MIN_CHARGE_CURRENT_A); set e.g. 0.1 for a genuinely continuous
+            # load (a resistive heater on a dimmer) with no such floor.
+            schema_dict[vol.Optional(f"min_current_{i}", default=0.0)] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.0, max=32.0, step=0.1,
+                    unit_of_measurement="A",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+            # Optional: a binary_sensor.* or sensor.* (e.g. OCPP's own ChargePointStatus
+            # sensor) reporting whether something is actually plugged in / able to
+            # accept charge. Leave unset if you don't have one — GridLens never
+            # withholds charging just because it couldn't confirm a plug; this only
+            # stops it commanding current into an empty socket.
+            schema_dict[vol.Optional(f"plug_sensor_{i}")] = selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["binary_sensor", "sensor"])
             )
             # Optional: which Controlled Load register (if any) this device is physically
             # wired to. Only shown when the household declared at least one CL register in
@@ -484,7 +634,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="device_power",
             data_schema=vol.Schema(schema_dict),
-            description_placeholders={"devices": "\n".join(device_lines)},
+            description_placeholders={"devices": "\n".join(device_lines), **name_placeholders},
         )
 
     async def async_step_declared_loads(
@@ -532,7 +682,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     bool(user_input.get(f"in_aggregate_{i}", False))
                     for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
                 ]
-                return await self.async_step_current_plan()
+                return await self.async_step_estimated_loads()
 
         cl_register_options = []
         if self._has_cl1:
@@ -571,6 +721,69 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="declared_loads",
             data_schema=vol.Schema(schema_dict),
             errors=errors,
+        )
+
+    async def async_step_estimated_loads(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.FlowResult:
+        """Devices with a control entity (switch.*/climate.*) but no energy sensor at
+        all and no way to add one — e.g. an IR-blaster-driven aircon. GridLens builds a
+        synthetic energy sensor for these from aggregate-load inference (an optional
+        auto-refine, load_estimation.py) seeded with a manual estimate. Fixed
+        DEFERRABLE_LOAD_ESTIMATED_SLOTS slots, same static-schema reasoning as the
+        declared-loads step above; a slot with a blank name is unused."""
+        if user_input is not None:
+            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_NAMES] = [
+                str(user_input.get(f"est_name_{i}", "") or "").strip()
+                for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
+            ]
+            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_CONTROL] = [
+                str(user_input.get(f"est_control_{i}", "") or "")
+                for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
+            ]
+            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_KW] = [
+                float(user_input.get(f"est_kw_{i}", 1.0) or 1.0)
+                for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
+            ]
+            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_AUTO] = [
+                bool(user_input.get(f"est_auto_{i}", False))
+                for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
+            ]
+            self._sensor_data[CONF_LOAD_POWER_SENSOR] = str(
+                user_input.get("load_power_sensor", "") or ""
+            )
+            return await self.async_step_current_plan()
+
+        schema_dict = {}
+        for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS):
+            schema_dict[vol.Optional(f"est_name_{i}", default="")] = selector.TextSelector()
+            # switch.* or climate.* — the device GridLens turns on/off. Required for a
+            # slot to actually take effect (see __init__.py._ensure_load_estimators).
+            schema_dict[vol.Optional(f"est_control_{i}")] = selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["switch", "climate"])
+            )
+            schema_dict[vol.Optional(f"est_kw_{i}", default=1.0)] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.05, max=20.0, step=0.05,
+                    unit_of_measurement="kW",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+            # Opt-in: refine the seed above from real on/off transitions (needs
+            # load_power_sensor below configured — otherwise this silently never fires).
+            schema_dict[vol.Optional(f"est_auto_{i}", default=False)] = selector.BooleanSelector()
+        # One field for the whole step, not per-slot: the whole-house load power sensor
+        # auto-refine samples around a transition. The same kind of entity you'd use for
+        # the Power Flow card's own "Load Power Entity" option — optional here too; if
+        # left unset, auto-refine simply never fires and every slot above stays on its
+        # manual kW seed.
+        schema_dict[vol.Optional("load_power_sensor")] = selector.EntitySelector(
+            selector.EntitySelectorConfig(domain="sensor")
+        )
+
+        return self.async_show_form(
+            step_id="estimated_loads",
+            data_schema=vol.Schema(schema_dict),
         )
 
     async def async_step_current_plan(
@@ -1032,9 +1245,20 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
 
         existing_max_kw = entry_data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
         existing_switches = entry_data.get(CONF_DEFERRABLE_LOAD_SWITCHES, [])
+        existing_climate_modes = entry_data.get(CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE, [])
         existing_soc = entry_data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, [])
         existing_cl = entry_data.get(CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD, [])
         existing_in_agg = entry_data.get(CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE, [])
+        # Modulating-control fields — absent from every config entry saved before this
+        # change, hence `.get(KEY, [])`: an old entry just yields empty lists here, and
+        # every device below falls through to its "not modulating" default, unchanged
+        # from what it did before this feature existed.
+        existing_setpoint = entry_data.get(CONF_DEFERRABLE_LOAD_SETPOINT, [])
+        existing_setpoint_unit = entry_data.get(CONF_DEFERRABLE_LOAD_SETPOINT_UNIT, [])
+        existing_phases = entry_data.get(CONF_DEFERRABLE_LOAD_PHASES, [])
+        existing_voltage = entry_data.get(CONF_DEFERRABLE_LOAD_VOLTAGE, [])
+        existing_min_current = entry_data.get(CONF_DEFERRABLE_LOAD_MIN_CURRENT, [])
+        existing_plug_sensor = entry_data.get(CONF_DEFERRABLE_LOAD_PLUG_SENSOR, [])
         # Existing lists are keyed by position in the previously saved sensor
         # list; map by sensor_id so reordering/removing devices keeps defaults.
         prev_sensors = entry_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
@@ -1043,6 +1267,11 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             s: existing_switches[i]
             for i, s in enumerate(prev_sensors)
             if i < len(existing_switches) and existing_switches[i]
+        }
+        prev_climate_mode = {
+            s: existing_climate_modes[i]
+            for i, s in enumerate(prev_sensors)
+            if i < len(existing_climate_modes) and existing_climate_modes[i]
         }
         prev_soc = {
             s: existing_soc[i]
@@ -1059,11 +1288,44 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             for i, s in enumerate(prev_sensors)
             if i < len(existing_in_agg)
         }
+        prev_setpoint = {
+            s: existing_setpoint[i]
+            for i, s in enumerate(prev_sensors)
+            if i < len(existing_setpoint) and existing_setpoint[i]
+        }
+        prev_setpoint_unit = {
+            s: existing_setpoint_unit[i]
+            for i, s in enumerate(prev_sensors)
+            if i < len(existing_setpoint_unit)
+        }
+        prev_phases = {
+            s: existing_phases[i]
+            for i, s in enumerate(prev_sensors)
+            if i < len(existing_phases)
+        }
+        prev_voltage = {
+            s: existing_voltage[i]
+            for i, s in enumerate(prev_sensors)
+            if i < len(existing_voltage)
+        }
+        prev_min_current = {
+            s: existing_min_current[i]
+            for i, s in enumerate(prev_sensors)
+            if i < len(existing_min_current)
+        }
+        prev_plug_sensor = {
+            s: existing_plug_sensor[i]
+            for i, s in enumerate(prev_sensors)
+            if i < len(existing_plug_sensor) and existing_plug_sensor[i]
+        }
 
         if user_input is not None:
             max_kw_list = [float(user_input.get(f"max_kw_{i}", 3.5)) for i in range(len(selected))]
             switches_list = [
                 str(user_input.get(f"switch_{i}", "") or "") for i in range(len(selected))
+            ]
+            climate_mode_list = [
+                str(user_input.get(f"climate_on_mode_{i}", "") or "") for i in range(len(selected))
             ]
             soc_list = [
                 str(user_input.get(f"soc_{i}", "") or "") for i in range(len(selected))
@@ -1074,11 +1336,41 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             in_agg_list = [
                 bool(user_input.get(f"in_aggregate_{i}", False)) for i in range(len(selected))
             ]
+            # Modulating ("type 2") control, per device — same fields/coercion as the
+            # setup-flow version of this step; see that copy's comment for the full
+            # rationale. Unlike the entity-selector fields above, there's no
+            # stale-vs-fresh ambiguity to worry about here: the form always re-asserts
+            # a value (defaulting to "not modulating") on every save through this step.
+            setpoint_list = [
+                str(user_input.get(f"setpoint_{i}", "") or "") for i in range(len(selected))
+            ]
+            setpoint_unit_list = [
+                str(user_input.get(f"setpoint_unit_{i}", "") or "") for i in range(len(selected))
+            ]
+            phases_list = [
+                int(user_input.get(f"phases_{i}", 0) or 0) for i in range(len(selected))
+            ]
+            voltage_list = [
+                float(user_input.get(f"voltage_{i}", 0.0) or 0.0) for i in range(len(selected))
+            ]
+            min_current_list = [
+                float(user_input.get(f"min_current_{i}", 0.0) or 0.0) for i in range(len(selected))
+            ]
+            plug_sensor_list = [
+                str(user_input.get(f"plug_sensor_{i}", "") or "") for i in range(len(selected))
+            ]
             self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
             self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE] = climate_mode_list
             self._sensor_data[CONF_DEFERRABLE_LOAD_SOC_SENSORS] = soc_list
             self._sensor_data[CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD] = cl_list
             self._sensor_data[CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE] = in_agg_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_SETPOINT] = setpoint_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_SETPOINT_UNIT] = setpoint_unit_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_PHASES] = phases_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_VOLTAGE] = voltage_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_MIN_CURRENT] = min_current_list
+            self._sensor_data[CONF_DEFERRABLE_LOAD_PLUG_SENSOR] = plug_sensor_list
             return await self.async_step_declared_loads()
 
         # Controlled Load register choices, gated on the flags collected in
@@ -1091,10 +1383,15 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
 
         schema_dict = {}
         device_lines = []
+        name_placeholders: dict[str, str] = {}
         for i, sensor_id in enumerate(selected):
             state = self.hass.states.get(sensor_id)
             name = state.attributes.get("friendly_name", sensor_id) if state else sensor_id
             device_lines.append(f"{i + 1}. {name}")
+            # Substituted into each field's own label below (see strings.json's
+            # "{device_N_name} — ..." labels) so the form shows the actual device name
+            # instead of "Device N".
+            name_placeholders[f"device_{i}_name"] = name
             default_kw = prev_kw.get(sensor_id, 3.5)
             schema_dict[vol.Optional(f"max_kw_{i}", default=default_kw)] = selector.NumberSelector(
                 selector.NumberSelectorConfig(
@@ -1111,7 +1408,25 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 if prev_sw else vol.Optional(f"switch_{i}")
             )
             schema_dict[switch_key] = selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="switch")
+                selector.EntitySelectorConfig(domain=["switch", "climate"])
+            )
+            # Only relevant if the control entity above is a climate.* one that doesn't
+            # support climate.turn_on/turn_off (most do) — which hvac_mode to command for
+            # "on". Ignored otherwise.
+            schema_dict[vol.Optional(
+                f"climate_on_mode_{i}", default=prev_climate_mode.get(sensor_id, "")
+            )] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        {"value": "", "label": "Auto (turn_on / restore last mode)"},
+                        {"value": "cool", "label": "Cool"},
+                        {"value": "heat", "label": "Heat"},
+                        {"value": "heat_cool", "label": "Heat/Cool (auto)"},
+                        {"value": "dry", "label": "Dry"},
+                        {"value": "fan_only", "label": "Fan only"},
+                    ],
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
             )
             # Optional battery/EV SOC sensor; pre-fill the previously saved one, same pattern
             # as the control switch above.
@@ -1122,6 +1437,73 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             )
             schema_dict[soc_key] = selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="sensor")
+            )
+            # --- Modulating ("type 2") control — see the setup-flow copy of this step
+            # for the full rationale (same fields, same meaning). Pre-fill every value
+            # from the previously saved config, sensor_id-keyed like switch/soc above,
+            # so reordering or removing a device elsewhere in the wizard doesn't lose
+            # a household's charger tuning.
+            prev_setpoint_entity = prev_setpoint.get(sensor_id)
+            setpoint_key = (
+                vol.Optional(f"setpoint_{i}", default=prev_setpoint_entity)
+                if prev_setpoint_entity else vol.Optional(f"setpoint_{i}")
+            )
+            schema_dict[setpoint_key] = selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="number")
+            )
+            schema_dict[vol.Optional(
+                f"setpoint_unit_{i}", default=prev_setpoint_unit.get(sensor_id, ""),
+            )] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        {"value": "", "label": "Auto (detect from the entity)"},
+                        {"value": "a", "label": "Amps (A)"},
+                        {"value": "w", "label": "Watts (W)"},
+                        {"value": "kw", "label": "Kilowatts (kW)"},
+                    ],
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            )
+            # Stored as int (see CONF_DEFERRABLE_LOAD_PHASES); the SelectSelector's own
+            # option values are strings, so re-stringify the saved default to match.
+            schema_dict[vol.Optional(
+                f"phases_{i}", default=str(prev_phases.get(sensor_id, 0)),
+            )] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        {"value": "0", "label": "Auto-detect"},
+                        {"value": "1", "label": "Single phase"},
+                        {"value": "2", "label": "Two phase"},
+                        {"value": "3", "label": "Three phase"},
+                    ],
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            )
+            schema_dict[vol.Optional(
+                f"voltage_{i}", default=prev_voltage.get(sensor_id, 0.0),
+            )] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.0, max=500.0, step=1,
+                    unit_of_measurement="V",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+            schema_dict[vol.Optional(
+                f"min_current_{i}", default=prev_min_current.get(sensor_id, 0.0),
+            )] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.0, max=32.0, step=0.1,
+                    unit_of_measurement="A",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+            prev_plug = prev_plug_sensor.get(sensor_id)
+            plug_key = (
+                vol.Optional(f"plug_sensor_{i}", default=prev_plug)
+                if prev_plug else vol.Optional(f"plug_sensor_{i}")
+            )
+            schema_dict[plug_key] = selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["binary_sensor", "sensor"])
             )
             # Optional Controlled Load register wiring; only shown when the household
             # declared at least one CL register in async_step_controlled_load.
@@ -1145,7 +1527,7 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         return self.async_show_form(
             step_id="device_power",
             data_schema=vol.Schema(schema_dict),
-            description_placeholders={"devices": "\n".join(device_lines)},
+            description_placeholders={"devices": "\n".join(device_lines), **name_placeholders},
         )
 
     async def async_step_declared_loads(self, user_input=None):
@@ -1195,7 +1577,7 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                     bool(user_input.get(f"in_aggregate_{i}", False))
                     for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
                 ]
-                return await self.async_step_current_plan()
+                return await self.async_step_estimated_loads()
 
         cl_register_options = []
         if self._has_cl1:
@@ -1246,6 +1628,76 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             step_id="declared_loads",
             data_schema=vol.Schema(schema_dict),
             errors=errors,
+        )
+
+    async def async_step_estimated_loads(self, user_input=None):
+        """Devices with a control entity but no energy sensor at all — see the setup-flow
+        docstring on this same step name for the full rationale."""
+        entry_data = self._config_entry.data
+        existing_names = entry_data.get(CONF_DEFERRABLE_LOAD_EST_NAMES, [])
+        existing_control = entry_data.get(CONF_DEFERRABLE_LOAD_EST_CONTROL, [])
+        existing_kw = entry_data.get(CONF_DEFERRABLE_LOAD_EST_KW, [])
+        existing_auto = entry_data.get(CONF_DEFERRABLE_LOAD_EST_AUTO, [])
+        existing_load_power = entry_data.get(CONF_LOAD_POWER_SENSOR, "")
+
+        if user_input is not None:
+            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_NAMES] = [
+                str(user_input.get(f"est_name_{i}", "") or "").strip()
+                for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
+            ]
+            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_CONTROL] = [
+                str(user_input.get(f"est_control_{i}", "") or "")
+                for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
+            ]
+            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_KW] = [
+                float(user_input.get(f"est_kw_{i}", 1.0) or 1.0)
+                for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
+            ]
+            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_AUTO] = [
+                bool(user_input.get(f"est_auto_{i}", False))
+                for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
+            ]
+            self._sensor_data[CONF_LOAD_POWER_SENSOR] = str(
+                user_input.get("load_power_sensor", "") or ""
+            )
+            return await self.async_step_current_plan()
+
+        schema_dict = {}
+        for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS):
+            schema_dict[vol.Optional(
+                f"est_name_{i}", default=existing_names[i] if i < len(existing_names) else "",
+            )] = selector.TextSelector()
+            prev_control = existing_control[i] if i < len(existing_control) else ""
+            control_key = (
+                vol.Optional(f"est_control_{i}", default=prev_control)
+                if prev_control else vol.Optional(f"est_control_{i}")
+            )
+            schema_dict[control_key] = selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["switch", "climate"])
+            )
+            schema_dict[vol.Optional(
+                f"est_kw_{i}", default=existing_kw[i] if i < len(existing_kw) else 1.0,
+            )] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.05, max=20.0, step=0.05,
+                    unit_of_measurement="kW",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+            schema_dict[vol.Optional(
+                f"est_auto_{i}", default=existing_auto[i] if i < len(existing_auto) else False,
+            )] = selector.BooleanSelector()
+        load_power_key = (
+            vol.Optional("load_power_sensor", default=existing_load_power)
+            if existing_load_power else vol.Optional("load_power_sensor")
+        )
+        schema_dict[load_power_key] = selector.EntitySelector(
+            selector.EntitySelectorConfig(domain="sensor")
+        )
+
+        return self.async_show_form(
+            step_id="estimated_loads",
+            data_schema=vol.Schema(schema_dict),
         )
 
     async def async_step_current_plan(self, user_input=None):

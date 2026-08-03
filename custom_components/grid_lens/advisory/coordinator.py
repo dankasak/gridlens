@@ -335,6 +335,11 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
                         else 0
                     )
             out.append({"daily_kwh": daily, "max_kw": maxkw, "hour_mask": mask,
+                        # Reserved for a later semi-continuous constraint — carried through
+                        # so the optimiser already receives it; nothing in the model reads it
+                        # yet. See plan_calculator._deferrable_min_kw for why the floor is
+                        # enforced in the controller instead.
+                        "min_kw": dev.get("min_kw", 0.0),
                         "name": dev.get("name"), "sensor_id": dev.get("sensor_id")})
         return out
 

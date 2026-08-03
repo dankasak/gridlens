@@ -289,6 +289,14 @@ class BatteryOptimizer:
         deferrable_loads is a list of per-device dicts, each with:
           'daily_kwh': float  — energy the device must consume per day
           'max_kw':    float  — maximum power draw per hour for that device
+          'min_kw':    float, optional — lowest power the device can physically be
+          given (a modulating EV charger's ~6 A floor); 0/absent = no floor.
+          **Reserved for a later semi-continuous constraint and currently IGNORED
+          here**: the variable stays continuous on 0..max_kw. Making the feasible
+          set {0} ∪ [min_kw, max_kw] needs a MILP binary per device per slot, which
+          this model only pays for conditional credits today; the floor is instead
+          enforced downstream by control/modulating_controller.py, which has to own
+          the decision anyway (it is the only layer that sees live surplus).
           'hour_mask': optional list of length T, values 0..1 (1 = device fully
           available that slot; fractional values scale the slot's energy cap, e.g.
           0.5 from a half-hour weekly schedule consumed at hourly resolution;

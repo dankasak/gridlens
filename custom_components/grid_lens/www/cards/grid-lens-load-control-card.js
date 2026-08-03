@@ -34,6 +34,35 @@
  *   - boost number: `number.*` with `deferrable_sensor_id === energy_entity`
  *     (GridLensDeferrableOverrideNumber).
  *
+ * Modulating (current-controlled) devices — `d.control_type === 'modulating'` (a
+ * `number.*` setpoint entity, e.g. an OCPP/Zaptec/Wallbox EV charger driven continuously
+ * in amps rather than switched on/off; see MODULATING_CONTRACT.md) — get the exact same
+ * row shape as every other device (segmented Off now/On now/Auto + all 3 Greedy buttons,
+ * never restructured or omitted per FEATURES.md §6), plus three additions appended after
+ * the existing sparkline/boost elements:
+ *   - a live current/power readout chip, read directly off `d.setpoint_entity` and
+ *     `d.power_entity` (both already resolved server-side, no new discovery needed);
+ *   - a max-current ceiling number input (`number.*_<device>_max_current` —
+ *     MODULATING_CONTRACT.md §6). The contract does not pin down this entity's discovery
+ *     fingerprint the way it documents Today Boost's, so this mirrors the closest existing
+ *     convention: joined on the same `deferrable_sensor_id` energy-sensor key Today Boost
+ *     already uses (a per-device ceiling is meaningful the same way a daily-kWh override
+ *     is), disambiguated from the Boost number by a `role === 'max_current'` marker, the
+ *     same way switch.py's three greedy switches already share one `switch` join key and
+ *     disambiguate with `role`. If number.py lands with a different attribute shape, only
+ *     `_maxCurrentFor()` below needs to change.
+ *   - a one-line "why" readout (`modulation_source`: plan/surplus/override/off, and
+ *     `plugged_in`) sourced from the control switch's own attributes — same entity/field
+ *     the greedy status line already reads, no extra lookup.
+ * A modulating device's physical join key (`phys`, used to find the control switch/select/
+ * greedy switches) falls back to `d.setpoint_entity` when `d.switch_entity` is empty — the
+ * common case per the contract ("setpoint present + no switch" — an OCPP charger has no
+ * separate on/off switch, `maximum_current: 0` stops delivery). Without this fallback every
+ * switchless modulating device's `phys` would be `null`/`""`, which would either fail to
+ * resolve those entities at all, or — worse — collide with every OTHER switchless
+ * modulating device on the same install sharing the same empty join key. See
+ * `_resolveRows()` for the exact fallback.
+ *
  * Config:
  *   type: custom:grid-lens-load-control-card
  *   title: Deferrable Loads          (optional)
@@ -147,6 +176,21 @@ class GridLensLoadControlCard extends HTMLElement {
     return null;
   }
 
+  // Max-current ceiling number (modulating devices only — `number.*_<device>_max_current`,
+  // MODULATING_CONTRACT.md §6). See the file header comment for why this join key
+  // (`deferrable_sensor_id` + `role`) is a best-effort mirror of two existing conventions
+  // rather than a documented fingerprint — the contract doesn't specify one for this entity.
+  _maxCurrentFor(d) {
+    const hass = this._hass;
+    if (!d || d.control_type !== 'modulating' || !d.energy_entity) return null;
+    for (const eid of Object.keys(hass.states)) {
+      if (!eid.startsWith('number.')) continue;
+      const a = hass.states[eid].attributes || {};
+      if (a.deferrable_sensor_id === d.energy_entity && a.role === 'max_current') return eid;
+    }
+    return null;
+  }
+
   // Allowed HOURS in the 24 hours starting now, from a device's 7x48 half-hour weekly
   // grid (Monday first). Mirrors schedule_grid.rolling_window_hours on the Python side:
   // this — not "allowed hours per day" — is what bounds a Today Boost, because the
@@ -223,8 +267,17 @@ class GridLensLoadControlCard extends HTMLElement {
 
   _resolveRows() {
     const devices = this._resolveDevices();
-    const rows = devices.map((d) => {
-      const phys = d.switch_entity || null;
+    // Deliberately NOT re-sorted (e.g. alphabetically) — devices stay in the same order
+    // as the `deferrable_loads` attribute itself, matching every other card that reads
+    // it (grid-lens-defer-schedule-card.js, the Power Flow card, the Power Chart card).
+    // This card used to alphabetize its rows, which put it out of step with those —
+    // same device, different row position depending which card you were looking at.
+    return devices.map((d) => {
+      // Falls back to the setpoint entity when there's no separate on/off switch — the
+      // common case for a modulating device (see file header comment). For an on/off
+      // device or a modulating device that DOES have a switch configured, this is
+      // unchanged from before (switch_entity wins).
+      const phys = d.switch_entity || d.setpoint_entity || null;
       return {
         device: d,
         controlEid: this._controlSwitchFor(phys),
@@ -233,10 +286,9 @@ class GridLensLoadControlCard extends HTMLElement {
         gsEid: this._greedySwitchFor(phys, 'greedy_schedule'),
         gfEid: this._greedySwitchFor(phys, 'greedy_surplus'),
         boostEid: this._boostFor(d.energy_entity),
+        maxCurEid: this._maxCurrentFor(d),
       };
     });
-    rows.sort((r1, r2) => (r1.device.name || '').localeCompare(r2.device.name || ''));
-    return rows;
   }
 
   set hass(hass) {
@@ -247,6 +299,7 @@ class GridLensLoadControlCard extends HTMLElement {
     const rows = this._resolveRows();
     this._pollHistory(rows);
     const sig = rows.map((r) => {
+      const d = r.device;
       const c = r.controlEid && hass.states[r.controlEid];
       const s = r.selEid && hass.states[r.selEid];
       const g = r.gEid && hass.states[r.gEid];
@@ -254,14 +307,26 @@ class GridLensLoadControlCard extends HTMLElement {
       const gf = r.gfEid && hass.states[r.gfEid];
       const b = r.boostEid && hass.states[r.boostEid];
       const ceiling = this._boostCeiling(r.device);
+      // Modulating-only live fields — a device's own setpoint/power readings and its
+      // max-current ceiling, none of which are covered by the control switch's `c`
+      // signature above. Gated on control_type so a non-modulating row's signature is
+      // byte-for-byte identical to before this feature (no spurious repaints, no risk of
+      // ever tripping the "must render exactly as it does today" requirement).
+      const isMod = d.control_type === 'modulating';
+      const mc = isMod && r.maxCurEid ? hass.states[r.maxCurEid] : null;
+      const sp = isMod && d.setpoint_entity ? hass.states[d.setpoint_entity] : null;
+      const pw = isMod && d.power_entity ? hass.states[d.power_entity] : null;
       return [
         r.device.energy_entity,
         // greedy_reason / forecast_free_kwh live in the control switch's ATTRIBUTES and
         // move while its state stays "on", so they need to be in the signature or the
         // greedy status line would freeze at whatever it said on the last state change.
+        // modulation_source / plugged_in are the same story for the modulating "why" line.
         c ? [c.state, (c.attributes || {}).note, (c.attributes || {}).greedy_reason,
              (c.attributes || {}).greedy_blocked,
-             (c.attributes || {}).forecast_free_kwh].join('|') : '',
+             (c.attributes || {}).forecast_free_kwh,
+             (c.attributes || {}).modulation_source,
+             (c.attributes || {}).plugged_in].join('|') : '',
         s ? s.state : '',
         g ? g.state : '',
         gs ? gs.state : '',
@@ -270,6 +335,9 @@ class GridLensLoadControlCard extends HTMLElement {
         // Time-dependent (the window rolls forward), so it belongs in the repaint
         // signature — otherwise the ceiling hint goes stale as the day advances.
         ceiling == null ? '' : ceiling.toFixed(1),
+        mc ? mc.state : '',
+        sp ? sp.state : '',
+        pw ? pw.state : '',
       ].join('~');
     }).join(',');
     if (sig !== this._sig) { this._sig = sig; this._rows = rows; this._paint(); }
@@ -334,6 +402,19 @@ class GridLensLoadControlCard extends HTMLElement {
                font-size: 12px; font-family: inherit; text-align: right; }
         .boost-input::-webkit-outer-spin-button, .boost-input::-webkit-inner-spin-button { margin: 0; }
         .boost-unit { font-size: 10px; color: var(--ink2); }
+        /* Modulating-device additions (current-controlled EV chargers etc — see the file
+           header comment). Same chip look as .boost so they read as siblings rather than
+           a bolted-on new style, but their own classes since they're not a boost value. */
+        .modcur { font-size: 11px; font-weight: 600; color: var(--ink); white-space: nowrap;
+               border: 1px solid var(--border); border-radius: 7px; padding: 3px 8px;
+               flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+        .maxcur { display: flex; align-items: center; gap: 3px; flex: 0 0 auto;
+               border: 1px solid var(--border); border-radius: 7px; padding: 3px 7px; }
+        .maxcur-label { font-size: 10px; color: var(--ink2); }
+        .maxcur-input { width: 32px; border: none; background: transparent; color: var(--ink);
+               font-size: 12px; font-family: inherit; text-align: right; }
+        .maxcur-input::-webkit-outer-spin-button, .maxcur-input::-webkit-inner-spin-button { margin: 0; }
+        .maxcur-unit { font-size: 10px; color: var(--ink2); }
         /* Daily-kWh sparkline: how much this device has actually drawn per day over the
            last two weeks, so a user reaching for Today Boost has a number to react to
            instead of guessing. Deliberately not colour-coded per device (unlike the
@@ -477,6 +558,83 @@ class GridLensLoadControlCard extends HTMLElement {
     return `<div class="greedy-line">Greedy: armed, waiting for free energy</div>`;
   }
 
+  // Modulating-only "why" line — answers "why is my car charging at 8 A right now?"
+  // (FEATURES.md §11 observability) straight from the control switch's own attributes,
+  // no extra entity lookup. `plugged_in === false` is called out ahead of the source
+  // label since it explains a 0 A readout outright; `plugged_in == null` (unconfigured/
+  // unavailable plug sensor) means "assume plugged" per the contract, so it says nothing.
+  // Reuses the .greedy-line/.greedy-line.active styling below rather than inventing a new
+  // look — 'surplus' gets the same "good news, it's free" accent the greedy line uses.
+  _modulationLine(a, d) {
+    if (!a || d.control_type !== 'modulating') return '';
+    if (a.plugged_in === false) {
+      return `<div class="greedy-line">Unplugged — charging stopped</div>`;
+    }
+    const label = {
+      plan: 'Following the plan',
+      surplus: 'Charging on surplus solar/export',
+      override: 'Manual override',
+      off: 'Not charging',
+    }[a.modulation_source];
+    if (!label) return '';
+    return `<div class="greedy-line${a.modulation_source === 'surplus' ? ' active' : ''}">${esc(label)}</div>`;
+  }
+
+  // Live current/power readout chip for a modulating device — the setpoint entity's own
+  // current value (ground truth, not the controller's internal target) plus the device's
+  // live power draw when a power sensor resolved (same `power_entity` every other feature
+  // on this card already uses, no new discovery). Degrades to an em-dash rather than
+  // hiding the chip outright when the setpoint entity is unavailable/unknown, so the row
+  // keeps its shape instead of jumping when a charger briefly drops offline.
+  _currentReadoutHtml(d) {
+    if (d.control_type !== 'modulating') return '';
+    const hass = this._hass;
+    const spSt = d.setpoint_entity ? hass.states[d.setpoint_entity] : null;
+    const spVal = spSt ? parseFloat(spSt.state) : NaN;
+    const spOk = spSt && Number.isFinite(spVal) && !['unavailable', 'unknown'].includes(spSt.state);
+    const spUnit = (spSt && spSt.attributes && spSt.attributes.unit_of_measurement) || 'A';
+    const pwSt = d.power_entity ? hass.states[d.power_entity] : null;
+    const pwVal = pwSt ? parseFloat(pwSt.state) : NaN;
+    const pwOk = pwSt && Number.isFinite(pwVal) && !['unavailable', 'unknown'].includes(pwSt.state);
+    const pwUnit = (pwSt && pwSt.attributes && pwSt.attributes.unit_of_measurement) || 'W';
+    const pwKw = pwOk ? (pwUnit.toLowerCase() === 'kw' ? pwVal : pwVal / 1000) : null;
+    const parts = [];
+    if (spOk) parts.push(`${spVal.toFixed(1)} ${esc(spUnit)}`);
+    if (pwKw != null) parts.push(`${pwKw.toFixed(2)} kW`);
+    const text = parts.length ? parts.join(' · ') : '–';
+    const tip = 'Live charging current'
+      + (d.power_entity ? ' and measured power draw' : '')
+      + '. Shows "–" when the setpoint entity is unavailable.';
+    return `<div class="modcur" tabindex="0" data-tip="${esc(tip)}">${text}</div>`;
+  }
+
+  // Max-current ceiling input (modulating devices only) — a user-set cap on the current
+  // Grid Lens may command this charger to, feeding the controller's `cap_w` (see
+  // MODULATING_CONTRACT.md §3.1 step 3 / §6). Same input-then-commit pattern as the
+  // Today Boost box below. Omitted (not disabled) when the entity hasn't resolved yet —
+  // a modulating device with no max_current number at all reads as "not configured yet",
+  // same treatment the rest of this card gives a missing auxiliary entity.
+  _maxCurrentHtml(r, d) {
+    if (d.control_type !== 'modulating' || !r.maxCurEid) return '';
+    const hass = this._hass;
+    const st = hass.states[r.maxCurEid];
+    if (!st) return '';
+    const ba = st.attributes || {};
+    const val = parseFloat(st.state);
+    const shown = Number.isFinite(val) ? val : (ba.max ?? 0);
+    const unit = ba.unit_of_measurement || 'A';
+    const tip = `Ceiling on the current Grid Lens may command this charger to — turn down `
+      + `to reserve capacity for something else sharing the circuit. `
+      + `Native max: ${ba.max ?? '–'} ${esc(unit)}.`;
+    return `
+      <div class="maxcur" tabindex="0" data-tip="${esc(tip)}">
+        <span class="maxcur-label">Max</span>
+        <input type="number" class="maxcur-input" data-eid="${esc(r.maxCurEid)}"
+          min="${ba.min ?? 0}" max="${ba.max ?? 32}" step="${ba.step ?? 1}" value="${shown}">
+        <span class="maxcur-unit">${esc(unit)}</span>
+      </div>`;
+  }
+
   // 14-day daily-kWh bar sparkline for a device's energy sensor — a quick visual answer
   // to "what does this thing normally use per day?" right next to the Today Boost input
   // it informs. Undefined cache entry = still loading (blank placeholder, no layout
@@ -530,14 +688,21 @@ class GridLensLoadControlCard extends HTMLElement {
       const a = controlSt ? (controlSt.attributes || {}) : {};
       const note = friendlyNote(a.note);
       const isErr = (a.note || '').startsWith('command_error');
+      // A modulating device with no separate on/off switch (the common case) has no
+      // switch_entity to show here — fall back to the setpoint entity so the meta line
+      // still names the entity actually being driven instead of trailing off after "· ".
+      const drivenEntity = d.switch_entity || d.setpoint_entity || '';
       const meta = d.controllable
-        ? `${on ? 'Controlling' : 'Not controlling'} · ${esc(d.switch_entity || '')}${note ? ' · ' + esc(note) : ''}`
+        ? `${on ? 'Controlling' : 'Not controlling'} · ${esc(drivenEntity)}${note ? ' · ' + esc(note) : ''}`
         : 'Forecast only — no control switch configured';
       // Second meta line: the live greedy story. Answers "is greedy doing anything right
       // now, and if not, how close is it?" — the boolean toggles above only say it's
       // armed. Rendered off the control switch's own attributes (the controller's
       // status()), so it needs no extra entity lookup.
       const greedyLine = this._greedyLine(a);
+      // Third meta line, modulating devices only: why the current is where it is right
+      // now (plan/surplus/override/plugged-in) — see _modulationLine above.
+      const modLine = this._modulationLine(a, d);
 
       // Control area: a fully-wired device gets the real segmented control (or a plain
       // toggle fallback if the override select hasn't appeared yet); a device with no
@@ -606,6 +771,12 @@ class GridLensLoadControlCard extends HTMLElement {
       // the boost input it's meant to inform.
       const sparkHtml = this._sparklineHtml(d.energy_entity);
 
+      // Modulating-only additions — appended after the existing sparkline/boost elements
+      // so a non-modulating row's markup up to this point is byte-for-byte unchanged.
+      // Both return '' for a non-modulating device, so nothing is inserted for one.
+      const currentHtml = this._currentReadoutHtml(d);
+      const maxCurHtml = this._maxCurrentHtml(r, d);
+
       // Today Boost override (merged in from the old boost-tuning-card 2026-07-31) —
       // shown for every device that has one, controllable or not.
       let boostHtml = '';
@@ -643,9 +814,12 @@ class GridLensLoadControlCard extends HTMLElement {
             <div class="name">${esc(d.name || d.energy_entity)}</div>
             <div class="meta${isErr ? ' err' : ''}">${meta}</div>
             ${greedyLine}
+            ${modLine}
           </div>
           ${sparkHtml}
           ${boostHtml}
+          ${currentHtml}
+          ${maxCurHtml}
           ${greedyHtml}
           ${controlHtml}
         </div>`;
@@ -687,6 +861,20 @@ class GridLensLoadControlCard extends HTMLElement {
         const eid = el.getAttribute('data-eid');
         let v = parseFloat(el.value);
         if (!Number.isFinite(v) || v < 0) v = 0;
+        this._hass.callService('number', 'set_value', { entity_id: eid, value: v });
+      };
+      el.addEventListener('change', commit);
+      el.addEventListener('keydown', (e) => { if (e.key === 'Enter') el.blur(); });
+    });
+    // Max-current ceiling — same commit-on-change/Enter pattern as the Today Boost input.
+    body.querySelectorAll('.maxcur-input').forEach((el) => {
+      const commit = () => {
+        const eid = el.getAttribute('data-eid');
+        let v = parseFloat(el.value);
+        const lo = parseFloat(el.min), hi = parseFloat(el.max);
+        if (!Number.isFinite(v)) return;
+        if (Number.isFinite(lo)) v = Math.max(lo, v);
+        if (Number.isFinite(hi)) v = Math.min(hi, v);
         this._hass.callService('number', 'set_value', { entity_id: eid, value: v });
       };
       el.addEventListener('change', commit);

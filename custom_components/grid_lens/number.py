@@ -4,6 +4,7 @@ are tuning knobs a user changes often, not one-time setup values.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 
 from homeassistant.components.number import NumberEntity, NumberMode
@@ -19,6 +20,10 @@ from .const import (
     CONF_MIN_EXPORT_PRICE,
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
+    CONF_DEFERRABLE_LOAD_SETPOINT,
+    CONF_DEFERRABLE_LOAD_MIN_CURRENT,
+    DEFAULT_SUPPLY_VOLTAGE,
+    DEFAULT_MIN_CHARGE_CURRENT_A,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -44,6 +49,45 @@ def _device_display_name(hass: HomeAssistant, sensor_id: str) -> str:
     return object_id.replace("_", " ").title()
 
 
+def _resolve_max_current_a(hass: HomeAssistant, controller, setpoint_id: str, max_kw: float) -> float:
+    """Ceiling for the Max Current number's own ``native_max_value`` — the setpoint
+    entity's own advertised max (A) if it publishes one (standard HA number-entity state
+    attributes ``max``/``native_max_value``), else this device's configured max_kw
+    converted to A via the controller's already-resolved voltage/phases
+    (``controller.status()`` — see MODULATING_CONTRACT.md §3.4), falling back to
+    DEFAULT_SUPPLY_VOLTAGE/single-phase if no controller instance exists yet (setup
+    ordering — the modulating controller may not be constructed the very first time
+    entities are added). This is only the entity's *default ceiling value* (the user can
+    always dial it down), not a control-loop parameter, so an approximate fallback here
+    is harmless — the controller's own clamp (cap_w) is what actually protects the
+    hardware, using its own voltage/phases, independent of what this number shows.
+    """
+    state = hass.states.get(setpoint_id)
+    if state is not None:
+        raw = state.attributes.get("max", state.attributes.get("native_max_value"))
+        try:
+            if raw is not None and float(raw) > 0:
+                return float(raw)
+        except (TypeError, ValueError):
+            pass
+    voltage = DEFAULT_SUPPLY_VOLTAGE
+    phases = 1
+    if controller is not None:
+        try:
+            status = controller.status()
+            voltage = float(status.get("voltage") or DEFAULT_SUPPLY_VOLTAGE)
+            phases = int(status.get("phases") or 1)
+        except Exception:  # noqa: BLE001 — a status() hiccup must not block entity setup
+            voltage, phases = DEFAULT_SUPPLY_VOLTAGE, 1
+    if voltage <= 0:
+        voltage = DEFAULT_SUPPLY_VOLTAGE
+    if phases <= 0:
+        phases = 1
+    if max_kw <= 0:
+        return DEFAULT_MIN_CHARGE_CURRENT_A
+    return round(max_kw * 1000.0 / (voltage * phases), 1)
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
@@ -65,6 +109,37 @@ async def async_setup_entry(
             max_kw = max_kws[i] if i < len(max_kws) else 3.5
             entities.append(
                 GridLensDeferrableOverrideNumber(entry, store, sensor_id, name, max_kw)
+            )
+
+    # One "max current" ceiling per modulating ("type 2") deferrable device — a user cap
+    # on the current GridLens may command, on top of whatever the plan/greedy logic
+    # decides (MODULATING_CONTRACT.md §6). Gated on CONF_DEFERRABLE_LOAD_SETPOINT[i] being
+    # set, exactly like ModulatingLoadController's own type-2 test — this key is absent
+    # from every config entry saved before this feature, so an existing on/off or
+    # forecast-only device gains no new entity here.
+    setpoints = entry.data.get(CONF_DEFERRABLE_LOAD_SETPOINT, [])
+    if setpoints:
+        min_currents = entry.data.get(CONF_DEFERRABLE_LOAD_MIN_CURRENT, [])
+        max_kws = entry.data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
+        # LoadControlManager builds one ModulatingLoadController per modulating device,
+        # keyed by the same list index as everywhere else (control/load_control_manager.py).
+        # It may legitimately be absent (setup failed, or this is the very first entity
+        # pass before the manager exists) — GridLensModulatingMaxCurrentNumber tolerates a
+        # None controller and simply can't push its value anywhere until one shows up.
+        load_mgr = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_load_control")
+        for i, setpoint_id in enumerate(setpoints):
+            if not setpoint_id:
+                continue
+            controller = load_mgr.controllers.get(i) if load_mgr is not None else None
+            name = _device_display_name(hass, sensors[i]) if i < len(sensors) else setpoint_id
+            min_a = min_currents[i] if i < len(min_currents) and min_currents[i] else DEFAULT_MIN_CHARGE_CURRENT_A
+            max_kw = max_kws[i] if i < len(max_kws) else 0.0
+            max_a = _resolve_max_current_a(hass, controller, setpoint_id, float(max_kw))
+            entities.append(
+                GridLensModulatingMaxCurrentNumber(
+                    entry, controller, i, name, setpoint_id, float(min_a), max_a,
+                    sensor_id=sensors[i] if i < len(sensors) else "",
+                )
             )
 
     if entities:
@@ -168,3 +243,119 @@ class GridLensDeferrableOverrideNumber(NumberEntity):
             await self._store.async_set(self._sensor_id, value)
         self._attr_native_value = value if value > 0 else 0.0
         self.async_write_ha_state()
+
+
+class GridLensModulatingMaxCurrentNumber(RestoreEntity, NumberEntity):
+    """User ceiling (A) on the current GridLens may command a modulating ("type 2") EV
+    charger — a `number.*` setpoint entity configured per MODULATING_CONTRACT.md §2/§6,
+    as opposed to a plain on/off `switch.*`/`climate.*` load. Wired straight through to
+    the device's ``ModulatingLoadController.set_current_cap_a()``, which folds it into
+    the commanded envelope on every fast (30 s) tick: ``cap_w = min(max_w, this ceiling,
+    the setpoint entity's own native max)`` — see ``modulate()``'s clamp step in
+    control/modulating_controller.py. This entity never talks to hardware itself; it only
+    ever narrows what the controller is allowed to command.
+
+    RestoreEntity, not the shared-Store pattern GridLensDeferrableOverrideNumber uses
+    above: this is a durable "don't let GridLens command more than X A on this circuit"
+    limit a user sets once and rarely revisits, not a rolling daily override with its own
+    carry-over-notification semantics — a plain restored number is the right amount of
+    persistence here (see feedback_restore_entity_deadman_race in project memory for the
+    one case where RestoreEntity was rejected for GridLens control state: that one had a
+    deadman that force-clears intent on every reload, which doesn't apply to this value —
+    nothing here ever resets it out from under the user).
+
+    Defaults to its own max (no restriction out of the box) — the point of this control
+    is "let the user turn it DOWN from what the hardware/plan would otherwise use", not
+    "start pre-throttled and confuse everyone about why charging is slow".
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:current-ac"
+    _attr_native_unit_of_measurement = "A"
+    _attr_native_step = 0.5
+    _attr_mode = NumberMode.BOX
+
+    def __init__(
+        self,
+        entry: ConfigEntry,
+        controller,
+        index: int,
+        name: str,
+        setpoint_entity_id: str,
+        min_a: float,
+        max_a: float,
+        sensor_id: str = "",
+    ) -> None:
+        self._controller = controller
+        self._index = index
+        self._setpoint_entity_id = setpoint_entity_id
+        self._sensor_id = sensor_id
+        self._attr_name = f"{name} Max Current"
+        self._attr_unique_id = f"{entry.entry_id}_deferrable_max_current_{index}"
+        self._attr_native_min_value = min_a
+        self._attr_native_max_value = max_a
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_native_value = max_a  # unrestricted out of the box
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last is not None and last.state not in ("unknown", "unavailable"):
+            try:
+                self._attr_native_value = max(
+                    self._attr_native_min_value,
+                    min(self._attr_native_max_value, float(last.state)),
+                )
+            except ValueError:
+                pass
+        # Push the restored (or default) ceiling into the controller now — otherwise a
+        # restart would silently leave the controller at ITS OWN default (unrestricted)
+        # until the user happens to touch this slider again, quietly discarding a
+        # previously-set limit for a whole session.
+        await self._push_to_controller(self._attr_native_value)
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        # Three join keys, because a card has to find this entity by attribute
+        # fingerprint alone (never by naming convention — FEATURES.md §10):
+        # * `deferrable_sensor_id` is THE canonical per-device key across this
+        #   integration — the schedule store, Today Boost and the deferrable_loads sensor
+        #   attribute all key off the device's energy sensor id, so a card that already
+        #   resolved a device has this in hand.
+        # * `role` disambiguates which of a device's several GridLens-owned numbers this
+        #   is, matching the greedy switches' own `role` discriminator in switch.py.
+        # * `setpoint_entity` is the fallback for a modulating device whose energy sensor
+        #   is a synthetic/estimated one, where the card may only know the setpoint.
+        return {
+            "deferrable_sensor_id": self._sensor_id,
+            "role": "max_current",
+            "setpoint_entity": self._setpoint_entity_id,
+        }
+
+    async def async_set_native_value(self, value: float) -> None:
+        self._attr_native_value = value
+        await self._push_to_controller(value)
+        self.async_write_ha_state()
+
+    async def _push_to_controller(self, value: float) -> None:
+        # The controller may not exist yet (setup ordering, entitlement pending) or may
+        # not be a modulating one (config drift, e.g. the setpoint entity was removed out
+        # from under an existing device) — set_current_cap_a() is only guaranteed on
+        # ModulatingLoadController, never on the plain on/off DeferrableLoadController.
+        # Guard rather than assume, and never let a controller-side hiccup break this
+        # entity's own write — same "never raise" discipline as every actuation path in
+        # this integration.
+        setter = getattr(self._controller, "set_current_cap_a", None)
+        if setter is None:
+            return
+        try:
+            result = setter(value)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Max Current ceiling push failed for %s: %s", self._attr_name, err)
