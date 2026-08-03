@@ -122,6 +122,18 @@ async def _discover_energy_sensors(hass: HomeAssistant) -> dict:
         return {}
 
 
+# Every field _energy_schema presents. Anything listed here is fully user-editable,
+# so an absent value on submit means "cleared" and must overwrite what's stored.
+_ENERGY_SCHEMA_KEYS = (
+    CONF_ENERGY_SENSOR,
+    CONF_SOLAR_SENSOR,
+    CONF_GRID_EXPORT_SENSOR,
+    CONF_GRID_POWER_SENSOR,
+    CONF_IMPORT_PRICE_SENSOR,
+    CONF_EXPORT_PRICE_SENSOR,
+)
+
+
 def _energy_schema(defaults: dict) -> vol.Schema:
     """Build the energy sensors schema, pre-filling discovered values."""
 
@@ -130,7 +142,10 @@ def _energy_schema(defaults: dict) -> vol.Schema:
 
     def opt(key):
         if defaults.get(key):
-            return vol.Optional(key, default=defaults[key])
+            # suggested_value, not default: an EntitySelector the user clears comes
+            # back absent from user_input, and a `default` would silently re-apply
+            # the old entity id — making an optional sensor impossible to remove.
+            return vol.Optional(key, description={"suggested_value": defaults[key]})
         return vol.Optional(key)
 
     def req(key):
@@ -872,9 +887,11 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             self._discovered = await _discover_energy_sensors(self.hass)
             # Merge: entry data takes precedence over fresh discovery (user may have overridden)
             merged = {**self._discovered}
-            for key in (CONF_ENERGY_SENSOR, CONF_SOLAR_SENSOR, CONF_GRID_EXPORT_SENSOR,
-                        CONF_GRID_POWER_SENSOR, CONF_IMPORT_PRICE_SENSOR, CONF_EXPORT_PRICE_SENSOR):
-                if entry_data.get(key):
+            for key in _ENERGY_SCHEMA_KEYS:
+                # Membership, not truthiness: a stored None means the user deliberately
+                # cleared that sensor. Testing `entry_data.get(key)` would treat cleared
+                # the same as never-set and let Energy-dashboard discovery put it back.
+                if key in entry_data:
                     merged[key] = entry_data[key]
             self._discovered = merged
 
@@ -893,9 +910,15 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                         errors[CONF_ENERGY_SENSOR] = "wrong_state_class"
 
             if not errors:
-                self._sensor_data = {
-                    k: v for k, v in {**entry_data, **user_input}.items()
-                }
+                self._sensor_data = {**entry_data, **user_input}
+                # Every key in _energy_schema is user-editable, and a cleared
+                # EntitySelector is absent from user_input rather than None. Spreading
+                # entry_data first would inherit the old value for exactly those keys,
+                # so re-assert each one explicitly: absent == cleared.
+                for key in _ENERGY_SCHEMA_KEYS:
+                    if key == CONF_ENERGY_SENSOR:
+                        continue  # required field — never clearable
+                    self._sensor_data[key] = user_input.get(key) or None
                 # entry_data is spread first above, so without this the freshly
                 # answered controlled_load step would be silently clobbered back
                 # to its old saved value.

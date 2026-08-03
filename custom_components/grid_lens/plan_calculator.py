@@ -516,9 +516,6 @@ class PlanCalculator:
             )
             await _progress("Fetched export price history")
         hourly_day_profile = self._compute_hourly_day_profile(usage_data, grid_export_data)
-        display_import_cost, display_export_credit = await self._calculate_cost_breakdown(
-            usage_data, grid_export_data
-        )
         energy_flows = await self._prepare_energy_flow_data(
             usage_data,
             solar_data if solar_data else [],
@@ -558,12 +555,10 @@ class PlanCalculator:
                     deferrable_loads=deferrable_loads,
                 )
 
-                if is_current and self.import_price_sensor:
-                    supply_cost = plan.daily_supply_charge * actual_days
-                    subscription = getattr(plan, 'monthly_subscription_fee', 0.0) * (actual_days / 30.44)
-                    cost = current_plan_energy_cost + supply_cost + subscription
-                    _LOGGER.warning(f"Current plan {plan_key}: actual energy ${current_plan_energy_cost:.2f} + supply ${supply_cost:.2f} + subscription ${subscription:.2f} = ${cost:.2f}")
-
+                # The current plan keeps its LP-optimised `cost` here. This used to be
+                # overwritten with price-sensor-derived energy, which priced the held
+                # plan off a feed that need not correspond to it at all (e.g. a Flow
+                # Power wholesale sensor left configured after switching to a TOU plan).
                 fixed_credit = getattr(plan, 'fixed_daily_credit', 0.0) * actual_days
                 plan_costs[plan_key] = cost - fixed_credit
                 breakdown = plan.get_display_breakdown(opt_result)
@@ -574,24 +569,9 @@ class PlanCalculator:
                     'plan_info': plan.get_plan_info(),
                 }
 
-            elif is_current and self.import_price_sensor:
-                supply_cost = plan.daily_supply_charge * actual_days
-                subscription = getattr(plan, 'monthly_subscription_fee', 0.0) * (actual_days / 30.44)
-                cost = current_plan_energy_cost + supply_cost + subscription
-                plan_costs[plan_key] = cost
-                plan_optimization_results[plan_key] = {
-                    'breakdown': {
-                        'total': round(cost, 2),
-                        'energy_cost': round(current_plan_energy_cost, 2),
-                        'supply_charge': round(supply_cost, 2),
-                        'subscription_fee': round(subscription, 2),
-                        'note': f'Energy from price sensor; supply ${plan.daily_supply_charge:.2f}/day + subscription ${getattr(plan, "monthly_subscription_fee", 0.0):.2f}/month',
-                    },
-                    'strategy': plan.describe_strategy(),
-                    'plan_info': plan.get_plan_info(),
-                }
-                _LOGGER.warning(f"Current plan {plan_key}: actual energy ${current_plan_energy_cost:.2f} + supply ${supply_cost:.2f} + subscription ${subscription:.2f} = ${cost:.2f}")
-
+            # (No price-sensor branch for the current plan: without a battery optimiser
+            # it falls through to the same simple per-plan calculation as every
+            # alternative, rather than being costed from an unrelated price feed.)
             else:
                 _LOGGER.warning(f"Using SIMPLE calculation for {plan_key}")
                 cost = self._calculate_plan_cost_simple(usage_data, plan)
@@ -630,19 +610,20 @@ class PlanCalculator:
                     slot['soc_percent'] = round(soc_hod_avg.get(h, 0.0), 1)
                 plan_optimization_results[plan_key]['hourly_profile'] = profile
 
-                # Replace LP schedule with actual historical battery behaviour.
+                # Overlay actual historical battery behaviour onto the LP schedule,
+                # in place. This used to *replace* the schedule with battery-only slots;
+                # harmless while the current plan's bill items came from a separate
+                # actual-usage path, but _compute_bill_items now reads this same
+                # schedule for every plan, and slots stripped of their import/export
+                # and rate fields zero out every line quantity while leaving the
+                # total correct — an itemised bill of all-zero kWh.
                 if battery_hod_avg and opt_result is not None:
-                    synthetic_schedule = []
-                    for _ in range(4):
-                        for h in range(24):
-                            batt = battery_hod_avg.get(h, {})
-                            synthetic_schedule.append({
-                                'hour':          h,
-                                'charge_kwh':    round(batt.get('charge_kwh', 0.0), 3),
-                                'discharge_kwh': round(batt.get('discharge_kwh', 0.0), 3),
-                                'soc_percent':   round(soc_hod_avg.get(h, 0.0), 1),
-                            })
-                    opt_result['schedule'] = synthetic_schedule
+                    for slot in opt_result.get('schedule') or []:
+                        h = slot.get('hour')
+                        batt = battery_hod_avg.get(h, {})
+                        slot['charge_kwh']    = round(batt.get('charge_kwh', 0.0), 3)
+                        slot['discharge_kwh'] = round(batt.get('discharge_kwh', 0.0), 3)
+                        slot['soc_percent']   = round(soc_hod_avg.get(h, 0.0), 1)
 
             # ── Bill items ───────────────────────────────────────────────────────────
             plan_optimization_results[plan_key]['breakdown']['bill_items'] = \
@@ -651,8 +632,15 @@ class PlanCalculator:
                     usage_data,
                     grid_export_data,
                     actual_days,
-                    import_cost_actual=display_import_cost if is_current else None,
-                    export_credit_actual=display_export_credit if is_current else None,
+                    # No current-plan special case (both default to None). Passing the
+                    # metered actuals here scored the current plan on a *substituted*
+                    # price — the configured import_price_sensor, or the 15c/kWh
+                    # fallback in _calculate_cost_breakdown when none is set — while
+                    # every alternative was priced by its own tariff off the LP
+                    # dispatch. That made the headline "current vs best alternative"
+                    # apples-to-oranges, and mispriced outright whenever the price
+                    # sensor didn't correspond to the plan actually held. The plan's
+                    # own rate structure is authoritative for every plan.
                     comparison_total=plan_costs.get(plan_key),
                     opt_result=opt_result,
                     pea_result=pea_results.get(plan_key),
@@ -660,13 +648,21 @@ class PlanCalculator:
                     cl_devices=cl_devices,
                 )
 
-            # Sync breakdown.total with bill_items.total for the current plan.
+            # The current plan's headline cost is its LP-optimised total, exactly like
+            # every alternative — bill_items no longer overrides it. Overriding used to
+            # push the substituted-price total (see the _compute_bill_items call above)
+            # into the ranking, so the one plan the user was actually on was the one
+            # scored on a different basis from everything it was compared against.
             if is_current:
-                bi = plan_optimization_results[plan_key]['breakdown'].get('bill_items')
-                if bi and 'total' in bi:
-                    plan_optimization_results[plan_key]['breakdown']['total'] = bi['total']
-                    plan_costs[plan_key] = bi['total']
                 current_plan_total = plan_costs[plan_key]
+                # Take the energy component from the plan's own breakdown too. It is
+                # surfaced as the `energy_cost` attribute on the current-plan cost
+                # sensor, and would otherwise still report the estimate from
+                # _calculate_current_plan_cost_with_battery — which falls back to a
+                # flat 15c/kWh when no price sensor is configured.
+                _current_bd = plan_optimization_results[plan_key].get('breakdown') or {}
+                if 'total_energy_cost' in _current_bd:
+                    current_plan_energy_cost = _current_bd['total_energy_cost']
 
             # ── Streaming callback ───────────────────────────────────────────────────
             if on_plan_ready:
@@ -1093,11 +1089,15 @@ class PlanCalculator:
                                  'kwh': round(tier_data[rk]['kwh'], 2),
                                  'amount': round(tier_data[rk]['cost'], 2)}
                                 for rk in all_rates]
-                # Reconcile: sensor-verified total overrides computed rate×kWh for largest tier
-                computed = sum(l['amount'] for l in energy_lines)
-                if energy_lines and abs(computed - import_cost_actual) > 0.02:
-                    energy_lines[0]['amount'] = round(
-                        import_cost_actual - sum(l['amount'] for l in energy_lines[1:]), 2)
+                # Deliberately NO reconciliation plug here. This used to force
+                # energy_lines[0] to absorb any gap between the summed rate×kWh and
+                # import_cost_actual, which silently made one line's amount stop
+                # equalling its own kwh × rate_c (and could even render it negative).
+                # It also concealed the misprice it was papering over: the lines always
+                # summed to the total, so the bill looked internally consistent. If a
+                # caller ever reintroduces import_cost_actual, a divergence here means
+                # the substituted price disagrees with the plan's own tariff — that
+                # should surface, not get absorbed.
             else:
                 energy_lines = [{'label': 'Energy', 'rate_c': 0,
                                  'kwh': round(total_import_kwh, 2),

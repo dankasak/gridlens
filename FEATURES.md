@@ -47,7 +47,11 @@ great overnight window is credited for the load-shifting it would actually enabl
 | `sensor.*_potential_monthly_savings` | Difference between the two. |
 | `sensor.*` per-plan metric sensors | `plan_sensors.py` — one set per modelled plan. |
 
-**Service:** `grid_lens.calculate_period` — re-run the comparison over an explicit date range.
+**Date-range re-run:** `GET /api/grid_lens/plan_data?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD`
+recalculates the whole comparison on the fly and returns it as JSON (this is what the
+dashboard's period picker calls). The old `grid_lens.calculate_period` service is
+**deprecated and raises** — it is still registered, so it looks callable, but
+`_calculate_and_populate_sensors` throws `HomeAssistantError` before returning anything.
 
 **Files:** `plan_calculator.py`, `retailer_plans.py`, `sensor.py`, `plan_sensors.py`.
 
@@ -63,6 +67,20 @@ wholesale-linked ones, supply charges.
 
 **Gotcha — capped-rate labels.** Label the free tier and the after-cap tier explicitly;
 rate-value-keyed dicts silently merge on collision. See the checklist entry.
+
+**Every plan is scored the same way, including the one the user is on.** The current plan
+gets no special path: its cost is the LP-optimised total priced by its own tariff, exactly
+like the alternatives it is ranked against. It used to be costed from the configured
+`import_price_sensor` (falling back to a flat 15c/kWh when unset) applied to actual metered
+kWh — which mispriced it outright whenever that sensor didn't correspond to the plan
+actually held, e.g. a wholesale feed left configured after switching to a TOU plan. Don't
+reintroduce an "actual vs modelled" asymmetry into the headline comparison; if a
+what-you-really-paid figure is wanted, price *actual* kWh through the *current plan's own
+tiers* (which `_compute_bill_items` already does correctly) rather than an external feed.
+
+**`import_price_sensor` / `export_price_sensor` are optional and unused by the comparison.**
+Nothing in the optimiser, control or advisory paths reads them. Leaving them set is
+harmless now, but they are no longer required for a correct current-plan cost.
 
 ---
 
