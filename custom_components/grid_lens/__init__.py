@@ -1021,6 +1021,83 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 return _serve(cached[1], True)
             return _serve(LOCKED_CARD_JS, False)
 
+    class PowerflowIconView(HomeAssistantView):
+        """Proxies one of the Power Flow card's node icons from the API — same
+        entitlement gate and server-to-server fetch pattern as PowerflowCardView
+        above, just for a binary asset instead of JS. See that class's docstring
+        for the browser-never-sees-the-API-key rationale, which applies here too.
+
+        These icons moved here (from a static file under this integration's own
+        www/icons/) 2026-08-05 — they'd been served publicly since before the
+        card was gated, exclusively for this card's own use, undermining the
+        exact protection this proxy exists to provide. See
+        GRIDLENS_CHECKLIST.md's 2026-08-05 entry for the full story.
+
+        Unlike the card JS, there's no "locked" placeholder image: if the
+        install isn't entitled, the real diagram never renders in the first
+        place (the paywall stub is a self-contained upsell UI with no node
+        icons of its own), so nothing would ever request one of these URLs
+        while un-entitled anyway. A 404 is a fine degradation for that case.
+        """
+
+        url = "/api/grid_lens/icons/{filename}"
+        name = "api:grid_lens:powerflow_icon"
+        requires_auth = False
+
+        _TTL_ENTITLED = 3600  # icon bytes change far less often than card logic
+        _TTL_LOCKED = 60      # still short, so an upgrade is reflected promptly
+
+        def __init__(self, hass_instance):
+            self.hass = hass_instance
+            # (entry_id, filename) -> (fetched_at, content, content_type, entitled)
+            self._cache: dict[tuple[str, str], tuple] = {}
+
+        async def get(self, request, filename):
+            import time
+            from .const import CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL
+
+            entries = self.hass.config_entries.async_entries(DOMAIN)
+            entry = entries[0] if entries else None
+            if not entry:
+                return web.Response(status=404)
+
+            key = (entry.entry_id, filename)
+            now = time.monotonic()
+            cached = self._cache.get(key)
+            if cached:
+                fetched_at, content, content_type, entitled = cached
+                ttl = self._TTL_ENTITLED if entitled else self._TTL_LOCKED
+                if now - fetched_at < ttl:
+                    return web.Response(body=content, content_type=content_type)
+
+            api_key = entry.data.get(CONF_GRIDLENS_API_KEY, "")
+            api_url = entry.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
+            try:
+                session = async_get_clientsession(self.hass)
+                async with session.get(
+                    f"{api_url}/cards/powerflow/icons/{filename}",
+                    headers={"X-API-Key": api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 200:
+                        content = await resp.read()
+                        content_type = resp.content_type
+                        self._cache[key] = (now, content, content_type, True)
+                        return web.Response(body=content, content_type=content_type)
+                    if resp.status in (401, 402, 403, 404):
+                        return web.Response(status=404)
+                    _LOGGER.warning(
+                        "Power Flow icon %s: unexpected status %s from API", filename, resp.status
+                    )
+            except Exception as err:  # noqa: BLE001 — network is best-effort here
+                _LOGGER.warning("Power Flow icon %s: could not reach API (%s)", filename, err)
+
+            # Network failure or an unexpected status: prefer stale-but-real over a
+            # broken image, same principle as PowerflowCardView.
+            if cached and cached[3]:
+                return web.Response(body=cached[1], content_type=cached[2])
+            return web.Response(status=404)
+
     class SubscribeCallbackView(HomeAssistantView):
         """Receive subscription callback from gridlens.au and advance the config flow."""
 
@@ -1076,6 +1153,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.http.register_view(DiagnosticExportView(hass))
     hass.http.register_view(PlanStreamView(hass))
     hass.http.register_view(PowerflowCardView(hass))
+    hass.http.register_view(PowerflowIconView(hass))
     hass.http.register_view(SubscribeCallbackView(hass))
 
     return True
