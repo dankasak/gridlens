@@ -43,6 +43,15 @@ Reachable directly via HTTP/curl from the HA add-on container — no tunnel need
   verbatim and swap only the material words, rather than describing the new target state
   from first principles. See `AIRCON_DRAGON_ICON_PLAN.md`'s "neutral breath" note for the
   concrete case (2 failed negation-based attempts vs. 1 successful structure-reuse attempt).
+- **A single hue word in the prompt isn't enough to pin down a specific color family.**
+  The EV charger's underglow (2026-08-05) was prompted as "violet-purple" and came back
+  reading pink/magenta on the first render — Wan I2V leaned toward the warmer end of the
+  described hue rather than the intended cool-toned purple. Fixed by naming several
+  adjacent *cool*-leaning color words together ("deep indigo-blue and violet", "cool
+  blue-violet electric... sapphire and indigo light") rather than repeating the one word
+  more emphatically. If a render's color drifts warm/pink when you wanted violet/blue (or
+  the equivalent in any other hue direction), broaden the color vocabulary in the next
+  attempt instead of just re-asserting the same single word.
 - **Verify a deploy without `gh` CLI.** This environment has no `gh auth` configured, so
   `gh run list` / workflow-status checks fail. For the private `gridlens-api` repo (which
   auto-deploys to the LXC via a GitHub Actions self-hosted runner on push to `main`), confirm
@@ -207,18 +216,51 @@ flood-fill only removes pixels *connected* to the border through a smoothly-vary
 path, anchored to each border seed's own color (`tol`/`anchor_max` in the script) so a long
 chain of small gradient steps can't drift all the way into a differently-colored object.
 
-**`deadzone` param (added 2026-08-05, default `0.06`).** I2V renders drift slightly in
-brightness frame-to-frame even in a nominally-static background region — this produces tiny
-nonzero per-frame diffs against the reference frame that yield a few percent of *oscillating*
-residual alpha: invisible composited on a light theme, visible as a faint flickering
-box/halo around the icon on a dark theme. `frac` values below `deadzone` now snap to fully
-transparent (0) instead of leaving that low-level flicker in. This is a general fix — it
-benefits every future i2v-chromakeyed icon, not just the one that surfaced it — so there's no
-need to re-derive or re-diagnose this if a new icon shows the same faint-halo symptom; check
-this script's `deadzone` value is still in place before assuming it's a new bug. If a new
-render shows a *stronger* halo than this default clears, raise `deadzone` rather than
+**`deadzone` param (added 2026-08-05, default now `0.15`, was `0.06`).** I2V renders drift
+slightly in brightness frame-to-frame even in a nominally-static background region — this
+produces tiny nonzero per-frame diffs against the reference frame that yield a few percent of
+*oscillating* residual alpha: invisible composited on a light theme, visible as a faint
+flickering box/halo around the icon on a dark theme. `frac` values below `deadzone` now snap
+to fully transparent (0) instead of leaving that low-level flicker in. This is a general fix —
+it benefits every future i2v-chromakeyed icon, not just the one that surfaced it — so there's
+no need to re-derive or re-diagnose this if a new icon shows the same faint-halo symptom;
+check this script's `deadzone` value is still in place before assuming it's a new bug. If a
+new render shows a *stronger* halo than this default clears, raise `deadzone` rather than
 re-tuning `tol`/`anchor_max` (those control the border flood-fill's *reach*, not per-frame
 noise).
+
+**⚠ Near-white/reflective subject material is chroma-key-hostile — watch for this when
+designing a new icon, not just when debugging one.** The battery jar's clear-glass body
+(2026-08-05) exposed a much bigger version of the same instability the `deadzone` fix above
+addresses: clear glass bleeds the white background through the *entire object*, not just its
+silhouette edge, so the border flood-fill correctly (if unhelpfully) marks large *interior*
+regions of the object itself as background-candidates, not just its edge pixels. Whether a
+candidate pixel then actually gets erased depends on its diff against frame 0 — and I2V's
+own rendering of glass/chrome/glossy highlights shimmers enough frame-to-frame that this diff
+swings back and forth across the erase threshold, popping whole chunks of the object (not a
+thin edge, entire visible regions — confirmed via opaque-pixel-count swings of 2000-5000px on
+an ~11000px icon, versus ~100-200px for icons without this material) transparent and back.
+Symptom to watch for: a visibly *moving* boundary between "there" and "not there" that tracks
+a geometric region of the icon (a whole glass panel, a whole chrome reflection), not a
+flickering *edge* halo (that's the ordinary `deadzone` case above).
+
+Fixed generally in the script (not per-icon): the background-candidate connectivity mask is
+now computed **once**, from frame 0 only (`_compute_base_visited`), and reused unchanged for
+every frame — this is a structural/geometric property (which pixels are smoothly connected to
+the border) that doesn't actually vary frame to frame, so freezing it removes one whole axis
+of instability. The per-frame erase decision (`frac`, still computed independently per frame
+via diff-against-frame-0) is then **temporally max-smoothed** across a small window
+(`smooth_window`, default 2 frames either side, `flood_key_bg_sequence`) before `deadzone` is
+applied — a pixel reading as "real content" in *any* nearby frame stays revealed across the
+whole window, which is the correct bias for a static object that should simply stay visible
+(ordinary background noise stays low in every nearby frame regardless, so the max doesn't
+rescue it). This is why `deadzone` moved from `0.06` to `0.15` in the same change: the
+max-smoothing has a side effect of spreading a transient single-frame noise spike into a
+faint multi-frame tint, and the old deadzone was tuned for un-smoothed per-frame noise, not
+this. If a future icon shows the same "chunk popping" symptom, this mechanism is already in
+place — check the actual render for how large/glossy/reflective the affected region is before
+assuming a new bug, and consider whether the new icon's *design* (not just its finalize
+params) could reduce the glass/chrome surface area in the first place.
 
 Both scripts default to 160×160 output (the powerflow card's node icons render at ~52-60px
 diameter by default — 160px gives headroom for `icon_scale`/retina without shipping a

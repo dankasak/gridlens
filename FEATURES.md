@@ -623,6 +623,25 @@ tick. The switches are plain polled entities and are the only surface that track
   custom-element tag (`grid-lens-powerflow-card`) so existing dashboard configs, including the
   seeded one, don't need to know which variant they're getting.
 
+**⚠ Every asset exclusive to a gated feature must be gated the same way as its JS — not
+just the code.** Found 2026-08-05: all 29 of the Power Flow card's node icons (battery,
+solar, grid, EV, water-heater, aircon) had been sitting in the *public* `gridlens` repo's
+`custom_components/grid_lens/www/icons/` the whole time, served as plain static files —
+predating this card being gated at all (`git log --follow` traces the oldest one back to a
+pre-gating "power-flow POC" commit) and never moved when gating was added. No other (free)
+card referenced any of them, so the exposure bought nothing and just quietly undermined the
+entitlement boundary this section otherwise describes carefully. Fixed by mirroring
+`PowerflowCardView` exactly for binary assets: `PowerflowIconView`
+(`/api/grid_lens/icons/{filename}`) proxies `GET /cards/powerflow/icons/{filename}`
+(`gridlens-api/app/cards.py`, same `require_api_key` + `powerflow_card` check, filename
+checked against a strict allowlist regex before any filesystem access), and the icon files
+themselves now live in `gridlens-api/app/cards/icons/`, not the public repo. **The lesson for
+any future gated feature**: adding a new node icon, image, or other binary asset that only
+that feature uses means adding it to the *private* repo's icon directory and, if it's a new
+top-level asset *type* (not just a new file under an existing served path), extending
+`PowerflowIconView`/`cards.py` — never drop it straight into the public repo's `www/`
+tree just because that's the path already being edited for something else nearby.
+
 **HA → API calls must** use `async_get_clientsession(hass)` and send
 `User-Agent: GridLens-HA-Integration/1.0`. A raw `aiohttp.ClientSession()` gets 403 from
 Cloudflare's bot protection.
