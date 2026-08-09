@@ -732,27 +732,50 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         auto-refine, load_estimation.py) seeded with a manual estimate. Fixed
         DEFERRABLE_LOAD_ESTIMATED_SLOTS slots, same static-schema reasoning as the
         declared-loads step above; a slot with a blank name is unused."""
+        errors: dict[str, str] = {}
         if user_input is not None:
-            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_NAMES] = [
+            est_names = [
                 str(user_input.get(f"est_name_{i}", "") or "").strip()
                 for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
             ]
-            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_CONTROL] = [
+            est_controls = [
                 str(user_input.get(f"est_control_{i}", "") or "")
                 for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
             ]
-            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_KW] = [
-                float(user_input.get(f"est_kw_{i}", 1.0) or 1.0)
-                for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
-            ]
-            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_AUTO] = [
-                bool(user_input.get(f"est_auto_{i}", False))
-                for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
-            ]
-            self._sensor_data[CONF_LOAD_POWER_SENSOR] = str(
-                user_input.get("load_power_sensor", "") or ""
-            )
-            return await self.async_step_current_plan()
+            # A slot with only one of {name, control} filled in silently does nothing
+            # (_ensure_load_estimators skips on blank name; a blank control just warns
+            # and skips too) — the exact bug this validation exists to catch upfront.
+            if any(bool(n) != bool(c) for n, c in zip(est_names, est_controls)):
+                errors["base"] = "estimated_load_name_control_mismatch"
+            # Same device registered on both the previous (forecast-only) step and this
+            # (controllable) one double-counts it — the LP sees it twice, once as an
+            # always-on-schedule declared load and once as the real controllable device.
+            # Caught for real on 2026-08-06: a Declared Loads leftover for "Daikin
+            # Aircon" sat alongside a half-set-up Estimated Loads slot for the same unit.
+            declared_names = {
+                str(n).strip().lower()
+                for n in self._sensor_data.get(CONF_DEFERRABLE_LOAD_DUMMY_NAMES, [])
+                if n
+            }
+            if not errors and any(
+                n.strip().lower() in declared_names for n in est_names if n
+            ):
+                errors["base"] = "estimated_load_duplicate_declared"
+            if not errors:
+                self._sensor_data[CONF_DEFERRABLE_LOAD_EST_NAMES] = est_names
+                self._sensor_data[CONF_DEFERRABLE_LOAD_EST_CONTROL] = est_controls
+                self._sensor_data[CONF_DEFERRABLE_LOAD_EST_KW] = [
+                    float(user_input.get(f"est_kw_{i}", 1.0) or 1.0)
+                    for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
+                ]
+                self._sensor_data[CONF_DEFERRABLE_LOAD_EST_AUTO] = [
+                    bool(user_input.get(f"est_auto_{i}", False))
+                    for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
+                ]
+                self._sensor_data[CONF_LOAD_POWER_SENSOR] = str(
+                    user_input.get("load_power_sensor", "") or ""
+                )
+                return await self.async_step_current_plan()
 
         schema_dict = {}
         for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS):
@@ -784,6 +807,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="estimated_loads",
             data_schema=vol.Schema(schema_dict),
+            errors=errors,
         )
 
     async def async_step_current_plan(
@@ -1640,27 +1664,48 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         existing_auto = entry_data.get(CONF_DEFERRABLE_LOAD_EST_AUTO, [])
         existing_load_power = entry_data.get(CONF_LOAD_POWER_SENSOR, "")
 
+        errors: dict[str, str] = {}
         if user_input is not None:
-            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_NAMES] = [
+            est_names = [
                 str(user_input.get(f"est_name_{i}", "") or "").strip()
                 for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
             ]
-            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_CONTROL] = [
+            est_controls = [
                 str(user_input.get(f"est_control_{i}", "") or "")
                 for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
             ]
-            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_KW] = [
-                float(user_input.get(f"est_kw_{i}", 1.0) or 1.0)
-                for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
-            ]
-            self._sensor_data[CONF_DEFERRABLE_LOAD_EST_AUTO] = [
-                bool(user_input.get(f"est_auto_{i}", False))
-                for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
-            ]
-            self._sensor_data[CONF_LOAD_POWER_SENSOR] = str(
-                user_input.get("load_power_sensor", "") or ""
-            )
-            return await self.async_step_current_plan()
+            # Same footgun as the setup-flow step: a slot with only a name or only a
+            # control entity is silently inert (_ensure_load_estimators skips it). Caught
+            # a real instance of this on 2026-08-06 — Daikin AC had control/kw/auto all
+            # configured with a blank name, so the slot never activated.
+            if any(bool(n) != bool(c) for n, c in zip(est_names, est_controls)):
+                errors["base"] = "estimated_load_name_control_mismatch"
+            # Same cross-step duplicate check as the setup flow — see its comment for the
+            # real incident this catches.
+            declared_names = {
+                str(n).strip().lower()
+                for n in self._sensor_data.get(CONF_DEFERRABLE_LOAD_DUMMY_NAMES, [])
+                if n
+            }
+            if not errors and any(
+                n.strip().lower() in declared_names for n in est_names if n
+            ):
+                errors["base"] = "estimated_load_duplicate_declared"
+            if not errors:
+                self._sensor_data[CONF_DEFERRABLE_LOAD_EST_NAMES] = est_names
+                self._sensor_data[CONF_DEFERRABLE_LOAD_EST_CONTROL] = est_controls
+                self._sensor_data[CONF_DEFERRABLE_LOAD_EST_KW] = [
+                    float(user_input.get(f"est_kw_{i}", 1.0) or 1.0)
+                    for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
+                ]
+                self._sensor_data[CONF_DEFERRABLE_LOAD_EST_AUTO] = [
+                    bool(user_input.get(f"est_auto_{i}", False))
+                    for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
+                ]
+                self._sensor_data[CONF_LOAD_POWER_SENSOR] = str(
+                    user_input.get("load_power_sensor", "") or ""
+                )
+                return await self.async_step_current_plan()
 
         schema_dict = {}
         for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS):
@@ -1698,6 +1743,7 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         return self.async_show_form(
             step_id="estimated_loads",
             data_schema=vol.Schema(schema_dict),
+            errors=errors,
         )
 
     async def async_step_current_plan(self, user_input=None):

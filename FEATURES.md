@@ -240,7 +240,14 @@ telemetry, just IR commands out). Config: `deferrable_load_est_names` /
 `..._est_control` / `..._est_kw` (manual seed) / `..._est_auto` (opt-in to refine the seed
 from real usage), fixed 3 slots, plus one entry-wide `load_power_sensor` (whole-house load
 power — the backend counterpart of the Power Flow card's own `load_power_entity` card
-option). GridLens builds a real synthetic energy sensor for each configured slot
+option). **A slot needs both a name and a control entity** — `_ensure_load_estimators`
+skips it silently (no warning) if either is blank, so a slot with the control entity/kW/
+auto-refine filled in but no name looks fully configured yet does nothing (hit for real,
+`GRIDLENS_CHECKLIST.md`, 2026-08-06); the config-flow step now rejects that combination
+instead of accepting it. A brand-new slot also won't be scheduled by the optimiser until its
+synthetic sensor has real usage history (`daily_kwh` starts at 0 — see §3's `daily_kwh`
+note) — use Today Boost to seed a target immediately instead of waiting ~14 days. GridLens
+builds a real synthetic energy sensor for each configured slot
 (`GridLensEstimatedEnergySensor`, `sensor.py`) and splices its entity_id straight into
 `deferrable_load_sensors` at setup (`__init__.py._ensure_load_estimators`, before anything
 else reads `entry.data`) — so every other deferrable-load feature (LP dispatch, control, the
