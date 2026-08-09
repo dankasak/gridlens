@@ -230,6 +230,122 @@ async def _run_no_load_power_sensor_never_arms():
     assert e._pending_since is None  # never armed — nothing to read
 
 
+# ----------------------------------------------------------------- own-meter (energy_sensor) sampling
+async def _run_energy_sensor_full_cycle_updates_estimate():
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    hass.states.set("sensor.meter", "10.0", {"unit_of_measurement": "kWh"})
+    store = FakeStore()
+    e = _estimator(hass, store=store, energy_sensor="sensor.meter", seed_kw=1.2)
+    e._arm_energy_sample(_T0)
+    hass.states.set("switch.x", "on")
+    # On for 1h, counter rose 1.0kWh -> 1000W average, house-load sensor never read.
+    hass.states.set("sensor.meter", "11.0", {"unit_of_measurement": "kWh"})
+    await e._complete_energy_sample(_T0 + timedelta(hours=1))
+    assert e.sample_count == 1
+    assert e.last_sample_delta_w == 1000.0
+    assert store.saved["k1"]["sample_count"] == 1
+
+
+async def _run_energy_sensor_ignores_house_load_contamination():
+    # The scenario this was built for: a second, unrelated HVAC unit's compressor swings
+    # the whole-house load sensor during the on-period. Own-meter sampling never reads
+    # sensor.house_load at all, so it can't be contaminated by it.
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    hass.states.set("sensor.meter", "10.0", {"unit_of_measurement": "kWh"})
+    hass.states.set("sensor.house_load", "500", {"unit_of_measurement": "W"})
+    e = _estimator(hass, energy_sensor="sensor.meter", seed_kw=1.2)
+    e._arm_energy_sample(_T0)
+    hass.states.set("switch.x", "on")
+    hass.states.set("sensor.house_load", "9000", {"unit_of_measurement": "W"})  # other HVAC
+    hass.states.set("sensor.meter", "11.0", {"unit_of_measurement": "kWh"})
+    await e._complete_energy_sample(_T0 + timedelta(hours=1))
+    assert e.last_sample_delta_w == 1000.0  # unaffected by the house_load spike
+
+
+async def _run_energy_sensor_short_on_period_is_discarded():
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    hass.states.set("sensor.meter", "10.0", {"unit_of_measurement": "kWh"})
+    e = _estimator(hass, energy_sensor="sensor.meter")
+    e._arm_energy_sample(_T0)
+    hass.states.set("switch.x", "on")
+    hass.states.set("sensor.meter", "10.1", {"unit_of_measurement": "kWh"})
+    # Only 30s on — below MIN_ENERGY_SAMPLE_HOURS, discard rather than trust a coarse
+    # counter's rounding.
+    await e._complete_energy_sample(_T0 + timedelta(seconds=30))
+    assert e.sample_count == 0
+
+
+async def _run_energy_sensor_counter_reset_is_discarded():
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    hass.states.set("sensor.meter", "10.0", {"unit_of_measurement": "kWh"})
+    e = _estimator(hass, energy_sensor="sensor.meter")
+    e._arm_energy_sample(_T0)
+    hass.states.set("switch.x", "on")
+    hass.states.set("sensor.meter", "0.5", {"unit_of_measurement": "kWh"})  # device rebooted
+    await e._complete_energy_sample(_T0 + timedelta(hours=1))
+    assert e.sample_count == 0
+
+
+async def _run_energy_sensor_unavailable_blip_does_not_fragment_sample():
+    # The bug this guards: a flaky integration (e.g. ECHONET Lite) reporting the control
+    # entity as unavailable mid-run must NOT be treated as the device switching off (which
+    # would end the in-flight sample early) nor switching back on when it reconnects
+    # (which would re-arm a fresh one) — either would chop one continuous on-period into
+    # short fragments a coarse energy counter reads wildly inflated deltas over.
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    hass.states.set("sensor.meter", "10.0", {"unit_of_measurement": "kWh"})
+    _NOW[0] = _T0
+    e = _estimator(hass, energy_sensor="sensor.meter", seed_kw=1.2)
+    await e._on_control_state_change(types.SimpleNamespace(data={
+        "old_state": FakeState("off"), "new_state": FakeState("on"),
+    }))
+    start_at = e._energy_on_start_at
+    assert start_at == _T0
+
+    # Blip to unavailable a minute later, then back to on a minute after that — neither
+    # end should touch the in-flight sample.
+    _NOW[0] = _T0 + timedelta(minutes=1)
+    await e._on_control_state_change(types.SimpleNamespace(data={
+        "old_state": FakeState("on"), "new_state": FakeState("unavailable"),
+    }))
+    assert e._energy_on_start_at == start_at  # sample was NOT completed by the blip
+
+    _NOW[0] = _T0 + timedelta(minutes=2)
+    await e._on_control_state_change(types.SimpleNamespace(data={
+        "old_state": FakeState("unavailable"), "new_state": FakeState("on"),
+    }))
+    assert e._energy_on_start_at == start_at  # reconnect did NOT re-arm a new sample
+
+    # Genuine off, one hour after the ORIGINAL arm — 1.0kWh/1h = 1000W, matching the
+    # device's real sustained draw, not some short-fragment artifact.
+    _NOW[0] = _T0 + timedelta(hours=1)
+    hass.states.set("sensor.meter", "11.0", {"unit_of_measurement": "kWh"})
+    await e._on_control_state_change(types.SimpleNamespace(data={
+        "old_state": FakeState("on"), "new_state": FakeState("off"),
+    }))
+    assert e.sample_count == 1
+    assert e.last_sample_delta_w == 1000.0
+
+
+async def _run_energy_sensor_takes_priority_over_house_load_arming():
+    # With energy_sensor set, an off->on transition must never arm the house-load path.
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    hass.states.set("sensor.meter", "10.0", {"unit_of_measurement": "kWh"})
+    hass.states.set("sensor.house_load", "500", {"unit_of_measurement": "W"})
+    e = _estimator(hass, energy_sensor="sensor.meter")
+    await e._on_control_state_change(types.SimpleNamespace(data={
+        "old_state": FakeState("off"), "new_state": FakeState("on"),
+    }))
+    assert e._pending_since is None
+    assert e._energy_on_start_kwh == 10.0
+
+
 # ----------------------------------------------------------------- track_energy
 async def _run_track_energy_false_skips_integration_timer():
     hass = FakeHass()
@@ -293,6 +409,12 @@ if __name__ == "__main__":
         ("device_off_at_settle_is_discarded", lambda: _run(_run_device_off_at_settle_is_discarded)),
         ("implausible_delta_is_discarded", lambda: _run(_run_implausible_delta_is_discarded)),
         ("no_load_power_sensor_never_arms", lambda: _run(_run_no_load_power_sensor_never_arms)),
+        ("energy_sensor_full_cycle_updates_estimate", lambda: _run(_run_energy_sensor_full_cycle_updates_estimate)),
+        ("energy_sensor_ignores_house_load_contamination", lambda: _run(_run_energy_sensor_ignores_house_load_contamination)),
+        ("energy_sensor_short_on_period_is_discarded", lambda: _run(_run_energy_sensor_short_on_period_is_discarded)),
+        ("energy_sensor_counter_reset_is_discarded", lambda: _run(_run_energy_sensor_counter_reset_is_discarded)),
+        ("energy_sensor_unavailable_blip_does_not_fragment_sample", lambda: _run(_run_energy_sensor_unavailable_blip_does_not_fragment_sample)),
+        ("energy_sensor_takes_priority_over_house_load_arming", lambda: _run(_run_energy_sensor_takes_priority_over_house_load_arming)),
         ("track_energy_false_skips_timer", lambda: _run(_run_track_energy_false_skips_integration_timer)),
         ("track_energy_true_creates_timer", lambda: _run(_run_track_energy_true_creates_integration_timer)),
         ("integration_tick_advances_only_while_on", lambda: _run(_run_integration_tick_advances_kwh_only_while_on)),

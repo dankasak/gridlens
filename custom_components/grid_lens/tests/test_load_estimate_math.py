@@ -19,8 +19,10 @@ sys.path.insert(0, _COMPONENT)
 
 from load_estimate_math import (  # noqa: E402
     EMA_ALPHA,
+    MIN_ENERGY_SAMPLE_HOURS,
     SAMPLE_FLOOR_W,
     ema_update,
+    energy_sample_avg_w,
     integrate_kwh,
     sample_ceiling_w,
     sample_delta_w,
@@ -96,6 +98,25 @@ def test_integrate_never_goes_backwards():
           integrate_kwh(5.0, power_w=0.0, elapsed_hours=1.0) == 5.0)
 
 
+def test_energy_sample_avg_w_computes_rate():
+    check("1.0kWh over 1h -> 1000W",
+          energy_sample_avg_w(1.0, 1.0) == 1000.0)
+    check("0.6kWh over 30min -> 1200W",
+          energy_sample_avg_w(0.6, 0.5) == 1200.0)
+
+
+def test_energy_sample_avg_w_rejects_too_short_a_window():
+    check("just under the minimum window is rejected",
+          energy_sample_avg_w(1.0, MIN_ENERGY_SAMPLE_HOURS * 0.9) is None)
+    check("exactly the minimum window is accepted",
+          energy_sample_avg_w(1.0, MIN_ENERGY_SAMPLE_HOURS) is not None)
+
+
+def test_energy_sample_avg_w_rejects_negative_delta():
+    check("a counter that went backwards (reset/rollover) is rejected, not treated as 0",
+          energy_sample_avg_w(-0.1, 1.0) is None)
+
+
 if __name__ == "__main__":
     for fn in [
         test_delta_is_settled_minus_baseline,
@@ -106,6 +127,9 @@ if __name__ == "__main__":
         test_ema_converges_over_repeated_identical_samples,
         test_integrate_adds_energy_while_on,
         test_integrate_never_goes_backwards,
+        test_energy_sample_avg_w_computes_rate,
+        test_energy_sample_avg_w_rejects_too_short_a_window,
+        test_energy_sample_avg_w_rejects_negative_delta,
     ]:
         fn()
 

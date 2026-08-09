@@ -1,8 +1,14 @@
 """LoadEstimator — builds a synthetic energy sensor for a deferrable load with no real
 energy feedback path at all (e.g. an IR-blaster-driven aircon), by watching a whole-house
-load power sensor around the device's own off->on transitions.
+load power sensor around the device's own off->on transitions. Also backs a live power
+reading for a device whose only real telemetry is a cumulative (non-real-time) energy
+counter — for THAT case, when ``energy_sensor`` is set, calibration instead comes from the
+device's own meter across one full on-period, never the whole-house sensor (see
+_on_control_state_change) — immune to another load's power swinging during the same
+window, which the whole-house path is not.
 
-One instance per "estimated load" config slot (see const.py's CONF_DEFERRABLE_LOAD_EST_*).
+One instance per "estimated load" config slot (see const.py's CONF_DEFERRABLE_LOAD_EST_*),
+or per power-only-inference device (__init__.py._ensure_load_estimators's "step 2").
 Learns from ANY off->on transition of the device's control entity — not just ones GridLens
 itself commanded — so it bootstraps from ordinary use (manual toggles, climate_scheduler,
 Force On) as well as GridLens's own dispatch. See load_estimate_math.py for the pure
@@ -29,7 +35,13 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
-from .load_estimate_math import ema_update, integrate_kwh, sample_delta_w, sample_is_plausible
+from .load_estimate_math import (
+    ema_update,
+    energy_sample_avg_w,
+    integrate_kwh,
+    sample_delta_w,
+    sample_is_plausible,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,6 +93,7 @@ class LoadEstimator:
         load_power_sensor: str,
         other_control_entity_ids: list[str],
         track_energy: bool = True,
+        energy_sensor: str = "",
     ) -> None:
         self.hass = hass
         self._store = store
@@ -107,6 +120,13 @@ class LoadEstimator:
         # accumulating a second, redundant (and uncalibrated) energy total alongside the
         # device's real one.
         self.track_energy = bool(track_energy)
+        # A real (if coarse/non-real-time) cumulative energy sensor on the device itself —
+        # e.g. an ECHONET Lite aircon's measured_cumulative_power_consumption. When set,
+        # this is the ONLY calibration source used (see _on_control_state_change): it's
+        # immune to any other load's power swinging during the sample window by
+        # construction, unlike house-load sampling below, so there's no reason to also run
+        # the contamination-prone path once a clean own-meter reading is available.
+        self.energy_sensor = energy_sensor or ""
 
         self.estimated_w = self.seed_kw * 1000.0
         self.sample_count = 0
@@ -119,6 +139,15 @@ class LoadEstimator:
         self._pending_since: Optional[datetime] = None
         self._contaminated = False
         self._warned_no_load_sensor = False
+
+        self._energy_on_start_kwh: Optional[float] = None
+        self._energy_on_start_at: Optional[datetime] = None
+
+        # Last *confirmed* True/False on/off reading, surviving through intervening
+        # unavailable/unknown blips (see _on_control_state_change) — distinct from a raw
+        # old_state._is_on() read, which would collapse a blip to None and get treated as
+        # a real transition.
+        self._confirmed_on: Optional[bool] = None
 
         self._cancel_control_listener: Optional[Callable] = None
         self._cancel_other_listener: Optional[Callable] = None
@@ -203,16 +232,50 @@ class LoadEstimator:
         unit = (st.attributes or {}).get("unit_of_measurement")
         return value if unit == "W" else value * 1000.0  # treat anything else as kW
 
+    def _read_energy_kwh(self) -> Optional[float]:
+        if not self.energy_sensor:
+            return None
+        st = self.hass.states.get(self.energy_sensor)
+        if st is None or st.state in ("unknown", "unavailable", None):
+            return None
+        try:
+            value = float(st.state)
+        except (TypeError, ValueError):
+            return None
+        unit = (st.attributes or {}).get("unit_of_measurement")
+        return value / 1000.0 if unit == "Wh" else value  # treat anything else as kWh
+
     # ------------------------------------------------------------------ event handlers
     async def _on_control_state_change(self, event) -> None:
-        old_state = event.data.get("old_state")
         new_state = event.data.get("new_state")
-        was_on = self._is_on(old_state)
         is_on = self._is_on(new_state)
         now = dt_util.now()
-        if was_on is not True and is_on is True:
+        if is_on is None:
+            # Transient unavailable/unknown (e.g. a flaky integration reconnecting) is not
+            # a real device transition — ignore it entirely rather than treating it as
+            # "off". Previously this fell through to the was-on/is-on comparisons below,
+            # which read unavailable the same as a genuine off: a control entity that
+            # blips unavailable while genuinely running would spuriously *complete* the
+            # in-flight energy sample early (as if it just switched off), then *arm* a
+            # brand-new one on reconnect (as if it just switched back on) — chopping one
+            # continuous on-period into short, arbitrary fragments. Own-meter calibration
+            # reads a coarse, laggy cumulative counter (e.g. ECHONET Lite, updating in
+            # ~0.1kWh steps every several minutes); dividing a lagged tick by one of those
+            # short fragment durations produced wildly inflated W estimates (observed:
+            # 2987W for a unit whose own meter showed ~1kWh/hour = ~1000W sustained).
+            return
+        was_on = self._confirmed_on
+        self._confirmed_on = is_on
+        if self.energy_sensor:
+            # Own-meter sampling: one observation per full on-period, immune to any other
+            # device's power draw — never falls through to house-load sampling below.
+            if was_on is not True and is_on is True:
+                self._arm_energy_sample(now)
+            elif is_on is False and self._energy_on_start_at is not None:
+                await self._complete_energy_sample(now)
+        elif was_on is not True and is_on is True:
             await self._arm_sample(now)
-        elif is_on is not True and self._pending_since is not None:
+        elif is_on is False and self._pending_since is not None:
             # Turned off again before the settle window elapsed — the sample window is
             # ambiguous (spin-up interrupted), discard rather than guess.
             self._cancel_pending()
@@ -283,6 +346,47 @@ class LoadEstimator:
         )
         await self._persist()
 
+    def _arm_energy_sample(self, now: datetime) -> None:
+        kwh = self._read_energy_kwh()
+        if kwh is None:
+            return
+        self._energy_on_start_kwh = kwh
+        self._energy_on_start_at = now
+
+    async def _complete_energy_sample(self, now: datetime) -> None:
+        start_kwh = self._energy_on_start_kwh
+        start_at = self._energy_on_start_at
+        self._energy_on_start_kwh = None
+        self._energy_on_start_at = None
+        if start_kwh is None or start_at is None:
+            return
+        kwh_now = self._read_energy_kwh()
+        if kwh_now is None:
+            return
+        elapsed_h = max(0.0, (now - start_at).total_seconds()) / 3600.0
+        avg_w = energy_sample_avg_w(kwh_now - start_kwh, elapsed_h)
+        if avg_w is None:
+            _LOGGER.debug(
+                "Load estimator for %s: discarding own-meter sample — on-period too "
+                "short or energy counter went backwards (reset/rollover)", self.name,
+            )
+            return
+        if not sample_is_plausible(avg_w, self.seed_kw):
+            _LOGGER.debug(
+                "Load estimator for %s: discarding implausible own-meter sample "
+                "avg=%.0fW", self.name, avg_w,
+            )
+            return
+        self.estimated_w = ema_update(self.estimated_w, avg_w)
+        self.sample_count += 1
+        self.last_sample_delta_w = avg_w
+        self.last_sample_at = dt_util.now()
+        _LOGGER.info(
+            "Load estimator for %s: accepted own-meter sample avg=%.0fW (n=%d) -> "
+            "estimate=%.0fW", self.name, avg_w, self.sample_count, self.estimated_w,
+        )
+        await self._persist()
+
     async def _on_integration_tick(self, now) -> None:
         is_on = self._is_on(self.hass.states.get(self.control_entity_id))
         last = self._last_integrated_at or now
@@ -313,5 +417,6 @@ class LoadEstimator:
             "last_sample_at": self.last_sample_at.isoformat() if self.last_sample_at else None,
             "auto_refine": self.auto_refine,
             "load_power_sensor": self.load_power_sensor or None,
+            "energy_sensor": self.energy_sensor or None,
             "track_energy": self.track_energy,
         }

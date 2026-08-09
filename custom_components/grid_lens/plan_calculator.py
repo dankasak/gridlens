@@ -559,7 +559,38 @@ class PlanCalculator:
             opt_result = None
 
             # ── Cost + optimisation ──────────────────────────────────────────────────
-            if self.has_battery and self.battery_optimizer and solar_data:
+            if is_current:
+                # The plan actually held isn't hypothetical — price it from what
+                # really happened, never from the LP's optimal-dispatch fantasy
+                # (opt_result stays None for the rest of this iteration; see the
+                # "Bill items" section below, which is where the actual-usage
+                # pricing against the plan's own tariff happens). Sensor-based
+                # pricing is only correct here when the plan's own rate genuinely
+                # is dynamic (is_market_linked, e.g. Amber SmartShift) — its static
+                # import_rates JSON is a nominal reference, not the real historical
+                # price, so tariff-pricing actual usage against it would be wrong.
+                # Every other plan's published tariff *is* its real rate.
+                if plan.is_market_linked:
+                    _LOGGER.warning(f"Using ACTUAL sensor-priced calculation for current plan {plan_key}")
+                    supply_amount = round(plan.daily_supply_charge * actual_days, 2)
+                    cost = current_plan_energy_cost + supply_amount
+                    plan_costs[plan_key] = cost
+                    breakdown = {
+                        'total': round(cost, 2),
+                        'total_energy_cost': round(current_plan_energy_cost, 2),
+                        'supply_charge': supply_amount,
+                        'note': 'Priced from the configured price sensor (market-linked plan)',
+                    }
+                else:
+                    _LOGGER.warning(f"Using ACTUAL tariff-priced calculation for current plan {plan_key}")
+                    breakdown = {}
+                plan_optimization_results[plan_key] = {
+                    'optimization': None,
+                    'breakdown': breakdown,
+                    'strategy': plan.describe_strategy(),
+                    'plan_info': plan.get_plan_info(),
+                }
+            elif self.has_battery and self.battery_optimizer and solar_data:
                 _LOGGER.warning(f"Using OPTIMISED battery calculation for {plan_key}")
                 cost, opt_result = await self._calculate_plan_cost_with_battery_optimization(
                     plan,
@@ -568,11 +599,6 @@ class PlanCalculator:
                     grid_export_data,
                     deferrable_loads=deferrable_loads,
                 )
-
-                # The current plan keeps its LP-optimised `cost` here. This used to be
-                # overwritten with price-sensor-derived energy, which priced the held
-                # plan off a feed that need not correspond to it at all (e.g. a Flow
-                # Power wholesale sensor left configured after switching to a TOU plan).
                 fixed_credit = getattr(plan, 'fixed_daily_credit', 0.0) * actual_days
                 plan_costs[plan_key] = cost - fixed_credit
                 breakdown = plan.get_display_breakdown(opt_result)
@@ -582,10 +608,6 @@ class PlanCalculator:
                     'strategy': plan.describe_strategy(),
                     'plan_info': plan.get_plan_info(),
                 }
-
-            # (No price-sensor branch for the current plan: without a battery optimiser
-            # it falls through to the same simple per-plan calculation as every
-            # alternative, rather than being costed from an unrelated price feed.)
             else:
                 _LOGGER.warning(f"Using SIMPLE calculation for {plan_key}")
                 cost = self._calculate_plan_cost_simple(usage_data, plan)
@@ -640,40 +662,64 @@ class PlanCalculator:
                         slot['soc_percent']   = round(soc_hod_avg.get(h, 0.0), 1)
 
             # ── Bill items ───────────────────────────────────────────────────────────
-            plan_optimization_results[plan_key]['breakdown']['bill_items'] = \
-                self._compute_bill_items(
-                    plan,
-                    usage_data,
-                    grid_export_data,
-                    actual_days,
-                    # No current-plan special case (both default to None). Passing the
-                    # metered actuals here scored the current plan on a *substituted*
-                    # price — the configured import_price_sensor, or the 15c/kWh
-                    # fallback in _calculate_cost_breakdown when none is set — while
-                    # every alternative was priced by its own tariff off the LP
-                    # dispatch. That made the headline "current vs best alternative"
-                    # apples-to-oranges, and mispriced outright whenever the price
-                    # sensor didn't correspond to the plan actually held. The plan's
-                    # own rate structure is authoritative for every plan.
-                    comparison_total=plan_costs.get(plan_key),
-                    opt_result=opt_result,
+            if is_current and not plan.is_market_linked:
+                # Actual-usage path: energy_lines, FiT and conditional credits are all
+                # derived from usage_data/export_data priced against the plan's own
+                # tariff (opt_result is None here, so no LP-schedule branch can fire).
+                # import_cost_actual only has to be non-None to select this path —
+                # _compute_bill_items recomputes the real number itself from usage_data
+                # (see its "Deliberately NO reconciliation plug" note below). export
+                # stays sensor-priced only when export itself is spot-priced (a plan
+                # can have a fixed import tariff but a dynamic FiT); otherwise it's
+                # tariff-priced from actual export_data, same as import.
+                export_actual = None
+                if plan.spot_export_pricing and self.export_price_sensor and grid_export_data:
+                    export_actual = await self._calculate_cost_with_prices(
+                        grid_export_data, self.export_price_sensor, "export"
+                    )
+                bi = self._compute_bill_items(
+                    plan, usage_data, grid_export_data, actual_days,
+                    import_cost_actual=0.0,
+                    export_credit_actual=export_actual,
+                    comparison_total=None,
+                    opt_result=None,
                     pea_result=pea_results.get(plan_key),
                     export_fine_data=export_fine_data,
                     cl_devices=cl_devices,
                 )
+                bd = plan_optimization_results[plan_key]['breakdown']
+                bd['bill_items'] = bi
+                bd['total'] = bi['total']
+                bd['total_energy_cost'] = round(
+                    sum(l['amount'] for l in bi['energy_lines']) - bi['fit']['credit'], 2)
+                bd['supply_charge'] = bi['supply']['amount']
+                if bi.get('conditional_credits'):
+                    bd['conditional_credits'] = bi['conditional_credits']
+                plan_costs[plan_key] = bi['total']
+            elif is_current:
+                pass  # market-linked current plan: already priced above from the sensor feed
+            else:
+                plan_optimization_results[plan_key]['breakdown']['bill_items'] = \
+                    self._compute_bill_items(
+                        plan,
+                        usage_data,
+                        grid_export_data,
+                        actual_days,
+                        comparison_total=plan_costs.get(plan_key),
+                        opt_result=opt_result,
+                        pea_result=pea_results.get(plan_key),
+                        export_fine_data=export_fine_data,
+                        cl_devices=cl_devices,
+                    )
 
-            # The current plan's headline cost is its LP-optimised total, exactly like
-            # every alternative — bill_items no longer overrides it. Overriding used to
-            # push the substituted-price total (see the _compute_bill_items call above)
-            # into the ranking, so the one plan the user was actually on was the one
-            # scored on a different basis from everything it was compared against.
+            # The current plan's headline cost now comes from actual metered usage
+            # (see the Cost + Bill items sections above), not the LP's hypothetical
+            # optimum — plan_costs[plan_key] was already set directly there.
             if is_current:
                 current_plan_total = plan_costs[plan_key]
                 # Take the energy component from the plan's own breakdown too. It is
                 # surfaced as the `energy_cost` attribute on the current-plan cost
-                # sensor, and would otherwise still report the estimate from
-                # _calculate_current_plan_cost_with_battery — which falls back to a
-                # flat 15c/kWh when no price sensor is configured.
+                # sensor.
                 _current_bd = plan_optimization_results[plan_key].get('breakdown') or {}
                 if 'total_energy_cost' in _current_bd:
                     current_plan_energy_cost = _current_bd['total_energy_cost']
@@ -1060,6 +1106,12 @@ class PlanCalculator:
         # allowance naturally resets each calendar day.
         daily_used: dict = {}
         cap_labels: dict = {}
+        # Deliberately a SEPARATE dict from cap_labels, keyed by rate value only
+        # (no direction) — an import tier and an export tier can land on the same
+        # rate (e.g. GloBird's 0c Free Window import vs 0c No-Feed-in export), and
+        # cap_labels.setdefault() would let whichever direction is processed first
+        # silently win the other's label. See feedback_capped_rate_labels memory.
+        export_cap_labels: dict = {}
 
         supply_amount = round(plan.daily_supply_charge * actual_days, 2)
         subscription_fee = getattr(plan, 'monthly_subscription_fee', 0.0)
@@ -1275,21 +1327,31 @@ class PlanCalculator:
         # FiT: priority order:
         #   1. Current plan with spot export (Amber-as-current): use actual sensor credit
         #   2. LP-optimised non-current plan: use solver's per-step export credit
-        #   3. Current plan with fixed FiT: apply plan.get_export_rate() to actual export_data
-        fit_credit = 0.0
-        fit_eligible_kwh = 0.0
+        #   3. Current plan with fixed FiT: apply plan's own export tariff to actual export_data
+        # Bucketed by rate (fit_tier_data), same as energy_lines above, so the bill
+        # shows one line per FiT tier/window (e.g. GloBird's "Super Export top up"
+        # separate from its base "Solar/Generation Feed in" line) instead of one
+        # blended average-rate line that doesn't correspond to anything printed on
+        # a real bill — the whole point being to let a customer tick this off
+        # against their actual retailer bill line by line.
+        fit_tier_data: dict = defaultdict(lambda: {'kwh': 0.0, 'cost': 0.0})
         if export_credit_actual is not None and getattr(plan, 'spot_export_pricing', False):
-            # Spot-priced export for the current plan (e.g. Amber): use sensor's actual credit.
-            fit_credit = export_credit_actual
-            fit_eligible_kwh = total_export_kwh
+            # Spot-priced export for the current plan (e.g. Amber): use sensor's
+            # actual credit as a single line — there's no fixed rate/window to
+            # itemise a continuously-variable spot price against.
+            if total_export_kwh > 1e-9:
+                fit_tier_data[-1.0]['kwh'] = total_export_kwh
+                fit_tier_data[-1.0]['cost'] = export_credit_actual
         elif lp_schedule and export_credit_actual is None:
             # LP-optimised non-current plan: use per-step export credit from the solver.
             for step in lp_schedule:
                 exp = step.get('export_kwh', 0.0)
                 cred = step.get('export_credit', 0.0)
-                if exp > 1e-6 and step.get('export_rate', 0.0) > 0:
-                    fit_credit += cred
-                    fit_eligible_kwh += exp
+                rate = step.get('export_rate', 0.0)
+                if exp > 1e-6 and rate > 0:
+                    rk = round(rate, 4)
+                    fit_tier_data[rk]['kwh']  += exp
+                    fit_tier_data[rk]['cost'] += cred
         else:
             # Current plan with fixed FiT (e.g. Flow Power): apply plan rate to actual export_data.
             #
@@ -1305,11 +1367,12 @@ class PlanCalculator:
                 local_dt = d['timestamp'].astimezone(tz)
                 covered_hours.add(local_dt.replace(minute=0, second=0, microsecond=0))
                 for rate, part_kwh in self._split_capped_kwh(
-                        plan, "export", local_dt, d['value'], daily_used, cap_labels):
+                        plan, "export", local_dt, d['value'], daily_used, export_cap_labels):
                     if rate > 0:
-                        fit_credit += part_kwh * rate
-                        fit_eligible_kwh += part_kwh
-            # Hourly fallback for hours outside short-term retention: pro-rate each
+                        rk = round(rate, 4)
+                        fit_tier_data[rk]['kwh']  += part_kwh
+                        fit_tier_data[rk]['cost'] += part_kwh * rate
+            # Hourly fallback for hours outside short-term retention: split each
             # bucket across its two half-hours (windows never split finer than :30),
             # assuming export is spread evenly within the bucket. Not cap-aware
             # (only fires for data beyond 5-minute short-term retention, i.e. old
@@ -1321,12 +1384,34 @@ class PlanCalculator:
                     continue
                 r0 = plan.get_export_rate(local_dt)
                 r30 = plan.get_export_rate(local_dt + timedelta(minutes=30))
-                halves = [r for r in (r0, r30) if r > 0]
-                if halves:
-                    fit_credit += d['value'] / 2 * sum(halves)
-                    fit_eligible_kwh += d['value'] / 2 * len(halves)
-        fit_credit = round(fit_credit, 2)
-        fit_eligible_kwh = round(fit_eligible_kwh, 2)
+                for r in (r0, r30):
+                    if r > 0:
+                        rk = round(r, 4)
+                        fit_tier_data[rk]['kwh']  += d['value'] / 2
+                        fit_tier_data[rk]['cost'] += d['value'] / 2 * r
+
+        # Label every FiT tier the plan declares (even ones with zero export so
+        # far), same precedence as energy_lines: the plan's own flat label first,
+        # the cap-split "(first/after N kWh/day)" label wins when it applies.
+        fit_rate_to_label: dict = {
+            round(float(r['rate']), 4): r.get('label', 'Solar Export')
+            for r in plan.get_export_rate_defs() if r.get('rate') is not None
+        }
+        fit_rate_to_label.update(export_cap_labels)
+        fit_rate_to_label[-1.0] = 'Feed-in (spot price)'
+
+        fit_all_rates = sorted(fit_tier_data.keys(), reverse=True)
+        fit_lines = [
+            {
+                'label': fit_rate_to_label.get(rk, 'Solar Export'),
+                'rate_c': round(rk * 100, 2) if rk >= 0 else None,
+                'kwh': round(fit_tier_data[rk]['kwh'], 2),
+                'amount': round(fit_tier_data[rk]['cost'], 2),
+            }
+            for rk in fit_all_rates
+        ]
+        fit_credit = round(sum(l['amount'] for l in fit_lines), 2)
+        fit_eligible_kwh = round(sum(l['kwh'] for l in fit_lines), 2)
         fit_rate_c = round(fit_credit / fit_eligible_kwh * 100, 2) if fit_eligible_kwh > 0 else 0.0
 
         # Demand charge (peak-kW), only when the customer is on a demand tariff and
@@ -1399,6 +1484,7 @@ class PlanCalculator:
             'demand': demand,
             'controlled_load': {'lines': cl_lines, 'amount': cl_amount} if cl_lines else None,
             'fit': {
+                'lines': fit_lines,
                 'rate_c': fit_rate_c,
                 'kwh': fit_eligible_kwh,
                 'total_export_kwh': round(total_export_kwh, 2),

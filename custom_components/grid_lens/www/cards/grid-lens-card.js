@@ -678,18 +678,13 @@ class GridLensCard extends HTMLElement {
       if (showBreakdown) {
         const bi = breakdown.bill_items;
         if (bi) {
+          // Section order deliberately mirrors a real retailer bill (fixed
+          // charges first, then usage, then export credits, then bonus
+          // credits, then total) so a customer can tick this card off
+          // against their actual bill line by line — see the GloBird ZEROHERO
+          // reconciliation this was modelled on. Don't reorder without
+          // re-checking against a real bill sample.
           let rows = '';
-
-          // Energy lines
-          rows += '<div class="bill-section-head">Energy charges</div>';
-          bi.energy_lines.forEach(line => {
-            rows += `<div class="breakdown-row">
-              <div class="breakdown-label">${line.label}<br>
-                <span style="font-size:11px;opacity:0.7">${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh</span>
-              </div>
-              <div class="breakdown-value">$${line.amount.toFixed(2)}</div>
-            </div>`;
-          });
 
           // Supply charge
           const s = bi.supply;
@@ -726,7 +721,7 @@ class GridLensCard extends HTMLElement {
           }
 
           // Controlled Load — device(s) wired to a CL register, priced separately
-          // at the plan's flat CL rate instead of the general import tiers above.
+          // at the plan's flat CL rate instead of the general import tiers below.
           if (bi.controlled_load) {
             rows += '<div class="bill-section-head">Controlled load</div>';
             bi.controlled_load.lines.forEach(line => {
@@ -739,24 +734,41 @@ class GridLensCard extends HTMLElement {
             });
           }
 
+          // Energy (usage) lines
+          rows += '<div class="bill-section-head">Usage charges</div>';
+          bi.energy_lines.forEach(line => {
+            rows += `<div class="breakdown-row">
+              <div class="breakdown-label">${line.label}<br>
+                <span style="font-size:11px;opacity:0.7">${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh</span>
+              </div>
+              <div class="breakdown-value">$${line.amount.toFixed(2)}</div>
+            </div>`;
+          });
+
+          // Feed-in credit — one line per FiT tier/window (e.g. a capped "top up"
+          // rate separate from the base feed-in rate), same as a real bill.
+          const f = bi.fit;
+          if (f.kwh > 0 && f.lines && f.lines.length) {
+            rows += '<div class="bill-section-head bill-fit">Solar / feed-in credit</div>';
+            f.lines.forEach(line => {
+              const rateLabel = line.rate_c != null
+                ? `${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh`
+                : `spot price &times; ${line.kwh.toFixed(1)}&thinsp;kWh`;
+              rows += `<div class="breakdown-row bill-fit">
+                <div class="breakdown-label" style="color:inherit">${line.label}<br>
+                  <span style="font-size:11px;opacity:0.7">${rateLabel}</span>
+                </div>
+                <div class="breakdown-value" style="color:inherit">&minus;$${line.amount.toFixed(2)}</div>
+              </div>`;
+            });
+          }
+
           // VPP participation credit
           if (bi.vpp_credit) {
             rows += '<div class="bill-section-head bill-fit">VPP credit</div>';
             rows += `<div class="breakdown-row bill-fit">
               <div class="breakdown-label" style="color:inherit">VPP participation credit</div>
               <div class="breakdown-value" style="color:inherit">&minus;$${bi.vpp_credit.toFixed(2)}</div>
-            </div>`;
-          }
-
-          // Feed-in credit
-          const f = bi.fit;
-          if (f.kwh > 0) {
-            rows += '<div class="bill-section-head bill-fit">Feed-in credit</div>';
-            rows += `<div class="breakdown-row bill-fit">
-              <div class="breakdown-label" style="color:inherit">Feed-in tariff<br>
-                <span style="font-size:11px;opacity:0.7">${f.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${f.kwh.toFixed(1)}&thinsp;kWh</span>
-              </div>
-              <div class="breakdown-value" style="color:inherit">&minus;$${f.credit.toFixed(2)}</div>
             </div>`;
           }
 

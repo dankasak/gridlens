@@ -67,7 +67,7 @@
  *   type: custom:grid-lens-load-control-card
  *   title: Deferrable Loads          (optional)
  */
-import { STYLE, esc } from './grid-lens-chart-common.js?v=20260802b';
+import { STYLE, esc } from './grid-lens-chart-common.js?v=20260809a';
 
 const HISTORY_DAYS = 14;
 const HISTORY_REFRESH_MS = 15 * 60000;

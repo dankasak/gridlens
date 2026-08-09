@@ -298,6 +298,20 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   const zero = (yMin < 0) ? `<line x1="${g.ml}" y1="${Y(0)}" x2="${g.w - g.mr}" y2="${Y(0)}" stroke="var(--axis)"/>` : '';
   let defs = '', paths = '';
   const base = Y(Math.max(yMin, 0));
+  // A forecast/planned area fill only washes the future (right of "now") — but only on
+  // a chart that also draws a measured `actual` series: there, the past portion of the
+  // forecast fill was stacking a second same-colour wash on top of the actual series'
+  // own fill (which already only spans its own t0→now data), reading as one solid
+  // continuous block even where nothing measured ran. A chart with no actual series at
+  // all (e.g. the cash chart's cumulative-cost line) has nothing to show in its place,
+  // so it keeps shading the full range as before. The forecast *line* itself still
+  // draws full-width (unclipped) so a planned-vs-actual comparison is still possible —
+  // only the fill is ever cut off.
+  const hasActual = series.some((s) => s.actual);
+  const futureClipId = 'futureclip';
+  if (hasActual) {
+    defs += `<clipPath id="${futureClipId}"><rect x="${nowX.toFixed(1)}" y="0" width="${Math.max(0, g.w - nowX).toFixed(1)}" height="${g.h}"/></clipPath>`;
+  }
   // Two-pass render. Pass 1 collects each series' path geometry plus its "size"
   // (Σ|v| ≈ the area its fill would cover). Pass 2 emits gradient fills back-to-front
   // ordered LARGEST first, so a big series' wash sits behind the smaller ones and every
@@ -332,7 +346,8 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   for (const g2 of geo.filter((x) => x.s.area).sort((a, b) => b.mag - a.mag)) {
     const gid = 'g' + g2.si;
     defs += gradDef(gid, g2.s.color, 0.42);
-    paths += `<path d="${g2.d} L${g2.rightX.toFixed(1)},${base.toFixed(1)} L${g2.pts[0][0].toFixed(1)},${base.toFixed(1)} Z" fill="url(#${gid})"/>`;
+    const clip = (hasActual && !g2.s.actual) ? ` clip-path="url(#${futureClipId})"` : '';
+    paths += `<path d="${g2.d} L${g2.rightX.toFixed(1)},${base.toFixed(1)} L${g2.pts[0][0].toFixed(1)},${base.toFixed(1)} Z" fill="url(#${gid})"${clip}/>`;
   }
   for (const { s, d } of geo) {
     paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.actual ? 1.75 : 2.5}" opacity="${s.actual ? 0.9 : 1}" stroke-linejoin="round" stroke-linecap="round" ${s.dash ? 'stroke-dasharray="5 4"' : ''}/>`;

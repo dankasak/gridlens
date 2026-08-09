@@ -93,7 +93,10 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
         "cards": [
             {
                 "type": "custom:grid-lens-powerflow-card",
-                "max_height": 600, "max_width": 600, "flex": "0 1 600px",
+                # height/width/flex must move together — the diagram is square, so a
+                # size bump here (e.g. to fit a taller node label) that doesn't keep
+                # all three in lockstep distorts the aspect ratio instead.
+                "max_height": 700, "max_width": 700, "flex": "0 1 700px",
                 "icon_scale": 1.5, "font_scale": 0.7,
                 # Live solar/grid/battery/EV POWER sensors aren't collected by
                 # config_flow (only daily-energy sensors are, for the plan-
@@ -105,7 +108,7 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
             },
             {
                 "type": "custom:grid-lens-power-chart-card",
-                "entity": dispatch, "max_height": 510, "flex": "1 1 300px",
+                "entity": dispatch, "max_height": 615, "flex": "1 1 300px",
             },
         ],
         "grid_options": {"columns": "full"},
@@ -283,7 +286,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260809a"
+    _CARD_VERSION = "20260809b"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -1186,7 +1189,12 @@ async def _ensure_load_estimators(hass: HomeAssistant, entry: ConfigEntry) -> tu
        power_entity, can show it. Covers both sensor-backed devices AND the
        estimated-load ones from step 1. Silently does nothing (per device) if
        CONF_LOAD_POWER_SENSOR isn't configured — same fail-open discipline as every
-       other optional sensor in this integration.
+       other optional sensor in this integration. Calibrates off the device's OWN
+       cumulative energy sensor (energy_sensor=sensor_id — that sensor is the reason the
+       device reached step 2 at all) rather than the whole-house load sensor whenever one
+       is present, so a second concurrent load (e.g. another HVAC unit's compressor
+       cycling, invisible as a discrete state change) can't contaminate the estimate —
+       see load_estimation.py's module docstring.
 
     Returns (energy_estimators, power_estimators):
     - energy_estimators: {est_slot_index: LoadEstimator} — sensor.py wraps each in a
@@ -1353,6 +1361,12 @@ async def _ensure_load_estimators(hass: HomeAssistant, entry: ConfigEntry) -> tu
                 control_entity_id=control, seed_kw=seed_kw, auto_refine=True,
                 load_power_sensor=load_power_sensor, other_control_entity_ids=others,
                 track_energy=False,
+                # sensor_id is by construction a cumulative energy sensor here (the whole
+                # reason this device reached step 2 is that it has no live power_entity) —
+                # calibrate the live-W estimate off the device's own meter rather than the
+                # whole-house load sensor, so a second concurrent load (e.g. another HVAC
+                # unit) can't contaminate it. See load_estimation.py's module docstring.
+                energy_sensor=sensor_id,
             )
             estimator.power_unique_id = unique_id
             estimator.power_sensor_entity_id = reg_entry.entity_id

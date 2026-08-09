@@ -64,6 +64,14 @@ class RetailerPlan(ABC):
     def get_conditional_credits(self) -> list:
         return self._conditional_credits
 
+    def get_export_rate_defs(self) -> list:
+        """Raw export rate definitions (rate/label/daily_cap_kwh/rate_after_cap
+        per tier), including tiers with zero export attributed to them so far.
+        Base plans have none — used by bill-item labelling to name every
+        declared FiT tier, not just the ones actual export data happened to
+        touch (see _compute_bill_items's fit_lines)."""
+        return []
+
     def get_controlled_load_rate(self, register: str) -> dict | None:
         """Simple linear lookup of this plan's rate for a CL register
         ('controlled_load_1' | 'controlled_load_2'), or None if the plan
@@ -266,6 +274,9 @@ class PlanFromData(RetailerPlan):
 
     def get_export_rate_info(self, dt: datetime) -> Dict:
         return self._rate_info(self._export_rates, dt)
+
+    def get_export_rate_defs(self) -> list:
+        return list(self._export_rates)
 
     def describe_strategy(self) -> str:
         return self._strategy
@@ -486,6 +497,9 @@ class VersionedPlan(RetailerPlan):
 
     def get_export_rate_info(self, dt: datetime) -> Dict:
         return self._plan_at(dt).get_export_rate_info(dt)
+
+    def get_export_rate_defs(self) -> list:
+        return self._latest.get_export_rate_defs()
 
     def describe_strategy(self) -> str:
         return self._latest.describe_strategy()

@@ -68,19 +68,39 @@ wholesale-linked ones, supply charges.
 **Gotcha — capped-rate labels.** Label the free tier and the after-cap tier explicitly;
 rate-value-keyed dicts silently merge on collision. See the checklist entry.
 
-**Every plan is scored the same way, including the one the user is on.** The current plan
-gets no special path: its cost is the LP-optimised total priced by its own tariff, exactly
-like the alternatives it is ranked against. It used to be costed from the configured
-`import_price_sensor` (falling back to a flat 15c/kWh when unset) applied to actual metered
-kWh — which mispriced it outright whenever that sensor didn't correspond to the plan
-actually held, e.g. a wholesale feed left configured after switching to a TOU plan. Don't
-reintroduce an "actual vs modelled" asymmetry into the headline comparison; if a
-what-you-really-paid figure is wanted, price *actual* kWh through the *current plan's own
-tiers* (which `_compute_bill_items` already does correctly) rather than an external feed.
+**The plan the user is actually on is never run through the LP.** Alternatives are scored by
+what the optimiser could *achieve* under each tariff — a legitimate "what if you switched"
+question. The current plan isn't hypothetical, so `calculate_plan_costs` (`plan_calculator.py`)
+gives it a dedicated path instead: actual metered import/export, priced against *its own*
+published tariff (`_compute_bill_items`'s actual-usage branch — cap-aware tiers, real
+conditional-credit evaluation from real per-day behaviour, real FiT windows), not the LP's
+optimal-dispatch fantasy. The two can diverge wildly — e.g. the LP assumes the battery
+fully free-cycles every single day inside a plan's zero-rate window, which real dispatch may
+never do — and conflating them once produced a "your bill breakdown" card showing $0.99 for
+a period GloBird actually billed $21.04 (`GRIDLENS_CHECKLIST.md`, 2026-08-04).
+`is_market_linked` plans (Amber SmartShift, real dynamic import) are the one exception: their
+own published rate structure is a nominal reference, not the real price, so actual usage is
+priced from the configured `import_price_sensor` / `export_price_sensor` instead — genuinely
+actual data, just sourced from a live feed rather than a static tariff. That sensor-priced
+path doesn't yet itemise per-tier (no per-interval FiT/energy_lines split for it) — a known
+gap, not a silent wrong number: it reports one clearly-labelled total instead of guessing.
 
-**`import_price_sensor` / `export_price_sensor` are optional and unused by the comparison.**
-Nothing in the optimiser, control or advisory paths reads them. Leaving them set is
-harmless now, but they are no longer required for a correct current-plan cost.
+**Bill breakdown mirrors a real retailer bill, on purpose.** The "our bill breakdown" card
+(`grid-lens-card.js`) orders and labels its rows to match how an Australian electricity bill
+actually reads — fixed charges (supply/subscription/demand/controlled load) first, usage
+charges next, feed-in/export credits next (one line **per rate tier**, e.g. a capped
+"top-up" rate separate from the base feed-in rate — via `_compute_bill_items`'s `fit.lines`,
+built the same way as `energy_lines`), bonus/conditional credits last, then the total. The
+point is letting a customer tick GloBird-ZEROHERO-style output off against their actual PDF
+bill line by line to verify the product is pricing them correctly — don't reorder or
+re-blend sections without checking against a real bill sample first (see CLAUDE.md).
+
+**Gotcha — capped-rate labels, now direction-scoped.** Label the free tier and the
+after-cap tier explicitly; a rate-value-keyed label dict silently merges on collision if two
+different tiers land on the same numeric rate — including *across* import and export (e.g.
+GloBird's 0c import Free Window and 0c export No-Feed-in window). `_compute_bill_items` uses
+separate `cap_labels` (import) and `export_cap_labels` (export) dicts for exactly this
+reason — don't merge them back into one shared dict. See the checklist entry.
 
 ---
 
@@ -249,6 +269,21 @@ exists purely to back `GridLensEstimatedPowerSensor`, a live-W reading = the est
 "on", 0 while "off"). `sensor.py._build_deferrable_loads()` falls back to it as `power_entity`
 whenever the real lookup finds nothing. A device with a real power sensor already, or with no
 control entity at all (forecast-only), is left untouched.
+
+**Calibration source** (own-meter preferred, added 2026-08-04): the device's cumulative
+energy sensor is passed in as `energy_sensor=sensor_id` — that sensor is *why* the device
+reached step 2 in the first place, since it's the only telemetry it has. When set,
+`LoadEstimator` calibrates by reading that sensor's value at the start and end of one full
+on-period and dividing the rise by the elapsed time (`load_estimate_math.energy_sample_avg_w`,
+discards a sample if the on-period was too short to trust or the counter went backwards —
+a device reboot resetting its counter, not a real near-zero reading), **never** the
+whole-house `load_power_sensor` — that fallback path is only still used for step 1's true
+"no sensor at all" estimated loads. Own-meter calibration is immune to any *other* load's
+power draw during the same window, unlike house-load sampling, which attributes the whole
+house-power delta at an off→on transition to the one device turning on — wrong whenever a
+second load is drawing variable power at the same time (e.g. two aircon units running
+together, one ECHONET-metered and one not: the metered one's own counter is unaffected by
+the other's compressor cycling, but the house-load delta isn't).
 
 **Daily kWh** comes from a 14-day historical average of the device's own energy sensor,
 overridable per-day (see Today Boost).
@@ -551,6 +586,40 @@ convention, never a hardcoded entity id — so they work unmodified on any insta
 | `grid-lens-load-control-card` | One row per deferrable load: Today Boost, greedy toggles, Off now / On now / Auto, and live greedy status. |
 | `grid-lens-defer-schedule-card` | The 7 × 48 allowed-run-times editor. |
 | `grid-lens-flex-row-card` | Layout helper. |
+
+**Aggregated Aircon node** (Power Flow card, added 2026-08-02, wattage+estimate cue added
+2026-08-05). Every `climate.*` entity that isn't a group/aggregator wrapper (identified by the
+*absence* of a `member_entities` attribute — not by name or integration, so any HA climate
+group is excluded the same way) is folded into one "dragon" node instead of drawing its own —
+heat/cool/neutral/idle art picked from the busiest state across all units, with a corner badge
+showing the active count and a tooltip breakdown ("1 heating · 2 off"). **Per-unit detail panel**
+(added 2026-08-05, tap-to-toggle 2026-08-05): tapping/clicking the dragon icon itself (not just
+the corner badge) opens a panel below the diagram with the same summary line plus one line per
+`climate.*` unit — its resolved state (Heating/Cooling/Off/etc) and, wherever the entity reports
+`current_temperature`/`temperature` (or `target_temp_low`/`target_temp_high` for range-mode
+units), its current and target temperature. Units that report neither temperature attribute just
+show their state with no temp suffix. Deliberately **not** a native SVG `<title>` (tried first,
+reverted same day): the card fully rebuilds `shadowRoot.innerHTML` on every re-render — which
+fires on any watched solar/grid/battery/load power change, i.e. every few seconds — so a native
+title's DOM node kept getting torn down before the browser's hover-and-wait timer could fire, and
+it doesn't work on touch at all. The panel's open/closed state instead lives on the component
+instance (`_openTooltipId`), survives the `innerHTML` rebuild, and its content re-reads live each
+render so it stays open and up to date rather than vanishing; tap the panel's close button or
+anywhere else on the card to dismiss it. Built generically off `_pnode`'s `nodeTooltip` field, so
+any other node could opt into the same panel just by setting it. A `climate.*` entity
+that's ALSO a deferrable load's `switch_entity` (e.g. an ECHONET Lite aircon under load control)
+is represented here instead of getting its own individual node — full aggregation, no per-unit
+carve-out. **Wattage**: summed across whichever units resolve a `power_entity` via that same
+deferrable-loads lookup — partial coverage is fine (an install with one metered unit and two
+unmonitored ones still shows a number for the one it can see); no wattage line at all when zero
+units resolve one, rather than fabricating a figure. Prefixed with **"~"** and called out in the
+tooltip as "(estimated)" whenever any summed component is a `LoadEstimator`-backed synthetic
+reading rather than a real meter — detected generically by the presence of an `auto_refine`
+attribute (a shape unique to `GridLensEstimatedPowerSensor`), not by entity name. This is also
+why a bad estimate here (a device on a flaky integration flapping `unavailable` mid-run — see
+`load_estimation.py`'s `_confirmed_on` handling) can make the **Home** node read low or 0:
+`Home = max(0, whole_home_load − Σ deferrable_loads)`, and every deferrable load's power
+(including an over-estimated aircon) is subtracted out of it.
 
 **Seeded dashboard.** New installs get a "Grid Lens" sidebar dashboard built by
 `_build_seed_views()` in `__init__.py`, written **once** into `.storage/lovelace.grid_lens`.
