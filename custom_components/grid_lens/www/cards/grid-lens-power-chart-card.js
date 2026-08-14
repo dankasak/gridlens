@@ -13,7 +13,7 @@
  */
 import {
   GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor,
-} from './grid-lens-chart-common.js?v=20260809a';
+} from './grid-lens-chart-common.js?v=20260811b';
 
 // Free-energy shading (see _freeEnergyBands). CSS custom props rather than literals so
 // both bands follow the viewer's light/dark theme like every other colour on this card;
@@ -48,7 +48,13 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       // this away" warning) and teal for a free-import window (a good thing, and the
       // same family this project's charts already use for sell/credit).
       + ` :host { --free-spill:#f97316; --free-import:#0d9488; }`
-      + ` :host(.dark) { --free-spill:#fb923c; --free-import:#2dd4bf; }`;
+      + ` :host(.dark) { --free-spill:#fb923c; --free-import:#2dd4bf; }`
+      // Click-to-isolate legend entries (see _legendItem()/_wireLegendToggle()). `.dim`
+      // is opacity only, not display:none — the entry stays clickable so switching
+      // isolation straight to a different series (or back to "all") is one click, not two.
+      + ` .legend-item { cursor: pointer; padding: 1px 4px; margin: -1px -4px; border-radius: 4px; transition: opacity .12s ease, background .12s ease; }`
+      + ` .legend-item:hover { background: color-mix(in srgb, var(--ink) 8%, transparent); }`
+      + ` .legend-item.dim { opacity: .4; }`;
   }
 
   // Matches the Power Flow card's own per-device colour assignment (a hot-water device gets
@@ -89,10 +95,22 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     return byId;
   }
 
+  // A clickable legend entry for one logical series (forecast + measured pair share a
+  // `group` — see _energySeries()). Click isolates the chart to just that group; clicking
+  // the already-isolated one again clears isolation and restores every series — wired in
+  // _wireLegendToggle(). `.dim`'d when something else is isolated, so the isolated one
+  // reads as the obvious "on" state rather than everything just looking identical.
+  _legendItem(group, swatchHtml, label) {
+    const dim = this._isolatedGroup && this._isolatedGroup !== group ? ' dim' : '';
+    const tip = this._isolatedGroup === group ? 'Click to show every series again' : 'Click to show only this series';
+    return `<span class="legend-item${dim}" data-group="${esc(group)}" tabindex="0" title="${esc(tip)}">${swatchHtml}${esc(label)}</span>`;
+  }
+
   _legendHtml() {
     const dnames = this._deferNames || [];
-    const deferLegend = dnames.map((nm, i) =>
-      `<span><i style="border-top:2px solid ${this._deferColor(i)}"></i>${esc(nm)}</span>`).join('');
+    const deferLegend = dnames.map((nm, i) => this._legendItem(
+      `defer_${i}`, `<i style="border-top:2px solid ${this._deferColor(i)}"></i>`, nm,
+    )).join('');
     // Only advertise the free-energy shading when there actually is some in view — on a
     // plan with no $0 window and no spill the legend would otherwise carry two
     // permanently-unused entries. Filtered to the selected view range for the same
@@ -104,14 +122,28 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       (hasSpill ? `<span><span class="swatch" style="background:${FREE_SPILL};opacity:.55"></span>Free energy wasted</span>` : '')
       + (hasFree ? `<span><span class="swatch" style="background:${FREE_IMPORT};opacity:.55"></span>Free import window</span>` : '');
     return `
-      <span><span class="swatch" style="background:var(--solar)"></span>Solar</span>
-      <span><span class="swatch" style="background:var(--load)"></span>Load</span>
-      <span><span class="swatch" style="background:var(--gridflow)"></span>Grid (+import / -export)</span>
-      <span><span class="swatch" style="background:var(--battery)"></span>Battery (+charge / -discharge)</span>
+      ${this._legendItem('solar', '<span class="swatch" style="background:var(--solar)"></span>', 'Solar')}
+      ${this._legendItem('load', '<span class="swatch" style="background:var(--load)"></span>', 'Load')}
+      ${this._legendItem('grid', '<span class="swatch" style="background:var(--gridflow)"></span>', 'Grid (+import / -export)')}
+      ${this._legendItem('battery', '<span class="swatch" style="background:var(--battery)"></span>', 'Battery (+charge / -discharge)')}
       ${deferLegend}
       ${bandLegend}
       <span style="color:var(--muted)">— thin = measured</span>
     `;
+  }
+
+  // Click-to-isolate: click a legend entry to show only its series (forecast + measured),
+  // click the already-isolated one again to restore all. Re-wired every paint since
+  // GridLensChartCardBase._paint() replaces .body's innerHTML wholesale each time.
+  _wireLegendToggle() {
+    const items = this.shadowRoot.querySelectorAll('.legend [data-group]');
+    items.forEach((el) => {
+      el.addEventListener('click', () => {
+        const g = el.getAttribute('data-group');
+        this._isolatedGroup = this._isolatedGroup === g ? null : g;
+        this._paint();
+      });
+    });
   }
 
   // Stretches of the plan where energy is free and the plan does not use all of it —
@@ -179,32 +211,40 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       // spans t0→now (its data boundary), so left of "now" the planned + measured
       // washes of the same colour overlap and read as a deeper tint of that colour —
       // acceptable, and the user explicitly asked for history to be filled too.
+      // `group` pairs each series with its legend entry (forecast + measured share one) —
+      // see _legendItem()/_wireLegendToggle(). Purely a client-side tag, multiLineChart
+      // never looks at it; _chartSvg() filters the array down to one group before handing
+      // it off when a legend entry is isolated.
       series: [
-        { key: 'solar_kwh', color: 'var(--solar)', area: true, scale: kwScale },
-        { key: 'load_kwh', color: 'var(--load)', area: true, scale: kwScale },
-        { calc: (row) => this._gridNet(row), color: 'var(--gridflow)', area: true, scale: kwScale },
-        { key: 'battery_kwh', color: 'var(--battery)', area: true, scale: kwScale },
+        { key: 'solar_kwh', group: 'solar', color: 'var(--solar)', area: true, scale: kwScale },
+        { key: 'load_kwh', group: 'load', color: 'var(--load)', area: true, scale: kwScale },
+        { calc: (row) => this._gridNet(row), group: 'grid', color: 'var(--gridflow)', area: true, scale: kwScale },
+        { key: 'battery_kwh', group: 'battery', color: 'var(--battery)', area: true, scale: kwScale },
         // step: true — a deferrable device's planned power is piecewise-constant (off, or on
         // at ~max_kw for a slot), not a smooth ramp. Without it smoothPath's cubic spline
         // curves gradually up from 0 toward the turn-on slot instead of holding flat at 0
         // until the device actually switches on. See stepPath()'s own comment.
-        ...dnames.map((nm, i) => ({ key: `defer_${i}`, color: this._deferColor(i), area: true, scale: kwScale, step: true })),
-        { points: this._actualEnergy.solar, color: 'var(--solar)', actual: true, area: true },
-        { points: this._actualEnergy.load, color: 'var(--load)', actual: true, area: true },
-        { points: this._actualEnergy.grid, color: 'var(--gridflow)', actual: true, area: true },
-        { points: this._actualEnergy.battery, color: 'var(--battery)', actual: true, area: true },
+        ...dnames.map((nm, i) => ({ key: `defer_${i}`, group: `defer_${i}`, color: this._deferColor(i), area: true, scale: kwScale, step: true })),
+        { points: this._actualEnergy.solar, group: 'solar', color: 'var(--solar)', actual: true, area: true },
+        { points: this._actualEnergy.load, group: 'load', color: 'var(--load)', actual: true, area: true },
+        { points: this._actualEnergy.grid, group: 'grid', color: 'var(--gridflow)', actual: true, area: true },
+        { points: this._actualEnergy.battery, group: 'battery', color: 'var(--battery)', actual: true, area: true },
         // step: true here too — a real deferrable appliance (EV charger, hot water element)
         // switches on/off in seconds on the hardware side, but HA's history API only samples
         // on significant_changes_only, so two sparse readings (last "off", first "on") would
         // otherwise get smoothPath'd into the exact same diagonal-ramp artifact as the
         // forecast series above, just drawn from real sensor data instead of planned data.
-        ...dnames.map((nm, i) => ({ points: actualDefer[i], color: this._deferColor(i), actual: true, area: true, step: true })),
+        ...dnames.map((nm, i) => ({ points: actualDefer[i], group: `defer_${i}`, color: this._deferColor(i), actual: true, area: true, step: true })),
       ],
     };
   }
 
   _chartSvg() {
-    const { series } = this._energySeries();
+    let { series } = this._energySeries();
+    // Isolated to one legend group (see _wireLegendToggle): drop every other series
+    // rather than just dimming them, so the y-axis also rescales to that series' own
+    // range — a small signal like Battery is otherwise squashed flat next to Solar/Load.
+    if (this._isolatedGroup) series = series.filter((s) => s.group === this._isolatedGroup);
     // Taller than the other line charts (default 160) so this pairs visually with the
     // Power Flow card next to it in the dashboard section, which is roughly square.
     // symmetric: true — grid/battery are signed (import/charge positive, export/discharge

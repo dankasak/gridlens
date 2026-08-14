@@ -354,6 +354,17 @@ people fighting over one switch.
   real-world consequence than reverting an inverter mode.
 - **A manual override wins over everything**, including greedy and the drift re-assert.
   "Hands off; set it to X and leave it."
+- **The advisory forecast respects the override too** (`advisory/coordinator.py`'s
+  `_deferrable_for_horizon`) — Force Off zeroes the device's per-slot availability mask
+  for the whole horizon (it genuinely cannot run until Auto is reselected), Force On
+  opens every slot regardless of the painted weekly schedule. Without this the LP kept
+  planning the device's normal schedule while it sat physically forced off, and the
+  Power Chart card's forecast line (drawn straight from `sensor.*_planned_dispatch`'s
+  `trajectory`) showed a charge that was never going to happen — reported live
+  2026-08-12 (EV charger left on Force Off overnight after a manual "drive it now").
+  Scoped to the live advisory/dispatch plan only, not plan-comparison's LP (a
+  temporary override on the device you actually own shouldn't bias how an alternative
+  retailer plan is ranked).
 - Deliberately **decoupled** from the battery `ControlManager`: load control has zero
   brand-specific logic and must work on a house with no battery at all.
 
@@ -545,6 +556,18 @@ malformed/missing store must never silently pin a device off, it just means unre
 spans two weekdays. "Hours available in the next 24 h" (`rolling_window_hours`) is the right
 bound for anything user-facing, not "allowed hours per day".
 
+**Unpainted-aircon nudge** (added 2026-08-11). "Fully unrestricted until painted" is a
+reasonable default for a pool pump or EV charger, but a worse trap for a `climate.*`-
+controlled device (aircon, added §5/§6, 2026-08-02): comfort, not price, decides when it
+needs to run, so an unpainted one lets the LP assume it can shift a whole day's runtime to
+3am — in plan comparison *and* the real dispatch/control plan, since it's the same LP
+(§0/§2). `_notify_unpainted_climate_schedules` (`__init__.py`, runs once per setup/reload
+right after the schedule store loads) fires a persistent notification naming every
+`climate.*`-backed deferrable device with no stored weekly grid, pointing at the Deferrable
+Loads dashboard card; it self-clears once every such device has a schedule painted. This
+only prompts — it doesn't change LP behaviour or force a default schedule, and a
+`switch.*`-controlled device (pool pump, EV charger) is never flagged.
+
 ---
 
 ## 9. Today Boost
@@ -584,7 +607,7 @@ convention, never a hardcoded entity id — so they work unmodified on any insta
 |---|---|
 | `grid-lens-card` | Full plan comparison (the Plan Comparison view). |
 | `grid-lens-powerflow-card` | **Gated** — live radial energy flow: solar / grid / battery / home + one node per deferrable load, animated flow balls, live buy/sell price, greedy badges. Requires the Battery Control + Power Flow add-on; see §12. |
-| `grid-lens-power-chart-card` | Measured & forecast power (kW) — solar, load, signed grid, signed battery, per-device deferrable, plus free-energy shading. |
+| `grid-lens-power-chart-card` | Measured & forecast power (kW) — solar, load, signed grid, signed battery, per-device deferrable, plus free-energy shading. Click a legend name to isolate that series (forecast + measured pair, y-axis rescales to it); click it again to restore every series. |
 | `grid-lens-price-chart-card` | Import/export rate trajectory. |
 | `grid-lens-soc-chart-card` | Battery SOC curve. |
 | `grid-lens-cash-chart-card` | Cumulative cost/credit. |
@@ -661,7 +684,7 @@ that?" has to be answerable from the dashboard alone.
 |---|---|
 | `switch.*_battery_control` attributes | Applied action/power, last tick, plan age, degraded state, note. |
 | `switch.*_<device>_control` attributes | Commanded state, threshold, override, all three greedy toggles, **`greedy_reason`**, **`greedy_blocked`**, **`forecast_free_kwh` / `forecast_needed_kwh`**, note. Modulating devices add `control_type`, `setpoint_entity`, `min_w`/`cap_w`, `commanded_w`/`commanded_setpoint`, `plugged_in`, `last_write`, `modulation_source`. |
-| **Load Control card** | Per row: control state, and a live greedy line — the firing reason, or why it's blocked, or a **progress bar toward the forecast-surplus bar** (`6.2 / 8.0 kWh`) while it's armed and tracking. For a modulating device (§6a): live amps + kW, the max-current ceiling input, and a one-line "why" — `modulation_source` (plan / surplus / override / off) and `plugged_in`. "Why is my car charging at 8 A right now?" must be answerable from the row. |
+| **Load Control card** | Per row: control state, and a live greedy line — the firing reason, or why it's blocked, or the **forecast-surplus progress bar** (`6.2 / 8.0 kWh`, hover/focus tooltip explains it). Shown both while armed and tracking toward the trigger, and after it's fired (condition 3 held it on) — the same bar, capped at 100%, rather than only appearing pre-trigger. For a modulating device (§6a): live amps + kW, the max-current ceiling input, and a one-line "why" — `modulation_source` (plan / surplus / override / off) and `plugged_in`. "Why is my car charging at 8 A right now?" must be answerable from the row. |
 | **Power Flow card** | A badge on a load node while *greedy*, not the plan, is holding it on — leaf for the two instantaneous reasons, sun-alert for forecast surplus, with the kWh figures in the tooltip. |
 | **Power Chart card** | Free-energy time bands: **orange = free energy being wasted** (plan exports into a ≤$0 export price), **teal = free import window**. Legend appears only when a band is in view; the crosshair tooltip names the band. |
 | `ha core logs` | Every optimiser run logs horizon, device count, solver status, credits, caps, export floor. |

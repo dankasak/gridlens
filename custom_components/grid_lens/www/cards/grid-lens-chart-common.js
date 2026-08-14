@@ -701,6 +701,10 @@ export class GridLensChartCardBase extends HTMLElement {
       <div class="charts"><div class="xtip"></div>${this._chartSvg()}</div>
     `;
     this._wireCrosshair();
+    // Optional per-subclass hook — only grid-lens-power-chart-card defines this today
+    // (click-a-legend-name-to-isolate-its-series). innerHTML above wipes any previously
+    // wired listeners, so this has to re-run every paint, same as _wireCrosshair.
+    if (this._wireLegendToggle) this._wireLegendToggle();
   }
 
   _toggleHtml() {

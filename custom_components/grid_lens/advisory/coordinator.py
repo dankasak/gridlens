@@ -297,6 +297,26 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             for h in range(len(load_hod))
         ]
 
+    def _device_override(self, sensor_id: str) -> str | None:
+        """Current Force On/Off override (select.py) for a deferrable device, or None
+        while it's on Auto.
+
+        Looked up by sensor_id against the configured device list rather than trusting
+        index alignment with self._deferrable_params — that list has already dropped
+        any device with daily_kwh<=0 by the time it reaches _deferrable_for_horizon, so
+        its position no longer matches LoadControlManager.controllers' index."""
+        if not sensor_id:
+            return None
+        load_mgr = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_load_control")
+        if load_mgr is None:
+            return None
+        sensors = self._cfg("deferrable_load_sensors", []) or []
+        try:
+            index = sensors.index(sensor_id)
+        except ValueError:
+            return None
+        return load_mgr.get_override(index)
+
     async def _deferrable_for_horizon(self, bundle) -> list:
         """Build the optimizer's per-device deferrable dicts for THIS horizon: device
         daily_kwh/max_kw + a per-slot availability mask.
@@ -306,7 +326,17 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         shared store every tick, so a schedule edit takes effect within one advisory
         cycle. A device with no stored schedule yet is unrestricted (no mask, available
         every hour) until the user paints one — the schedule card is the only place
-        this is set (see const.py's note on the retired static hours config field)."""
+        this is set (see const.py's note on the retired static hours config field).
+
+        A device currently under a manual Force On/Off override (select.py) has that
+        override overlaid on top of the schedule mask: Force Off zeroes the whole
+        horizon (GridLens won't touch the switch again until Auto is reselected, so it
+        genuinely cannot run — see DeferrableLoadController.override), Force On opens
+        the whole horizon regardless of the painted window. Without this the LP (and
+        the forecast line the Power Chart card draws straight from it) keeps planning
+        around the device's normal schedule and shows a charge that will never
+        physically happen, e.g. an EV charger left on Force Off overnight — found
+        2026-08-12."""
         from ..schedule_grid import slot_allowed
 
         store = self.hass.data.get(DOMAIN, {}).get(
@@ -334,6 +364,11 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
                         1 if slot_allowed(week, local.weekday(), local.hour, local.minute)
                         else 0
                     )
+            override = self._device_override(dev.get("sensor_id", ""))
+            if override == "off":
+                mask = [0] * bundle.slots
+            elif override == "on":
+                mask = [1] * bundle.slots
             out.append({"daily_kwh": daily, "max_kw": maxkw, "hour_mask": mask,
                         # Reserved for a later semi-continuous constraint — carried through
                         # so the optimiser already receives it; nothing in the model reads it

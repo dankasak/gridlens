@@ -286,7 +286,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260809b"
+    _CARD_VERSION = "20260811b"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -1055,6 +1055,17 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             # (entry_id, filename) -> (fetched_at, content, content_type, entitled)
             self._cache: dict[tuple[str, str], tuple] = {}
 
+        # The card JS appends a hand-bumped ?v= query string (ICON_V) to every icon
+        # URL, changed whenever icon bytes change — so a given URL's content is
+        # permanently fixed and safe to cache aggressively in the browser. Without
+        # this, every request (including the query string) was refetched from HA on
+        # every page load, since aiohttp's web.Response sends no cache headers by
+        # default. That's most visible over the reverse-proxied FQDN path, where
+        # these binary assets are also multiplexed as HTTP/2 streams over one
+        # connection instead of the browser's parallel HTTP/1.1 connections used for
+        # direct-IP access — repeated no-cache refetches compound that slowdown.
+        _BROWSER_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
+
         async def get(self, request, filename):
             import time
             from .const import CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL
@@ -1071,7 +1082,10 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 fetched_at, content, content_type, entitled = cached
                 ttl = self._TTL_ENTITLED if entitled else self._TTL_LOCKED
                 if now - fetched_at < ttl:
-                    return web.Response(body=content, content_type=content_type)
+                    return web.Response(
+                        body=content, content_type=content_type,
+                        headers=self._BROWSER_CACHE_HEADERS,
+                    )
 
             api_key = entry.data.get(CONF_GRIDLENS_API_KEY, "")
             api_url = entry.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
@@ -1086,7 +1100,10 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                         content = await resp.read()
                         content_type = resp.content_type
                         self._cache[key] = (now, content, content_type, True)
-                        return web.Response(body=content, content_type=content_type)
+                        return web.Response(
+                            body=content, content_type=content_type,
+                            headers=self._BROWSER_CACHE_HEADERS,
+                        )
                     if resp.status in (401, 402, 403, 404):
                         return web.Response(status=404)
                     _LOGGER.warning(
@@ -1098,7 +1115,10 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             # Network failure or an unexpected status: prefer stale-but-real over a
             # broken image, same principle as PowerflowCardView.
             if cached and cached[3]:
-                return web.Response(body=cached[1], content_type=cached[2])
+                return web.Response(
+                    body=cached[1], content_type=cached[2],
+                    headers=self._BROWSER_CACHE_HEADERS,
+                )
             return web.Response(status=404)
 
     class SubscribeCallbackView(HomeAssistantView):
@@ -1387,6 +1407,52 @@ async def _ensure_load_estimators(hass: HomeAssistant, entry: ConfigEntry) -> tu
     return energy_estimators, power_estimators
 
 
+async def _notify_unpainted_climate_schedules(hass: HomeAssistant, entry: ConfigEntry, sched_store) -> None:
+    """Nudge for a climate.*-controlled deferrable load (aircon) with no painted weekly
+    schedule (§8 in FEATURES.md).
+
+    A device with no stored grid is fully unrestricted — any hour — which is a reasonable
+    default for a pool pump or EV charger (their daily energy genuinely can land anywhere),
+    but not for an air conditioner: comfort, not price, decides when it needs to run, so an
+    unpainted aircon lets the optimiser assume it can shift a whole day's runtime to 3am in
+    both plan comparison and the real dispatch/control plan (same LP, FEATURES.md §0/§2).
+    Runs once per setup/reload; re-evaluates every time so the notification clears itself
+    once every climate.*-backed device has a schedule painted.
+    """
+    from .const import CONF_DEFERRABLE_LOAD_SENSORS, CONF_DEFERRABLE_LOAD_SWITCHES
+    from .entity_lookup import resolve_device_name
+
+    sensors = list(entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or [])
+    switches = list(entry.data.get(CONF_DEFERRABLE_LOAD_SWITCHES, []) or [])
+    notification_id = f"grid_lens_unpainted_climate_schedule_{entry.entry_id}"
+
+    unpainted = []
+    for i, sensor_id in enumerate(sensors):
+        control = switches[i] if i < len(switches) else ""
+        if not control.startswith("climate."):
+            continue
+        if await sched_store.async_get(sensor_id) is not None:
+            continue  # already painted
+        unpainted.append(resolve_device_name(hass, control, sensor_id) or control)
+
+    if not unpainted:
+        persistent_notification.async_dismiss(hass, notification_id)
+        return
+
+    device_list = "\n".join(f"- {name}" for name in unpainted)
+    persistent_notification.async_create(
+        hass,
+        "A deferrable load with no painted schedule is treated as reschedulable to **any "
+        "hour** — reasonable for a pool pump or EV charger, but usually wrong for an air "
+        "conditioner, since you run it for real-time comfort, not to chase the cheapest "
+        "hour. Without a schedule, plan comparisons and the dispatch plan may assume it "
+        f"could run at 3am.\n\nPaint allowed run times for:\n{device_list}\n\non the "
+        "**Deferrable Loads** dashboard card's weekly schedule.",
+        title="Grid Lens: Set aircon run-time hours",
+        notification_id=notification_id,
+    )
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Grid Lens from a config entry."""
     _LOGGER.info("Setting up Grid Lens")
@@ -1418,6 +1484,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _sched_store = DeferrableScheduleStore(hass, entry.entry_id)
     await _sched_store.async_load()
     hass.data[DOMAIN][f"{entry.entry_id}_deferrable_schedules"] = _sched_store
+
+    await _notify_unpainted_climate_schedules(hass, entry, _sched_store)
 
     # GridLens-owned daily energy archive: captures per-day PV/import/export totals
     # into HA Storage so long-horizon features never depend on the user's recorder

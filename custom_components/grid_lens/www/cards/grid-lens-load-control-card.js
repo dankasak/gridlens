@@ -67,7 +67,7 @@
  *   type: custom:grid-lens-load-control-card
  *   title: Deferrable Loads          (optional)
  */
-import { STYLE, esc } from './grid-lens-chart-common.js?v=20260809a';
+import { STYLE, esc } from './grid-lens-chart-common.js?v=20260811b';
 
 const HISTORY_DAYS = 14;
 const HISTORY_REFRESH_MS = 15 * 60000;
@@ -528,6 +528,17 @@ class GridLensLoadControlCard extends HTMLElement {
   // forecast-surplus condition is armed and tracking, in which case we show progress
   // toward its bar rather than a silent boolean that flips with no warning. Empty when
   // greedy is off entirely — no point adding a line that just says "nothing".
+  // Shared explanation for the forecast-surplus trigger bar, wherever it's shown (armed
+  // and still tracking, or already fired). Same X/Y the numbers next to it show — this
+  // just spells out what "trigger progress" means, since the bar alone doesn't.
+  _forecastSurplusTip(have, need) {
+    return `Trigger progress: forecast free energy the plan would otherwise waste over the `
+      + `look-ahead window (spilled $0 export, or an unused $0-import window) versus what `
+      + `this device would use running flat out for that whole window. Fills to 100% when `
+      + `the free energy forecast catches up to that — the instant Greedy switches the `
+      + `device on early. Currently ${have.toFixed(1)} of ${need.toFixed(1)} kWh.`;
+  }
+
   _greedyLine(a) {
     if (!a || !a.greedy) return '';
     const reason = a.greedy_reason;
@@ -537,10 +548,17 @@ class GridLensLoadControlCard extends HTMLElement {
         export_surplus: 'On — running on surplus export',
         forecast_surplus: 'On — forecast surplus',
       }[reason] || `On — ${esc(reason)}`;
-      const nums = (reason === 'forecast_surplus' && a.forecast_free_kwh != null)
-        ? ` (${(+a.forecast_free_kwh).toFixed(1)} of ${(+a.forecast_needed_kwh).toFixed(1)} kWh)`
-        : '';
-      return `<div class="greedy-line active">Greedy: ${label}${nums}</div>`;
+      let nums = '';
+      let bar = '';
+      if (reason === 'forecast_surplus' && a.forecast_free_kwh != null && a.forecast_needed_kwh) {
+        const have = +a.forecast_free_kwh, need = +a.forecast_needed_kwh;
+        const pct = Math.max(0, Math.min(100, need > 0 ? (have / need) * 100 : 100));
+        const tip = this._forecastSurplusTip(have, need);
+        nums = ` (${have.toFixed(1)} of ${need.toFixed(1)} kWh)`;
+        bar = `<span class="gbar" tabindex="0" data-tip="${esc(tip)}">`
+          + `<span style="width:${pct.toFixed(0)}%"></span></span>`;
+      }
+      return `<div class="greedy-line active">Greedy: ${label}${nums}${bar}</div>`;
     }
     if (a.greedy_blocked) {
       const why = a.greedy_blocked === 'override'
@@ -551,9 +569,11 @@ class GridLensLoadControlCard extends HTMLElement {
     if (a.greedy_forecast_surplus && a.forecast_free_kwh != null && a.forecast_needed_kwh) {
       const have = +a.forecast_free_kwh, need = +a.forecast_needed_kwh;
       const pct = Math.max(0, Math.min(100, (have / need) * 100));
+      const tip = this._forecastSurplusTip(have, need);
       return `<div class="greedy-line">Greedy: armed · forecast surplus `
         + `${have.toFixed(1)} / ${need.toFixed(1)} kWh`
-        + `<span class="gbar"><span style="width:${pct.toFixed(0)}%"></span></span></div>`;
+        + `<span class="gbar" tabindex="0" data-tip="${esc(tip)}">`
+        + `<span style="width:${pct.toFixed(0)}%"></span></span></div>`;
     }
     return `<div class="greedy-line">Greedy: armed, waiting for free energy</div>`;
   }
