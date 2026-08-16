@@ -17,11 +17,30 @@ export const VIEW_BACK_MS = 2 * 3600000;    // show 2h of history to the left of
 
 // ---------------------------------------------------------------- pure helpers
 
-// Downsample a {t,v} series to at most `max` points (keeps rendering light).
+// Downsample a {t,v} series to at most `max` points (keeps rendering light). Buckets by
+// TIME, not by raw array index: index-based striding assumes points are evenly spaced, but
+// real HA history isn't — a power sensor updates near-continuously while a device is active
+// and barely at all while idle. An index stride sized for the dense (active) stretch can
+// step clean over an entire idle stretch, including the transition point where the value
+// actually drops back to zero — leaving a step-drawn series holding its last "on" reading
+// all the way out to wherever the stride next happens to land, however much later that is.
+// Found via a real EV charger: 20 minutes of genuine ~1.8kW charging, stride-sampled down to
+// where the off-transition fell between two kept indices, then held "on" for the following
+// ~3 idle hours until the next kept (and coincidentally also off) sample. Time buckets can't
+// do that — each bucket is a fixed wall-clock slice, so the transition survives in whichever
+// bucket it actually falls into, capping the worst-case error at one bucket width.
 export function ds(pts, max = 160) {
   if (!pts || pts.length <= max) return pts || [];
-  const step = Math.ceil(pts.length / max);
-  const out = pts.filter((_, i) => i % step === 0);
+  const t0 = pts[0].t.getTime(), t1 = pts[pts.length - 1].t.getTime();
+  if (t1 <= t0) return [pts[0], pts[pts.length - 1]];
+  const bucketMs = (t1 - t0) / max;
+  const out = [];
+  let bucket = -1;
+  for (const p of pts) {
+    const b = Math.min(max - 1, Math.floor((p.t.getTime() - t0) / bucketMs));
+    if (b !== bucket) { out.push(p); bucket = b; }
+    else { out[out.length - 1] = p; }
+  }
   if (out[out.length - 1] !== pts[pts.length - 1]) out.push(pts[pts.length - 1]);
   return out;
 }
