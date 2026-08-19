@@ -192,7 +192,14 @@ right):
     there's no cost risk in over-committing when import is free.
   - **Load-covering discharge** → self-consumption (forcing "battery first" at $0 FiT would
     spill real-time load dips into a worthless export).
-  - **Discharge with a material export component** → forced battery-first at the planned rate.
+  - **Load-covering discharge in a free-import window** (`import_rate ≈ 0`) → **IDLE**, not
+    self-consumption. Self-consumption is price-blind, so on a day where actual solar
+    undershoots the forecast (cloud) it would drain the battery to cover load that
+    equally-free grid import could have served for nothing. IDLE holds SOC and lets the
+    shortfall fall through to import — the discharge-side mirror of the free-import charge
+    branch above.
+  - **Discharge with a material export component** → forced battery-first at the planned rate,
+    even when import happens to be free (export earns money regardless of the import side).
 - Entering max self-consumption **must reset the charge cap to the hardware max**, or tiny
   LP grid nibbles force-charge the battery low and export free solar.
 

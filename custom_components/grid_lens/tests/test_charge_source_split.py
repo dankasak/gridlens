@@ -375,6 +375,49 @@ def test_material_export_above_floor_but_minority_share_is_self_consumption():
     assert bc.names() == ["set_self_consumption_mode"], bc.calls
 
 
+def test_free_window_load_covering_discharge_goes_idle():
+    """A load-covering discharge slot (export_w == 0) during a genuinely FREE import slot
+    (import_rate == 0, e.g. GloBird ZEROHERO's free window) must go IDLE, not
+    self-consumption — self-consumption is price-blind and would drain the battery to cover
+    a live solar shortfall (e.g. unforecast cloud) that equally-free grid import could have
+    served for nothing."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.DISCHARGE,
+        power_w=3_000.0, export_w=0.0, import_rate=0.0,
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    assert bc.names() == ["set_idle"], bc.calls
+
+
+def test_free_window_material_export_still_force_discharges():
+    """A material-export discharge slot must still force_discharge even when import_rate is
+    free — the plan wants to sell, which is unaffected by the import side being free."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.DISCHARGE,
+        power_w=10_000.0, export_w=8_780.0, import_rate=0.0,
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    assert bc.names() == ["force_discharge"], bc.calls
+
+
+def test_priced_load_covering_discharge_unaffected_by_free_rate_logic():
+    """Same load-covering discharge as the free-window test above, but at a real (non-zero)
+    import rate, must be unaffected — still self-consumption (guards against the free-rate
+    IDLE branch leaking into priced slots)."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.DISCHARGE,
+        power_w=3_000.0, export_w=0.0, import_rate=0.517,
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    assert bc.names() == ["set_self_consumption_mode"], bc.calls
+
+
 def test_stale_plan_hands_back_to_native():
     """Watchdog: a stale plan reverts to native EMS exactly once (deadman preserved)."""
     ex, bc = _make_executor()

@@ -304,7 +304,11 @@ class ScheduleExecutor:
     # A DISCHARGE slot only runs as a forced "battery first" discharge when the plan wants
     # a *material* amount of export: a real share of the slot (fraction) AND above an
     # absolute floor. Everything else is treated as load-covering discharge and runs as
-    # self-consumption, which discharges to match load exactly with no rate forced.
+    # self-consumption, which discharges to match load exactly with no rate forced —
+    # unless the slot's import is genuinely free, in which case it goes IDLE instead (see
+    # ``_resolve_discharge``): self-consumption is price-blind, so on a day where actual
+    # solar undershoots the forecast (cloud) it would otherwise drain the battery to cover
+    # load that equally-free grid import could have served for nothing.
     #
     # force_discharge sets the ESS max-discharging-limit to the commanded watts and selects
     # "battery first" mode, which drives discharge *toward* that setpoint — if real-time
@@ -320,13 +324,22 @@ class ScheduleExecutor:
 
         * material export (e.g. the paid evening peak) -> genuine forced discharge at the
           slot's full planned rate, battery-first.
-        * otherwise -> load-covering discharge: run self-consumption so the battery meets
-          house load exactly and the inverter never forces a rate that could spill into a
-          $0 export.
+        * load-covering discharge during a genuinely FREE import slot (``import_rate`` ~0,
+          e.g. a GloBird ZEROHERO free window) -> IDLE, not self-consumption. Self-consumption
+          discharges to match whatever live load/solar gap exists with no awareness of price,
+          so on a day where actual solar undershoots the forecast (cloud) it drains the
+          battery to cover load that could have been served by equally-free grid import
+          instead. IDLE holds SOC and lets the shortfall fall through to import — mirrors the
+          free-price branch in ``_resolve_charge``.
+        * otherwise -> load-covering discharge at a priced rate: run self-consumption so the
+          battery meets house load exactly and the inverter never forces a rate that could
+          spill into a $0 export.
         """
         export_w = iv.export_w
         if export_w > self._EXPORT_MIN_W and export_w >= self._EXPORT_MIN_FRACTION * max(iv.power_w, 0.0):
             return BatteryAction.DISCHARGE, iv.power_w
+        if iv.import_rate is not None and iv.import_rate <= self._FREE_RATE_EPS:
+            return BatteryAction.IDLE, 0.0
         return BatteryAction.SELF_USE, 0.0
 
     def status(self) -> dict:
