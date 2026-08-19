@@ -68,6 +68,20 @@ def sample_is_plausible(delta_w: float, seed_kw: float, floor_w: float = SAMPLE_
     return floor_w <= delta_w <= max(sample_ceiling_w(seed_kw), floor_w)
 
 
+def energy_sample_reject_reason(delta_kwh: float, elapsed_hours: float) -> Optional[str]:
+    """Why `energy_sample_avg_w` would refuse to trust this observation, distinguishing
+    the two very different causes a caller (LoadEstimator) wants to log/record
+    separately: an on-period that just hasn't run long enough yet to trust the coarse
+    counter's resolution, versus the counter itself having gone backwards (a device
+    reboot resetting it, or a rollover) — the same delta/elapsed inputs, but one is
+    "wait longer" and the other is "the meter lied". None if the sample is trustworthy."""
+    if delta_kwh < 0:
+        return "counter_reset"
+    if elapsed_hours < MIN_ENERGY_SAMPLE_HOURS:
+        return "too_short"
+    return None
+
+
 def energy_sample_avg_w(delta_kwh: float, elapsed_hours: float) -> Optional[float]:
     """Average power implied by a cumulative energy sensor's rise over one full on-period.
     None (rather than 0) for a duration too short to trust, or a negative delta — a

@@ -263,6 +263,20 @@ bootstraps from ordinary use. Distinct from "declared/dummy" loads below — tho
 forecast-only by design (the Controlled Load nomination mechanism) and were **not** extended
 by this feature.
 
+**Estimator observability** (added 2026-08-17) — every measured observation (accepted *or*
+rejected, up to the last 40) is persisted as `sample_history` on the estimator
+(`load_estimation.py::_record_sample`, restored across restarts) and exposed via `status()`,
+not just the single most-recent sample kept before. The Load Control card (§10/§11) reads it:
+any row backed by an estimator (either an unmonitored load above, or the power-only case
+below) gets a small toggle that expands a per-device panel — current estimate/seed/sample
+count/calibration source, a convergence chart of the estimate over time, and a list of the
+most recent accept/reject decisions with why (`implausible`, `contaminated`, own-meter
+`too_short`/`counter_reset`). This exists because a rejected or corrupted sample previously
+had no surface at all beyond a DEBUG log line — the 2026-08-05 flap-corruption bug (a
+spurious 2987W reading from an unavailable/unknown control-entity blip mistaken for a real
+off→on transition) would have been visible immediately on this panel instead of only in
+retrospect via the log.
+
 **Power-only inference for the Power Flow card** (added 2026-08-02) — fully automatic, no
 config beyond `load_power_sensor` (same field as above). The Power Flow card drops any
 deferrable-load node with no live `power_entity`, and `entity_lookup.resolve_power_sensor()`
@@ -685,6 +699,7 @@ that?" has to be answerable from the dashboard alone.
 | `switch.*_battery_control` attributes | Applied action/power, last tick, plan age, degraded state, note. |
 | `switch.*_<device>_control` attributes | Commanded state, threshold, override, all three greedy toggles, **`greedy_reason`**, **`greedy_blocked`**, **`forecast_free_kwh` / `forecast_needed_kwh`**, note. Modulating devices add `control_type`, `setpoint_entity`, `min_w`/`cap_w`, `commanded_w`/`commanded_setpoint`, `plugged_in`, `last_write`, `modulation_source`. |
 | **Load Control card** | Per row: control state, and a live greedy line — the firing reason, or why it's blocked, or the **forecast-surplus progress bar** (`6.2 / 8.0 kWh`, hover/focus tooltip explains it). Shown both while armed and tracking toward the trigger, and after it's fired (condition 3 held it on) — the same bar, capped at 100%, rather than only appearing pre-trigger. For a modulating device (§6a): live amps + kW, the max-current ceiling input, and a one-line "why" — `modulation_source` (plan / surplus / override / off) and `plugged_in`. "Why is my car charging at 8 A right now?" must be answerable from the row. |
+| **Load Control card → Estimator panel** | Per-device toggle (rows backed by a `LoadEstimator`, §5, only) expanding: current estimate/seed kW/sample count/calibration source, a convergence chart of the estimate over time, and the last 8 accept/reject decisions with why (`implausible`, `contaminated`, own-meter `too_short`/`counter_reset`). "Why does this estimate look wrong?" must be answerable without `ha core logs`. |
 | **Power Flow card** | A badge on a load node while *greedy*, not the plan, is holding it on — leaf for the two instantaneous reasons, sun-alert for forecast surplus, with the kWh figures in the tooltip. |
 | **Power Chart card** | Free-energy time bands: **orange = free energy being wasted** (plan exports into a ≤$0 export price), **teal = free import window**. Legend appears only when a band is in view; the crosshair tooltip names the band. |
 | `ha core logs` | Every optimiser run logs horizon, device count, solver status, credits, caps, export floor. |

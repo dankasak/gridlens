@@ -38,6 +38,7 @@ from .const import DOMAIN
 from .load_estimate_math import (
     ema_update,
     energy_sample_avg_w,
+    energy_sample_reject_reason,
     integrate_kwh,
     sample_delta_w,
     sample_is_plausible,
@@ -52,6 +53,14 @@ STORE_VERSION = 1
 SETTLE_SECONDS = 180.0
 # How often the running kWh total is advanced while the device reads "on".
 INTEGRATION_INTERVAL_SECONDS = 60
+# Bounded so the persisted blob and the sensor's extra_state_attributes payload both stay
+# small — enough recent decisions (accepted AND rejected) to plot a convergence trend and
+# see WHY a sample was thrown out, without accumulating forever. See status()/
+# _record_sample — this is what makes an accept/reject call inspectable from the
+# dashboard rather than only from the debug log, the gap that let the 2026-08-05
+# flap-corruption bug (see _on_control_state_change) produce a spurious 2987W estimate
+# with nothing on any card hinting why.
+HISTORY_MAX = 40
 
 
 class EstimateStore:
@@ -133,6 +142,11 @@ class LoadEstimator:
         self.running_kwh = 0.0
         self.last_sample_delta_w: Optional[float] = None
         self.last_sample_at: Optional[datetime] = None
+        # Every measured observation, accepted or rejected, newest last — see
+        # _record_sample. Distinct from last_sample_delta_w/last_sample_at above (which
+        # only ever reflect the last *accepted* sample, kept for backwards compatibility
+        # with anything already reading those two fields).
+        self.sample_history: list[dict] = []
         self._last_integrated_at: Optional[datetime] = None
 
         self._pending_baseline_w: Optional[float] = None
@@ -161,6 +175,7 @@ class LoadEstimator:
         self.estimated_w = float(data.get("estimated_w", self.estimated_w))
         self.sample_count = int(data.get("sample_count", 0))
         self.running_kwh = float(data.get("running_kwh", 0.0))
+        self.sample_history = list(data.get("sample_history") or [])[-HISTORY_MAX:]
         last_at = data.get("last_integrated_at")
         self._last_integrated_at = dt_util.parse_datetime(last_at) if last_at else None
 
@@ -319,27 +334,38 @@ class LoadEstimator:
         if baseline is None:
             return
         if self._is_on(self.hass.states.get(self.control_entity_id)) is not True:
-            return  # turned off again right at the boundary — discard
-        if contaminated:
-            _LOGGER.debug(
-                "Load estimator for %s: discarding sample — another deferrable device "
-                "changed state during the settle window", self.name,
-            )
-            return
+            return  # turned off again right at the boundary — discard, no measurement taken
         settled = self._read_load_w()
         if settled is None:
-            return
+            return  # sensor unavailable at settle time — no measurement taken, nothing to record
+        # Read the settled value (and compute delta_w) BEFORE branching on contamination —
+        # previously a contaminated window returned before this point, so a contaminated
+        # sample never appeared anywhere (not even the debug log's number). Now it's
+        # recorded as a rejection like any other, which is the whole point: a rejected
+        # sample should be as inspectable as an accepted one.
         delta_w = sample_delta_w(baseline, settled)
+        if contaminated:
+            _LOGGER.debug(
+                "Load estimator for %s: discarding sample delta=%.0fW — another "
+                "deferrable device changed state during the settle window",
+                self.name, delta_w,
+            )
+            self._record_sample("house_load", delta_w, False, "contaminated")
+            await self._persist()
+            return
         if not sample_is_plausible(delta_w, self.seed_kw):
             _LOGGER.debug(
                 "Load estimator for %s: discarding implausible sample delta=%.0fW",
                 self.name, delta_w,
             )
+            self._record_sample("house_load", delta_w, False, "implausible")
+            await self._persist()
             return
         self.estimated_w = ema_update(self.estimated_w, delta_w)
         self.sample_count += 1
         self.last_sample_delta_w = delta_w
         self.last_sample_at = dt_util.now()
+        self._record_sample("house_load", delta_w, True, None)
         _LOGGER.info(
             "Load estimator for %s: accepted sample delta=%.0fW (n=%d) -> estimate=%.0fW",
             self.name, delta_w, self.sample_count, self.estimated_w,
@@ -364,23 +390,35 @@ class LoadEstimator:
         if kwh_now is None:
             return
         elapsed_h = max(0.0, (now - start_at).total_seconds()) / 3600.0
-        avg_w = energy_sample_avg_w(kwh_now - start_kwh, elapsed_h)
+        delta_kwh = kwh_now - start_kwh
+        avg_w = energy_sample_avg_w(delta_kwh, elapsed_h)
         if avg_w is None:
+            reason = energy_sample_reject_reason(delta_kwh, elapsed_h)
             _LOGGER.debug(
-                "Load estimator for %s: discarding own-meter sample — on-period too "
-                "short or energy counter went backwards (reset/rollover)", self.name,
+                "Load estimator for %s: discarding own-meter sample — %s", self.name,
+                "on-period too short to trust" if reason == "too_short"
+                else "energy counter went backwards (reset/rollover)",
             )
+            # No rate could even be computed here (as opposed to the implausible-avg_w
+            # case below, which has a real number to show) — record with delta_w=None
+            # rather than fabricating a misleading figure from a delta_kwh that isn't a
+            # trustworthy rate.
+            self._record_sample("own_meter", None, False, reason)
+            await self._persist()
             return
         if not sample_is_plausible(avg_w, self.seed_kw):
             _LOGGER.debug(
                 "Load estimator for %s: discarding implausible own-meter sample "
                 "avg=%.0fW", self.name, avg_w,
             )
+            self._record_sample("own_meter", avg_w, False, "implausible")
+            await self._persist()
             return
         self.estimated_w = ema_update(self.estimated_w, avg_w)
         self.sample_count += 1
         self.last_sample_delta_w = avg_w
         self.last_sample_at = dt_util.now()
+        self._record_sample("own_meter", avg_w, True, None)
         _LOGGER.info(
             "Load estimator for %s: accepted own-meter sample avg=%.0fW (n=%d) -> "
             "estimate=%.0fW", self.name, avg_w, self.sample_count, self.estimated_w,
@@ -401,8 +439,29 @@ class LoadEstimator:
             "estimated_w": self.estimated_w,
             "sample_count": self.sample_count,
             "running_kwh": self.running_kwh,
+            "sample_history": self.sample_history,
             "last_integrated_at": (self._last_integrated_at or dt_util.now()).isoformat(),
         })
+
+    def _record_sample(
+        self, kind: str, delta_w: Optional[float], accepted: bool, reason: Optional[str],
+    ) -> None:
+        """Append one accept/reject decision to sample_history — called for every
+        observation a settle/complete pass actually manages to measure, whether it ends
+        up folded into the estimate or thrown out. `delta_w` is None for a rejection
+        where no rate could even be computed (see energy_sample_reject_reason's
+        too_short/counter_reset — an own-meter sample too short/backwards to divide),
+        as opposed to a rejection where a rate WAS computed but judged implausible."""
+        self.sample_history.append({
+            "at": dt_util.now().isoformat(),
+            "delta_w": round(delta_w, 1) if delta_w is not None else None,
+            "resulting_w": round(self.estimated_w, 1),
+            "accepted": accepted,
+            "reason": reason,
+            "kind": kind,
+        })
+        if len(self.sample_history) > HISTORY_MAX:
+            del self.sample_history[: len(self.sample_history) - HISTORY_MAX]
 
     # ------------------------------------------------------------------ observability
     def status(self) -> dict:
@@ -419,4 +478,5 @@ class LoadEstimator:
             "load_power_sensor": self.load_power_sensor or None,
             "energy_sensor": self.energy_sensor or None,
             "track_energy": self.track_energy,
+            "sample_history": self.sample_history,
         }

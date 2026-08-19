@@ -23,6 +23,7 @@ from load_estimate_math import (  # noqa: E402
     SAMPLE_FLOOR_W,
     ema_update,
     energy_sample_avg_w,
+    energy_sample_reject_reason,
     integrate_kwh,
     sample_ceiling_w,
     sample_delta_w,
@@ -117,6 +118,19 @@ def test_energy_sample_avg_w_rejects_negative_delta():
           energy_sample_avg_w(-0.1, 1.0) is None)
 
 
+def test_energy_sample_reject_reason_distinguishes_causes():
+    # The two things energy_sample_avg_w collapses to a single None — same distinction
+    # LoadEstimator._record_sample needs to log/display separately (see
+    # load_estimation.py's _complete_energy_sample).
+    check("negative delta -> counter_reset (checked before the duration, since a reset "
+          "is the more specific/actionable cause even for a too-short window)",
+          energy_sample_reject_reason(-0.1, MIN_ENERGY_SAMPLE_HOURS * 0.9) == "counter_reset")
+    check("too-short window with a normal (non-negative) delta -> too_short",
+          energy_sample_reject_reason(1.0, MIN_ENERGY_SAMPLE_HOURS * 0.9) == "too_short")
+    check("a trustworthy sample has no reject reason",
+          energy_sample_reject_reason(1.0, MIN_ENERGY_SAMPLE_HOURS) is None)
+
+
 if __name__ == "__main__":
     for fn in [
         test_delta_is_settled_minus_baseline,
@@ -130,6 +144,7 @@ if __name__ == "__main__":
         test_energy_sample_avg_w_computes_rate,
         test_energy_sample_avg_w_rejects_too_short_a_window,
         test_energy_sample_avg_w_rejects_negative_delta,
+        test_energy_sample_reject_reason_distinguishes_causes,
     ]:
         fn()
 

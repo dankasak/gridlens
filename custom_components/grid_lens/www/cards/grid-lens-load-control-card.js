@@ -67,7 +67,7 @@
  *   type: custom:grid-lens-load-control-card
  *   title: Deferrable Loads          (optional)
  */
-import { STYLE, esc } from './grid-lens-chart-common.js?v=20260816a';
+import { STYLE, esc, multiLineChart } from './grid-lens-chart-common.js?v=20260816a';
 
 const HISTORY_DAYS = 14;
 const HISTORY_REFRESH_MS = 15 * 60000;
@@ -76,6 +76,34 @@ function friendlyNote(note) {
   if (!note) return '';
   if (note.startsWith('command_error')) return 'Command error';
   return note.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase());
+}
+
+// Friendly labels for LoadEstimator's sample_history rejection reasons (see
+// load_estimation.py's _record_sample) — mirrors friendlyNote()'s job for the control
+// switch's `note` field, one level down (why a specific *measurement* was thrown out,
+// not why the device isn't controlling).
+const EST_REASON_LABELS = {
+  implausible: 'Outside plausible range',
+  contaminated: 'Another device changed state mid-sample',
+  too_short: 'On-period too short to trust',
+  counter_reset: 'Energy counter went backwards',
+};
+function estReasonLabel(reason) {
+  return EST_REASON_LABELS[reason] || (reason ? reason.replace(/_/g, ' ') : '');
+}
+
+// Coarse "how long ago" for a sample_history timestamp — these are debug-panel entries,
+// not a live countdown, so a coarse bucket (not seconds) reads better than exact HH:MM.
+function relTime(iso) {
+  if (!iso) return '–';
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return '–';
+  if (ms < 90000) return 'just now';
+  const m = Math.round(ms / 60000);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
 }
 
 function localMidnightDaysAgo(n) {
@@ -99,6 +127,10 @@ class GridLensLoadControlCard extends HTMLElement {
     // timer rather than on every hass tick).
     this._historyCache = {};
     this._historyPending = new Set();
+    // Which rows have their LoadEstimator debug panel open — keyed by the device's
+    // energy_entity, purely local UI state (no entity write), same "Set of keys" shape
+    // as _historyPending. Never cleared on repaint so it survives every hass tick.
+    this._expandedEstimator = new Set();
   }
 
   setConfig(config) {
@@ -189,6 +221,29 @@ class GridLensLoadControlCard extends HTMLElement {
       if (a.deferrable_sensor_id === d.energy_entity && a.role === 'max_current') return eid;
     }
     return null;
+  }
+
+  // The LoadEstimator-backed entity for a device, if any — a device with a real energy
+  // sensor has neither of these (GridLensEstimatedEnergySensor/…PowerSensor are the only
+  // entities that ever set `sample_count`, see load_estimation.py's status()), so
+  // presence of that one attribute is the join, same attribute-shape-over-naming-
+  // convention pattern every other resolver on this card uses (`on_threshold_w`,
+  // `override`, `deferrable_sensor_id`…). Checks energy_entity first (an "estimated
+  // load" with no real sensor at all — FEATURES.md §5 step 1 — where the synthetic
+  // energy sensor itself carries sample_count), falling back to power_entity (the
+  // "power-only inference" case, §5 step 2: device has a REAL energy sensor but no power
+  // sensor, so the estimator only backs a synthetic power reading, and sample_count
+  // lives there instead). Returns null for a directly-metered device with neither —
+  // exactly "no estimator panel for this row".
+  _estimatorFor(d) {
+    const hass = this._hass;
+    const tryEid = (eid) => {
+      if (!eid) return null;
+      const st = hass.states[eid];
+      const a = st && st.attributes;
+      return a && 'sample_count' in a ? { eid, state: st, attrs: a } : null;
+    };
+    return tryEid(d.energy_entity) || tryEid(d.power_entity);
   }
 
   // Allowed HOURS in the 24 hours starting now, from a device's 7x48 half-hour weekly
@@ -316,6 +371,13 @@ class GridLensLoadControlCard extends HTMLElement {
       const mc = isMod && r.maxCurEid ? hass.states[r.maxCurEid] : null;
       const sp = isMod && d.setpoint_entity ? hass.states[d.setpoint_entity] : null;
       const pw = isMod && d.power_entity ? hass.states[d.power_entity] : null;
+      // LoadEstimator fields — sample_count/last_sample_at change only when a new
+      // observation lands (rarely, on the order of minutes), so they're a cheap proxy
+      // for "sample_history changed" without needing to serialize the whole array into
+      // the signature on every tick. null (join renders as '') for a directly-metered
+      // device, which never repaints from this alone.
+      const est = this._estimatorFor(d);
+      const estA = est && est.attrs;
       return [
         r.device.energy_entity,
         // greedy_reason / forecast_free_kwh live in the control switch's ATTRIBUTES and
@@ -338,6 +400,7 @@ class GridLensLoadControlCard extends HTMLElement {
         mc ? mc.state : '',
         sp ? sp.state : '',
         pw ? pw.state : '',
+        estA ? `${estA.sample_count}|${estA.last_sample_at}|${estA.estimated_kw}|${est.state.state}` : '',
       ].join('~');
     }).join(',');
     if (sig !== this._sig) { this._sig = sig; this._rows = rows; this._paint(); }
@@ -428,6 +491,28 @@ class GridLensLoadControlCard extends HTMLElement {
         .sbar.today { background: var(--ink); opacity: .85; }
         .spark-avg { font-size: 9.5px; color: var(--ink2); white-space: nowrap; }
         .spark-ph { width: 62px; height: 22px; }
+        /* LoadEstimator debug panel — toggle button on a row backed by an estimator
+           (no real energy sensor), and the expanded detail block underneath it. Reuses
+           .gbtn's icon-button look for the toggle so it reads as a sibling of the
+           Greedy icons rather than a new control language. */
+        .est-toggle.on { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+        .est-panel { flex: 1 1 100%; margin: 2px 0 6px 34px; padding: 10px 12px;
+               border: 1px solid var(--border); border-radius: 9px; background: var(--panel-bg, rgba(127,127,127,.06)); }
+        .est-stats { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-bottom: 8px; }
+        .est-stat { display: flex; flex-direction: column; gap: 1px; }
+        .est-stat .v { font-size: 13px; font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
+        .est-stat .l { font-size: 9.5px; color: var(--ink2); text-transform: uppercase; letter-spacing: .02em; }
+        .est-chart { margin: 4px 0 8px; }
+        .est-chart .chart-svg { width: 100%; height: 90px; display: block; }
+        .est-empty { font-size: 11.5px; color: var(--ink2); font-style: italic; padding: 4px 0; }
+        .est-samples { display: flex; flex-direction: column; gap: 3px; }
+        .est-sample-hd { font-size: 9.5px; color: var(--ink2); text-transform: uppercase; letter-spacing: .02em; margin-bottom: 2px; }
+        .est-sample { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--ink); padding: 2px 0; }
+        .est-sample .t { color: var(--ink2); flex: 0 0 64px; }
+        .est-sample .d { flex: 0 0 64px; font-variant-numeric: tabular-nums; }
+        .est-sample .r { flex: 1 1 auto; font-size: 10.5px; }
+        .est-sample.ok .r { color: var(--good); }
+        .est-sample.rej .r { color: var(--buy); }
         /* Custom tooltip: a JS-delegated popup (see _initTooltip) standing in for the
            native title="" tooltip everywhere on this card. Native title tooltips have a
            long, browser-controlled show delay (~1s in Chrome) and are unreliable to
@@ -684,6 +769,88 @@ class GridLensLoadControlCard extends HTMLElement {
       </div>`;
   }
 
+  // Icon toggle that opens/closes the LoadEstimator debug panel for a row — reuses the
+  // .gbtn look (see the Greedy icons) so it reads as a sibling control, not a new
+  // language. Only rendered for a row _estimatorFor() resolved something for.
+  _estimatorToggleHtml(est) {
+    const open = this._expandedEstimator.has(est.eid);
+    return `<div class="gbtn est-toggle${open ? ' on' : ''}" data-est-eid="${esc(est.eid)}" tabindex="0"
+      data-tip="${open ? 'Hide' : 'Show'} how this device's usage is being estimated">
+      <ha-icon icon="mdi:chart-bell-curve-cumulative"></ha-icon>
+    </div>`;
+  }
+
+  // The expanded debug panel itself: current numbers, a convergence chart of accepted
+  // samples over time, and a list of the most recent accept/reject decisions with why —
+  // see load_estimation.py's LoadEstimator.status()/sample_history. This is the surface
+  // the whole feature exists for: making an estimate (and any sample thrown out along
+  // the way) inspectable from the dashboard instead of only the debug log.
+  _estimatorPanelHtml(d, est) {
+    const a = est.attrs;
+    const history = Array.isArray(a.sample_history) ? a.sample_history : [];
+    const kind = a.energy_sensor ? 'own meter' : (a.load_power_sensor ? 'house load' : 'not sampled yet');
+
+    // Prefer the last *accepted* sample_history entry over last_sample_delta_w/_at —
+    // those two attributes are only ever updated in-memory (load_estimation.py never
+    // persists them across a restart, unlike sample_history), so they go stale to null
+    // right after HA restarts even when sample_count shows samples already happened.
+    // history carries the same info and IS persisted, so this reads correctly in both
+    // the same-session and post-restart case instead of only the former.
+    const lastAccepted = [...history].reverse().find((h) => h.accepted);
+    const lastSampleStr = lastAccepted
+      ? `${lastAccepted.delta_w != null ? lastAccepted.delta_w.toFixed(0) + ' W' : '–'} · ${relTime(lastAccepted.at)}`
+      : (a.last_sample_delta_w != null ? `${a.last_sample_delta_w.toFixed(0)} W · ${relTime(a.last_sample_at)}` : '–');
+
+    const stats = [
+      ['Estimate', `${(a.estimated_kw * 1000).toFixed(0)} W`],
+      ['Seed', `${a.manual_kw.toFixed(2)} kW`],
+      ['Samples', `${a.sample_count}`],
+      ['Last sample', lastSampleStr],
+      ['Calibrates from', kind],
+      ['Auto-refine', a.auto_refine ? 'On' : 'Off'],
+    ];
+    if (a.track_energy) stats.push(['Running today', `${(parseFloat(est.state.state) || 0).toFixed(2)} kWh`]);
+    const statsHtml = stats.map(([l, v]) => `
+      <div class="est-stat"><span class="v">${esc(v)}</span><span class="l">${esc(l)}</span></div>`).join('');
+
+    // Convergence chart — one point per accepted sample, the running estimate right
+    // after it was folded in. multiLineChart's "points" mode (see grid-lens-chart-
+    // common.js) takes {t: Date, v} pairs directly, so history needs no reshaping into
+    // 30-min trajectory slots the way every other chart on this card's siblings does.
+    const withTime = history.map((h) => ({ ...h, t: new Date(h.at) })).filter((h) => !isNaN(h.t.getTime()));
+    let chartHtml;
+    if (withTime.length >= 2) {
+      const t0 = withTime[0].t.getTime(), t1 = Date.now();
+      chartHtml = multiLineChart(withTime, { t0, t1 }, [{
+        points: withTime.map((h) => ({ t: h.t, v: h.resulting_w })),
+        color: 'var(--ink)',
+      }], { height: 90, fmt: (v) => `${v.toFixed(0)}W` });
+    } else {
+      chartHtml = `<div class="est-empty">Not enough samples yet to chart a trend — needs at least 2 observations (accepted or rejected).</div>`;
+    }
+
+    // Most recent decisions first — this is what makes a rejected sample (contaminated,
+    // implausible, own-meter counter reset…) visible at all; previously only the debug
+    // log ever saw these.
+    const rows = history.slice(-8).reverse().map((h) => {
+      const magnitude = h.delta_w != null ? `${h.delta_w.toFixed(0)} W` : '–';
+      const why = h.accepted ? 'Accepted' : `Rejected · ${esc(estReasonLabel(h.reason))}`;
+      return `<div class="est-sample ${h.accepted ? 'ok' : 'rej'}">
+        <span class="t">${relTime(h.at)}</span><span class="d">${magnitude}</span><span class="r">${why}</span>
+      </div>`;
+    }).join('');
+    const samplesHtml = history.length
+      ? `<div class="est-samples"><div class="est-sample-hd">Recent observations</div>${rows}</div>`
+      : '';
+
+    return `
+      <div class="est-panel">
+        <div class="est-stats">${statsHtml}</div>
+        <div class="est-chart">${chartHtml}</div>
+        ${samplesHtml}
+      </div>`;
+  }
+
   _paint() {
     const body = this.shadowRoot && this.shadowRoot.querySelector('.body');
     if (!body) return;
@@ -791,6 +958,14 @@ class GridLensLoadControlCard extends HTMLElement {
       // the boost input it's meant to inform.
       const sparkHtml = this._sparklineHtml(d.energy_entity);
 
+      // LoadEstimator debug toggle + panel — only for a device whose usage is inferred
+      // rather than measured (see _estimatorFor). '' for every directly-metered device,
+      // same "return '' when not applicable" convention as the modulating-only helpers.
+      const est = this._estimatorFor(d);
+      const estToggleHtml = est ? this._estimatorToggleHtml(est) : '';
+      const estPanelHtml = est && this._expandedEstimator.has(est.eid)
+        ? this._estimatorPanelHtml(d, est) : '';
+
       // Modulating-only additions — appended after the existing sparkline/boost elements
       // so a non-modulating row's markup up to this point is byte-for-byte unchanged.
       // Both return '' for a non-modulating device, so nothing is inserted for one.
@@ -841,7 +1016,9 @@ class GridLensLoadControlCard extends HTMLElement {
           ${currentHtml}
           ${maxCurHtml}
           ${greedyHtml}
+          ${estToggleHtml}
           ${controlHtml}
+          ${estPanelHtml}
         </div>`;
     }).join('');
 
@@ -874,6 +1051,15 @@ class GridLensLoadControlCard extends HTMLElement {
             entity_id: grp.getAttribute('data-ctl'),
           });
         }
+      });
+    });
+    // LoadEstimator debug panel toggle — local UI state only, no service call.
+    body.querySelectorAll('.est-toggle[data-est-eid]').forEach((el) => {
+      el.addEventListener('click', () => {
+        const eid = el.getAttribute('data-est-eid');
+        if (this._expandedEstimator.has(eid)) this._expandedEstimator.delete(eid);
+        else this._expandedEstimator.add(eid);
+        this._paint();
       });
     });
     body.querySelectorAll('.boost-input').forEach((el) => {
