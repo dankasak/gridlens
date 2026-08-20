@@ -7,11 +7,23 @@ import logging
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import DOMAIN
+
+# Power Flow diagram layouts the user can independently show/hide on the Power Flow
+# dashboard view: (layout key, display name, icon, default on). Both can be on at once —
+# the seed renders them side by side, scene first. Classic defaults ON and scene OFF,
+# matching the card's own `layout` default and the "classic is the low-CPU option" stance
+# in FEATURES.md §10 — a fresh install shouldn't start decoding scene video per card
+# without opting in.
+_POWERFLOW_LAYOUTS = (
+    ("scene", "Show Scene Power Flow", "mdi:image-filter-hdr", False),
+    ("classic", "Show Classic Power Flow", "mdi:chart-donut-variant", True),
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,6 +54,15 @@ async def async_setup_entry(
             entities.append(
                 GridLensDeferrableGreedySurplusSwitch(load_mgr, entry, index, controller.name)
             )
+
+    # Power Flow layout visibility toggles — pure dashboard display preferences, so they
+    # exist on every entry regardless of battery/inverter/entitlement config (the Power Flow
+    # card itself is gated, but a toggle for a card you can't see is harmless, and gating
+    # these too would make the seeded view's conditional cards reference missing entities).
+    for layout, name, icon, default_on in _POWERFLOW_LAYOUTS:
+        entities.append(
+            GridLensPowerflowLayoutSwitch(entry, layout, name, icon, default_on)
+        )
 
     if entities:
         async_add_entities(entities)
@@ -325,5 +346,61 @@ class GridLensDeferrableGreedySurplusSwitch(RestoreEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         await self._manager.set_greedy_forecast_surplus(self._index, False)
+        self._attr_is_on = False
+        self.async_write_ha_state()
+
+
+class GridLensPowerflowLayoutSwitch(RestoreEntity, SwitchEntity):
+    """ON = show this Power Flow diagram layout (scene / classic) on the Power Flow view.
+
+    A pure display preference, not device control: nothing actuates hardware and there is no
+    deadman, so plain ``RestoreEntity`` is the right persistence here — the dedicated-Store
+    pattern used by the control switches exists specifically because a deadman forces those
+    off on every reload, which would corrupt a restored intent (see control/manager.py and
+    the 2026-08-01 checklist entry). Neither hazard applies to a checkbox for a chart.
+
+    Entity category CONFIG so these sit under the device's configuration entities rather
+    than mixed in with the operational sensors/switches.
+
+    The seeded Power Flow view wraps each diagram instance in a native ``conditional`` card
+    keyed to one of these, and the compact advisory card renders them as toggle chips in its
+    header (``layout_toggles``) — but nothing here is dashboard-specific: these are ordinary
+    switches, so a user can equally drive them from an automation (e.g. only render the
+    scene layout on the wall tablet in the evening).
+    """
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(
+        self, entry: ConfigEntry, layout: str, name: str, icon: str, default_on: bool
+    ) -> None:
+        self._layout = layout
+        self._attr_name = name
+        self._attr_icon = icon
+        self._attr_unique_id = f"{entry.entry_id}_powerflow_show_{layout}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_is_on = default_on
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last is not None and last.state in ("on", "off"):
+            self._attr_is_on = last.state == "on"
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {"layout": self._layout}
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self._attr_is_on = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
         self._attr_is_on = False
         self.async_write_ha_state()

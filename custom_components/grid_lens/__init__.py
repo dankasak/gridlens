@@ -13,8 +13,9 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
     DOMAIN, PLAN_ID_TO_KEY, CONF_DISTRIBUTOR, CONF_DEFERRABLE_LOAD_SENSORS,
-    CONF_LOAD_POWER_SENSOR, CONF_GRID_POWER_SENSOR,
+    CONF_LOAD_POWER_SENSOR, CONF_GRID_POWER_SENSOR, CONF_ENERGY_SENSOR,
     CONF_BATTERY_CHARGE_POWER_SENSOR, CONF_BATTERY_DISCHARGE_POWER_SENSOR,
+    CONF_DEFERRABLE_LOAD_SOC_SENSORS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -40,6 +41,68 @@ Contents:
   energy_flows.json         — Hourly energy flows (first 24 hours of period)
   plans/<plan>.json         — Per-plan LP schedules, bill breakdowns, hourly profiles
 """
+
+
+def _discover_grid_power_entity(hass: HomeAssistant, entry) -> str | None:
+    """Live SIGNED grid power entity (+ import / − export) for the Power Flow Grid node.
+
+    An explicit ``grid_power_sensor`` always wins. Otherwise this is auto-discovered rather
+    than asked for: HA core exposes no universal live grid-power slot (unlike solar — the
+    Energy Dashboard's grid source carries only cumulative ``stat_energy_from``/``_to``, no
+    live rate), but an integration that publishes grid *energy* virtually always publishes
+    live grid *power* from the same device. So look on the same DEVICE as the grid
+    import-energy sensor the user already configured, whatever the brand.
+
+    Direction-specific halves (``*_import_power`` / ``*_export_power``) and per-phase
+    breakdowns are skipped — the card reads one signed value, and an unsigned half can't
+    express direction on its own. Returns None rather than guessing if nothing clean
+    matches, which just leaves the Grid node without a live figure (the pre-existing
+    behaviour) instead of showing a confidently wrong one.
+
+    NOTE: deliberately scoped to the dashboard card. It does NOT write
+    ``grid_power_sensor`` into the config entry, because that field additionally arms
+    Greedy Consumption's real-time export-surplus trigger (``control/load_control_manager``)
+    — a behaviour change that switches real appliances on and must stay an explicit opt-in,
+    not a side effect of fixing a diagram.
+    """
+    explicit = entry.data.get(CONF_GRID_POWER_SENSOR)
+    if explicit:
+        return explicit
+    energy_sensor = entry.data.get(CONF_ENERGY_SENSOR)
+    if not energy_sensor:
+        return None
+
+    from homeassistant.helpers import entity_registry as er
+
+    reg = er.async_get(hass)
+    source = reg.async_get(energy_sensor)
+    if source is None or not source.device_id:
+        return None
+
+    candidates: list[str] = []
+    for ent in reg.entities.values():
+        if ent.device_id != source.device_id or ent.domain != "sensor":
+            continue
+        low = ent.entity_id.lower()
+        if "grid" not in low:
+            continue                        # battery/PV power on the same device
+        if "phase" in low:
+            continue                        # per-phase breakdown, not the site total
+        if "import" in low or "export" in low:
+            continue                        # unsigned half — no direction on its own
+        state = hass.states.get(ent.entity_id)
+        if state is None:
+            continue
+        attrs = state.attributes
+        if attrs.get("device_class") != "power":
+            continue
+        if str(attrs.get("unit_of_measurement", "")).lower() not in ("w", "kw"):
+            continue
+        candidates.append(ent.entity_id)
+
+    # Shortest id wins when an integration exposes several: the unadorned site total
+    # rather than a longer derived/qualified variant of it.
+    return sorted(candidates, key=len)[0] if candidates else None
 
 
 def _build_seed_views(hass: HomeAssistant) -> list[dict]:
@@ -83,13 +146,17 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
             **({"entity": current_plan_cost} if current_plan_cost else {}),
         }],
     }
-    views = [plan_comparison_view]
+    # Plan Comparison goes LAST, appended at the end of this function (user request
+    # 2026-08-20) — it's the "should I switch retailer?" question, revisited occasionally,
+    # whereas Power Flow is the day-to-day screen. HA opens a dashboard on its FIRST view,
+    # so ordering here decides the landing page, not just tab order.
+    views = []
 
     dispatch = eid(f"{entry.entry_id}_planned_dispatch")
     if not dispatch:
         # Advisory/battery-plan system not set up for this entry (e.g. still
         # initializing) — the Plan Comparison view alone is still useful.
-        return views
+        return [plan_comparison_view]
 
     battery_control = eid(f"{entry.entry_id}_battery_control")
 
@@ -100,50 +167,130 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
     # without having to switch to Battery Plan). User request 2026-08-20: split the
     # diagram out of the Battery Plan view onto its own page, and surface the
     # optimiser/plan details there too.
+    # Live power sensors, threaded straight from the same config_flow fields the
+    # Sensors/Battery setup steps already collect (Load Power sensor, Grid Power
+    # sensor, Battery charge/discharge power sensors) — no separate onboarding
+    # needed, and no per-install hardcoding: any field left unset on a given install
+    # is simply omitted. solar_power_entity/ev_* have no config_flow counterpart yet
+    # (see FEATURES.md §10) — the card's own auto-discovery covers solar (HA Energy
+    # Dashboard's stat_rate); EV stays manual-only. Shared by both layout instances
+    # below so they can never drift apart.
+    powerflow_entities = {
+        **({"load_power_entity": entry.data.get(CONF_LOAD_POWER_SENSOR)}
+           if entry.data.get(CONF_LOAD_POWER_SENSOR) else {}),
+        # Explicit config if set, else discovered off the grid-energy sensor's own device
+        # — see _discover_grid_power_entity(). Card-only: does not arm greedy surplus.
+        **({"grid_power_entity": _discover_grid_power_entity(hass, entry)}
+           if _discover_grid_power_entity(hass, entry) else {}),
+        # battery_charge_power_sensor is the "signed" sensor by convention
+        # (plan_calculator.py's own reading of it — positive=charging,
+        # negative=discharging when no separate discharge sensor is set); pass the
+        # optional discharge sensor alongside it whenever the install has one, so the
+        # card can net the pair itself the same way plan_calculator already does for
+        # the LP's historical battery-power fetch.
+        **({"battery_power_entity": entry.data.get(CONF_BATTERY_CHARGE_POWER_SENSOR)}
+           if entry.data.get(CONF_BATTERY_CHARGE_POWER_SENSOR) else {}),
+        **({"battery_discharge_power_entity": entry.data.get(CONF_BATTERY_DISCHARGE_POWER_SENSOR)}
+           if entry.data.get(CONF_BATTERY_DISCHARGE_POWER_SENSOR) else {}),
+        **({"soc_entity": entry.data.get("battery_soc_sensor")}
+           if entry.data.get("battery_soc_sensor") else {}),
+        # Suppress the dedicated EV satellite node when the EV is ALREADY drawn as one of
+        # the deferrable-load nodes, or the same vehicle appears twice on the diagram. A
+        # deferrable load carrying its own SOC sensor is a battery-on-wheels — that config
+        # field exists precisely for an EV charger (FEATURES.md §5) — so this is derived
+        # from config rather than hardcoded: an install whose EV is *not* set up as a
+        # deferrable load still gets the satellite, which is the card's default.
+        **({"show_ev": False} if any(
+            (s or "").strip()
+            for s in (entry.data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, []) or [])
+        ) else {}),
+    }
+
+    # Two independently show/hide-able Power Flow diagram instances — the photoreal
+    # `scene` layout and the computed `classic` one — each wrapped in a native
+    # `conditional` card keyed to its own switch (switch.py's _POWERFLOW_LAYOUTS).
+    # Both can be on at once; scene renders left of classic, matching the order here.
+    # The toggles themselves are chips in the "Optimiser & Plan" header below rather
+    # than sitting on the diagrams, so the whole "what am I looking at / when was it
+    # computed" bar reads as one unit (user request 2026-08-20).
+    #
+    # Sizing differs per layout on purpose — don't copy one layout's numbers onto the
+    # other:
+    #  - classic renders square, so max_width is what actually sets its size and
+    #    max_height only needs to be a non-clipping ceiling above it (the "move all
+    #    three together" rule is about not distorting that square). 550 rather than a
+    #    full 700: side by side with the scene layout, a 700px classic crowds the row
+    #    and reads oversized on its own (matches the width this dev rig had hand-tuned
+    #    to before the split — 2026-08-20 user feedback: "a bit large").
+    #  - scene is pinned to its background's aspect ratio instead; the shipped v9 cabin
+    #    is 1360x752, so ~900x498 keeps it undistorted.
+    layout_cards = []
+    for layout, unique_suffix, geometry, extra in (
+        # show_labels off for scene: its photoreal elements ARE the indicators (a turning
+        # wheel, a breathing dragon), so name/value text drawn over them just clutters the
+        # artwork — the classic layout has no other way to identify a node, so it keeps
+        # its labels. Nodes stay tappable either way via the invisible hit-circle.
+        ("scene", "powerflow_show_scene",
+         {"max_height": 498, "max_width": 900, "flex": "0 1 900px"},
+         {"show_labels": False}),
+        ("classic", "powerflow_show_classic",
+         {"max_height": 780, "max_width": 550, "flex": "0 1 550px"},
+         {}),
+    ):
+        card = {
+            "type": "custom:grid-lens-powerflow-card",
+            "layout": layout,
+            "icon_scale": 1.5, "font_scale": 0.7,
+            **{k: v for k, v in geometry.items() if k != "flex"},
+            **extra,
+            **powerflow_entities,
+        }
+        toggle = eid(f"{entry.entry_id}_{unique_suffix}")
+        if toggle:
+            # `flex` is read by grid-lens-flex-row-card off the CHILD it lays out — which
+            # is the conditional wrapper here, not the diagram — so it belongs on the
+            # wrapper. The flex-row card collapses a hidden conditional child out of the
+            # row entirely (see its _syncVisibility), so the surviving layout reclaims
+            # the space instead of sitting next to an empty slot.
+            layout_cards.append({
+                "type": "conditional",
+                "conditions": [{"condition": "state", "entity": toggle, "state": "on"}],
+                "card": card,
+                "flex": geometry["flex"],
+            })
+        else:
+            # No toggle entity resolved (shouldn't happen — switch.py adds both
+            # unconditionally — but a seed must never emit a dangling entity reference):
+            # fall back to showing the card's own default layout, unconditionally.
+            if layout == "classic":
+                layout_cards.append({**card, "flex": geometry["flex"]})
+
     power_flow_sections = [{"column_span": 3, "cards": [{
         "type": "custom:grid-lens-advisory-card", "entity": dispatch,
         "compact": True, "title": "Optimiser & Plan",
         **({"control_switch_entity": battery_control} if battery_control else {}),
+        **({"layout_toggles": [
+            {"entity": t, "label": lbl}
+            for t, lbl in (
+                (eid(f"{entry.entry_id}_powerflow_show_scene"), "Scene"),
+                (eid(f"{entry.entry_id}_powerflow_show_classic"), "Classic"),
+            ) if t
+        ]} if eid(f"{entry.entry_id}_powerflow_show_scene")
+             or eid(f"{entry.entry_id}_powerflow_show_classic") else {}),
         "grid_options": {"columns": "full"},
     }]}, {"column_span": 3, "cards": [{
         "type": "custom:grid-lens-flex-row-card",
         "gap": 16,
         "cards": [
-            {
-                "type": "custom:grid-lens-powerflow-card",
-                # height/width/flex must move together — the diagram is square, so a
-                # size bump here (e.g. to fit a taller node label) that doesn't keep
-                # all three in lockstep distorts the aspect ratio instead.
-                "max_height": 700, "max_width": 700, "flex": "0 1 700px",
-                "icon_scale": 1.5, "font_scale": 0.7,
-                # Live power sensors, threaded straight from the same config_flow
-                # fields the Sensors/Battery setup steps already collect (Load Power
-                # sensor, Grid Power sensor, Battery charge/discharge power sensors) —
-                # no separate onboarding needed, and no per-install hardcoding: any
-                # field left unset on a given install is simply omitted, same pattern
-                # as soc_entity below. solar_power_entity/ev_* have no config_flow
-                # counterpart yet (see FEATURES.md §10) — the card's own auto-discovery
-                # covers solar (HA Energy Dashboard's stat_rate); EV stays manual-only.
-                **({"load_power_entity": entry.data.get(CONF_LOAD_POWER_SENSOR)}
-                   if entry.data.get(CONF_LOAD_POWER_SENSOR) else {}),
-                **({"grid_power_entity": entry.data.get(CONF_GRID_POWER_SENSOR)}
-                   if entry.data.get(CONF_GRID_POWER_SENSOR) else {}),
-                # battery_charge_power_sensor is the "signed" sensor by convention
-                # (plan_calculator.py's own reading of it — positive=charging,
-                # negative=discharging when no separate discharge sensor is set); pass
-                # the optional discharge sensor alongside it whenever the install has
-                # one, so the card can net the pair itself the same way plan_calculator
-                # already does for the LP's historical battery-power fetch.
-                **({"battery_power_entity": entry.data.get(CONF_BATTERY_CHARGE_POWER_SENSOR)}
-                   if entry.data.get(CONF_BATTERY_CHARGE_POWER_SENSOR) else {}),
-                **({"battery_discharge_power_entity": entry.data.get(CONF_BATTERY_DISCHARGE_POWER_SENSOR)}
-                   if entry.data.get(CONF_BATTERY_DISCHARGE_POWER_SENSOR) else {}),
-                **({"soc_entity": entry.data.get("battery_soc_sensor")}
-                   if entry.data.get("battery_soc_sensor") else {}),
-            },
+            *layout_cards,
             {
                 "type": "custom:grid-lens-power-chart-card",
                 "entity": dispatch, "max_height": 615, "flex": "1 1 300px",
+                # Beside a single diagram there's room for all three across; with BOTH
+                # layouts on, three-across squeezes every one of them, so the chart drops
+                # to a full-width line underneath instead (user request 2026-08-20).
+                # Evaluated against live visibility by the flex-row card, not baked in.
+                "own_line_when_siblings": 2,
             },
         ],
         "grid_options": {"columns": "full"},
@@ -291,6 +438,8 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
             "cards": [], "sections": [{"column_span": 2, "cards": settings_cards}],
         })
 
+    # Last, deliberately — see where it's built at the top of this function.
+    views.append(plan_comparison_view)
     return views
 
 
@@ -328,7 +477,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260820a"
+    _CARD_VERSION = "20260820f"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",

@@ -636,7 +636,7 @@ convention, never a hardcoded entity id — so they work unmodified on any insta
 | `grid-lens-advisory-card` | Plan status header (plan name/solver/last-run time, status badge), control-mode timeline, deferrable-load recommendations. `compact: true` config renders just the header — used as a slim "optimiser & plan" status bar at the top of the Power Flow view; `title` config overrides the header text in that mode. |
 | `grid-lens-load-control-card` | One row per deferrable load: Today Boost, greedy toggles, Off now / On now / Auto, and live greedy status. |
 | `grid-lens-defer-schedule-card` | The 7 × 48 allowed-run-times editor. |
-| `grid-lens-flex-row-card` | Layout helper. |
+| `grid-lens-flex-row-card` | Layout helper — per-child `flex` control, stacks below a breakpoint, and collapses children that hide themselves (native `conditional` cards) out of the row. |
 
 **Aggregated Aircon node** (Power Flow card, added 2026-08-02, wattage+estimate cue added
 2026-08-05). Every `climate.*` entity that isn't a group/aggregator wrapper (identified by the
@@ -674,12 +674,55 @@ why a bad estimate here (a device on a flaky integration flapping `unavailable` 
 
 **Seeded dashboard.** New installs get a "Grid Lens" sidebar dashboard built by
 `_build_seed_views()` in `__init__.py`, written **once** into `.storage/lovelace.grid_lens`.
-Views: Plan Comparison, Power Flow, Battery Plan, Settings.
+Views, in order: **Power Flow, Battery Plan, Settings, Plan Comparison**. Power Flow is
+first deliberately — HA opens a dashboard on its first view, so that's the landing page;
+Plan Comparison sits last as the occasionally-revisited "should I switch retailer?"
+screen (reordered 2026-08-20, user request).
 
 **Power Flow view** (split out of Battery Plan 2026-08-20, user request) — the
 `grid-lens-powerflow-card` diagram + `grid-lens-power-chart-card`, with the compact
 `grid-lens-advisory-card` status bar (see table above) pinned at the top so "when did
 the optimiser last run" is visible without switching to the Battery Plan view.
+
+**Power Flow layout toggles** (added 2026-08-20, user request). Two entities —
+`switch.*_show_scene_power_flow` and `switch.*_show_classic_power_flow`
+(`EntityCategory.CONFIG`, `RestoreEntity`-persisted, defined by `_POWERFLOW_LAYOUTS` in
+`switch.py`) — independently show/hide a `scene` and a `classic` instance of the Power
+Flow diagram. **Both can be on at once**, rendering side by side with scene on the left.
+Defaults: classic ON, scene OFF (classic is the low-CPU option — a fresh install
+shouldn't decode scene video without opting in). Ordinary switches, so an automation can
+drive them too (e.g. scene only on the wall tablet in the evening).
+- The seed wraps each diagram in a native `conditional` card keyed to its switch, inside
+  the `flex-row-card`. **`flex` goes on the conditional wrapper, not the diagram** — the
+  flex-row card lays out its direct children, which are the wrappers.
+- `grid-lens-flex-row-card` collapses a child that hides itself (`el.hidden`) out of the
+  row entirely — needed because it sets an inline `display:block` on every child, which
+  otherwise beats `[hidden]{display:none}` and leaves a blank gap holding its flex basis.
+  Uses a `MutationObserver` on `hidden` as well as syncing on `set hass`, since a
+  conditional card flips `hidden` when *it* receives hass, which can land after ours.
+- **With both layouts on, the power chart moves to a full-width line underneath them**
+  rather than squeezing three across. Driven by the flex-row card's
+  `own_line_when_siblings: N` per-child option (seed sets `2` on the chart), evaluated
+  against *live* visibility — so it reflows as the toggles change, not baked into the
+  seed. Implemented by nesting the non-own-line children in a nowrap `.group` and
+  switching only the own-line child's basis to 100%; the main row deliberately still
+  doesn't use `flex-wrap`, which this card abandoned early on because wrapping keys off
+  flex-*basis* rather than post-shrink size and broke rows far too eagerly.
+- The toggle chips are rendered by `grid-lens-advisory-card`'s `layout_toggles` config
+  (a generic list of `{entity, label}` — nothing Power-Flow-specific about it; works in
+  the full card too, not just `compact`).
+- **Sizing differs per layout on purpose** — don't copy one's numbers onto the other.
+  Classic renders square, so `max_width` (550) is what sets its size and `max_height`
+  (780) is just a non-clipping ceiling; the §10 "move all three together" gotcha is about
+  not distorting that square. Scene is pinned to its background's aspect ratio instead
+  (shipped v9 cabin is 1360×752 → ~900×498). The scene instance also sets
+  `show_labels: false` — its photoreal elements are themselves the indicators, so
+  overlaid name/value text just clutters the artwork; classic keeps its labels since it
+  has no other way to identify a node. Nodes stay tappable either way.
+- `show_ev` is **derived, not hardcoded**: the dedicated EV satellite node is suppressed
+  when any deferrable load has an SOC sensor configured (that field exists for an EV
+  charger — §5), since the vehicle is then already drawn as a load node and would appear
+  twice. An install whose EV isn't a deferrable load still gets the satellite.
 
 **Battery Plan view** — the status tiles (Now/SOC now/Planned end/Plan net cost), the
 full (non-compact) `grid-lens-advisory-card`, and the SOC/dispatch/price/cash forecast

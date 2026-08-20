@@ -17,11 +17,22 @@
  *   control_switch_entity: switch.roof_grid_lens_nsw_battery_control (optional)
  *   compact: true                                          (optional)
  *   title: "Optimiser & Plan"                               (optional, compact mode only)
+ *   layout_toggles:                                         (optional)
+ *     - entity: switch.<...>_show_scene_power_flow
+ *       label: Scene
+ *     - entity: switch.<...>_show_classic_power_flow
+ *       label: Classic
  *
  * `compact: true` renders only the header row (title, plan name/solver/last-run
  * time, status badge) and skips the mode timeline / deferrable-load sections below
  * it — a slim status bar for surfacing "when did the optimiser last run" on a page
  * that isn't the full Battery Plan view (e.g. at the top of the Power Flow page).
+ *
+ * `layout_toggles` adds a clickable on/off chip per entry to the header, toggling that
+ * entity (any `switch.*` — nothing here is specific to the Power Flow layouts it was
+ * built for). The chips are deliberately co-located with the plan status rather than
+ * living on the cards they control, so "what am I looking at, and when was it computed"
+ * reads as one bar. Independent of `compact` — works in the full card too.
  */
 import {
   STYLE, esc, fmtTime, fmtDayHour, modeLabel, MODE_COLORS, execMode, reasonFor, deferColorFor,
@@ -86,8 +97,55 @@ class GridLensAdvisoryCard extends HTMLElement {
       restored: a.restored === true,
     };
 
-    const sig = `${st.last_updated}|${switchSt ? switchSt.last_updated : ''}`;
+    // Toggle chips live in this card but reflect OTHER entities' state, so their states
+    // have to be part of the repaint signature — otherwise flipping one wouldn't redraw
+    // the chip until the dispatch sensor happened to update (up to a full plan interval).
+    const toggleSig = this._layoutToggles()
+      .map((t) => `${t.entity}=${hass.states[t.entity] ? hass.states[t.entity].state : '?'}`)
+      .join(',');
+
+    const sig = `${st.last_updated}|${switchSt ? switchSt.last_updated : ''}|${toggleSig}`;
     if (sig !== this._sig) { this._sig = sig; this._paint(); }
+  }
+
+  // Configured toggles, normalised and filtered to those naming an entity. Label falls
+  // back to the entity's friendly name so a minimal `- entity: switch.x` still reads.
+  _layoutToggles() {
+    const raw = this._config.layout_toggles;
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((t) => (typeof t === 'string' ? { entity: t } : t))
+      .filter((t) => t && t.entity);
+  }
+
+  _toggleChipsHtml() {
+    const toggles = this._layoutToggles();
+    if (!toggles.length || !this._hass) return '';
+    const chips = toggles.map((t) => {
+      const st = this._hass.states[t.entity];
+      if (!st) return '';
+      const on = String(st.state) === 'on';
+      const label = t.label
+        || (st.attributes && st.attributes.friendly_name)
+        || t.entity;
+      return `<button class="chip${on ? ' on' : ''}" type="button"
+        data-toggle-entity="${esc(t.entity)}"
+        role="switch" aria-checked="${on}"
+        title="${on ? 'Showing' : 'Hidden'} — click to toggle">
+        <span class="chip-dot"></span>${esc(label)}</button>`;
+    }).join('');
+    return chips ? `<div class="chips">${chips}</div>` : '';
+  }
+
+  _onChipClick(ev) {
+    const btn = ev.target && ev.target.closest && ev.target.closest('[data-toggle-entity]');
+    if (!btn || !this._hass) return;
+    ev.stopPropagation();
+    const entity_id = btn.getAttribute('data-toggle-entity');
+    // Optimistic paint so the chip responds instantly; the real state arrives via the
+    // hass update that follows and re-paints from the entity's actual state.
+    btn.classList.toggle('on');
+    this._hass.callService('switch', 'toggle', { entity_id });
   }
 
   // Trajectory slot duration (ms) — the only piece of _timeScale() this card still
@@ -100,9 +158,27 @@ class GridLensAdvisoryCard extends HTMLElement {
 
   _renderShell() {
     this.shadowRoot.innerHTML = `
-      <style>${STYLE}</style>
+      <style>${STYLE}
+        .hd-right { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+        .chips { display:flex; gap:6px; flex-wrap:wrap; }
+        .chip { display:inline-flex; align-items:center; gap:6px; cursor:pointer;
+                font:inherit; font-size:11px; font-weight:600; line-height:1;
+                padding:4px 9px; border-radius:20px; color:var(--ink2);
+                background:transparent; border:1px solid var(--border); }
+        .chip:hover { color:var(--ink); }
+        .chip:focus-visible { outline:2px solid var(--good); outline-offset:2px; }
+        .chip-dot { width:7px; height:7px; border-radius:50%; background:var(--idle);
+                    flex:none; }
+        .chip.on { color:var(--good);
+                   border-color:color-mix(in srgb,var(--good) 40%,transparent); }
+        .chip.on .chip-dot { background:var(--good); }
+      </style>
       <div class="card"><div class="body"></div></div>
     `;
+    // Delegated: _paint() replaces .body's innerHTML on every repaint, so per-chip
+    // listeners would be torn off. The listener lives on .body, which survives.
+    const body = this.shadowRoot.querySelector('.body');
+    if (body) body.addEventListener('click', (ev) => this._onChipClick(ev));
   }
 
   _paint() {
@@ -117,7 +193,10 @@ class GridLensAdvisoryCard extends HTMLElement {
           <div class="title">${title}</div>
           <div class="sub">${s.plan_name ? esc(s.plan_name) : 'Grid Lens advisory'}${s.solver ? ' · ' + esc(s.solver) : ''}${s.generated_at ? ' · ' + fmtTime(s.generated_at) : ''}</div>
         </div>
-        <div class="badge ${s.restored ? 'stale' : (s.status === 'ok' ? 'ok' : '')}">${s.restored ? 'LAST PLAN' : esc((s.status || 'unknown').toUpperCase())}</div>
+        <div class="hd-right">
+          ${this._toggleChipsHtml()}
+          <div class="badge ${s.restored ? 'stale' : (s.status === 'ok' ? 'ok' : '')}">${s.restored ? 'LAST PLAN' : esc((s.status || 'unknown').toUpperCase())}</div>
+        </div>
       </div>`;
 
     if (this._config.compact) {
