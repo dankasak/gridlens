@@ -685,6 +685,21 @@ the optimiser last run" is visible without switching to the Battery Plan view.
 full (non-compact) `grid-lens-advisory-card`, and the SOC/dispatch/price/cash forecast
 charts. No longer includes the Power Flow diagram (moved to its own view above).
 
+**⚠ Seed the dashboard THROUGH its live `LovelaceStorage`, not a bare `Store`.**
+`_register_dashboard` runs on `EVENT_HOMEASSISTANT_STARTED`, by which point the lovelace
+component has already built a `LovelaceStorage` for each registered dashboard — and that
+object caches its config in memory on first load. A dashboard whose store file didn't exist
+at startup (the first-run case) has already cached "no config", so writing the seed file via
+a separate `Store` leaves the stale cache serving an **empty dashboard for the rest of the
+session**: HA renders the title plus an untitled "New section" placeholder, with **no log
+line and no browser-console error**. Fixed 2026-08-20 by calling the live dashboard's own
+`async_save()` (which updates the cache and notifies listeners) when one exists, falling back
+to the raw store only when there's no live object yet. Every new install previously got a
+blank Grid Lens dashboard until its next HA restart. Symptom is indistinguishable from a
+corrupt/rejected config — if a seeded dashboard ever looks blank again, check whether the
+on-disk file is correct *and* whether anything wrote it behind the live object's back, before
+suspecting the seed content.
+
 **⚠ Two rules that bite:**
 1. **Card JS changes reach every dashboard automatically** (the seed just instantiates the
    card). **Dashboard structure/config changes do not** — adding/removing a card, changing a

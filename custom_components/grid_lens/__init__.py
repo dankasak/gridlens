@@ -401,15 +401,40 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 dash_data.setdefault("items", []).append(dashboard_config)
                 await dash_store.async_save(dash_data)
 
-            # Seed dashboard content if not yet created
+            # Seed dashboard content if not yet created.
+            #
+            # ⚠ Write THROUGH the live LovelaceStorage object when one already exists,
+            # never behind its back via a bare Store. This callback runs on
+            # EVENT_HOMEASSISTANT_STARTED — by then the lovelace component has already
+            # built a LovelaceStorage for every registered dashboard, and that object
+            # caches its config in memory on first load. For a dashboard whose store
+            # file didn't exist yet at startup (i.e. exactly the first-run case this
+            # branch is for), it has already cached "no config". Saving the file via a
+            # separate Store leaves that stale cache in place, so the running session
+            # keeps serving an EMPTY dashboard — HA renders just the title plus an
+            # untitled "New section" placeholder, with no error in the logs and none in
+            # the browser console — until the next restart reloads it from disk.
+            # LovelaceStorage.async_save() updates the cache and notifies listeners, so
+            # the seeded views show up immediately. (Diagnosed 2026-08-20; every new
+            # install got a blank Grid Lens dashboard until its next HA restart.)
             content_store = Store(hass, 1, "lovelace.grid_lens")
             if not await content_store.async_load():
-                await content_store.async_save({
-                    "config": {
-                        "title": "Grid Lens",
-                        "views": _build_seed_views(hass),
-                    }
-                })
+                seed_config = {
+                    "title": "Grid Lens",
+                    "views": _build_seed_views(hass),
+                }
+                live_dashboard = (
+                    dashboards.get("grid-lens") if isinstance(dashboards, dict) else None
+                )
+                if live_dashboard is not None and hasattr(live_dashboard, "async_save"):
+                    # async_save() takes the bare config and wraps it as {"config": ...}
+                    # itself — don't pre-wrap it here.
+                    await live_dashboard.async_save(seed_config)
+                else:
+                    # No live object to write through (dashboard registered below, in
+                    # this same call) — the raw store write is correct, and the object
+                    # created afterwards will load this file on its own first read.
+                    await content_store.async_save({"config": seed_config})
 
             # If already registered in-memory, nothing more to do
             if isinstance(dashboards, dict) and "grid-lens" in dashboards:
