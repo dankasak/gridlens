@@ -11,7 +11,11 @@ import aiohttp
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import DOMAIN, PLAN_ID_TO_KEY, CONF_DISTRIBUTOR, CONF_DEFERRABLE_LOAD_SENSORS
+from .const import (
+    DOMAIN, PLAN_ID_TO_KEY, CONF_DISTRIBUTOR, CONF_DEFERRABLE_LOAD_SENSORS,
+    CONF_LOAD_POWER_SENSOR, CONF_GRID_POWER_SENSOR,
+    CONF_BATTERY_CHARGE_POWER_SENSOR, CONF_BATTERY_DISCHARGE_POWER_SENSOR,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -112,11 +116,28 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
                 # all three in lockstep distorts the aspect ratio instead.
                 "max_height": 700, "max_width": 700, "flex": "0 1 700px",
                 "icon_scale": 1.5, "font_scale": 0.7,
-                # Live solar/grid/battery/EV POWER sensors aren't collected by
-                # config_flow (only daily-energy sensors are, for the plan-
-                # comparison LP) — the card falls back to its own built-in example
-                # defaults until that's added as a proper config field. SOC is
-                # genuinely install-agnostic config already, so pass it through.
+                # Live power sensors, threaded straight from the same config_flow
+                # fields the Sensors/Battery setup steps already collect (Load Power
+                # sensor, Grid Power sensor, Battery charge/discharge power sensors) —
+                # no separate onboarding needed, and no per-install hardcoding: any
+                # field left unset on a given install is simply omitted, same pattern
+                # as soc_entity below. solar_power_entity/ev_* have no config_flow
+                # counterpart yet (see FEATURES.md §10) — the card's own auto-discovery
+                # covers solar (HA Energy Dashboard's stat_rate); EV stays manual-only.
+                **({"load_power_entity": entry.data.get(CONF_LOAD_POWER_SENSOR)}
+                   if entry.data.get(CONF_LOAD_POWER_SENSOR) else {}),
+                **({"grid_power_entity": entry.data.get(CONF_GRID_POWER_SENSOR)}
+                   if entry.data.get(CONF_GRID_POWER_SENSOR) else {}),
+                # battery_charge_power_sensor is the "signed" sensor by convention
+                # (plan_calculator.py's own reading of it — positive=charging,
+                # negative=discharging when no separate discharge sensor is set); pass
+                # the optional discharge sensor alongside it whenever the install has
+                # one, so the card can net the pair itself the same way plan_calculator
+                # already does for the LP's historical battery-power fetch.
+                **({"battery_power_entity": entry.data.get(CONF_BATTERY_CHARGE_POWER_SENSOR)}
+                   if entry.data.get(CONF_BATTERY_CHARGE_POWER_SENSOR) else {}),
+                **({"battery_discharge_power_entity": entry.data.get(CONF_BATTERY_DISCHARGE_POWER_SENSOR)}
+                   if entry.data.get(CONF_BATTERY_DISCHARGE_POWER_SENSOR) else {}),
                 **({"soc_entity": entry.data.get("battery_soc_sensor")}
                    if entry.data.get("battery_soc_sensor") else {}),
             },

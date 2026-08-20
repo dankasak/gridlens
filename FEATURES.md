@@ -627,7 +627,7 @@ convention, never a hardcoded entity id — so they work unmodified on any insta
 | Card | Shows |
 |---|---|
 | `grid-lens-card` | Full plan comparison (the Plan Comparison view). |
-| `grid-lens-powerflow-card` | **Gated** — live radial energy flow: solar / grid / battery / home + one node per deferrable load, animated flow balls, live buy/sell price, greedy badges. Requires the Battery Control + Power Flow add-on; see §12. |
+| `grid-lens-powerflow-card` | **Gated** — live radial energy flow: solar / grid / battery / home + one node per deferrable load, animated flow balls, live buy/sell price, greedy badges. Requires the Battery Control + Power Flow add-on; see §12. `load_power_entity`/`grid_power_entity`/`battery_power_entity`/`battery_discharge_power_entity` are auto-populated in the seeded dashboard straight from the same `load_power_sensor`/`grid_power_sensor`/`battery_charge_power_sensor`/`battery_discharge_power_sensor` config_flow already collects (Sensors/Battery setup steps) — no separate onboarding needed; `solar_power_entity` auto-discovers from HA's own Energy Dashboard prefs; `ev_power_entity`/`ev_active_entity` remain manual-only (no config_flow counterpart — only needed when the EV isn't already represented as a regular deferrable load). |
 | `grid-lens-power-chart-card` | Measured & forecast power (kW) — solar, load, signed grid, signed battery, per-device deferrable, plus free-energy shading. Click a legend name to isolate that series (forecast + measured pair, y-axis rescales to it); click it again to restore every series. |
 | `grid-lens-price-chart-card` | Import/export rate trajectory. |
 | `grid-lens-soc-chart-card` | Battery SOC curve. |
