@@ -297,11 +297,22 @@ class LoadEstimator:
         self._last_integrated_at = now
 
     def _on_other_state_change(self, event) -> None:
-        # Any other configured deferrable device changing state during our pending
-        # sample window means the load-power delta can't be cleanly attributed to THIS
-        # device — mark the in-flight sample contaminated; _on_settle discards it.
-        if self._pending_since is not None:
-            self._contaminated = True
+        # Any other configured deferrable device actually turning on/off during our
+        # pending sample window means the load-power delta can't be cleanly attributed
+        # to THIS device — mark the in-flight sample contaminated; _on_settle discards
+        # it. async_track_state_change_event fires on ANY state-object write though,
+        # including attribute-only updates (e.g. a climate entity's current_temperature
+        # ticking over on its own poll cycle while it sits idle) — those aren't a real
+        # contamination source, so ignore them and only act when .state itself changed.
+        if self._pending_since is None:
+            return
+        old_state = event.data.get("old_state")
+        new_state = event.data.get("new_state")
+        old_val = old_state.state if old_state else None
+        new_val = new_state.state if new_state else None
+        if old_val == new_val:
+            return
+        self._contaminated = True
 
     async def _arm_sample(self, now: datetime) -> None:
         if not self.auto_refine:

@@ -15,6 +15,13 @@
  *   type: custom:grid-lens-advisory-card
  *   entity: sensor.roof_grid_lens_nsw_planned_dispatch     (required)
  *   control_switch_entity: switch.roof_grid_lens_nsw_battery_control (optional)
+ *   compact: true                                          (optional)
+ *   title: "Optimiser & Plan"                               (optional, compact mode only)
+ *
+ * `compact: true` renders only the header row (title, plan name/solver/last-run
+ * time, status badge) and skips the mode timeline / deferrable-load sections below
+ * it — a slim status bar for surfacing "when did the optimiser last run" on a page
+ * that isn't the full Battery Plan view (e.g. at the top of the Power Flow page).
  */
 import {
   STYLE, esc, fmtTime, fmtDayHour, modeLabel, MODE_COLORS, execMode, reasonFor, deferColorFor,
@@ -45,7 +52,7 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._renderShell();
   }
 
-  getCardSize() { return 3; }
+  getCardSize() { return this._config.compact ? 1 : 3; }
 
   set hass(hass) {
     this._hass = hass;
@@ -103,14 +110,20 @@ class GridLensAdvisoryCard extends HTMLElement {
     if (!body) return;
     const s = this._summary || {};
 
+    const title = this._config.title ? esc(this._config.title) : 'Battery Plan &amp; SOC Forecast';
     const header = `
       <div class="hd">
         <div>
-          <div class="title">Battery Plan &amp; SOC Forecast</div>
+          <div class="title">${title}</div>
           <div class="sub">${s.plan_name ? esc(s.plan_name) : 'Grid Lens advisory'}${s.solver ? ' · ' + esc(s.solver) : ''}${s.generated_at ? ' · ' + fmtTime(s.generated_at) : ''}</div>
         </div>
         <div class="badge ${s.restored ? 'stale' : (s.status === 'ok' ? 'ok' : '')}">${s.restored ? 'LAST PLAN' : esc((s.status || 'unknown').toUpperCase())}</div>
       </div>`;
+
+    if (this._config.compact) {
+      body.innerHTML = header;
+      return;
+    }
 
     if (!this._traj || s.status !== 'ok') {
       body.innerHTML = header +

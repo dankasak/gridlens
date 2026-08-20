@@ -87,7 +87,21 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
         # initializing) — the Plan Comparison view alone is still useful.
         return views
 
-    top_row = [{
+    battery_control = eid(f"{entry.entry_id}_battery_control")
+
+    # Power Flow view: the live diagram + power chart, plus a slim "optimiser & plan"
+    # status bar at the top (the same header the full advisory card shows on the
+    # Battery Plan view — plan name/solver/last-run time/status badge — rendered via
+    # its `compact: true` config so this page always shows when the optimiser last ran
+    # without having to switch to Battery Plan). User request 2026-08-20: split the
+    # diagram out of the Battery Plan view onto its own page, and surface the
+    # optimiser/plan details there too.
+    power_flow_sections = [{"column_span": 3, "cards": [{
+        "type": "custom:grid-lens-advisory-card", "entity": dispatch,
+        "compact": True, "title": "Optimiser & Plan",
+        **({"control_switch_entity": battery_control} if battery_control else {}),
+        "grid_options": {"columns": "full"},
+    }]}, {"column_span": 3, "cards": [{
         "type": "custom:grid-lens-flex-row-card",
         "gap": 16,
         "cards": [
@@ -112,7 +126,13 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
             },
         ],
         "grid_options": {"columns": "full"},
-    }]
+    }]}]
+    views.append({
+        "path": "power-flow", "type": "sections", "icon": "mdi:transmission-tower",
+        "title": "Power Flow", "max_columns": 3, "dense_section_placement": False,
+        "header": {"layout": "responsive", "badges_position": "bottom", "badges_wrap": "wrap"},
+        "cards": [], "sections": power_flow_sections,
+    })
 
     # Tunable settings (numeric overrides) and control switches both go on the
     # separate "Settings" view below, not "Battery Plan" — keeps the operational/
@@ -134,8 +154,6 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
     # boost control into this same settings area"), so nothing further is seeded for it.
     deferrable_sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or []
 
-    battery_control = eid(f"{entry.entry_id}_battery_control")
-
     status_tiles = []
     for label, key in (
         ("Now", "advisory_next_action"), ("SOC now", "advisory_soc_now"),
@@ -145,7 +163,10 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
         if found:
             status_tiles.append({"type": "tile", "entity": found, "name": label})
 
-    sections = [{"column_span": 3, "cards": top_row}]
+    # Battery Plan view: everything but the diagram — the full advisory card (mode
+    # timeline, deferrable-load recommendations) plus the SOC/dispatch/price/cash
+    # forecast charts. Split from Power Flow above 2026-08-20 (user request).
+    sections = []
     if status_tiles:
         sections.append({"column_span": 3, "cards": [{
             "type": "grid", "columns": len(status_tiles), "square": False,
@@ -286,7 +307,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260817a"
+    _CARD_VERSION = "20260820a"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",

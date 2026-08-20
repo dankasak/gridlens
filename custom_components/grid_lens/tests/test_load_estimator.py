@@ -190,12 +190,34 @@ async def _run_contaminated_sample_is_discarded():
     hass.states.set("sensor.house_load", "500", {"unit_of_measurement": "W"})
     e = _estimator(hass, other_control_entity_ids=["switch.other"])
     await e._arm_sample(_T0)
-    # Simulate the other device flipping during the settle window.
-    e._on_other_state_change(types.SimpleNamespace(data={}))
+    # Simulate the other device actually flipping on during the settle window.
+    e._on_other_state_change(types.SimpleNamespace(data={
+        "old_state": FakeState("off"),
+        "new_state": FakeState("on"),
+    }))
     hass.states.set("switch.x", "on")
     hass.states.set("sensor.house_load", "1700", {"unit_of_measurement": "W"})
     await e._on_settle(_T0 + timedelta(minutes=3))
     assert e.sample_count == 0  # discarded, contamination guard fired
+
+
+async def _run_other_device_attribute_only_update_does_not_contaminate():
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    hass.states.set("climate.other", "off")
+    hass.states.set("sensor.house_load", "500", {"unit_of_measurement": "W"})
+    e = _estimator(hass, other_control_entity_ids=["climate.other"])
+    await e._arm_sample(_T0)
+    # Simulate the other device's state object updating (e.g. a temperature poll)
+    # while its .state value ("off") stays the same — not a real on/off transition.
+    e._on_other_state_change(types.SimpleNamespace(data={
+        "old_state": FakeState("off", {"current_temperature": 21.0}),
+        "new_state": FakeState("off", {"current_temperature": 21.5}),
+    }))
+    hass.states.set("switch.x", "on")
+    hass.states.set("sensor.house_load", "1700", {"unit_of_measurement": "W"})
+    await e._on_settle(_T0 + timedelta(minutes=3))
+    assert e.sample_count == 1  # not contaminated — no real state change occurred
 
 
 async def _run_device_off_at_settle_is_discarded():
@@ -406,6 +428,7 @@ if __name__ == "__main__":
         ("current_power_w_unknown_state_is_zero", test_current_power_w_unknown_state_is_zero_not_a_guess),
         ("accepted_sample_updates_and_persists", lambda: _run(_run_accepted_sample_updates_estimate_and_persists)),
         ("contaminated_sample_is_discarded", lambda: _run(_run_contaminated_sample_is_discarded)),
+        ("other_device_attribute_only_update_does_not_contaminate", lambda: _run(_run_other_device_attribute_only_update_does_not_contaminate)),
         ("device_off_at_settle_is_discarded", lambda: _run(_run_device_off_at_settle_is_discarded)),
         ("implausible_delta_is_discarded", lambda: _run(_run_implausible_delta_is_discarded)),
         ("no_load_power_sensor_never_arms", lambda: _run(_run_no_load_power_sensor_never_arms)),

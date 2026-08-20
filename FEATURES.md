@@ -633,7 +633,7 @@ convention, never a hardcoded entity id — so they work unmodified on any insta
 | `grid-lens-soc-chart-card` | Battery SOC curve. |
 | `grid-lens-cash-chart-card` | Cumulative cost/credit. |
 | `grid-lens-dispatch-chart-card` | Planned EMS mode timeline. |
-| `grid-lens-advisory-card` | Plan status tiles. |
+| `grid-lens-advisory-card` | Plan status header (plan name/solver/last-run time, status badge), control-mode timeline, deferrable-load recommendations. `compact: true` config renders just the header — used as a slim "optimiser & plan" status bar at the top of the Power Flow view; `title` config overrides the header text in that mode. |
 | `grid-lens-load-control-card` | One row per deferrable load: Today Boost, greedy toggles, Off now / On now / Auto, and live greedy status. |
 | `grid-lens-defer-schedule-card` | The 7 × 48 allowed-run-times editor. |
 | `grid-lens-flex-row-card` | Layout helper. |
@@ -674,7 +674,16 @@ why a bad estimate here (a device on a flaky integration flapping `unavailable` 
 
 **Seeded dashboard.** New installs get a "Grid Lens" sidebar dashboard built by
 `_build_seed_views()` in `__init__.py`, written **once** into `.storage/lovelace.grid_lens`.
-Views: Plan Comparison, Battery Plan, Settings.
+Views: Plan Comparison, Power Flow, Battery Plan, Settings.
+
+**Power Flow view** (split out of Battery Plan 2026-08-20, user request) — the
+`grid-lens-powerflow-card` diagram + `grid-lens-power-chart-card`, with the compact
+`grid-lens-advisory-card` status bar (see table above) pinned at the top so "when did
+the optimiser last run" is visible without switching to the Battery Plan view.
+
+**Battery Plan view** — the status tiles (Now/SOC now/Planned end/Plan net cost), the
+full (non-compact) `grid-lens-advisory-card`, and the SOC/dispatch/price/cash forecast
+charts. No longer includes the Power Flow diagram (moved to its own view above).
 
 **⚠ Two rules that bite:**
 1. **Card JS changes reach every dashboard automatically** (the seed just instantiates the
