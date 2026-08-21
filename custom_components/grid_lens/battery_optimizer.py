@@ -48,6 +48,45 @@ from typing import Dict, List
 _LOGGER = logging.getLogger(__name__)
 
 
+def _import_bound(load, solar, deferrable_loads, dt, max_charge_kw, max_discharge_kw):
+    """Safe per-slot upper bound on grid import, in kWh.
+
+    The energy-balance row is an EQUALITY, so this bound must never bind on import
+    the house genuinely needs — if it does, the model is not merely suboptimal, it is
+    INFEASIBLE, and the whole solve is thrown away.
+
+    Until 2026-08-21 this was ``(max_charge + max_discharge) * 2 * dt`` — derived
+    purely from the battery's power rating, with no reference to how much power the
+    house actually draws. A 5 kW/5 kW battery therefore capped grid import at 20 kWh
+    per hour, so any hour needing more than that (plus what the battery could
+    discharge) made every plan unsolvable: scipy returned "infeasible", HiGHS and
+    PuLP were tried and failed too, and the greedy fallback — which models no
+    deferrable loads at all — silently produced the answer. Three-phase supplies, an
+    EV charger running alongside an oven, or simply a miscalibrated energy sensor all
+    trip it.
+
+    Sized instead from the demand actually being served: worst net load anywhere in
+    the horizon, plus every deferrable device at full rated draw, plus charging the
+    battery flat out, plus 50% headroom. The old battery-derived value is kept as a
+    floor so a tiny-load horizon still gets a sane big-M.
+
+    Deliberately finite rather than infinite: it doubles as the big-M for the
+    conditional-credit indicator rows, and an unbounded import would let a plan whose
+    export rate exceeds its import rate in some hour farm unbounded arbitrage.
+    """
+    peak_net = 0.0
+    for t in range(len(load)):
+        net = load[t] - (solar[t] if t < len(solar) else 0.0)
+        if net > peak_net:
+            peak_net = net
+    deferrable_kwh = sum(
+        float(d.get('max_kw', 0.0) or 0.0) * dt for d in (deferrable_loads or [])
+    )
+    battery_floor = (max_charge_kw + max_discharge_kw) * 2.0 * dt
+    demand_based = (peak_net + deferrable_kwh + max_charge_kw * dt) * 1.5
+    return max(battery_floor, demand_based)
+
+
 def _reprice_slot(row: Dict, delta_kwh: float) -> tuple:
     """Recompute a slot's import/export kWh and $ cost after shifting
     ``delta_kwh`` of deferrable-load energy into (positive) or out of
@@ -408,7 +447,7 @@ class BatteryOptimizer:
         }
 
     # ------------------------------------------------------------------
-    # MILP implementation — tries HiGHS, scipy, PuLP/CBC in order
+    # MILP implementation — scipy (HiGHS-backed) first, PuLP/CBC as a last resort
     # ------------------------------------------------------------------
 
     def _lp_optimize(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads,
@@ -416,23 +455,33 @@ class BatteryOptimizer:
                      soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
                      terminal_soc_value=None, import_caps=None, export_caps=None,
                      conditional_credits=None, min_export_price=0.0):
-        """Build and solve the LP. Raises on failure so caller can fall back."""
-        # HiGHS/PuLP paths model none of the extras below; only the scipy path (the
-        # complete, production path) does. Skip straight to scipy for any of them.
-        # (terminal_soc_value softens the terminal-SOC constraint — scipy-only.)
-        demand_active = demand_rate > 0 and demand_window_mask and any(demand_window_mask)
-        caps_active = bool(import_caps) or bool(export_caps)
-        credits_active = bool(conditional_credits)
-        if (not demand_active and not caps_active and timestep_hours == 1.0
-                and soc_reward == 0.0 and export_penalty == 0.0 and not no_grid_charge
-                and terminal_soc_value is None and not credits_active
-                and min_export_price == 0.0):
-            try:
-                return self._lp_highspy(solar, load, r_imp, r_exp, E0, T, deferrable_loads)
-            except ImportError:
-                pass  # highspy not installed — try scipy
-            except Exception as exc:
-                _LOGGER.warning("HiGHS MILP failed (%s) — trying scipy", exc)
+        """Build and solve the LP. Raises on failure so caller can fall back.
+
+        Chain is scipy → PuLP/CBC → (caller's greedy fallback).
+
+        A second, hand-rolled HiGHS path via `highspy` lived here until 2026-08-22.
+        It was removed rather than kept working: scipy's own `linprog(method="highs")`
+        and `optimize.milp` **are** HiGHS, so it was a parallel route to the same
+        solver, carrying its own copy of the model that drifted from the real one. It
+        modelled no deferrable loads, demand charges, caps, credits, min-export price
+        or soft terminal SOC, so the gate that kept it safe had narrowed it to bare
+        battery-only horizons with no features at all — and it had been raising
+        AttributeError on every call for months before that (see GRIDLENS_CHECKLIST.md
+        2026-08-21/22), so scipy was doing this work in practice regardless.
+
+        The one thing it expressed that `_lp_scipy` does not is an explicit binary
+        import/export exclusivity constraint. `_lp_scipy` handles that case as it
+        always has for every non-trivial horizon: cap import at `_import_bound` and
+        net any simultaneous import/export to a single direction in post-processing.
+        """
+        # PuLP models none of the extras the scipy path does — no deferrable loads,
+        # no demand charges, caps, credits, min-export price or soft terminal SOC —
+        # despite accepting a deferrable_loads argument and silently ignoring it.
+        # It is the last resort before greedy, and must not be handed a horizon it
+        # would answer the wrong question about. Same reasoning as the
+        # current-plan-vs-LP split in CLAUDE.md: a plausible number from the wrong
+        # model is worse than no number.
+        deferrable_active = bool(deferrable_loads)
 
         try:
             return self._lp_scipy(solar, load, r_imp, r_exp, E0, T, deferrable_loads,
@@ -450,6 +499,14 @@ class BatteryOptimizer:
         except Exception as exc:
             _LOGGER.warning("scipy LP failed (%s) — trying PuLP/CBC", exc)
 
+        if deferrable_active:
+            # _lp_pulp ignores deferrable_loads too (see above). Refusing here sends
+            # the caller to the greedy fallback, which at least reports solver=greedy
+            # rather than passing off a deferrable-blind MILP as a full solve.
+            raise RuntimeError(
+                "no solver available that models deferrable loads "
+                "(scipy failed; PuLP does not model them)"
+            )
         try:
             return self._lp_pulp(solar, load, r_imp, r_exp, E0, T, deferrable_loads)
         except Exception:
@@ -475,7 +532,12 @@ class BatteryOptimizer:
 
         eta = self.eta
         dt = timestep_hours  # slot length in hours; variables are ENERGY (kWh) per slot
-        M = (self.max_charge_rate_kw + self.max_discharge_rate_kw) * 2.0 * dt
+        # Per-slot grid-import ceiling, and the big-M for the conditional-credit
+        # indicator rows further down. See _import_bound for why this must be sized
+        # from real demand and not from the battery's rating (it caused every solve
+        # on this horizon to come back INFEASIBLE).
+        M = _import_bound(load, solar, deferrable_loads, dt,
+                          self.max_charge_rate_kw, self.max_discharge_rate_kw)
         N = len(deferrable_loads)       # number of individual deferrable devices
         slots_per_day = int(round(24 / dt))
         n_days = math.ceil(T / slots_per_day)
@@ -1025,105 +1087,19 @@ class BatteryOptimizer:
             'solver':              solver_label,
         }
 
-    # ---- HiGHS (preferred — ships its own binary) ----
-
-    def _lp_highspy(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads=None):
-        from highspy import Highs  # type: ignore
-
-        h = Highs()
-        h.setOptionValue("output_flag", False)
-        h.setOptionValue("time_limit", 120.0)
-
-        eta = self.eta
-        INF = 1e30
-
-        # Variable layout: [imp(T) | exp(T) | cha(T) | dis(T) | soc(T) | z(T)]
-        # z[t] is a binary variable: 1 = grid importing, 0 = grid exporting.
-        # This enforces mutual exclusivity of import and export in the same hour,
-        # preventing the LP from exploiting plans where FiT > off-peak import rate
-        # by simultaneously buying and selling (which is physically impossible on a
-        # single-phase connection).
-        I, X, C, D, S, Z = 0, T, 2*T, 3*T, 4*T, 5*T
-
-        # Big-M: safe upper bound on any single-hour grid flow (kWh).
-        # A 10 kW single-phase connection can pass at most 10 kWh/hour.
-        M = max(self.max_charge_rate_kw, self.max_discharge_rate_kw) * 3.0
-
-        lb = [0.0] * (6 * T)
-        ub = [INF] * (6 * T)
-        costs = [0.0] * (6 * T)
-        for t in range(T):
-            costs[I + t] =  r_imp[t]
-            costs[X + t] = -r_exp[t]
-            ub[C + t] = self.max_charge_rate_kw
-            ub[D + t] = self.max_discharge_rate_kw
-            lb[S + t] = self.min_soc_kwh
-            ub[S + t] = self.max_soc_kwh
-            ub[Z + t] = 1.0  # binary: 0 or 1
-
-        h.addVars(6 * T, lb, ub)
-        h.changeColsCostByRange(0, 6 * T - 1, costs)
-
-        # Mark z[t] variables as integer (binary since bounds are 0 and 1)
-        for t in range(T):
-            h.changeColIntegrality(Z + t, 1)  # 1 = kInteger
-
-        for t in range(T):
-            # Energy balance: imp + dis - exp - cha = load - solar
-            rhs = load[t] - solar[t]
-            h.addRow(rhs, rhs, 4,
-                     [I+t, X+t, C+t, D+t],
-                     [1.0, -1.0, -1.0, 1.0])
-
-        for t in range(T):
-            # SOC update: soc[t] - eta*cha[t] + (1/eta)*dis[t] - soc[t-1] = 0
-            # (for t=0: soc[t-1] = E0, moved to RHS)
-            if t == 0:
-                h.addRow(E0, E0, 3,
-                         [S+t, C+t, D+t],
-                         [1.0, -eta, 1.0/eta])
-            else:
-                h.addRow(0.0, 0.0, 4,
-                         [S+t, S+t-1, C+t, D+t],
-                         [1.0, -1.0, -eta, 1.0/eta])
-
-        for t in range(T):
-            # imp[t] <= M * z[t]  →  imp[t] - M*z[t] <= 0
-            h.addRow(-INF, 0.0, 2, [I+t, Z+t], [1.0, -M])
-            # exp[t] <= M * (1 - z[t])  →  exp[t] + M*z[t] <= M
-            h.addRow(-INF, M, 2, [X+t, Z+t], [1.0, M])
-
-        # Terminal SOC: battery must end no emptier than it started.
-        E_end = min(max(E0, self.min_soc_kwh), self.max_soc_kwh)
-        h.addRow(E_end, INF, 1, [S+T-1], [1.0])
-
-        h.run()
-
-        status_str = str(h.getModelStatus())
-        if "Optimal" not in status_str and "Feasible" not in status_str:
-            raise RuntimeError(f"HiGHS status: {status_str}")
-
-        vals = list(h.getSolution().col_value)
-        _LOGGER.info("HiGHS MILP solved %d hours, status=%s", T, status_str)
-
-        return self._build_result_from_arrays(
-            T, solar, load, r_imp, r_exp,
-            imp=[vals[I+t] for t in range(T)],
-            exp=[vals[X+t] for t in range(T)],
-            cha=[vals[C+t] for t in range(T)],
-            dis=[vals[D+t] for t in range(T)],
-            soc=[vals[S+t] for t in range(T)],
-            solver="milp/highs",
-        )
-
-    # ---- PuLP / CBC fallback ----
+    # ---- PuLP/CBC (last resort before greedy; needs an external CBC binary) ----
 
     def _lp_pulp(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads=None):
+        """Battery-only MILP. **Models no deferrable loads** despite the argument, nor
+        demand charges, caps, credits, min-export price or soft terminal SOC —
+        _lp_optimize refuses to reach here when any of those are present. The argument
+        is kept only to size the import big-M."""
         import pulp
 
         prob = pulp.LpProblem("battery", pulp.LpMinimize)
         eta = self.eta
-        M = max(self.max_charge_rate_kw, self.max_discharge_rate_kw) * 3.0
+        M = _import_bound(load, solar, deferrable_loads, 1.0,
+                          self.max_charge_rate_kw, self.max_discharge_rate_kw)
 
         P_imp = [pulp.LpVariable(f"imp_{t}", lowBound=0) for t in range(T)]
         P_exp = [pulp.LpVariable(f"exp_{t}", lowBound=0) for t in range(T)]

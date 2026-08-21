@@ -56,6 +56,56 @@ from .entity_lookup import resolve_device_name, async_get_energy_dashboard_names
 _LOGGER = logging.getLogger(__name__)
 
 
+
+def power_unit_divisor(hass, entity_id: str) -> float:
+    """Return 1000.0 if sensor reports in W, 1.0 if already kW.
+
+    ⚠ Guessing wrong here is a 1000× error in every alternative-plan cost, so
+    the unit is resolved from the entity registry when the live state isn't
+    available yet — not silently defaulted.
+
+    This whole calculation can run within a second of HA starting, before a
+    slow-to-populate integration (MQTT, cloud-polled) has written any state.
+    `hass.states.get()` then returns None. The original code fell through to
+    1.0 in that case, treating a watts sensor as kilowatts: on 2026-08-21 this
+    install logged "582810.2 kWh charged, 557721.9 kWh discharged" over 30 days
+    (real values: 582.8 and 557.7). That inflated true-load feeds every
+    alternative plan's LP, which is why comparison costs read ~$200,000/month
+    while the current-plan figure — which uses metered import/export and never
+    touches this path — stayed correct at $14.03.
+
+    The entity registry persists a registered entity's unit across restarts and
+    doesn't need the integration to have loaded, so it answers correctly during
+    exactly the window that broke. If neither source knows, say so loudly rather
+    than quietly picking a number.
+    """
+    state_obj = hass.states.get(entity_id)
+    if state_obj:
+        unit = state_obj.attributes.get("unit_of_measurement", "")
+        if unit:
+            return 1000.0 if unit == "W" else 1.0
+
+    try:
+        from homeassistant.helpers import entity_registry as er
+        entry = er.async_get(hass).async_get(entity_id)
+        if entry is not None and entry.unit_of_measurement:
+            _LOGGER.info(
+                "%s has no state yet; using registry unit %s",
+                entity_id, entry.unit_of_measurement,
+            )
+            return 1000.0 if entry.unit_of_measurement == "W" else 1.0
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning("Registry unit lookup failed for %s: %s", entity_id, exc)
+
+    _LOGGER.warning(
+        "Cannot determine the unit of %s (no state, not in the entity "
+        "registry) — assuming kW. If it actually reports W, every "
+        "alternative-plan cost will be inflated 1000×.",
+        entity_id,
+    )
+    return 1.0
+
+
 class PlanCalculator:
     """Calculate and compare electricity plan costs."""
 
@@ -2173,14 +2223,7 @@ class PlanCalculator:
             _LOGGER.warning("No battery power sensor configured")
             return []
 
-        def _unit_divisor(entity_id: str) -> float:
-            """Return 1000.0 if sensor reports in W, 1.0 if already kW."""
-            state_obj = self.hass.states.get(entity_id)
-            if state_obj:
-                unit = state_obj.attributes.get("unit_of_measurement", "")
-                if unit == "W":
-                    return 1000.0
-            return 1.0
+        _unit_divisor = lambda eid: power_unit_divisor(self.hass, eid)  # noqa: E731
 
         charge_divisor = _unit_divisor(self.battery_power_sensor)
         discharge_sensor = self.entry.data.get("battery_discharge_power_sensor")

@@ -74,18 +74,20 @@
 
         <h2 id="configure">Configure</h2>
         <p>After restarting, go to <strong>Settings → Devices &amp; Services → Add Integration</strong> and search for <strong>Grid Lens</strong>.</p>
-        <p>The setup wizard will ask you to:</p>
+        <p>Setup is four short screens:</p>
         <ol style="margin: 0.75rem 0 1rem 1.5rem; font-size: 0.93rem; color: #333;">
-          <li style="margin-bottom: 0.5rem">Select your <strong>state</strong> and <strong>network distributor</strong> (the company that owns the poles and wires — not your retailer)</li>
-          <li style="margin-bottom: 0.5rem">Select your energy sensors (grid import, grid export, solar production, battery)</li>
-          <li style="margin-bottom: 0.5rem">Select your current electricity plan</li>
-          <li style="margin-bottom: 0.5rem">Optionally subscribe for access to all plans</li>
+          <li style="margin-bottom: 0.5rem">Your <strong>state</strong> and <strong>email address</strong>. If more than one network in your state has plan data, you'll be asked which distributor operates the poles and wires at your address — it's printed on your bill, and it isn't your retailer.</li>
+          <li style="margin-bottom: 0.5rem">Your <strong>energy sensors</strong> (grid import, and optionally export, solar and price). These are pre-filled from your Home Assistant Energy dashboard if you've set one up.</li>
+          <li style="margin-bottom: 0.5rem">Your <strong>battery</strong>, if you have one — capacity and charge/discharge rates. The checkbox is pre-ticked if your Energy dashboard already has a battery configured.</li>
+          <li style="margin-bottom: 0.5rem">Your <strong>current electricity plan</strong>.</li>
         </ol>
+        <p>If your Energy dashboard lists individual appliances, you'll also get a screen to pick which of them can be shifted to cheaper hours, and set each one's maximum power.</p>
+        <p>Everything else — controlled load, allowed run hours, modulating charger control, battery efficiency and charge limits — has a sensible default and can be changed later under <strong>Grid Lens → Configure</strong>. Nothing you skip at setup is lost.</p>
         <div class="note">
-          <strong>Proof-of-concept phase:</strong> Grid Lens currently supports <strong>NSW — Ausgrid</strong> (Sydney, Central Coast, Newcastle, and Hunter regions). We are expanding to Endeavour Energy, Essential Energy, and other states rapidly. If your network isn't listed yet, check back soon.
+          <strong>Proof-of-concept phase:</strong> Grid Lens currently supports <strong>NSW — Ausgrid</strong> (Sydney, Central Coast, Newcastle, and Hunter regions). We are expanding to Endeavour Energy, Essential Energy, and other states rapidly. If your network isn't covered yet, setup will tell you so on the first screen rather than letting you fill in the rest.
         </div>
         <div class="note" style="margin-top: 0.75rem">
-          <strong>Free plan:</strong> You can skip the subscription step and model your current plan at no cost.
+          <strong>Free plan:</strong> Setup never asks you to pay. Your free account models your current plan at no cost; upgrading to compare against every plan is offered afterwards as a notification.
         </div>
 
         <h2 id="dashboard">View the dashboard</h2>
@@ -216,7 +218,8 @@
 
         <h2 id="api-key">API key</h2>
         <p>The free plan requires no API key — Grid Lens registers your installation automatically and grants access to model your current plan.</p>
-        <p>A Pro subscription ($1/month) gives you an API key that unlocks all available plans. If you subscribe outside of the HA setup flow, enter your key under <strong>Grid Lens → Configure → Update API Key</strong>.</p>
+        <p>A Pro subscription ($1/month) gives you an API key that unlocks all available plans. Enter it under <strong>Grid Lens → Configure → API key &amp; connection</strong>.</p>
+        <p>If you remove and re-add the integration, setup will tell you the installation is already registered and ask for your existing key. We only store a hashed copy, so we can't show it to you again — keep it somewhere safe, or email <a href="mailto:support@gridlens.au">support@gridlens.au</a> from your registered address for a replacement.</p>
 
         <h2 id="troubleshoot">Troubleshooting</h2>
         <h3>Integration not appearing after install</h3>

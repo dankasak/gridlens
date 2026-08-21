@@ -116,10 +116,33 @@ SOC limits, per-device availability masks, and daily energy requirements.
 solved schedule into a dispatch plan + trajectory), `advisory/forecast.py`,
 `advisory/rates.py`, `advisory/load_history.py`.
 
-**Solver chain:** HiGHS (`_lp_highspy`) → scipy `linprog` MILP → PuLP.
-**⚠ Known:** the HiGHS path is broken (`'Highs' object has no attribute
-`changeColsCostByRange'`) and *always* falls back to scipy. Not caused by any recent work;
-every plan silently solves on scipy MILP. Logs say `lp/scipy-milp solved 72 hours`.
+**Solver chain:** scipy `linprog`/`milp` → PuLP/CBC → greedy.
+
+**scipy IS HiGHS.** `linprog(method="highs")` and `optimize.milp` both use it, with no
+external binary. A second hand-rolled `highspy` path (`_lp_highspy`) existed until
+2026-08-22 and was **removed, not repaired**: it was a parallel route to the same solver,
+carrying its own copy of the model that had drifted from the real one, and it had been
+raising `AttributeError` on every call for months. Don't reintroduce one —
+`tests/test_import_bound.py` guards against it.
+
+**Only the scipy path is complete.** `_lp_pulp` is battery-only: no deferrable loads,
+demand charges, capped rates, conditional credits, min-export price or soft terminal SOC,
+despite accepting a `deferrable_loads` argument and ignoring it. `_lp_optimize` gates on
+every one of those and refuses PuLP outright for a deferrable horizon, so a fallback can
+never quietly answer a different question than the one asked. **Do not relax that gate.**
+
+**The greedy fallback also models no deferrable loads** (`_greedy_optimize` takes no such
+argument). Any solver failure therefore doesn't just cost optimality, it changes the
+question being answered — which is why a solve reaching greedy is worth investigating, not
+tolerating. Check `solver=` in the log: `lp/scipy` or `lp/scipy-milp` is healthy.
+
+**Grid-import bound (`_import_bound`).** The per-slot import ceiling, doubling as the
+conditional-credit big-M. Must be sized from real demand — peak net load + all deferrable
+draw + battery charging + 50% — because the energy-balance row is an equality and a bound
+below genuine need makes the model **infeasible**, not merely suboptimal. Until 2026-08-21
+it was derived from the battery's power rating alone, so a 5 kW/5 kW battery capped import
+at 20 kWh/h and any bigger hour made every plan unsolvable. Kept finite: an unbounded import
+lets a plan with FiT above its import rate farm unlimited arbitrage.
 
 **Notable modelling decisions** (each has a checklist entry with the reasoning):
 - **Soft terminal SOC** — energy left in the battery at horizon end is valued at the
@@ -840,6 +863,98 @@ in the same change.
 
 ---
 
+## 12a. Setup (the config flow)
+
+**What it does.** Gets a new install to its first plan comparison in as few answers as
+possible, and pushes everything with a sane default into the options flow instead.
+
+**Screens, in order** (`config_flow.py`, `GridLensConfigFlow`):
+
+| Step | Asks | Shown when |
+|---|---|---|
+| `user` | State, email | Always |
+| `distributor` | Network | Only if >1 network in that state has plan data |
+| `sensors` | Grid import (required); solar, export, grid power, import/export price (optional) | Always — pre-filled from HA's Energy dashboard |
+| `battery` | Has battery, capacity, max charge/discharge | Always; checkbox pre-ticked if the Energy dashboard has a battery source |
+| `devices` | Which Energy-dashboard appliances are deferrable | Only if the Energy dashboard lists device_consumption entries |
+| `device_power` | Max power + optional control entity, per device | Only if a device was selected |
+| `current_plan` | Current plan, demand tariff, VPP program | Always — then registers with the API |
+
+A minimal install (no battery, no dashboard devices) is **four screens**. The most complex
+is seven.
+
+**Coverage gate.** `_load_coverage()` runs on the first submit: one `/plans/list` call per
+candidate network in the chosen state, concurrently. It decides three things at once —
+whether to abort (`state_not_supported`, no plan data anywhere in that state), whether to
+skip the distributor screen (exactly one covered network), and what the final step's plan
+dropdown contains. Because the plan list is prefetched here, `current_plan` does no plan
+I/O and its dropdown can never be empty. **Before 2026-08-21 there was no gate**: a user
+outside NSW/Ausgrid filled in every screen and hit a required dropdown with zero options,
+no error and no way forward.
+
+**What setup deliberately does *not* ask** — all of it lives in **Configure → Reconfigure**
+(`GridLensOptionsFlow`, which still walks the full wizard) and all of it has a default that
+is right for most installs:
+
+- Controlled Load 1/2 (defaults false) — a DNSP/meter fact most people can't answer offhand,
+  and it only gates a dropdown on the advanced load steps.
+- Inverter brand/transport — auto-detected via `detect_inverter_brand()` when a battery is
+  declared, otherwise left unset. Battery control is a separately-entitled add-on that ships
+  default-off (§4), so the honest time to ask is when it's switched on.
+- Battery round-trip efficiency, min SOC, max SOC (`_BATTERY_ADVANCED_DEFAULTS` = 95%/10%/90%,
+  written explicitly into the entry because the optimiser and guardrails read those keys).
+- Per-device: climate on-mode, SOC sensor, controlled-load register, in-aggregate flag, and
+  the whole modulating-control set (setpoint, unit, phases, voltage, min current, plug
+  sensor) — §6a. Stored as aligned blank lists so downstream `zip`s stay index-safe.
+- Declared Loads and Estimated Loads (§5) — both advanced, and near-duplicates that
+  confused a real user in 2026-08-06.
+- API URL — now on the options flow's **API key & connection** step, where self-hosting
+  belongs.
+
+**Upgrade pitch.** Setup no longer ends on a blocking `async_external_step` redirect to
+gridlens.au/subscribe (which also silently did nothing on installs with no external/internal
+URL). `async_step_finalize` creates a persistent notification (`{DOMAIN}_upgrade`) instead.
+**Note:** the `/api/grid_lens/subscribe_callback` view and its `pending_subscriptions` dict
+in `__init__.py` are now unreferenced by the config flow.
+
+**Reinstall (409) — improved, not solved. ⚠ OPEN GAP.** `/register` is keyed on HA
+installation UUID, so removing and re-adding the integration 409s and lands on `manual_key`.
+That step used to say "Don't have a key yet? Subscribe" — wrong advice for someone who
+already owns one. It now explains that only a hash is stored so the key cannot be shown
+again, and points at `support@gridlens.au`.
+
+**A user who lost their key still cannot self-serve, and support cannot serve them with
+tooling.** Two things are missing, both deliberately left for a product decision:
+
+- **No email infrastructure exists in the API at all** (no smtp/sendgrid/mailgun anywhere in
+  `gridlens-api/app/`), so there is no "email me my key" path to build against.
+- **No admin key-reissue endpoint exists** — every `/admin/*` route is plans/VPP only.
+  Honouring the promise the config flow and `docs/docs.html` now both make ("email us for a
+  replacement") currently means **hand-editing the `api_keys` table in MySQL**. Fine at
+  current scale, but it is manual, undocumented as a runbook, and will not survive volume.
+- The obvious no-email alternative — let a matching `ha_installation_id` + email rotate the
+  key — is **not** a safe default: anyone knowing both could hijack a *paid* key. That's a
+  security trade-off for the owner to make, not an implementation detail.
+
+Raised with the user 2026-08-21; see `GRIDLENS_CHECKLIST.md` for that day's entry.
+
+**Gotchas.**
+- **`translations/en.json` is what HA actually loads for a custom component — never
+  `strings.json`.** A label present only in `strings.json` renders as its raw key
+  (`gridlens_email`) in the UI. They drifted and did exactly that on setup's first screen;
+  `sync-to-ha.sh` now regenerates `en.json` from `strings.json` on every sync.
+- `_validate_energy_sensors()` covers import, solar **and** export. Only import used to be
+  checked, so a watts sensor in the solar or export slot was accepted and quietly mispriced
+  every comparison.
+- `control/manager.py`'s `_DEFAULT_BRAND` is still `"sigenergy"` — a hardcoded fallback that
+  predates this work and is contrary to §0's generic-design rule. Not changed here (live
+  installs may lean on it); see `GRIDLENS_CHECKLIST.md` 2026-08-21.
+
+**Tests.** `tests/test_config_flow.py` — 13 offline tests driving the flow end to end with
+stubbed HA + voluptuous (neither importable in this container).
+
+---
+
 ## 13. Coverage
 
 Proof-of-concept: **NSW — Ausgrid**. Endeavour, Essential, and other states in progress.
@@ -854,7 +969,7 @@ real-data population partway through — see `VPP_CONTROLLED_LOAD_HANDOFF.md` be
 custom_components/grid_lens/
 ├── __init__.py              entry setup, _CARD_VERSION, _build_seed_views (dashboard seed)
 ├── const.py                 CONF_* keys, parse_hours_spec
-├── config_flow.py           setup + options (reconfigure) flows
+├── config_flow.py           setup + options (reconfigure) flows — §12a
 ├── plan_calculator.py       plan cost engine
 ├── retailer_plans.py        plan fetch/cache from the API
 ├── battery_optimizer.py     the LP/MILP

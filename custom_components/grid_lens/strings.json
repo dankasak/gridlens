@@ -3,35 +3,21 @@
     "step": {
       "user": {
         "title": "Grid Lens Setup",
-        "description": "Tell us your location and create your GridLens account.",
+        "description": "Grid Lens compares your real metered electricity usage against every plan on your network, so you can see what you'd pay on each one.\n\nSetup is three short screens.",
         "data": {
           "state": "State",
-          "postcode": "Postcode",
-          "gridlens_email": "Email address",
-          "gridlens_api_url": "GridLens API URL"
+          "gridlens_email": "Email address"
         },
         "data_description": {
-          "gridlens_email": "Used to create your free GridLens account.",
-          "gridlens_api_url": "Leave as default unless self-hosting."
+          "state": "Used to look up the plans and network tariffs that apply to you.",
+          "gridlens_email": "Creates your free Grid Lens account. We don't send marketing email."
         }
       },
       "distributor": {
         "title": "Select Your Network Distributor",
-        "description": "Choose your electricity network distributor. Grid Lens currently has plan data for **Ausgrid** (Sydney, Central Coast, Newcastle, Hunter). Support for Endeavour Energy and Essential Energy is coming soon.",
+        "description": "More than one network in your state has plan data. Choose the distributor that operates the poles and wires at your address — it's printed on your electricity bill, and it determines which plans and network tariffs apply to you.",
         "data": {
           "distributor": "Distributor"
-        }
-      },
-      "controlled_load": {
-        "title": "Controlled Load",
-        "description": "Does your meter have a Controlled Load circuit switched by your network distributor? This is set by your DNSP based on your meter/wiring, not by your retail plan — check your switchboard or a past bill for a 'Controlled Load' line if unsure. Leave both off if you don't have one.",
-        "data": {
-          "has_controlled_load_1": "I have Controlled Load 1 (CL1)",
-          "has_controlled_load_2": "I have Controlled Load 2 (CL2)"
-        },
-        "data_description": {
-          "has_controlled_load_1": "Tick if your meter has a Controlled Load 1 (CL1) circuit — commonly used for hot water or a pool pump, switched on by your network at set times.",
-          "has_controlled_load_2": "Tick if your meter has a Controlled Load 2 (CL2) circuit, a second switched register some networks offer."
         }
       },
       "sensors": {
@@ -56,7 +42,7 @@
       },
       "battery": {
         "title": "Battery Configuration",
-        "description": "If you have a home battery, configure it here.\n\n• Your current plan cost uses **actual** battery behaviour from your sensors.\n• Alternative plans show costs with **optimally** scheduled battery usage so you can see the true potential saving.",
+        "description": "If you have a home battery, configure it here.\n\n• Your current plan cost uses **actual** battery behaviour from your sensors.\n• Alternative plans show costs with **optimally** scheduled battery usage so you can see the true potential saving.\n\nEfficiency and charge limits use sensible defaults — adjust them later under **Configure** if you need to.",
         "data": {
           "has_battery": "I have a home battery",
           "battery_capacity": "Battery capacity (kWh)",
@@ -81,13 +67,6 @@
           "battery_discharge_power_sensor": "Discharge power sensor if separate from the charge sensor. Leave blank if your charge sensor is signed (negative when discharging)."
         }
       },
-      "inverter": {
-        "title": "Inverter / Battery Control",
-        "description": "{detected}\n\nGrid Lens can actively manage your battery (charge/discharge) to follow the cheapest schedule. Select which inverter integration it should send commands to.",
-        "data": {
-          "inverter_select": "Inverter"
-        }
-      },
       "devices": {
         "title": "Deferrable Loads",
         "description": "These appliances were found in your Energy Dashboard. Select any that can be **rescheduled to cheaper hours** — the optimizer will find the best time to run them under each plan.\n\nTypical deferrable loads: EV charger, pool pump, dishwasher, washing machine, water heater.",
@@ -97,7 +76,7 @@
       },
       "device_power": {
         "title": "Deferrable Load Power Limits",
-        "description": "For each device, enter its maximum rated power (kW) — this caps how much the optimizer can assign it in any hour.\n\nSet each device's **allowed run times** afterward on the **Deferrable Loads** dashboard card (a paintable weekly schedule) — every device starts unrestricted (any hour) until you paint one.\n\nOptionally pick a **control switch** for a device: a `switch.*` **or `climate.*`** entity (e.g. an aircon) GridLens will turn on/off to run that load at the optimal times (each gets its own default-off master switch you enable when ready). Leave blank for forecast-only devices. Optionally pick a **battery/EV state of charge sensor** too — most relevant for an EV charger, shown on the Power Flow card like the home battery's SOC. Leave blank for loads with no battery of their own. If you told us earlier you have a Controlled Load circuit, you can also mark a device as wired to it — the register a device physically draws from, if any. Optionally point a device at a **charging current/power setpoint** — a `number.*` entity such as OCPP's maximum_current, Easee's dynamic_charger_limit, Wallbox's maximum_charging_current, or the equivalent on Zaptec, go-e, openEVSE, Tesla or a Sigenergy AC charger — to modulate it continuously instead of just switching it on/off; leave it blank to keep plain on/off control (or forecast-only, if the switch above is blank too). Live solar-surplus tracking for a modulating device additionally needs the **Grid Power sensor** (Energy Sensors step) configured — without it, the charger just follows the optimizer's plan and never chases a passing cloud. Setpoint unit, phase count and supply voltage default to auto-detected values right for almost every install; minimum current defaults to 6 A (the EV charging floor), and an optional plug/connected sensor lets GridLens avoid commanding current into an empty socket.\n\n{devices}",
+        "description": "For each appliance, enter its maximum rated power — this caps how much the optimizer can assign it in any hour.\n\nOptionally pick a **control entity** (a `switch.*` or `climate.*` entity) so Grid Lens can run that load at the cheapest times. Each one gets its own master switch, off until you enable it. Leave blank to have Grid Lens forecast around the device without controlling it.\n\nEverything else — allowed run hours, controlled-load wiring, and modulating (variable-current) charger control — is set after setup: run hours on the **Deferrable Loads** dashboard card, the rest under **Configure**.",
         "data": {
           "max_kw_0": "{device_0_name} — max power",
           "max_kw_1": "{device_1_name} — max power",
@@ -109,158 +88,21 @@
           "max_kw_7": "{device_7_name} — max power",
           "max_kw_8": "{device_8_name} — max power",
           "max_kw_9": "{device_9_name} — max power",
-          "switch_0": "{device_0_name} — control switch/climate entity (optional)",
-          "climate_on_mode_0": "{device_0_name} — climate \"on\" mode (climate.* control entities without turn_on/turn_off support only; ignored otherwise)",
-          "switch_1": "{device_1_name} — control switch/climate entity (optional)",
-          "climate_on_mode_1": "{device_1_name} — climate \"on\" mode (climate.* control entities without turn_on/turn_off support only; ignored otherwise)",
-          "switch_2": "{device_2_name} — control switch/climate entity (optional)",
-          "climate_on_mode_2": "{device_2_name} — climate \"on\" mode (climate.* control entities without turn_on/turn_off support only; ignored otherwise)",
-          "switch_3": "{device_3_name} — control switch/climate entity (optional)",
-          "climate_on_mode_3": "{device_3_name} — climate \"on\" mode (climate.* control entities without turn_on/turn_off support only; ignored otherwise)",
-          "switch_4": "{device_4_name} — control switch/climate entity (optional)",
-          "climate_on_mode_4": "{device_4_name} — climate \"on\" mode (climate.* control entities without turn_on/turn_off support only; ignored otherwise)",
-          "switch_5": "{device_5_name} — control switch/climate entity (optional)",
-          "climate_on_mode_5": "{device_5_name} — climate \"on\" mode (climate.* control entities without turn_on/turn_off support only; ignored otherwise)",
-          "switch_6": "{device_6_name} — control switch/climate entity (optional)",
-          "climate_on_mode_6": "{device_6_name} — climate \"on\" mode (climate.* control entities without turn_on/turn_off support only; ignored otherwise)",
-          "switch_7": "{device_7_name} — control switch/climate entity (optional)",
-          "climate_on_mode_7": "{device_7_name} — climate \"on\" mode (climate.* control entities without turn_on/turn_off support only; ignored otherwise)",
-          "switch_8": "{device_8_name} — control switch/climate entity (optional)",
-          "climate_on_mode_8": "{device_8_name} — climate \"on\" mode (climate.* control entities without turn_on/turn_off support only; ignored otherwise)",
-          "switch_9": "{device_9_name} — control switch/climate entity (optional)",
-          "climate_on_mode_9": "{device_9_name} — climate \"on\" mode (climate.* control entities without turn_on/turn_off support only; ignored otherwise)",
-          "soc_0": "{device_0_name} — battery/EV SOC sensor (optional)",
-          "soc_1": "{device_1_name} — battery/EV SOC sensor (optional)",
-          "soc_2": "{device_2_name} — battery/EV SOC sensor (optional)",
-          "soc_3": "{device_3_name} — battery/EV SOC sensor (optional)",
-          "soc_4": "{device_4_name} — battery/EV SOC sensor (optional)",
-          "soc_5": "{device_5_name} — battery/EV SOC sensor (optional)",
-          "soc_6": "{device_6_name} — battery/EV SOC sensor (optional)",
-          "soc_7": "{device_7_name} — battery/EV SOC sensor (optional)",
-          "soc_8": "{device_8_name} — battery/EV SOC sensor (optional)",
-          "soc_9": "{device_9_name} — battery/EV SOC sensor (optional)",
-          "setpoint_0": "{device_0_name} — charging current/power setpoint (optional; makes this a modulating load)",
-          "setpoint_1": "{device_1_name} — charging current/power setpoint (optional; makes this a modulating load)",
-          "setpoint_2": "{device_2_name} — charging current/power setpoint (optional; makes this a modulating load)",
-          "setpoint_3": "{device_3_name} — charging current/power setpoint (optional; makes this a modulating load)",
-          "setpoint_4": "{device_4_name} — charging current/power setpoint (optional; makes this a modulating load)",
-          "setpoint_5": "{device_5_name} — charging current/power setpoint (optional; makes this a modulating load)",
-          "setpoint_6": "{device_6_name} — charging current/power setpoint (optional; makes this a modulating load)",
-          "setpoint_7": "{device_7_name} — charging current/power setpoint (optional; makes this a modulating load)",
-          "setpoint_8": "{device_8_name} — charging current/power setpoint (optional; makes this a modulating load)",
-          "setpoint_9": "{device_9_name} — charging current/power setpoint (optional; makes this a modulating load)",
-          "setpoint_unit_0": "{device_0_name} — setpoint unit (auto-detected if left as Auto)",
-          "setpoint_unit_1": "{device_1_name} — setpoint unit (auto-detected if left as Auto)",
-          "setpoint_unit_2": "{device_2_name} — setpoint unit (auto-detected if left as Auto)",
-          "setpoint_unit_3": "{device_3_name} — setpoint unit (auto-detected if left as Auto)",
-          "setpoint_unit_4": "{device_4_name} — setpoint unit (auto-detected if left as Auto)",
-          "setpoint_unit_5": "{device_5_name} — setpoint unit (auto-detected if left as Auto)",
-          "setpoint_unit_6": "{device_6_name} — setpoint unit (auto-detected if left as Auto)",
-          "setpoint_unit_7": "{device_7_name} — setpoint unit (auto-detected if left as Auto)",
-          "setpoint_unit_8": "{device_8_name} — setpoint unit (auto-detected if left as Auto)",
-          "setpoint_unit_9": "{device_9_name} — setpoint unit (auto-detected if left as Auto)",
-          "phases_0": "{device_0_name} — supply phases (auto-detected if left as Auto-detect)",
-          "phases_1": "{device_1_name} — supply phases (auto-detected if left as Auto-detect)",
-          "phases_2": "{device_2_name} — supply phases (auto-detected if left as Auto-detect)",
-          "phases_3": "{device_3_name} — supply phases (auto-detected if left as Auto-detect)",
-          "phases_4": "{device_4_name} — supply phases (auto-detected if left as Auto-detect)",
-          "phases_5": "{device_5_name} — supply phases (auto-detected if left as Auto-detect)",
-          "phases_6": "{device_6_name} — supply phases (auto-detected if left as Auto-detect)",
-          "phases_7": "{device_7_name} — supply phases (auto-detected if left as Auto-detect)",
-          "phases_8": "{device_8_name} — supply phases (auto-detected if left as Auto-detect)",
-          "phases_9": "{device_9_name} — supply phases (auto-detected if left as Auto-detect)",
-          "voltage_0": "{device_0_name} — supply voltage, V (0 = use 230 V default)",
-          "voltage_1": "{device_1_name} — supply voltage, V (0 = use 230 V default)",
-          "voltage_2": "{device_2_name} — supply voltage, V (0 = use 230 V default)",
-          "voltage_3": "{device_3_name} — supply voltage, V (0 = use 230 V default)",
-          "voltage_4": "{device_4_name} — supply voltage, V (0 = use 230 V default)",
-          "voltage_5": "{device_5_name} — supply voltage, V (0 = use 230 V default)",
-          "voltage_6": "{device_6_name} — supply voltage, V (0 = use 230 V default)",
-          "voltage_7": "{device_7_name} — supply voltage, V (0 = use 230 V default)",
-          "voltage_8": "{device_8_name} — supply voltage, V (0 = use 230 V default)",
-          "voltage_9": "{device_9_name} — supply voltage, V (0 = use 230 V default)",
-          "min_current_0": "{device_0_name} — minimum current, A (0 = use 6 A default)",
-          "min_current_1": "{device_1_name} — minimum current, A (0 = use 6 A default)",
-          "min_current_2": "{device_2_name} — minimum current, A (0 = use 6 A default)",
-          "min_current_3": "{device_3_name} — minimum current, A (0 = use 6 A default)",
-          "min_current_4": "{device_4_name} — minimum current, A (0 = use 6 A default)",
-          "min_current_5": "{device_5_name} — minimum current, A (0 = use 6 A default)",
-          "min_current_6": "{device_6_name} — minimum current, A (0 = use 6 A default)",
-          "min_current_7": "{device_7_name} — minimum current, A (0 = use 6 A default)",
-          "min_current_8": "{device_8_name} — minimum current, A (0 = use 6 A default)",
-          "min_current_9": "{device_9_name} — minimum current, A (0 = use 6 A default)",
-          "plug_sensor_0": "{device_0_name} — plug/connected sensor (optional)",
-          "plug_sensor_1": "{device_1_name} — plug/connected sensor (optional)",
-          "plug_sensor_2": "{device_2_name} — plug/connected sensor (optional)",
-          "plug_sensor_3": "{device_3_name} — plug/connected sensor (optional)",
-          "plug_sensor_4": "{device_4_name} — plug/connected sensor (optional)",
-          "plug_sensor_5": "{device_5_name} — plug/connected sensor (optional)",
-          "plug_sensor_6": "{device_6_name} — plug/connected sensor (optional)",
-          "plug_sensor_7": "{device_7_name} — plug/connected sensor (optional)",
-          "plug_sensor_8": "{device_8_name} — plug/connected sensor (optional)",
-          "plug_sensor_9": "{device_9_name} — plug/connected sensor (optional)",
-          "cl_0": "{device_0_name} — controlled load register (optional)",
-          "cl_1": "{device_1_name} — controlled load register (optional)",
-          "cl_2": "{device_2_name} — controlled load register (optional)",
-          "cl_3": "{device_3_name} — controlled load register (optional)",
-          "cl_4": "{device_4_name} — controlled load register (optional)",
-          "cl_5": "{device_5_name} — controlled load register (optional)",
-          "cl_6": "{device_6_name} — controlled load register (optional)",
-          "cl_7": "{device_7_name} — controlled load register (optional)",
-          "cl_8": "{device_8_name} — controlled load register (optional)",
-          "cl_9": "{device_9_name} — controlled load register (optional)",
-          "in_aggregate_0": "{device_0_name} — already counted in main reading",
-          "in_aggregate_1": "{device_1_name} — already counted in main reading",
-          "in_aggregate_2": "{device_2_name} — already counted in main reading",
-          "in_aggregate_3": "{device_3_name} — already counted in main reading",
-          "in_aggregate_4": "{device_4_name} — already counted in main reading",
-          "in_aggregate_5": "{device_5_name} — already counted in main reading",
-          "in_aggregate_6": "{device_6_name} — already counted in main reading",
-          "in_aggregate_7": "{device_7_name} — already counted in main reading",
-          "in_aggregate_8": "{device_8_name} — already counted in main reading",
-          "in_aggregate_9": "{device_9_name} — already counted in main reading"
-        }
-      },
-      "declared_loads": {
-        "title": "Declared Loads — Forecast Only, No Control",
-        "description": "**GridLens cannot turn a device declared here on or off — it only forecasts around it.** For a device with no HA-visible energy sensor at all — the normal case for a genuine Controlled Load circuit, which is wired separately from whatever an inverter's CT clamp monitors, so it usually can't be pointed at a sensor via the previous step — declare it here instead with an estimated **average daily kWh**. Up to 2 slots; leave the name blank to skip a slot.\n\n**If this device has a `switch.*` or `climate.*` entity you could use to turn it on or off, don't declare it here.** Leave it blank on this page and configure it on the next page instead (**Estimated Loads — Controllable**) — that's the version of this feature that lets GridLens actually schedule the device, not just forecast around it. Declaring the same device on both pages double-counts it.\n\nIf you told us earlier you have a Controlled Load circuit, you can mark a declared load as wired to it. Turn on **already counted in main reading** only if this load's energy is currently mixed into your main energy sensor (e.g. a general-circuit appliance you're considering moving to Controlled Load) — leave it off for a load already on a genuinely separate register (the normal case), since your main sensor never saw it in the first place.",
-        "data": {
-          "name_0": "Load 1 — name",
-          "kwh_0": "Load 1 — estimated average daily kWh",
-          "max_kw_0": "Load 1 — max power",
-          "hours_0": "Load 1 — available hours",
-          "cl_0": "Load 1 — controlled load register (optional)",
-          "in_aggregate_0": "Load 1 — already counted in main reading",
-          "name_1": "Load 2 — name",
-          "kwh_1": "Load 2 — estimated average daily kWh",
-          "max_kw_1": "Load 2 — max power",
-          "hours_1": "Load 2 — available hours",
-          "cl_1": "Load 2 — controlled load register (optional)",
-          "in_aggregate_1": "Load 2 — already counted in main reading"
-        }
-      },
-      "estimated_loads": {
-        "title": "Estimated Loads — Controllable",
-        "description": "**GridLens can turn a device configured here on or off to follow the plan** — this is the version of the previous page's feature for devices you can actually control. For a device with a control entity (a `switch.*` or `climate.*` entity, e.g. an IR-blaster-driven aircon) but no energy sensor at all and no way to add one, GridLens can build one itself: it watches your whole-house **load power sensor** around the device's own on/off transitions and infers its real power draw over time, starting from your manual estimate below. Up to 3 slots; leave both the name AND control entity blank to skip a slot — a slot needs both filled in, or neither. A device with no control entity at all (nothing to turn on/off) belongs on the previous page instead, not here.\n\n**Don't also declare this same device on the previous page** — a name used here can't also appear there; a device only needs one entry, and using both double-counts it.\n\n**Auto-refine** only runs if you set the load power sensor below; if you leave a slot's auto-refine off (or don't set a load power sensor at all), it simply stays on your manual kW estimate forever.\n\nSetting the **whole-house load power sensor** below does double duty: it powers auto-refine for the estimated loads above, and it also automatically gives ANY controllable deferrable load elsewhere in your setup a synthetic live-power reading if it doesn't have one of its own — the common case for a device whose only telemetry is a cumulative energy counter (e.g. most ECHONET Lite aircons). That's what makes it show up on the Power Flow card. No extra configuration needed for those devices — this one sensor is all it takes.",
-        "data": {
-          "est_name_0": "Load 1 — name",
-          "est_control_0": "Load 1 — control entity (switch or climate)",
-          "est_kw_0": "Load 1 — estimated power draw",
-          "est_auto_0": "Load 1 — auto-refine from load power sensor",
-          "est_name_1": "Load 2 — name",
-          "est_control_1": "Load 2 — control entity (switch or climate)",
-          "est_kw_1": "Load 2 — estimated power draw",
-          "est_auto_1": "Load 2 — auto-refine from load power sensor",
-          "est_name_2": "Load 3 — name",
-          "est_control_2": "Load 3 — control entity (switch or climate)",
-          "est_kw_2": "Load 3 — estimated power draw",
-          "est_auto_2": "Load 3 — auto-refine from load power sensor",
-          "load_power_sensor": "Whole-house load power sensor (optional — powers auto-refine below AND gives any controllable device with no live power sensor of its own, e.g. an ECHONET aircon, a usable power reading on the Power Flow card)"
+          "switch_0": "{device_0_name} — control entity (optional)",
+          "switch_1": "{device_1_name} — control entity (optional)",
+          "switch_2": "{device_2_name} — control entity (optional)",
+          "switch_3": "{device_3_name} — control entity (optional)",
+          "switch_4": "{device_4_name} — control entity (optional)",
+          "switch_5": "{device_5_name} — control entity (optional)",
+          "switch_6": "{device_6_name} — control entity (optional)",
+          "switch_7": "{device_7_name} — control entity (optional)",
+          "switch_8": "{device_8_name} — control entity (optional)",
+          "switch_9": "{device_9_name} — control entity (optional)"
         }
       },
       "current_plan": {
         "title": "Your Current Plan",
-        "description": "Select the electricity plan you are currently on.\n\nThis creates your **free Grid Lens account**, which compares your current plan against itself so you can see your cost breakdown.\n\n[Upgrade at gridlens.au/pricing](https://gridlens.au/pricing) to compare against all available plans in your state and find out if you could be paying less.",
+        "description": "Select the electricity plan you are currently on.\n\nThis creates your **free Grid Lens account**, which compares your current plan against itself so you can see your cost breakdown.\n\n[Upgrade at gridlens.au/pricing](https://gridlens.au/pricing) to compare against all available plans on your network and find out if you could be paying less.",
         "data": {
           "current_plan": "Current plan",
           "has_demand_tariff": "I'm on a demand tariff",
@@ -271,15 +113,14 @@
           "vpp_program": "If you're enrolled in a retailer VPP credit program on top of your plan (e.g. AGL Bring Your Own Battery), select it here. This is independent of your plan choice — switching plans with the same retailer won't affect it. Leave as 'None / not enrolled' if you're not in one."
         }
       },
-      "subscribe": {
-        "title": "Unlock All Plans",
-        "description": "Your free account compares your current plan only.\n\nSubscribe to compare against every available plan in your state and find out if you're on the best deal. The next page will open gridlens.au — complete your subscription there, then return here automatically.\n\nOr close that page to continue with your free account."
-      },
       "manual_key": {
-        "title": "Enter Your API Key",
-        "description": "This Home Assistant installation is already registered with Grid Lens.\n\nEnter your existing API key to compare against all available plans in your state.\n\nDon't have a key yet? [Subscribe at gridlens.au/pricing](https://gridlens.au/pricing).",
+        "title": "This Installation Already Has a Key",
+        "description": "This Home Assistant installation is already registered with Grid Lens under **{email}**, so a new key can't be issued for it.\n\nThis is normal if you've removed and re-added the integration. Paste the key you saved when you first set it up.\n\nWe only ever store a hashed copy of your key, so we can't show it to you again. If you've lost it, contact support@gridlens.au from your registered email address and we'll issue a replacement.",
         "data": {
           "gridlens_api_key": "Grid Lens API key"
+        },
+        "data_description": {
+          "gridlens_api_key": "Starts with `gl_`."
         }
       }
     },
@@ -295,7 +136,8 @@
       "estimated_load_duplicate_declared": "That name is already used on the Declared Loads page. A device only needs one entry — remove it from Declared Loads (blank the name there) if you want to configure it here as controllable instead."
     },
     "abort": {
-      "already_configured": "Grid Lens is already configured."
+      "already_configured": "Grid Lens is already configured.",
+      "state_not_supported": "Grid Lens doesn't have plan data for {state} yet, so it can't compare anything for you. Coverage is being added state by state — register at https://gridlens.au to be told when yours is ready."
     }
   },
   "options": {
@@ -303,7 +145,7 @@
       "init": {
         "title": "Grid Lens",
         "menu_options": {
-          "api_key": "Update API key",
+          "api_key": "API key & connection",
           "full_reconfigure": "Reconfigure sensors, devices & plan"
         }
       },
@@ -546,13 +388,15 @@
         }
       },
       "api_key": {
-        "title": "Grid Lens API Key",
-        "description": "Your API key gives you access to all available plans in your state so you can see exactly which plan suits you best.\n\nLeave unchanged to keep your current key, or paste a new one below.\n\nGet a key at [gridlens.au/pricing](https://gridlens.au/pricing).",
+        "title": "API Key & Connection",
+        "description": "Your API key unlocks every plan on your network so you can see which one actually suits you.\n\nLeave unchanged to keep your current key, or paste a new one below.\n\nGet a key at [gridlens.au/pricing](https://gridlens.au/pricing).",
         "data": {
-          "gridlens_api_key": "Grid Lens API key"
+          "gridlens_api_key": "Grid Lens API key",
+          "gridlens_api_url": "Grid Lens API URL"
         },
         "data_description": {
-          "gridlens_api_key": "Leave blank or unchanged to keep using your existing key."
+          "gridlens_api_key": "Leave blank or unchanged to keep using your existing key.",
+          "gridlens_api_url": "Leave as the default unless you're self-hosting the Grid Lens API."
         }
       }
     },

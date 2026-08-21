@@ -2,15 +2,15 @@
 """Tests for the minimum export price floor (Feature 1 of
 DEFERRABLE_EXPORT_CONTROL_PLAN.md).
 
-battery_optimizer.py imports numpy/scipy/highspy only INSIDE the solver methods
-(_lp_highspy, _lp_scipy), not at module level, so BatteryOptimizer itself imports
+battery_optimizer.py imports numpy/scipy only INSIDE the solver methods
+(_lp_scipy, _lp_pulp), not at module level, so BatteryOptimizer itself imports
 and its call-chain wiring is testable here without scipy (unavailable in this
 container — see GRIDLENS_CHECKLIST.md). What's covered:
 
   1. optimize_hourly_schedule/._lp_optimize forward min_export_price correctly
      down the call chain.
-  2. The HiGHS-bypass gate: min_export_price=0.0 (default/disabled) leaves the
-     HiGHS-first attempt untouched (byte-identical to before this feature);
+  2. Solver routing: a min_export_price horizon reaches _lp_scipy, the only path
+     that models the floor, and is never handed to a solver that ignores it;
      min_export_price>0 skips straight to the scipy path, matching every other
      "extra" (demand, caps, credits, soc_reward, ...) already gated the same way.
 
@@ -76,12 +76,6 @@ def test_nonzero_value_forwarded_through_lp_optimize_to_lp_scipy():
         return {"schedule": []}
 
     opt._lp_scipy = fake_lp_scipy.__get__(opt, BatteryOptimizer)
-    # Force past the HiGHS attempt by making it raise ImportError, same as a real
-    # "highspy not installed" environment — _lp_optimize should fall through to scipy.
-    def fake_lp_highspy(self, *args, **kwargs):
-        raise ImportError("no highspy")
-
-    opt._lp_highspy = fake_lp_highspy.__get__(opt, BatteryOptimizer)
     opt.optimize_hourly_schedule(
         solar_profile=[1.0], load_profile=[1.0],
         import_rates=[0.30], export_rates=[0.05],
@@ -91,57 +85,72 @@ def test_nonzero_value_forwarded_through_lp_optimize_to_lp_scipy():
           seen.get("min_export_price") == 0.02, f"got {seen.get('min_export_price')!r}")
 
 
-def test_highs_gate_unaffected_when_disabled():
-    """min_export_price=0.0 (the default) must not change which solver path is
-    attempted first — every other 'extra' at its own default leaves HiGHS as the
-    first attempt, and this feature must not regress that."""
+def test_scipy_is_the_first_and_only_lp_path():
+    """min_export_price is modelled by _lp_scipy alone.
+
+    This used to assert HiGHS was attempted first when the floor was disabled, and
+    skipped when it was set. The parallel hand-rolled highspy model was removed on
+    2026-08-22 (scipy's linprog/milp already are HiGHS), so there is no gate left to
+    bypass — scipy is now reached directly whatever the floor is. The property that
+    still matters is that no deferrable-blind solver gets the horizon instead.
+    """
+    for floor in (0.0, 0.02):
+        opt = _optimizer()
+        calls = []
+
+        def fake_lp_scipy(self, *args, **kwargs):
+            calls.append("scipy")
+            return {"schedule": []}
+
+        def fake_lp_pulp(self, *args, **kwargs):
+            calls.append("pulp")
+            return {"schedule": []}
+
+        opt._lp_scipy = fake_lp_scipy.__get__(opt, BatteryOptimizer)
+        opt._lp_pulp = fake_lp_pulp.__get__(opt, BatteryOptimizer)
+        opt.optimize_hourly_schedule(
+            solar_profile=[1.0], load_profile=[1.0],
+            import_rates=[0.30], export_rates=[0.05],
+            min_export_price=floor,
+        )
+        check(f"scipy handles the solve directly (min_export_price={floor})",
+              calls == ["scipy"], f"calls={calls}")
+
+
+def test_floor_never_reaches_a_solver_that_ignores_it():
+    """If scipy fails, PuLP must not silently answer a min_export_price horizon.
+
+    PuLP models no export floor, so a fallback that accepted this horizon would
+    return a confident number for a different question.
+    """
     opt = _optimizer()
     calls = []
-
-    def fake_lp_highspy(self, *args, **kwargs):
-        calls.append("highspy")
-        return {"schedule": []}
-
-    opt._lp_highspy = fake_lp_highspy.__get__(opt, BatteryOptimizer)
-    opt.optimize_hourly_schedule(
-        solar_profile=[1.0], load_profile=[1.0],
-        import_rates=[0.30], export_rates=[0.05],
-    )
-    check("HiGHS attempted first when min_export_price is disabled (0.0)",
-          calls == ["highspy"], f"calls={calls}")
-
-
-def test_nonzero_value_bypasses_highs_gate():
-    """Setting a floor forces the scipy path, same pattern as demand_rate/caps/
-    credits/soc_reward/export_penalty/no_grid_charge/terminal_soc_value — none of
-    those extras are modelled by the HiGHS/PuLP paths, only scipy."""
-    opt = _optimizer()
-    calls = []
-
-    def fake_lp_highspy(self, *args, **kwargs):
-        calls.append("highspy")
-        return {"schedule": []}
 
     def fake_lp_scipy(self, *args, **kwargs):
         calls.append("scipy")
+        raise RuntimeError("scipy down")
+
+    def fake_lp_pulp(self, *args, **kwargs):
+        calls.append("pulp")
         return {"schedule": []}
 
-    opt._lp_highspy = fake_lp_highspy.__get__(opt, BatteryOptimizer)
     opt._lp_scipy = fake_lp_scipy.__get__(opt, BatteryOptimizer)
+    opt._lp_pulp = fake_lp_pulp.__get__(opt, BatteryOptimizer)
     opt.optimize_hourly_schedule(
         solar_profile=[1.0], load_profile=[1.0],
         import_rates=[0.30], export_rates=[0.05],
         min_export_price=0.02,
+        deferrable_loads=[{"max_kw": 3.5, "daily_kwh": 8.0}],
     )
-    check("HiGHS is skipped and scipy is called directly when a floor is set",
-          calls == ["scipy"], f"calls={calls}")
+    check("PuLP refused a deferrable+floor horizon after scipy failed",
+          "pulp" not in calls, f"calls={calls}")
 
 
 if __name__ == "__main__":
     test_default_is_disabled_and_forwarded_as_zero()
     test_nonzero_value_forwarded_through_lp_optimize_to_lp_scipy()
-    test_highs_gate_unaffected_when_disabled()
-    test_nonzero_value_bypasses_highs_gate()
+    test_scipy_is_the_first_and_only_lp_path()
+    test_floor_never_reaches_a_solver_that_ignores_it()
     if _FAILURES:
         print(f"\nFAIL — {len(_FAILURES)} failure(s): {_FAILURES}")
         sys.exit(1)
