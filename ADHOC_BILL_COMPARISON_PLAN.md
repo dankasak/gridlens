@@ -2,7 +2,7 @@
 
 Status: **planning only, no code written yet.** Written 2026-08-09, grounded in direct reads
 of `plan_calculator.py`, `retailer_plans.py`, `__init__.py` (view registration + `PlanDataView`),
-and `config_flow.py` on this install. Read `GRIDLENS_CHECKLIST.md` and `FEATURES.md` §1 (Plan
+and `config_flow.py` on this install. Read `docs/GRIDLENS_CHECKLIST.md` and `FEATURES.md` §1 (Plan
 comparison) first for how the *existing* comparison engine works — this doc only covers what's
 new.
 

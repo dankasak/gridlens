@@ -13,7 +13,7 @@ exists.
 Originally written 2026-07-29, grounded in the current `grid-lens-powerflow-card.js` via
 direct file/line reads. Motivating case: an animated hot-water icon (steam rising from a
 kettle) that plays while the hot-water deferrable load is drawing power, and sits
-static/idle otherwise. Read `GRIDLENS_CHECKLIST.md` first for overall project state — this
+static/idle otherwise. Read `docs/GRIDLENS_CHECKLIST.md` first for overall project state — this
 doc is scoped to one card, not a project-wide feature.
 
 ## Current behavior (why this doesn't already work)

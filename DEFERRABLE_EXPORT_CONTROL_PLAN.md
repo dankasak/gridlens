@@ -2,7 +2,7 @@
 
 Status: **planning only, no code written yet.** Written 2026-07-23, grounded in the current
 codebase (`custom_components/grid_lens/`) via direct file/line reads, not guesses. Read
-`GRIDLENS_CHECKLIST.md` first for project state; this doc is the spec for three new features
+`docs/GRIDLENS_CHECKLIST.md` first for project state; this doc is the spec for three new features
 requested 2026-07-23. **All four open product decisions below are now settled** (user, 2026-07-23)
 — see "Product decisions" section; the rest of the doc reflects them.
 
@@ -59,7 +59,7 @@ and still exports the physically-forced residual when they don't. This is a pure
   byte-identical behavior everywhere else (matches how every other optional param in this file
   behaves). Add to the existing solver-path gate (`import_caps`/`export_caps`/`demand_active`,
   `battery_optimizer.py` gate site) so setting it forces the scipy path — consistent with every
-  other "extra feature" in this file (HiGHS is broken anyway, per `GRIDLENS_CHECKLIST.md`'s
+  other "extra feature" in this file (HiGHS is broken anyway, per `docs/GRIDLENS_CHECKLIST.md`'s
   Known Issues).
 - `plan_calculator.py`: read `CONF_MIN_EXPORT_PRICE` off `entry.data` alongside
   `CONF_BATTERY_MIN_SOC`/`CONF_BATTERY_MAX_SOC` (`:82-83`), pass into the

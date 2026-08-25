@@ -4,7 +4,7 @@
 user-facing feature, with the entities it creates, the config it needs, the files that
 implement it, and the gotchas. Read this to understand **how the product works**.
 
-**What it is not:** a history. `GRIDLENS_CHECKLIST.md` is the append-only record of *what
+**What it is not:** a history. `docs/GRIDLENS_CHECKLIST.md` is the append-only record of *what
 happened when* and *why a decision was made* — read that for rationale, incidents, and
 work-in-progress. This doc is the answer to "what does it do today, and where is it?".
 
@@ -77,7 +77,7 @@ conditional-credit evaluation from real per-day behaviour, real FiT windows), no
 optimal-dispatch fantasy. The two can diverge wildly — e.g. the LP assumes the battery
 fully free-cycles every single day inside a plan's zero-rate window, which real dispatch may
 never do — and conflating them once produced a "your bill breakdown" card showing $0.99 for
-a period GloBird actually billed $21.04 (`GRIDLENS_CHECKLIST.md`, 2026-08-04).
+a period GloBird actually billed $21.04 (`docs/GRIDLENS_CHECKLIST.md`, 2026-08-04).
 `is_market_linked` plans (Amber SmartShift, real dynamic import) are the one exception: their
 own published rate structure is a nominal reference, not the real price, so actual usage is
 priced from the configured `import_price_sensor` / `export_price_sensor` instead — genuinely
@@ -273,7 +273,7 @@ power — the backend counterpart of the Power Flow card's own `load_power_entit
 option). **A slot needs both a name and a control entity** — `_ensure_load_estimators`
 skips it silently (no warning) if either is blank, so a slot with the control entity/kW/
 auto-refine filled in but no name looks fully configured yet does nothing (hit for real,
-`GRIDLENS_CHECKLIST.md`, 2026-08-06); the config-flow step now rejects that combination
+`docs/GRIDLENS_CHECKLIST.md`, 2026-08-06); the config-flow step now rejects that combination
 instead of accepting it. A brand-new slot also won't be scheduled by the optimiser until its
 synthetic sensor has real usage history (`daily_kwh` starts at 0 — see §3's `daily_kwh`
 note) — use Today Boost to seed a target immediately instead of waiting ~14 days. GridLens
@@ -936,7 +936,7 @@ tooling.** Two things are missing, both deliberately left for a product decision
   key — is **not** a safe default: anyone knowing both could hijack a *paid* key. That's a
   security trade-off for the owner to make, not an implementation detail.
 
-Raised with the user 2026-08-21; see `GRIDLENS_CHECKLIST.md` for that day's entry.
+Raised with the user 2026-08-21; see `docs/GRIDLENS_CHECKLIST.md` for that day's entry.
 
 **Gotchas.**
 - **`translations/en.json` is what HA actually loads for a custom component — never
@@ -948,7 +948,7 @@ Raised with the user 2026-08-21; see `GRIDLENS_CHECKLIST.md` for that day's entr
   every comparison.
 - `control/manager.py`'s `_DEFAULT_BRAND` is still `"sigenergy"` — a hardcoded fallback that
   predates this work and is contrary to §0's generic-design rule. Not changed here (live
-  installs may lean on it); see `GRIDLENS_CHECKLIST.md` 2026-08-21.
+  installs may lean on it); see `docs/GRIDLENS_CHECKLIST.md` 2026-08-21.
 
 **Tests.** `tests/test_config_flow.py` — 13 offline tests driving the flow end to end with
 stubbed HA + voluptuous (neither importable in this container).

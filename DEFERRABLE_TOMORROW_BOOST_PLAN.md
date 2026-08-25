@@ -5,7 +5,7 @@ Status: **planning only, no code written yet.** Written 2026-07-29, grounded in 
 already-shipped "today boost" (Feature 2 in `DEFERRABLE_EXPORT_CONTROL_PLAN.md`, live in
 `number.py`/`deferrable_overrides.py`) with a second, independent boost for **tomorrow**
 specifically — e.g. "I'm driving further tomorrow, charge the EV more tomorrow" without
-inflating today's target. Read `GRIDLENS_CHECKLIST.md` first for overall project state.
+inflating today's target. Read `docs/GRIDLENS_CHECKLIST.md` first for overall project state.
 
 ## Why this isn't just "add a second number entity"
 
