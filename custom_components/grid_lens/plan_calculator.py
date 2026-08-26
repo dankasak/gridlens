@@ -1017,9 +1017,56 @@ class PlanCalculator:
             'approximate': True,
         }
 
+    # How many of a rate's cap periods fall in a billing period, and how a
+    # STRICT cap buckets time. Only 'day' occurs in the plan DB today; the rest
+    # are here so a non-daily threshold is stored and priced rather than
+    # silently treated as daily.
+    _CAP_PERIOD_DAYS = {"day": 1.0, "week": 7.0, "month": 30.44,
+                        "quarter": 91.31, "year": 365.25}
+
+    @staticmethod
+    def _cap_bucket(cap_period: str, local_dt):
+        """The key a STRICT cap resets on."""
+        if cap_period == "week":
+            return local_dt.isocalendar()[:2]
+        if cap_period == "month":
+            return (local_dt.year, local_dt.month)
+        if cap_period == "quarter":
+            return (local_dt.year, (local_dt.month - 1) // 3)
+        if cap_period == "year":
+            return local_dt.year
+        if cap_period == "billing_period":
+            return "bill"          # one bucket for the whole bill
+        return local_dt.date()     # 'day' — the default and the common case
+
+    def _cap_allowance(self, cap: float, cap_period: str, cap_application: str,
+                       period_days: int | None) -> float:
+        """Total free kWh available to one cap key.
+
+        STRICT: `cap` per bucket, which is what daily_cap_kwh has always meant.
+        POOLED: the allowance accrues over the whole billing period — GloBird
+        state it plainly ("if step one is allocated at 20kWh per day, and there
+        are 30 days in the billing period, your step one allowance would be
+        600kWh"), and EnergyAustralia apply the same regulated Solar Sharer cap
+        as "an average of 24 kWh per day across your billing period". Pricing a
+        pooled cap as strict understates the plan, because a quiet day can no
+        longer subsidise a heavy one.
+        """
+        if cap_application != "pooled":
+            return cap
+        if not period_days:
+            # No billing-period length to pool over: fall back to the strict
+            # reading rather than inventing an allowance. Understates the plan,
+            # which is the safe direction to be wrong in.
+            return cap
+        per = self._CAP_PERIOD_DAYS.get(cap_period)
+        if per is None:          # 'billing_period' — already the whole period
+            return cap
+        return cap * (period_days / per)
+
     def _split_capped_kwh(
         self, plan, direction: str, local_dt, kwh: float,
-        daily_used: dict, cap_labels: dict,
+        daily_used: dict, cap_labels: dict, period_days: int | None = None,
     ) -> list:
         """Split ``kwh`` at ``local_dt`` across a capped rate's free portion and
         its post-cap rate once ``daily_cap_kwh`` is exceeded for that calendar
@@ -1046,20 +1093,36 @@ class PlanCalculator:
             return [(rate, kwh)]
 
         label = info.get("label") or "Energy"
-        key = (direction, local_dt.date(), label)
+        cap_period = info.get("cap_period") or "day"
+        cap_application = info.get("cap_application") or "strict"
+        # A pooled cap has ONE bucket for the whole bill, so the key carries no
+        # time component and unused allowance carries across days.
+        bucket = (None if cap_application == "pooled"
+                  else self._cap_bucket(cap_period, local_dt))
+        key = (direction, bucket, label)
+        allowance = self._cap_allowance(cap, cap_period, cap_application,
+                                        period_days)
         used = daily_used.get(key, 0.0)
-        remaining = max(0.0, cap - used)
+        remaining = max(0.0, allowance - used)
         free_kwh = min(kwh, remaining)
         over_kwh = kwh - free_kwh
         daily_used[key] = used + free_kwh
 
+        # Bill line items must read like the retailer's own wording, so the
+        # unit follows cap_period and pooling is named rather than implied.
+        unit = {"day": "kWh/day", "week": "kWh/week", "month": "kWh/month",
+                "quarter": "kWh/quarter", "year": "kWh/year",
+                "billing_period": "kWh/bill"}.get(cap_period, "kWh/day")
+        pooled_note = " avg" if cap_application == "pooled" else ""
         parts = []
         if free_kwh > 1e-9:
             parts.append((rate, free_kwh))
-            cap_labels.setdefault(round(rate, 4), f"{label} (first {cap:g} kWh/day)")
+            cap_labels.setdefault(round(rate, 4),
+                                  f"{label} (first {cap:g} {unit}{pooled_note})")
         if over_kwh > 1e-9:
             parts.append((after_rate, over_kwh))
-            cap_labels.setdefault(round(after_rate, 4), f"{label} (after {cap:g} kWh/day)")
+            cap_labels.setdefault(round(after_rate, 4),
+                                  f"{label} (after {cap:g} {unit}{pooled_note})")
         return parts
 
     def _calculate_actual_conditional_credits(
@@ -1183,7 +1246,8 @@ class PlanCalculator:
                 if kwh > 1e-6:
                     local_dt = d['timestamp'].astimezone(tz)
                     for rate, part_kwh in self._split_capped_kwh(
-                            plan, "import", local_dt, kwh, daily_used, cap_labels):
+                            plan, "import", local_dt, kwh, daily_used, cap_labels,
+                            actual_days):
                         rk = round(rate, 4)
                         tier_data[rk]['kwh'] += part_kwh
                         tier_data[rk]['cost'] += part_kwh * rk
@@ -1295,7 +1359,8 @@ class PlanCalculator:
             for d in usage_data:
                 local_dt = d['timestamp'].astimezone(tz)
                 for rate, part_kwh in self._split_capped_kwh(
-                        plan, "import", local_dt, d['value'], daily_used, cap_labels):
+                        plan, "import", local_dt, d['value'], daily_used, cap_labels,
+                        actual_days):
                     rk = round(rate, 4)
                     tier_data[rk]['kwh'] += part_kwh
                     tier_data[rk]['cost'] += part_kwh * rate
@@ -1417,7 +1482,8 @@ class PlanCalculator:
                 local_dt = d['timestamp'].astimezone(tz)
                 covered_hours.add(local_dt.replace(minute=0, second=0, microsecond=0))
                 for rate, part_kwh in self._split_capped_kwh(
-                        plan, "export", local_dt, d['value'], daily_used, export_cap_labels):
+                        plan, "export", local_dt, d['value'], daily_used,
+                        export_cap_labels, actual_days):
                     if rate > 0:
                         rk = round(rate, 4)
                         fit_tier_data[rk]['kwh']  += part_kwh

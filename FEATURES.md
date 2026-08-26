@@ -61,9 +61,25 @@ out; the API only *delivers plan definitions*. See `PRIVACY_DATA_INVENTORY.md` i
 repo.
 
 **Rate structures modelled:** flat, TOU (multi-window, per-weekday), demand tariffs,
-controlled load, tiered/capped rates (free-then-paid daily blocks), conditional daily
+controlled load, tiered/capped rates (free-then-paid blocks), conditional daily
 credits (e.g. "stay under X kWh in this window, get $1"), feed-in tariffs including
 wholesale-linked ones, supply charges.
+
+**Cap semantics — `cap_period` + `cap_application`** (`plan_rates`, added 2026-08-26).
+`daily_cap_kwh` gives a cap's size; these two say what it means:
+- `cap_period` — what the allowance is quoted per (`day` … `billing_period`). Defaults to
+  `day`, which is what every plan was before.
+- `cap_application` — `strict` is a hard limit inside each period. `pooled` means the
+  allowance accrues across the billing period (allowance × days), so unused headroom banks.
+
+Both exist in the market, on the *same* regulated product: AGL applies Solar Sharer's
+24 kWh as "the first 24 kWh… **each day**", EnergyAustralia as "an **average** of 24 kWh
+per day across your billing period". GloBird's step rates pool likewise. **Pricing a pooled
+cap as strict understates the plan**, so this is money, not labelling.
+The bill calculation pools exactly (`cap × days_in_period`). ⚠ The optimiser can only pool
+across its 24–48h **horizon**, not a real billing month — strictly better than treating it
+as strict, but it cannot bank allowance from last week. Bill line items follow suit,
+reading "first 24 kWh/day avg" for a pooled cap.
 
 **Gotcha — capped-rate labels.** Label the free tier and the after-cap tier explicitly;
 rate-value-keyed dicts silently merge on collision. See the checklist entry.

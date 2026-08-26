@@ -47,11 +47,13 @@ class RetailerPlan(ABC):
         """Rate plus daily-cap metadata for the matched window. Base plans have
         no cap concept; ``PlanFromData`` overrides this with the real lookup."""
         return {"rate": self.get_import_rate(dt), "label": None,
-                "daily_cap_kwh": None, "rate_after_cap": None}
+                "daily_cap_kwh": None, "rate_after_cap": None,
+                "cap_period": "day", "cap_application": "strict"}
 
     def get_export_rate_info(self, dt: datetime) -> Dict:
         return {"rate": self.get_export_rate(dt), "label": None,
-                "daily_cap_kwh": None, "rate_after_cap": None}
+                "daily_cap_kwh": None, "rate_after_cap": None,
+                "cap_period": "day", "cap_application": "strict"}
 
     @abstractmethod
     def describe_strategy(self) -> str:
@@ -246,12 +248,22 @@ class PlanFromData(RetailerPlan):
     def _rate_info(self, rates: list, dt: datetime) -> Dict:
         rate_def = self._match_rate_def(rates, dt)
         if rate_def is None:
-            return {"rate": 0.0, "label": None, "daily_cap_kwh": None, "rate_after_cap": None}
+            return {"rate": 0.0, "label": None, "daily_cap_kwh": None,
+                    "rate_after_cap": None, "cap_period": "day",
+                    "cap_application": "strict"}
         return {
             "rate": float(rate_def["rate"]),
             "label": rate_def.get("label"),
             "daily_cap_kwh": rate_def.get("daily_cap_kwh"),
             "rate_after_cap": rate_def.get("rate_after_cap"),
+            # The API omits these when they are at their defaults, so every
+            # existing plan's JSON is unchanged — hence the fallbacks rather
+            # than a bare .get(). "strict" = a hard limit inside each period;
+            # "pooled" = the allowance accrues across the billing period, so
+            # unused headroom banks (GloBird's step rates, EnergyAustralia's
+            # Solar Sharer). See plan_rates.cap_period / cap_application.
+            "cap_period": rate_def.get("cap_period") or "day",
+            "cap_application": rate_def.get("cap_application") or "strict",
         }
 
     def _rate_label_for_hour(self, hour: int) -> str:
@@ -577,11 +589,22 @@ def build_rate_caps(
             label = info.get("label") or "Energy"
             group = groups.setdefault(label, {
                 "daily_cap_kwh": cap, "rate_after_cap": after,
+                # Carried through so the LP can widen a pooled cap from one row
+                # per calendar day to one row across the horizon.
+                "cap_period": info.get("cap_period") or "day",
+                "cap_application": info.get("cap_application") or "strict",
                 "hour_mask": [0] * n_slots,
             })
             group["hour_mask"][t] = 1
-            cap_labels.setdefault(round(info["rate"], 4), f"{label} (first {cap:g} kWh/day)")
-            cap_labels.setdefault(round(after, 4), f"{label} (after {cap:g} kWh/day)")
+            _unit = {"day": "kWh/day", "week": "kWh/week", "month": "kWh/month",
+                     "quarter": "kWh/quarter", "year": "kWh/year",
+                     "billing_period": "kWh/bill"}.get(
+                         info.get("cap_period") or "day", "kWh/day")
+            _avg = " avg" if (info.get("cap_application") == "pooled") else ""
+            cap_labels.setdefault(round(info["rate"], 4),
+                                  f"{label} (first {cap:g} {_unit}{_avg})")
+            cap_labels.setdefault(round(after, 4),
+                                  f"{label} (after {cap:g} {_unit}{_avg})")
         return list(groups.values())
 
     import_caps = _build(plan.get_import_rate_info)

@@ -585,6 +585,15 @@ class BatteryOptimizer:
                     "free_idx0": free_idx0, "over_idx0": over_idx0,
                     "rate_after_cap": cw["rate_after_cap"],
                     "daily_cap_kwh": cw["daily_cap_kwh"],
+                    # Carry the cap's SEMANTICS, not just its size. This dict is
+                    # rebuilt from the incoming descriptor rather than passed
+                    # through, so any field not copied here is silently lost:
+                    # cap_application was, and every pooled cap was solved as
+                    # strict while the data, the API and build_rate_caps were all
+                    # correct (found 2026-08-26 by the constraint-row log below,
+                    # which reported "strict" for a rate the DB had as pooled).
+                    "cap_period": cw.get("cap_period", "day"),
+                    "cap_application": cw.get("cap_application", "strict"),
                 })
 
         # Conditional day-credits (e.g. GloBird ZEROHERO's "$1/day when imports
@@ -841,16 +850,35 @@ class BatteryOptimizer:
         # imp[t] - Σ def_i[t] ≤ load[t]  ⇒  grid may cover house load + deferrable devices,
         # but any battery charge must come from solar surplus only.
         ngc_rows = T if no_grid_charge else 0
-        # Daily cumulative cap: one row per (cap window, calendar day) covered by that
-        # window's hours, using the same slots_per_day chunking as the deferrable-load
-        # daily totals above. Σ free[j] over that day's hours ≤ daily_cap_kwh.
+        # Cumulative cap rows. A STRICT cap is one row per (cap window, calendar
+        # day) — Σ free[j] over that day's hours ≤ daily_cap_kwh — using the same
+        # slots_per_day chunking as the deferrable-load daily totals above.
+        #
+        # A POOLED cap (cap_application='pooled') is settled over the retailer's
+        # whole billing period, so within this horizon it is ONE row across every
+        # slot of the window, with the allowance scaled by the days the horizon
+        # actually covers. That is strictly more permissive than the per-day form
+        # and uses fewer rows, which is the point: a quiet morning can fund a
+        # heavy afternoon, exactly as GloBird and EnergyAustralia describe.
+        #
+        # ⚠ APPROXIMATION. The horizon is 24-48h, not a billing period, so this
+        # pools over the horizon rather than the real month. It cannot bank
+        # allowance from last week. It is strictly closer to the truth than
+        # treating a pooled cap as strict — which understates the plan every
+        # day — but it is not exact, and a plan whose value depends on pooling
+        # across weeks will still be undervalued here.
         cap_day_groups = []
         for cb in cap_blocks:
+            if cb.get("cap_application") == "pooled":
+                horizon_days = max(1.0, len(cb["hours"]) and T / slots_per_day)
+                cap_day_groups.append(
+                    (cb, list(range(len(cb["hours"]))), horizon_days))
+                continue
             days: dict[int, list[int]] = {}
             for j, t in enumerate(cb["hours"]):
                 days.setdefault(t // slots_per_day, []).append(j)
             for js in days.values():
-                cap_day_groups.append((cb, js))
+                cap_day_groups.append((cb, js, 1.0))
         # One big-M row per masked slot of each credit-day: imp[t] <= threshold
         # when y=1 (imp[t] + M*y <= threshold + M; y=0 relaxes it to imp[t] <= M,
         # already the physical ceiling everywhere else). threshold_kwh is a
@@ -888,10 +916,10 @@ class BatteryOptimizer:
                     A_ub[r, (5 + i) * T + t] = -1.0
                 b_ub[r] = load[t]
                 r += 1
-        for cb, js in cap_day_groups:
+        for cb, js, n_days in cap_day_groups:
             for j in js:
                 A_ub[r, cb["free_idx0"] + j] = 1.0
-            b_ub[r] = cb["daily_cap_kwh"]
+            b_ub[r] = cb["daily_cap_kwh"] * n_days
             r += 1
         for cb2 in credit_blocks:
             for t in cb2["hours"]:
@@ -1064,11 +1092,21 @@ class BatteryOptimizer:
                 target = import_tranche if cb["direction"] == "import" else export_tranche
                 free_total = sum(v[0] for t, v in target.items() if t in cb["hours"])
                 over_total = sum(v[1] for t, v in target.items() if t in cb["hours"])
+                # Report the constraint rows this block actually produced, not
+                # just its inputs. A pooled cap collapses to ONE row spanning the
+                # horizon while a strict cap gets one per calendar day, and until
+                # now that difference was invisible at runtime — provable by unit
+                # test, but not observable on a live solve, which is exactly the
+                # kind of gap that lets a wiring mistake sit unnoticed.
+                rows = [(js, nd) for cb2, js, nd in cap_day_groups if cb2 is cb]
+                budget = sum(cb["daily_cap_kwh"] * nd for _, nd in rows)
                 _LOGGER.warning(
                     "cap block %s: %d hours, daily_cap=%.1f, rate_after_cap=%.3f, "
-                    "free=%.2fkWh, over_cap=%.2fkWh",
+                    "free=%.2fkWh, over_cap=%.2fkWh | %s: %d constraint row(s), "
+                    "%.1fkWh budget over the horizon",
                     cb["direction"], len(cb["hours"]), cb["daily_cap_kwh"],
                     cb["rate_after_cap"], free_total, over_total,
+                    cb.get("cap_application", "strict"), len(rows), budget,
                 )
         return {
             'schedule':            schedule,
