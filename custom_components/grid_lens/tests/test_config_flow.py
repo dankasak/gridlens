@@ -517,6 +517,56 @@ def test_reinstall_recovers_mirrored_key_without_asking():
     print("  \u2713 409 with a valid local mirror recovers the key, no manual entry")
 
 
+def test_recovered_paid_key_gets_no_free_tier_upsell():
+    """A recovered key is often already paid. Telling a subscriber their "free account
+    is locked to that one plan" is wrong and reads as "you have no API key" — which is
+    exactly what it looked like in the wild once 409 started routing through finalize
+    (manual_key never showed this notification)."""
+    import gl.credentials as creds
+
+    creds.stored = {"ha_installation_id": "u-1", "api_key": "gl_paid",
+                    "email": "a@b.com", "api_url": "https://api.gridlens.au"}
+    notes = sys.modules["homeassistant.components.persistent_notification"]
+    notes.created.clear()
+    try:
+        routes = _routes(register=(409, {"detail": "already registered"}))
+        routes["/plans/meta"] = (200, {"tier": "paid", "locked_plan": None})
+        f = _flow(FakeSession(routes))
+        run(f.async_step_user({const.CONF_STATE: "NSW", const.CONF_GRIDLENS_EMAIL: "a@b.com"}))
+        f._sensor_data = {}
+        res = run(f.async_step_current_plan({const.CONF_CURRENT_PLAN: "globird_zerohero"}))
+        assert res["type"] == "create_entry", res
+        assert res["data"][const.CONF_GRIDLENS_API_KEY] == "gl_paid"
+        assert not notes.created, f"paid account was shown an upgrade pitch: {notes.created}"
+    finally:
+        creds.stored = None
+        notes.created.clear()
+    print("  \u2713 a recovered paid key completes setup with no upgrade pitch")
+
+
+def test_free_tier_still_gets_the_upsell():
+    """The pitch must survive for the accounts it is actually for."""
+    import gl.credentials as creds
+
+    creds.stored = {"ha_installation_id": "u-1", "api_key": "gl_free",
+                    "email": "a@b.com", "api_url": "https://api.gridlens.au"}
+    notes = sys.modules["homeassistant.components.persistent_notification"]
+    notes.created.clear()
+    try:
+        routes = _routes(register=(409, {"detail": "already registered"}))
+        routes["/plans/meta"] = (200, {"tier": "free", "locked_plan": "globird_zerohero"})
+        f = _flow(FakeSession(routes))
+        run(f.async_step_user({const.CONF_STATE: "NSW", const.CONF_GRIDLENS_EMAIL: "a@b.com"}))
+        f._sensor_data = {}
+        res = run(f.async_step_current_plan({const.CONF_CURRENT_PLAN: "globird_zerohero"}))
+        assert res["type"] == "create_entry", res
+        assert notes.created and notes.created[0][1] == f"{const.DOMAIN}_upgrade", notes.created
+    finally:
+        creds.stored = None
+        notes.created.clear()
+    print("  \u2713 a recovered free key still gets the upgrade pitch")
+
+
 def test_recovery_rejects_a_mirrored_key_the_api_no_longer_accepts():
     """Fail safe: a stale mirrored key must fall back to asking, never be written into
     the entry — an install that looks configured and then 401s on every refresh is worse

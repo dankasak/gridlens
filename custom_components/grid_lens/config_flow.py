@@ -263,6 +263,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._api_vpp_programs: list[dict] = []
         self._api_key: str = ""
         self._ha_uuid: str = ""
+        self._api_tier: str | None = None
 
     @staticmethod
     @callback
@@ -719,6 +720,16 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             api_url=self._api_url,
         )
 
+        # Only pitch the upgrade to accounts that would actually benefit. A fresh
+        # /register always creates a free key, so the pitch is right there; a key
+        # recovered on reinstall is frequently already paid, and telling a subscriber
+        # their "free account is locked to that one plan" is both wrong and insulting.
+        if self._api_tier and self._api_tier != "free":
+            return self.async_create_entry(
+                title=f"Grid Lens - {self._state}",
+                data=self._sensor_data,
+            )
+
         persistent_notification.async_create(
             self.hass,
             "Grid Lens is set up and comparing your current plan against itself, so "
@@ -759,9 +770,16 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status == 200:
+                    # Remember the tier: a recovered key is often a paid one, and
+                    # finalize must not greet a subscriber with a free-tier upsell.
+                    try:
+                        self._api_tier = (await resp.json()).get("tier")
+                    except Exception:
+                        self._api_tier = None
                     _LOGGER.info(
                         "Recovered the existing Grid Lens API key from local storage "
-                        "after a reinstall; no re-entry needed"
+                        "after a reinstall; no re-entry needed (tier=%s)",
+                        self._api_tier or "unknown",
                     )
                     return api_key
                 _LOGGER.debug(
