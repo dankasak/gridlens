@@ -927,6 +927,12 @@ is right for most installs:
 - API URL — now on the options flow's **API key & connection** step, where self-hosting
   belongs.
 
+**One entry per install.** `single_config_entry` in `manifest.json` — a second entry means a
+second coordinator against the same inverter, which is a real hazard once a battery is
+declared. A second Add Integration now aborts on `single_instance_allowed`. This also rules
+out a genuine multi-state install; nobody has asked for one, and the safety case wins until
+somebody does.
+
 **Upgrade pitch.** Setup no longer ends on a blocking `async_external_step` redirect to
 gridlens.au/subscribe (which also silently did nothing on installs with no external/internal
 URL). `async_step_finalize` creates a persistent notification (`{DOMAIN}_upgrade`) instead.
@@ -946,6 +952,14 @@ A purely local fix suffices because **a 409 can only occur when `.storage` survi
 keeps the installation UUID in `.storage/core.uuid`, so wiping `.storage` regenerates it and
 `/register` simply returns 200. Same UUID ⟹ same `.storage` ⟹ the mirror is still there. No
 `async_remove_entry` is defined, so nothing deletes it on removal.
+
+The pitch in `async_step_finalize` is **tier-aware**: it is shown only to free accounts.
+A fresh `/register` always mints a free key so the pitch is right there, but a recovered key
+is frequently already paid, and telling a subscriber their "free account is locked to that
+one plan" reads as *"you have no API key"* while every paid feature keeps working. The tier
+comes from the `/plans/meta` response already being made to validate the recovered key, so
+it costs no extra request. `manual_key` never showed this notification, which is why the
+problem only appeared once recovery started routing through `finalize`.
 
 `manual_key` remains as the fallback for the residual cases (mirror deleted by hand, key
 revoked server-side, partially-restored backup) and still explains that only a hash is
