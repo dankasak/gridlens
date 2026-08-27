@@ -172,6 +172,24 @@ def _bootstrap():
     inv.INVERTER_BRANDS = {"sigenergy": {"mqtt": "Sigenergy (MQTT)"}}
     inv.detect_inverter_brand = lambda hass: getattr(hass, "detected_inverter", None)
     sys.modules["gl.inverters"] = inv
+    # Stubbed rather than loaded: credentials.py talks to homeassistant.helpers.storage,
+    # and what these tests care about is whether the flow *consults* the mirror on 409
+    # and *writes* it on success — not how Store serialises.
+    creds = types.ModuleType("gl.credentials")
+    creds.__path__ = []
+    creds.saved = []
+    creds.stored = None
+
+    async def _save(hass, *, ha_uuid, api_key, email, api_url):
+        creds.saved.append({"ha_installation_id": ha_uuid, "api_key": api_key,
+                            "email": email, "api_url": api_url})
+
+    async def _load_creds(hass, ha_uuid):
+        return creds.stored
+
+    creds.async_save_credentials = _save
+    creds.async_load_credentials = _load_creds
+    sys.modules["gl.credentials"] = creds
     return _load(os.path.join(_COMPONENT, "config_flow.py"), "gl.config_flow", package="gl")
 
 
@@ -474,6 +492,51 @@ def test_reinstall_offers_manual_key():
     assert ok["data"][const.CONF_GRIDLENS_API_KEY] == "gl_existing"
     assert ok["data"][const.CONF_CURRENT_PLAN] == "globird_zerohero"
     print("  ✓ 409 reinstall path reaches manual key entry and preserves the plan")
+
+
+def test_reinstall_recovers_mirrored_key_without_asking():
+    """The reinstall gap (FEATURES.md 12a): a 409 used to dead-end on manual_key, asking
+    for a key the API only ever displays once. With a local mirror present and still
+    valid, setup must complete silently instead."""
+    import gl.credentials as creds
+
+    creds.stored = {"ha_installation_id": "u-1", "api_key": "gl_mirrored",
+                    "email": "a@b.com", "api_url": "https://api.gridlens.au"}
+    creds.saved = []
+    try:
+        session = FakeSession(_routes(register=(409, {"detail": "already registered"})))
+        f = _flow(session)
+        run(f.async_step_user({const.CONF_STATE: "NSW", const.CONF_GRIDLENS_EMAIL: "a@b.com"}))
+        f._sensor_data = {}
+        res = run(f.async_step_current_plan({const.CONF_CURRENT_PLAN: "globird_zerohero"}))
+        assert res["type"] == "create_entry", res
+        assert res["data"][const.CONF_GRIDLENS_API_KEY] == "gl_mirrored", res["data"]
+        assert res["data"][const.CONF_CURRENT_PLAN] == "globird_zerohero"
+    finally:
+        creds.stored = None
+    print("  \u2713 409 with a valid local mirror recovers the key, no manual entry")
+
+
+def test_recovery_rejects_a_mirrored_key_the_api_no_longer_accepts():
+    """Fail safe: a stale mirrored key must fall back to asking, never be written into
+    the entry — an install that looks configured and then 401s on every refresh is worse
+    than one that asked a question."""
+    import gl.credentials as creds
+
+    creds.stored = {"ha_installation_id": "u-1", "api_key": "gl_revoked",
+                    "email": "a@b.com", "api_url": "https://api.gridlens.au"}
+    try:
+        routes = _routes(register=(409, {"detail": "already registered"}))
+        routes["/plans/meta"] = (401, {"detail": "invalid key"})
+        session = FakeSession(routes)
+        f = _flow(session)
+        run(f.async_step_user({const.CONF_STATE: "NSW", const.CONF_GRIDLENS_EMAIL: "a@b.com"}))
+        f._sensor_data = {}
+        res = run(f.async_step_current_plan({const.CONF_CURRENT_PLAN: "globird_zerohero"}))
+        assert res["step_id"] == "manual_key", res
+    finally:
+        creds.stored = None
+    print("  \u2713 a revoked mirrored key falls back to manual entry, not a broken entry")
 
 
 def test_upgrade_pitch_is_a_notification_not_a_redirect():

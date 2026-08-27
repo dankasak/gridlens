@@ -77,6 +77,7 @@ from .const import (
     STATES,
     DISTRIBUTORS,
 )
+from .credentials import async_load_credentials, async_save_credentials
 from .inverters import INVERTER_BRANDS, detect_inverter_brand
 
 _LOGGER = logging.getLogger(__name__)
@@ -645,9 +646,23 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         })
                         return await self.async_step_finalize()
                     elif resp.status == 409:
+                        # Already registered — almost always a reinstall. The API stores
+                        # only a hash and cannot hand the key back, but we mirrored it
+                        # locally, and a 409 implies .storage survived (the installation
+                        # UUID lives there), so the mirror is still present. Recover
+                        # silently rather than dead-ending the user on manual_key.
                         self._sensor_data[CONF_CURRENT_PLAN] = plan_id
                         self._sensor_data[CONF_HAS_DEMAND_TARIFF] = has_demand_tariff
                         self._sensor_data[CONF_VPP_PROGRAM] = vpp_program
+                        recovered = await self._async_recover_api_key(ha_uuid)
+                        if recovered:
+                            self._api_key = recovered
+                            self._sensor_data.update({
+                                CONF_GRIDLENS_EMAIL: self._email,
+                                CONF_GRIDLENS_API_URL: self._api_url,
+                                CONF_GRIDLENS_API_KEY: recovered,
+                            })
+                            return await self.async_step_finalize()
                         return await self.async_step_manual_key()
                     else:
                         errors["base"] = "cannot_connect"
@@ -694,6 +709,16 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         did nothing at all on installs with no external/internal URL configured. The
         same pitch now waits in the notification drawer.
         """
+        # Mirror the credentials so a future reinstall can recover without the user
+        # having to have kept a copy of a key that is only ever displayed once.
+        await async_save_credentials(
+            self.hass,
+            ha_uuid=self._ha_uuid,
+            api_key=self._api_key,
+            email=self._email,
+            api_url=self._api_url,
+        )
+
         persistent_notification.async_create(
             self.hass,
             "Grid Lens is set up and comparing your current plan against itself, so "
@@ -711,6 +736,41 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             title=f"Grid Lens - {self._state}",
             data=self._sensor_data,
         )
+
+    async def _async_recover_api_key(self, ha_uuid: str) -> str | None:
+        """Return a locally-mirrored API key for this installation, if it still works.
+
+        Returns None on anything unexpected so the caller falls back to asking the user;
+        a stale key must never be written into a new entry, because the resulting install
+        looks configured and then 401s on every refresh.
+        """
+        data = await async_load_credentials(self.hass, ha_uuid)
+        if not data:
+            return None
+        api_key = data.get("api_key")
+        if not api_key:
+            return None
+        try:
+            session = async_get_clientsession(self.hass)
+            async with session.get(
+                f"{self._api_url}/plans/meta",
+                params={"state": self._state},
+                headers={"X-API-Key": api_key, "User-Agent": _USER_AGENT},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    _LOGGER.info(
+                        "Recovered the existing Grid Lens API key from local storage "
+                        "after a reinstall; no re-entry needed"
+                    )
+                    return api_key
+                _LOGGER.debug(
+                    "Mirrored API key did not validate (HTTP %s); asking the user",
+                    resp.status,
+                )
+        except Exception:
+            _LOGGER.debug("Could not validate the mirrored API key", exc_info=True)
+        return None
 
     async def async_step_manual_key(
         self, user_input: dict[str, Any] | None = None
@@ -739,6 +799,14 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             CONF_GRIDLENS_API_URL: self._api_url,
                             CONF_GRIDLENS_API_KEY: api_key,
                         })
+                        # Mirror it, so this is the last time it has to be typed in.
+                        await async_save_credentials(
+                            self.hass,
+                            ha_uuid=self._ha_uuid,
+                            api_key=api_key,
+                            email=self._email,
+                            api_url=self._api_url,
+                        )
                         return self.async_create_entry(
                             title=f"Grid Lens - {self._state}",
                             data=self._sensor_data,

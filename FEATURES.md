@@ -933,11 +933,25 @@ URL). `async_step_finalize` creates a persistent notification (`{DOMAIN}_upgrade
 **Note:** the `/api/grid_lens/subscribe_callback` view and its `pending_subscriptions` dict
 in `__init__.py` are now unreferenced by the config flow.
 
-**Reinstall (409) — improved, not solved. ⚠ OPEN GAP.** `/register` is keyed on HA
-installation UUID, so removing and re-adding the integration 409s and lands on `manual_key`.
-That step used to say "Don't have a key yet? Subscribe" — wrong advice for someone who
-already owns one. It now explains that only a hash is stored so the key cannot be shown
-again, and points at `support@gridlens.au`.
+**Reinstall (409) — solved locally.** `/register` is keyed on HA installation UUID, so
+removing and re-adding the integration 409s. The integration mirrors its credentials into a
+**global** `Store` (`grid_lens_credentials` — deliberately *not* entry-id-suffixed, so the
+config flow can read it before any entry exists), written by `async_save_credentials()` on
+every successful setup and backfilled on every `async_setup_entry` so installs predating the
+feature are covered from their next restart. On 409 the flow calls
+`_async_recover_api_key()`, revalidates the mirrored key against `/plans/meta`, and
+continues silently — no re-entry, no support ticket.
+
+A purely local fix suffices because **a 409 can only occur when `.storage` survived**: HA
+keeps the installation UUID in `.storage/core.uuid`, so wiping `.storage` regenerates it and
+`/register` simply returns 200. Same UUID ⟹ same `.storage` ⟹ the mirror is still there. No
+`async_remove_entry` is defined, so nothing deletes it on removal.
+
+`manual_key` remains as the fallback for the residual cases (mirror deleted by hand, key
+revoked server-side, partially-restored backup) and still explains that only a hash is
+stored and points at `support@gridlens.au`. Recovery is fail-safe: any unexpected condition
+returns `None` and falls back to asking, because writing a stale key would produce an
+install that looks configured and then 401s on every refresh.
 
 **A user who lost their key still cannot self-serve, and support cannot serve them with
 tooling.** Two things are missing, both deliberately left for a product decision:

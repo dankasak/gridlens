@@ -11,6 +11,7 @@ import aiohttp
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+from .credentials import async_save_credentials
 from .const import (
     DOMAIN, PLAN_ID_TO_KEY, CONF_DISTRIBUTOR, CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_LOAD_POWER_SENSOR, CONF_GRID_POWER_SENSOR, CONF_ENERGY_SENSOR,
@@ -1674,6 +1675,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.info("Setting up Grid Lens")
 
     hass.data.setdefault(DOMAIN, {})
+
+    # Backfill the credential recovery store. Installs predating it have no store yet, so
+    # without this they would still dead-end on manual_key after a reinstall — which is
+    # every existing user. Runs on each setup so a key pasted later (Configure -> API key
+    # & connection reloads the entry) is mirrored too; in the steady state it rewrites
+    # identical content.
+    try:
+        import uuid as _uuid
+        from homeassistant.helpers import instance_id as _instance_id
+        from .const import (CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL,
+                            CONF_GRIDLENS_EMAIL)
+        await async_save_credentials(
+            hass,
+            ha_uuid=str(_uuid.UUID(await _instance_id.async_get(hass))),
+            api_key=entry.data.get(CONF_GRIDLENS_API_KEY),
+            email=entry.data.get(CONF_GRIDLENS_EMAIL),
+            api_url=entry.data.get(CONF_GRIDLENS_API_URL),
+        )
+    except Exception:
+        # Warning, not debug: this should never fail, and if it does the user silently
+        # loses reinstall recovery — they would only find out during a reinstall, at the
+        # exact moment the key they need is unrecoverable. Most installs run
+        # `logger: default: warning`, where a debug line is invisible.
+        _LOGGER.warning("Could not mirror Grid Lens credentials for reinstall recovery",
+                        exc_info=True)
 
     # Must run first, before anything below reads entry.data and before the update
     # listener is registered (see _ensure_load_estimators's own docstring for why).
