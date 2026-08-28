@@ -103,6 +103,10 @@ class LoadControlManager:
         # export-surplus condition. "" = not configured — that condition simply never
         # fires (the import-price-free condition still works without it).
         self._grid_power_sensor: str = d.get(CONF_GRID_POWER_SENSOR) or ""
+        # One-shot latch for the "greedy is armed but has no grid reading" warning below.
+        # Logged once per manager rather than every 5-minute tick, per CONF_GRID_POWER_SENSOR's
+        # own "fails open, logs once" discipline.
+        self._warned_no_grid_power = False
 
         # One controller per device that has a control entity configured. Keyed by the
         # device's index in the deferrable lists, so DispatchInterval.deferrable_w[i] lines
@@ -412,6 +416,22 @@ class LoadControlManager:
         free_kwh, free_hours = (None, 0.0)
         if controller.greedy and controller.greedy_forecast_surplus:
             free_kwh, free_hours = self._forecast_free_kwh(index, now)
+        if controller.greedy and not self._grid_power_sensor and not self._warned_no_grid_power:
+            # Greedy's export-surplus condition is the one that catches a house spilling
+            # kilowatts at a $0 export price, and it is silently unavailable without this
+            # sensor — which is optional, easy to leave blank, and NOT auto-discoverable
+            # (the Energy dashboard stores energy statistics, never a live power entity).
+            # warning, not debug: a debug line here would be invisible on a default install,
+            # which is exactly the install this happens on.
+            self._warned_no_grid_power = True
+            _LOGGER.warning(
+                "Greedy Consumption is enabled for %s but no Grid Power sensor is "
+                "configured — the export-surplus condition can never fire, so the load "
+                "will stay off through free export. Set the (optional) Grid Power sensor "
+                "in Grid Lens > Reconfigure > Energy sensors to a live signed grid power "
+                "entity (positive = importing, negative = exporting).",
+                controller.name,
+            )
         try:
             await controller.apply(
                 planned_w, now,

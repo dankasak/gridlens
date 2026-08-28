@@ -101,7 +101,12 @@ def _install_stubs() -> None:
             return {"type": "abort", **kw}
 
     ce.ConfigFlow = _ConfigFlow
-    ce.OptionsFlow = type("OptionsFlow", (), {})
+    ce.OptionsFlow = type("OptionsFlow", (), {
+        "async_show_form": _ConfigFlow.async_show_form,
+        "async_show_menu": _ConfigFlow.async_show_menu,
+        "async_create_entry": _ConfigFlow.async_create_entry,
+        "async_abort": _ConfigFlow.async_abort,
+    })
     ce.ConfigEntry = type("ConfigEntry", (), {})
     ce.FlowResult = dict
     ha.config_entries = ce
@@ -600,6 +605,133 @@ def test_upgrade_pitch_is_a_notification_not_a_redirect():
     created = sys.modules["homeassistant.components.persistent_notification"].created
     assert created and created[0][1] == f"{const.DOMAIN}_upgrade", created
     print("  ✓ setup ends on entry creation; upgrade pitch left as a notification")
+
+
+# ------------------------------------------------- reconfigure: optional-sensor safety
+class _FakeDashboard:
+    def __init__(self, config):
+        self._config = config
+
+    async def async_load(self, force):
+        return self._config
+
+
+def _powerflow_dashboards(grid_entity):
+    """A storage-mode dashboard holding a Power Flow card nested in a stack — the shape a
+    real install has, not a top-level card."""
+    return {
+        "grid_lens": _FakeDashboard({
+            "views": [{
+                "cards": [{
+                    "type": "vertical-stack",
+                    "cards": [{
+                        "type": "custom:grid-lens-powerflow-card",
+                        "grid_power_entity": grid_entity,
+                    }],
+                }],
+            }],
+        }),
+    }
+
+
+def _options_flow(entry_data, states=None, dashboards=None):
+    entry = types.SimpleNamespace(data=entry_data, entry_id="e1")
+    f = cf.GridLensOptionsFlow(entry)
+    f.hass = FakeHass(FakeSession(_routes()), states)
+    if dashboards is not None:
+        f.hass.data["lovelace"] = types.SimpleNamespace(dashboards=dashboards)
+    return f
+
+
+_BASE_ENTRY = {
+    const.CONF_ENERGY_SENSOR: "sensor.import_energy",
+    const.CONF_SOLAR_SENSOR: "sensor.solar_energy",
+    const.CONF_GRID_EXPORT_SENSOR: "sensor.export_energy",
+    const.CONF_GRID_POWER_SENSOR: "sensor.grid_power",
+    const.CONF_IMPORT_PRICE_SENSOR: None,
+    const.CONF_EXPORT_PRICE_SENSOR: None,
+}
+
+# Units/state_class the flow's own validation expects on the three cumulative energy sensors.
+_KWH = {"unit_of_measurement": "kWh", "state_class": "total_increasing"}
+_OK_STATES = {
+    "sensor.import_energy": types.SimpleNamespace(state="1", attributes=_KWH),
+    "sensor.solar_energy": types.SimpleNamespace(state="1", attributes=_KWH),
+    "sensor.export_energy": types.SimpleNamespace(state="1", attributes=_KWH),
+}
+
+_SUBMIT_WITHOUT_GRID_POWER = {
+    const.CONF_ENERGY_SENSOR: "sensor.import_energy",
+    const.CONF_SOLAR_SENSOR: "sensor.solar_energy",
+    const.CONF_GRID_EXPORT_SENSOR: "sensor.export_energy",
+}
+
+
+def test_reconfigure_keeps_grid_power_when_entity_cannot_render():
+    """The 2026-08-28 data-loss bug. An EntitySelector seeded with an entity that doesn't
+    currently resolve renders EMPTY, and an untouched empty picker submits absent —
+    indistinguishable from a deliberate clear. Honouring it silently deleted
+    grid_power_sensor and disabled Greedy Consumption's export-surplus condition."""
+    f = _options_flow(_BASE_ENTRY, states=dict(_OK_STATES))  # sensor.grid_power NOT present
+    run(f.async_step_sensors())                              # render (seeds _discovered)
+    run(f.async_step_sensors(_SUBMIT_WITHOUT_GRID_POWER))    # submit, field came back empty
+    assert f._sensor_data[const.CONF_GRID_POWER_SENSOR] == "sensor.grid_power"
+    print("  ✓ an unrenderable optional sensor survives a reconfigure instead of being wiped")
+
+
+def test_reconfigure_still_honours_a_real_clear():
+    """The other half: when the entity DOES resolve, the picker showed it, so absent is a
+    genuine user action and must still clear. Preserving here would make the field
+    impossible to empty."""
+    states = dict(_OK_STATES)
+    states["sensor.grid_power"] = types.SimpleNamespace(state="-3200", attributes={})
+    f = _options_flow(_BASE_ENTRY, states=states)
+    run(f.async_step_sensors())
+    run(f.async_step_sensors(_SUBMIT_WITHOUT_GRID_POWER))
+    assert f._sensor_data[const.CONF_GRID_POWER_SENSOR] is None
+    print("  ✓ clearing a field that was actually rendering still clears it")
+
+
+def test_reconfigure_suggests_grid_power_from_powerflow_card():
+    """The user configured this exact entity on the Power Flow card. Asking a second time
+    for the same fact is the complaint that started this."""
+    states = dict(_OK_STATES)
+    states["sensor.house_grid_power"] = types.SimpleNamespace(state="-1000", attributes={})
+    entry = {**_BASE_ENTRY, const.CONF_GRID_POWER_SENSOR: None}
+    f = _options_flow(entry, states=states,
+                      dashboards=_powerflow_dashboards("sensor.house_grid_power"))
+    res = run(f.async_step_sensors())
+    seeded = res["data_schema"].schema
+    marker = next(k for k in seeded if str(k) == const.CONF_GRID_POWER_SENSOR)
+    assert marker.description.get("suggested_value") == "sensor.house_grid_power", marker.description
+    print("  ✓ a blank grid power sensor is pre-filled from the Power Flow card's own config")
+
+
+def test_reconfigure_ignores_a_stale_powerflow_card_entity():
+    """Discovery offers a real answer or nothing — never an entity that no longer exists,
+    which would re-introduce exactly the unrenderable-picker problem above."""
+    entry = {**_BASE_ENTRY, const.CONF_GRID_POWER_SENSOR: None}
+    f = _options_flow(entry, states=dict(_OK_STATES),
+                      dashboards=_powerflow_dashboards("sensor.long_gone"))
+    res = run(f.async_step_sensors())
+    seeded = res["data_schema"].schema
+    marker = next(k for k in seeded if str(k) == const.CONF_GRID_POWER_SENSOR)
+    assert not marker.description.get("suggested_value"), marker.description
+    print("  ✓ a stale Power Flow card entity is not offered as a suggestion")
+
+
+def test_reconfigure_never_overrides_a_stored_grid_power_sensor():
+    """Discovery fills a blank, it does not second-guess an answer already stored."""
+    states = dict(_OK_STATES)
+    states["sensor.grid_power"] = types.SimpleNamespace(state="0", attributes={})
+    states["sensor.house_grid_power"] = types.SimpleNamespace(state="0", attributes={})
+    f = _options_flow(_BASE_ENTRY, states=states,
+                      dashboards=_powerflow_dashboards("sensor.house_grid_power"))
+    res = run(f.async_step_sensors())
+    seeded = res["data_schema"].schema
+    marker = next(k for k in seeded if str(k) == const.CONF_GRID_POWER_SENSOR)
+    assert marker.description.get("suggested_value") == "sensor.grid_power"
+    print("  ✓ discovery fills a blank grid power sensor, never overrides a stored one")
 
 
 if __name__ == "__main__":

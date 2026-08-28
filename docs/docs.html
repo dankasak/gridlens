@@ -204,7 +204,11 @@
           <strong>Optional guardrails:</strong> <em>Greedy Respects Schedule</em> confines greedy to the appliance's own allowed run times. And a manual override always wins — greedy is suppressed entirely while you have a load forced On or Off.
         </div>
         <h3>Setting up the export-surplus trigger</h3>
-        <p>The <em>export surplus</em> trigger needs a <strong>live signed grid power sensor</strong> — positive when importing, negative when exporting — configured as <code>grid_power_sensor</code> under <strong>Grid Lens → Configure</strong>. Without it that one trigger simply never fires; the other two still work.</p>
+        <p>The <em>export surplus</em> trigger needs a <strong>live signed grid power sensor</strong> &mdash; positive when importing, negative when exporting &mdash; configured as <code>grid_power_sensor</code> under <strong>Grid Lens &rarr; Configure</strong>. Without it that one trigger simply never fires; the other two still work.</p>
+
+        <p>If you have already set up the <strong>Power Flow card</strong>, you have told Grid Lens this entity once and it is filled in for you &mdash; the card's <code>grid_power_entity</code> is the same reading with the same sign convention, so the setup form offers it back rather than asking twice. Otherwise the field starts blank: the other energy sensors come from your Home Assistant Energy dashboard, but that dashboard only records cumulative energy and has no live power reading to borrow.</p>
+
+        <p>If it is blank and Greedy Consumption is on, the Deferrable Loads card says so &mdash; the appliance's greedy line reads <em>&ldquo;export is free, but no grid power sensor is set&rdquo;</em> rather than pretending it is still waiting for surplus.</p>
         <p>Note this is a <em>power</em> (W) sensor, not one of the cumulative kWh sensors from your Energy dashboard.</p>
 
         <h2 id="observability">Seeing why it acted</h2>

@@ -616,6 +616,42 @@ sensor, positive = importing, negative = exporting. Without it, condition #2 sim
 fires; #1 and #3 still work. Note this is a *power* sensor: the Energy-dashboard sensors
 (`energy_sensor`, `solar_sensor`, `grid_export_sensor`) are cumulative kWh and cannot serve.
 
+⚠ **`grid_power_sensor` could be silently DESTROYED by a reconfigure, and the loss was
+invisible.** Found 2026-08-28: ~5 kW exported for two hours at $0 with the 1.9 kW EV charger
+sitting off. The field had been set correctly and was wiped by the reconfigure wizard.
+
+*The data-loss mechanism* (`config_flow.py::GridLensOptionsFlow.async_step_sensors`): every
+key in `_ENERGY_SCHEMA_KEYS` was re-asserted as `user_input.get(key) or None`, because a
+cleared `EntitySelector` submits *absent* rather than `None`. But an `EntitySelector` seeded
+via `suggested_value` with an entity id that doesn't currently resolve **renders empty** — and
+an untouched empty picker also submits absent. The two are indistinguishable, so a transient
+condition (the inverter integration hadn't finished loading when the wizard was opened, an
+entity was renamed) became a permanent deletion of a setting the user never touched, on a step
+they only walked through to reach something else. Now: absent + a seeded value the picker
+*could* render == cleared (honoured); absent + a seeded value that doesn't resolve == not
+answered, keep what is stored (and log a warning).
+
+*Why nothing caught it.* `grid_power_sensor` had **zero** config-flow test coverage, and the
+options flow had no test coverage at all. `tests/test_config_flow.py` now covers both halves
+of the clear rule plus discovery, and the preserve test was confirmed to fail against the old
+code before being kept.
+
+**It is now auto-discovered** (`_discover_grid_power_sensor`) from the install's own Power Flow
+card `grid_power_entity` — the same fact, the same sign convention, already answered by the
+same person. It is *not* guessed from entity names: "a power sensor with 'grid' in the name"
+would happily match an unsigned import-only register, and greedy would then read a positive
+import as "not exporting" forever. Silently wrong beats visibly absent. Note the HA Energy
+dashboard cannot supply this field — it stores cumulative energy statistics only, never a live
+power entity — which is why it is the one energy field that starts blank.
+
+Three further changes make an empty field visible rather than silent:
+- `greedy_blocked = "no_grid_power"` is recorded whenever the export price is ≤ 0 and the
+  grid reading is missing/unavailable, so the state is published, not inferred.
+- The Load Control card renders that case as *"Greedy: export is free, but no grid power
+  sensor is set"* instead of the misleading *"armed, waiting for free energy"*.
+- `LoadControlManager` logs a one-shot **warning** (not debug — a debug line is invisible on
+  the default install this happens on) naming the device and the fix.
+
 **Observability** — see §11.
 
 **Tuning knob:** `GREEDY_SURPLUS_LOOKAHEAD_HOURS = 4.0` in `load_control_manager.py`.
@@ -856,7 +892,7 @@ that?" has to be answerable from the dashboard alone.
 |---|---|
 | `switch.*_battery_control` attributes | Applied action/power, last tick, plan age, degraded state, note. |
 | `switch.*_<device>_control` attributes | Commanded state, threshold, override, all three greedy toggles, **`greedy_reason`**, **`greedy_blocked`**, **`forecast_free_kwh` / `forecast_needed_kwh`**, note. Modulating devices add `control_type`, `setpoint_entity`, `min_w`/`cap_w`, `commanded_w`/`commanded_setpoint`, `plugged_in`, `last_write`, `modulation_source`. |
-| **Load Control card** | Per row: control state, and a live greedy line — the firing reason, or why it's blocked, or the **forecast-surplus progress bar** (`6.2 / 8.0 kWh`, hover/focus tooltip explains it). Shown both while armed and tracking toward the trigger, and after it's fired (condition 3 held it on) — the same bar, capped at 100%, rather than only appearing pre-trigger. For a modulating device (§6a): live amps + kW, the max-current ceiling input, and a one-line "why" — `modulation_source` (plan / surplus / override / off) and `plugged_in`. "Why is my car charging at 8 A right now?" must be answerable from the row. |
+| **Load Control card** | Per row: control state, and a live greedy line — the firing reason, or why it's blocked (including **"export is free, but no grid power sensor is set"**, §7 — the only blocked state that will *never* clear on its own, so it names the fix rather than reading as "not yet"), or the **forecast-surplus progress bar** (`6.2 / 8.0 kWh`, hover/focus tooltip explains it). Shown both while armed and tracking toward the trigger, and after it's fired (condition 3 held it on) — the same bar, capped at 100%, rather than only appearing pre-trigger. For a modulating device (§6a): live amps + kW, the max-current ceiling input, and a one-line "why" — `modulation_source` (plan / surplus / override / off) and `plugged_in`. "Why is my car charging at 8 A right now?" must be answerable from the row. |
 | **Load Control card → Estimator panel** | Per-device toggle (rows backed by a `LoadEstimator`, §5, only) expanding: current estimate/seed kW/sample count/calibration source, a convergence chart of the estimate over time, and the last 8 accept/reject decisions with why (`implausible`, `contaminated`, own-meter `too_short`/`counter_reset`). "Why does this estimate look wrong?" must be answerable without `ha core logs`. |
 | **Power Flow card** | A badge on a load node while *greedy*, not the plan, is holding it on — leaf for the two instantaneous reasons, sun-alert for forecast surplus, with the kWh figures in the tooltip. |
 | **Power Chart card** | Free-energy time bands: **orange = free energy being wasted** (plan exports into a ≤$0 export price), **teal = free import window**. Legend appears only when a band is in view; the crosshair tooltip names the band. |

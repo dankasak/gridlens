@@ -416,6 +416,50 @@ async def _run_status_reports_greedy_blocked():
     assert c.status()["greedy_blocked"] == "override"
 
 
+async def _run_status_reports_no_grid_power_block():
+    """The regression this exists for (2026-08-28): the house was spilling ~5 kW at a $0
+    export price with a 1.9 kW EV charger sitting off, because no grid power sensor was
+    configured — so greedy's export-surplus condition could never be judged. Nothing
+    recorded that, and the card reported "armed, waiting for free energy", which reads as
+    "no surplus yet" rather than "cannot see one". The block reason is the only signal
+    distinguishing the two."""
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0,
+                                 min_on_seconds=0, min_off_seconds=0)
+    c.set_greedy(True)
+    # Export is free, but there is no grid reading at all.
+    await c.apply(0.0, _T0, export_rate=0.0, grid_power_w=None)
+    assert len(_turn_ons(hass)) == 0
+    assert c.status()["greedy_blocked"] == "no_grid_power"
+    assert c.status()["greedy_reason"] is None
+    # Same slot, grid reading now available and spilling more than the device draws ->
+    # the block clears and the condition fires.
+    await c.apply(0.0, _T0, export_rate=0.0, grid_power_w=-5000.0)
+    assert c.status()["greedy_blocked"] is None
+    assert c.status()["greedy_reason"] == "export_surplus"
+    assert len(_turn_ons(hass)) == 1
+
+
+async def _run_no_grid_power_block_yields_to_forecast_surplus():
+    """A missing grid reading must not leave a stale "blocked" alongside a greedy that
+    did fire on the forward-looking condition — status() would then report the device as
+    both running-on-greedy and greedy-blocked."""
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0,
+                                 min_on_seconds=0, min_off_seconds=0)
+    c.set_greedy(True)
+    c.set_greedy_forecast_surplus(True)
+    # No grid reading (would record no_grid_power), but the forecast clears the bar:
+    # 2 kW over 4 h needs 8 kWh and 10 kWh is forecast wasted.
+    await c.apply(0.0, _T0, export_rate=0.0, grid_power_w=None,
+                  forecast_free_kwh=10.0, forecast_hours=4.0)
+    assert c.status()["greedy_reason"] == "forecast_surplus"
+    assert c.status()["greedy_blocked"] is None
+    assert len(_turn_ons(hass)) == 1
+
+
 def test_surplus_bar_scales_with_covered_span():
     hass = FakeHass()
     c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
@@ -647,6 +691,8 @@ if __name__ == "__main__":
         ("surplus_bar_scales_with_covered_span", test_surplus_bar_scales_with_covered_span),
         ("status_reports_greedy_reason", lambda: _run_async(_run_status_reports_greedy_reason)),
         ("status_reports_greedy_blocked", lambda: _run_async(_run_status_reports_greedy_blocked)),
+        ("status_reports_no_grid_power_block", lambda: _run_async(_run_status_reports_no_grid_power_block)),
+        ("no_grid_power_block_yields_to_forecast_surplus", lambda: _run_async(_run_no_grid_power_block_yields_to_forecast_surplus)),
         ("manager_set_greedy_roundtrip", test_manager_set_greedy_roundtrip),
         ("manager_reads_grid_power_sensor", test_manager_reads_grid_power_sensor),
         ("manager_no_grid_power_sensor_configured", test_manager_no_grid_power_sensor_configured),

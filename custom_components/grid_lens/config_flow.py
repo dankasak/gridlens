@@ -182,6 +182,62 @@ async def _discover_energy_sensors(hass: HomeAssistant) -> dict:
         return {}
 
 
+async def _discover_grid_power_sensor(hass: HomeAssistant) -> str | None:
+    """The live signed grid power entity, recovered from the user's own Power Flow card.
+
+    ``grid_power_sensor`` is the one energy field ``_discover_energy_sensors`` can never
+    supply: it reads the HA Energy dashboard, which stores cumulative energy statistics
+    only — there is no live power entity in it to borrow. So the field starts blank on
+    every install, and the feature that depends on it (Greedy Consumption's export-surplus
+    condition, control/load_controller.py) is silently unavailable until someone notices.
+
+    But an install that has set up the Power Flow card has *already told Grid Lens this
+    exact fact*, under the card's own ``grid_power_entity`` option — same meaning, same
+    sign convention, chosen by the same person for the same house. Asking a second time is
+    the thing the user is entitled to object to. So: read it back.
+
+    Deliberately NOT a name/device_class heuristic over ``hass.states``. "A power sensor
+    with 'grid' in the name" would happily match an unsigned import-only register, and
+    greedy would then read a positive import as "not exporting" forever — silently wrong
+    beats visibly absent. This source is a real answer the user gave, or nothing.
+
+    Returns None on any problem: no card configured, lovelace unavailable, storage-mode
+    dashboards not readable. Callers pre-fill with it; they never depend on it.
+    """
+    lovelace_data = hass.data.get("lovelace")
+    if not lovelace_data or not hasattr(lovelace_data, "dashboards"):
+        return None
+    try:
+        for dashboard in (lovelace_data.dashboards or {}).values():
+            if dashboard is None or not hasattr(dashboard, "async_load"):
+                continue
+            try:
+                config = await dashboard.async_load(False)
+            except Exception:  # noqa: BLE001 — a YAML-mode or empty dashboard just skips
+                continue
+            for view in (config or {}).get("views", []) or []:
+                for card in _iter_cards(view.get("cards", []) or []):
+                    entity = card.get("grid_power_entity")
+                    if entity and hass.states.get(entity) is not None:
+                        return entity
+    except Exception as exc:  # noqa: BLE001 — discovery is a convenience, never a blocker
+        _LOGGER.debug("Could not scan dashboards for a grid power entity: %s", exc)
+    return None
+
+
+def _iter_cards(cards):
+    """Yield every card dict in a view, descending into nested/stacked cards.
+
+    A Power Flow card is very often inside a grid/vertical-stack rather than at the top
+    level of a view, so a flat scan would miss the common case.
+    """
+    for card in cards or []:
+        if not isinstance(card, dict):
+            continue
+        yield card
+        yield from _iter_cards(card.get("cards", []) or [])
+
+
 async def _discover_has_battery(hass: HomeAssistant) -> bool:
     """Whether HA's own Energy dashboard already knows about a home battery.
 
@@ -401,6 +457,11 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # Auto-discover on first visit
         if not self._discovered:
             self._discovered = await _discover_energy_sensors(self.hass)
+            # Grid power comes from a different source than the rest (see
+            # _discover_grid_power_sensor) — the Energy dashboard has no live power entity.
+            grid_power = await _discover_grid_power_sensor(self.hass)
+            if grid_power:
+                self._discovered.setdefault(CONF_GRID_POWER_SENSOR, grid_power)
             if self._discovered:
                 _LOGGER.info("Auto-discovered energy sensors: %s", self._discovered)
 
@@ -989,6 +1050,23 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 # the same as never-set and let Energy-dashboard discovery put it back.
                 if key in entry_data:
                     merged[key] = entry_data[key]
+            # Grid power is the exception to the rule above, and deliberately so. The
+            # "stored None means deliberately cleared" reading was only ever safe for the
+            # fields the Energy dashboard can re-supply; for this one, None is far more
+            # likely to be damage (the absent-means-cleared path below, before it was
+            # fixed) than intent — it cannot be auto-filled, so nothing has ever put a
+            # value here except the user. Offer the card's answer back as a SUGGESTION
+            # when the slot is empty; it still submits like any other field, and a user
+            # who really wants it empty can clear it on a form that is now showing them
+            # what they are clearing.
+            if not merged.get(CONF_GRID_POWER_SENSOR):
+                grid_power = await _discover_grid_power_sensor(self.hass)
+                if grid_power:
+                    merged[CONF_GRID_POWER_SENSOR] = grid_power
+                    _LOGGER.info(
+                        "Reconfigure: no grid power sensor stored — suggesting %s, "
+                        "taken from your Power Flow card's grid_power_entity.", grid_power,
+                    )
             self._discovered = merged
 
         if user_input is not None:
@@ -1000,10 +1078,44 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 # EntitySelector is absent from user_input rather than None. Spreading
                 # entry_data first would inherit the old value for exactly those keys,
                 # so re-assert each one explicitly: absent == cleared.
+                #
+                # ...but ONLY when "absent" actually carries the user's intent. An
+                # EntitySelector seeded (via suggested_value) with an entity id that no
+                # longer resolves renders EMPTY — the picker has nothing to show — and an
+                # untouched empty picker submits absent, indistinguishable from a
+                # deliberate clear. Honouring that turns a *transient* condition (the
+                # inverter/integration hadn't finished loading when the wizard was opened,
+                # an entity got renamed) into a PERMANENT deletion of a setting the user
+                # never touched, on a step they only walked through to reach something
+                # else. That is how this install lost `grid_power_sensor` — silently
+                # disabling Greedy Consumption's export-surplus condition, with the load
+                # sitting off through hours of free export (see GRIDLENS_CHECKLIST.md,
+                # 2026-08-28).
+                #
+                # So: absent + we seeded a value the picker could render == cleared, honour
+                # it. Absent + we seeded a value that doesn't currently resolve == the form
+                # could not have shown it, so there was nothing for the user to clear; keep
+                # what is stored. A user who genuinely wants it gone can clear a field that
+                # is actually rendering.
                 for key in _ENERGY_SCHEMA_KEYS:
                     if key == CONF_ENERGY_SENSOR:
                         continue  # required field — never clearable
-                    self._sensor_data[key] = user_input.get(key) or None
+                    submitted = user_input.get(key)
+                    if submitted:
+                        self._sensor_data[key] = submitted
+                        continue
+                    seeded = self._discovered.get(key)
+                    if seeded and self.hass.states.get(seeded) is None:
+                        _LOGGER.warning(
+                            "Reconfigure: keeping %s = %s. It came back empty, but that "
+                            "entity does not currently exist, so the picker could not have "
+                            "shown it — treating this as 'not answered', not 'cleared'. "
+                            "Clear the field while it is showing a value to remove it.",
+                            key, seeded,
+                        )
+                        self._sensor_data[key] = seeded
+                    else:
+                        self._sensor_data[key] = None
                 # entry_data is spread first above, so without this the freshly
                 # answered controlled_load step would be silently clobbered back
                 # to its old saved value.

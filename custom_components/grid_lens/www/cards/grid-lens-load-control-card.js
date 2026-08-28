@@ -645,6 +645,16 @@ class GridLensLoadControlCard extends HTMLElement {
       }
       return `<div class="greedy-line active">Greedy: ${label}${nums}${bar}</div>`;
     }
+    if (a.greedy_blocked === 'no_grid_power') {
+      // Distinct from the two "armed, but not right now" cases below it: this one is not a
+      // condition that will clear on its own. Export is free RIGHT NOW and greedy still
+      // can't act, because no live grid power sensor is readable. Say so, or the card reads
+      // "waiting for free energy" while free energy is actively being spilled.
+      return `<div class="greedy-line" data-tip="${esc('Greedy\'s export-surplus condition needs a live '
+        + 'grid power sensor (positive = importing, negative = exporting). Set the optional Grid Power '
+        + 'sensor in Grid Lens > Reconfigure > Energy sensors.')}" tabindex="0">`
+        + `Greedy: export is free, but no grid power sensor is set</div>`;
+    }
     if (a.greedy_blocked) {
       const why = a.greedy_blocked === 'override'
         ? 'suppressed by a manual override'

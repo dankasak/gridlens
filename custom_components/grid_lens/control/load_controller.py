@@ -224,15 +224,32 @@ class DeferrableLoadController:
         if import_rate is not None and import_rate <= 0.0:
             self._greedy_reason = "import_free"
             return True
-        if export_rate is not None and export_rate <= 0.0 and grid_power_w is not None:
-            # Sign convention: positive = importing, negative = exporting (see
-            # CONF_GRID_POWER_SENSOR). exporting_w is the magnitude of current export.
-            exporting_w = max(0.0, -grid_power_w)
-            if self.max_w > 0.0 and exporting_w >= self._export_surplus_threshold_w():
-                self._greedy_reason = "export_surplus"
-                return True
+        if export_rate is not None and export_rate <= 0.0:
+            if grid_power_w is None:
+                # The export price is $0 — the one situation this condition exists for —
+                # but there is no live grid reading to measure the spill against, so it
+                # cannot fire. Record that, because it is otherwise INVISIBLE: the device
+                # sits off through hours of free export and every published field says
+                # "armed, waiting for free energy", which reads as "no surplus yet" rather
+                # than "structurally unable to see one". Almost always means no
+                # CONF_GRID_POWER_SENSOR is configured (it is optional, and unlike the
+                # energy sensors it cannot be auto-discovered from the Energy dashboard,
+                # which stores only energy statistics — never a live power entity); it
+                # also covers a configured sensor that is unavailable right now.
+                self._greedy_blocked = "no_grid_power"
+            else:
+                # Sign convention: positive = importing, negative = exporting (see
+                # CONF_GRID_POWER_SENSOR). exporting_w is the magnitude of current export.
+                exporting_w = max(0.0, -grid_power_w)
+                if self.max_w > 0.0 and exporting_w >= self._export_surplus_threshold_w():
+                    self._greedy_reason = "export_surplus"
+                    self._greedy_blocked = None
+                    return True
         if self._forecast_surplus_wants_on(forecast_free_kwh, forecast_hours):
             self._greedy_reason = "forecast_surplus"
+            # A later condition firing supersedes the block recorded above — greedy is on,
+            # so publishing a "blocked" reason alongside it would just be noise.
+            self._greedy_blocked = None
             return True
         return False
 
@@ -507,8 +524,10 @@ class DeferrableLoadController:
             # reason it's on; the plan is, or it's off).
             "greedy_reason": self._greedy_reason,
             # Why greedy couldn't fire, when it couldn't: "schedule" (outside the device's
-            # availability window with Respects Schedule on) or "override" (a human has
-            # Force On/Off set). None = greedy was free to fire and simply didn't match.
+            # availability window with Respects Schedule on), "override" (a human has
+            # Force On/Off set), or "no_grid_power" (the export price is $0 but there is no
+            # readable grid power sensor, so the export-surplus condition can't be judged).
+            # None = greedy was free to fire and simply didn't match.
             "greedy_blocked": self._greedy_blocked,
             # Forecast-surplus progress: free energy the plan expects to waste over the
             # look-ahead vs the bar it has to clear. Both None unless the forecast-surplus
