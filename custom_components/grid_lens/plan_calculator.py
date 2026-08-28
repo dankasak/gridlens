@@ -198,6 +198,40 @@ class PlanCalculator:
         )
         return cents / 100.0
 
+    def _duplicate_plan_keys(self) -> set[str]:
+        """Display keys claimed by more than one plan in the current catalogue.
+
+        `plan_costs` and `plan_details` are dicts keyed on "{retailer} - {name}",
+        so two plans sharing one display name meant the second silently
+        overwrote the first and vanished from the comparison entirely. That is
+        not hypothetical: on 2026-08-28 sixteen pairs collided at once (AGL's
+        Single Rate and Time of Use "Residential Netflix Plan", Origin Basic,
+        Real Deal, Everyday Easy...), because retailers submit one display name
+        per tariff type and PRD authoring carried the name through verbatim.
+
+        The names themselves were then disambiguated in the plan data, so in
+        practice this returns an empty set. It stays as the structural guard:
+        the data can regress with the next authored plan, and a comparison
+        product silently dropping a plan is worse than an ugly label.
+        """
+        seen: dict[str, int] = {}
+        for plan in self._get_plans():
+            key = f"{plan.retailer} - {plan.plan_name}"
+            seen[key] = seen.get(key, 0) + 1
+        return {k for k, n in seen.items() if n > 1}
+
+    def _plan_key(self, plan, duplicates: set[str]) -> str:
+        """Unique display key for one plan. Must be computed identically
+        everywhere — `_detect_current_plan` and the pricing loop derive the
+        user's own plan key separately, and a suffix applied in only one of them
+        would stop the current plan being recognised as current."""
+        key = f"{plan.retailer} - {plan.plan_name}"
+        if key not in duplicates:
+            return key
+        # Deterministic and order-independent: keyed on the slug, not on which
+        # plan the iteration happened to reach first.
+        return f"{key} [{getattr(plan, 'plan_id', '') or 'variant'}]"
+
     def _get_plans(self) -> list[RetailerPlan]:
         """Return plan objects from API data. Tier filtering is enforced by the API.
 
@@ -525,6 +559,15 @@ class PlanCalculator:
             len(deferrable_loads),
         )
 
+        # One scan of the catalogue, reused by every key derivation below so the
+        # pricing loop and _detect_current_plan cannot disagree about a key.
+        _dup_keys = self._duplicate_plan_keys()
+        if _dup_keys:
+            _LOGGER.warning(
+                "%d plan display name(s) are shared by more than one plan and are "
+                "being suffixed with the plan id to keep them distinct: %s",
+                len(_dup_keys), ", ".join(sorted(_dup_keys)))
+
         # Identify the current plan (the one the user is actually on).
         # Only this plan uses real sensor data; all other plans are LP-optimised.
         _, current_plan_name = self._detect_current_plan(actual_days)
@@ -540,7 +583,7 @@ class PlanCalculator:
         for _pea_plan in _pea_plans_with_sensor:
             aemo_sensor = _pea_plan.aemo_price_sensor
             bpea = getattr(_pea_plan, 'bpea', 0.017)
-            _pea_key = f"{_pea_plan.retailer} - {_pea_plan.plan_name}"
+            _pea_key = self._plan_key(_pea_plan, _dup_keys)
             # Multiple plans (e.g. several Flow Power variants) share the same
             # household AEMO sensor — fetch its raw 5-min history only once.
             if aemo_sensor not in _aemo_price_cache:
@@ -600,11 +643,11 @@ class PlanCalculator:
 
         all_plans_ordered = sorted(
             self._get_plans(),
-            key=lambda p: 0 if f"{p.retailer} - {p.plan_name}" == current_plan_name else 1,
+            key=lambda p: 0 if self._plan_key(p, _dup_keys) == current_plan_name else 1,
         )
 
         for plan in all_plans_ordered:
-            plan_key = f"{plan.retailer} - {plan.plan_name}"
+            plan_key = self._plan_key(plan, _dup_keys)
             is_current = (plan_key == current_plan_name)
             opt_result = None
 
@@ -793,7 +836,7 @@ class PlanCalculator:
         # Final current-plan total (fallback if current plan not in plan_costs).
         current_supply = (
             next((p.daily_supply_charge for p in self._get_plans()
-                  if f"{p.retailer} - {p.plan_name}" == current_plan_name), 1.342)
+                  if self._plan_key(p, _dup_keys) == current_plan_name), 1.342)
             * actual_days
         )
         if current_plan_total is None:
@@ -812,7 +855,7 @@ class PlanCalculator:
             "current_plan_energy_cost": current_plan_energy_cost,
             "current_plan_monthly_fee": next(
                 (p.monthly_subscription_fee for p in self._get_plans()
-                 if f"{p.retailer} - {p.plan_name}" == current_plan_name),
+                 if self._plan_key(p, _dup_keys) == current_plan_name),
                 0.0,
             ),
             "current_plan_total": current_plan_total,
@@ -2128,9 +2171,10 @@ class PlanCalculator:
 
         # User-configured plan takes priority over auto-detection.
         # current_plan_override may be a slug ID or a "Retailer - Plan Name" string.
+        duplicates = self._duplicate_plan_keys()
         if self.current_plan_override:
             for plan in plans:
-                plan_key = f"{plan.retailer} - {plan.plan_name}"
+                plan_key = self._plan_key(plan, duplicates)
                 if plan_key == self.current_plan_override or getattr(plan, 'plan_id', None) == self.current_plan_override:
                     supply = plan.daily_supply_charge * days
                     _LOGGER.info("Current plan (configured): %s (supply $%.2f)", plan_key, supply)
@@ -2145,7 +2189,7 @@ class PlanCalculator:
             retailer_slug = plan.retailer.lower().replace(" ", "_")
             if retailer_slug in sensor or plan.retailer.lower().split()[0] in sensor:
                 supply = plan.daily_supply_charge * days
-                plan_key = f"{plan.retailer} - {plan.plan_name}"
+                plan_key = self._plan_key(plan, duplicates)
                 _LOGGER.info("Current plan (auto-detected): %s (supply $%.2f)", plan_key, supply)
                 return supply, plan_key
 
