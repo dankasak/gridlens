@@ -268,7 +268,11 @@ export function reasonFor(row, mode) {
 // positive-only series with a signed one (e.g. net grid import/export).
 export function multiLineChart(traj, timeScale, series, opts = {}) {
   if (!traj || !traj.length) return '';
-  const g = { w: GW, h: opts.height || 160, ml: GML, mr: GMR, mt: 10, mb: 22 };
+  // A right-hand axis needs room for its tick labels; GMR alone is only enough for a
+  // line to reach the edge. Widened here rather than at the constant so every other
+  // chart keeps its existing plot width exactly.
+  const rax = opts.rightAxis || null;
+  const g = { w: GW, h: opts.height || 160, ml: GML, mr: rax ? 34 : GMR, mt: 10, mb: 22 };
   const { t0, t1 } = timeScale;
   const X = (ms) => g.ml + (ms - t0) / (t1 - t0) * (g.w - g.ml - g.mr);
   const nowMs = Date.now();
@@ -284,11 +288,24 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
       .map(row => ({ ms: new Date(row.start).getTime(), v: (s.calc ? s.calc(row) : (+row[s.key] || 0)) * (s.scale || 1) }));
   });
   let yMax = 0, yMin = opts.yMin != null ? opts.yMin : 0;
-  for (const pts of raw) for (const p of pts) { if (p.v > yMax) yMax = p.v; if (p.v < yMin) yMin = p.v; }
+  // Right-axis series are excluded from the left axis' extent. Including them would let
+  // a 0-100 percentage stretch a kW axis to +100 and flatten every real flow to a line.
+  raw.forEach((pts, i) => {
+    if (series[i] && series[i].axis === 'right') return;
+    for (const p of pts) { if (p.v > yMax) yMax = p.v; if (p.v < yMin) yMin = p.v; }
+  });
   if (opts.symmetric) { const m = Math.max(Math.abs(yMin), Math.abs(yMax)); yMin = -m; yMax = m; }
   if (yMax === yMin) yMax = yMin + 1;
   const Y = (v) => g.mt + (1 - (v - yMin) / (yMax - yMin)) * (g.h - g.mt - g.mb);
   const fmt = opts.fmt || ((v) => v.toFixed(1));
+  // Series tagged axis:'right' are scaled by RY instead of Y. The two axes are wholly
+  // independent — that is the point of a secondary axis, and also its hazard: a value
+  // read off the right axis has no relationship to the left one at the same height. The
+  // caller is responsible for making the right-hand series look like it belongs to the
+  // right axis (see the SOC series in grid-lens-power-chart-card).
+  const RY = rax
+    ? (v) => g.mt + (1 - (v - rax.min) / (rax.max - rax.min)) * (g.h - g.mt - g.mb)
+    : null;
   let grid = '';
   for (let k = 0; k <= 4; k++) {
     const v = yMin + (yMax - yMin) * k / 4, y = Y(v);
@@ -310,6 +327,25 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
     bands += `<rect x="${x0.toFixed(1)}" y="${g.mt}" width="${(x1 - x0).toFixed(1)}"`
       + ` height="${(g.h - g.mb - g.mt).toFixed(1)}" fill="${b.color}"`
       + ` opacity="${b.opacity != null ? b.opacity : 0.16}"/>`;
+  }
+  // Right-axis ticks are drawn in the axis' own colour, and its series is drawn in that
+  // same colour, because the one real hazard of a secondary axis is a reader taking a
+  // value off the wrong scale. Colour is what ties a curve to the axis it belongs to;
+  // no gridlines are emitted for it, so the horizontal rules keep meaning the LEFT axis
+  // only. A caption sits above the top tick to name the unit outright.
+  let rgrid = '';
+  if (rax) {
+    const rc = rax.color || 'var(--ink2)';
+    const rfmt = rax.fmt || ((v) => String(v));
+    for (const v of (rax.ticks || [rax.min, (rax.min + rax.max) / 2, rax.max])) {
+      const y = RY(v);
+      rgrid += `<text x="${g.w - g.mr + 6}" y="${y + 3}" text-anchor="start" font-size="9" fill="${rc}">${rfmt(v)}</text>`;
+      rgrid += `<line x1="${g.w - g.mr}" y1="${y}" x2="${g.w - g.mr + 3}" y2="${y}" stroke="${rc}" stroke-width="1"/>`;
+    }
+    rgrid += `<line x1="${g.w - g.mr}" y1="${g.mt}" x2="${g.w - g.mr}" y2="${g.h - g.mb}" stroke="${rc}" stroke-width="1" opacity="0.5"/>`;
+    if (rax.label) {
+      rgrid += `<text x="${g.w - g.mr + 4}" y="${g.mt - 2}" text-anchor="start" font-size="9" fill="${rc}">${rax.label}</text>`;
+    }
   }
   const xt = xAxisTicks(X, t0, t1, g.h - g.mb, 9);
   const nowX = X(Math.min(Date.now(), t1));
@@ -341,7 +377,8 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   series.forEach((s, si) => {
     const rp = raw[si];
     if (!rp.length) return;
-    const pts = rp.map(p => [X(p.ms), Y(p.v)]);
+    const proj = (s.axis === 'right' && RY) ? RY : Y;
+    const pts = rp.map(p => [X(p.ms), proj(p.v)]);
     let d, rightX = pts[pts.length - 1][0];
     if (s.step) {
       d = stepPath(pts);
@@ -362,14 +399,20 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
     }
     geo.push({ s, si, d, pts, rightX, mag: rp.reduce((a, p) => a + Math.abs(p.v), 0) });
   });
-  for (const g2 of geo.filter((x) => x.s.area).sort((a, b) => b.mag - a.mag)) {
+  // `base` is the LEFT axis' zero, so a right-axis series' fill would run to a baseline
+  // that means nothing on its own scale. Right-axis series are line-only by construction.
+  for (const g2 of geo.filter((x) => x.s.area && x.s.axis !== 'right').sort((a, b) => b.mag - a.mag)) {
     const gid = 'g' + g2.si;
     defs += gradDef(gid, g2.s.color, 0.42);
     const clip = (hasActual && !g2.s.actual) ? ` clip-path="url(#${futureClipId})"` : '';
     paths += `<path d="${g2.d} L${g2.rightX.toFixed(1)},${base.toFixed(1)} L${g2.pts[0][0].toFixed(1)},${base.toFixed(1)} Z" fill="url(#${gid})"${clip}/>`;
   }
-  for (const { s, d } of geo) {
-    paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.actual ? 1.75 : 2.5}" opacity="${s.actual ? 0.9 : 1}" stroke-linejoin="round" stroke-linecap="round" ${s.dash ? 'stroke-dasharray="5 4"' : ''}/>`;
+  // Left-axis lines first, then right-axis ones on top: a secondary-axis series is
+  // usually context for everything else, so it must never end up buried under a wash.
+  const byAxis = [...geo.filter((x) => x.s.axis !== 'right'), ...geo.filter((x) => x.s.axis === 'right')];
+  for (const { s, d } of byAxis) {
+    const w = s.width || (s.actual ? 1.75 : 2.5);
+    paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${w}" opacity="${s.actual ? 0.9 : 1}" stroke-linejoin="round" stroke-linecap="round" ${s.dash ? 'stroke-dasharray="5 4"' : ''}/>`;
   }
   // preserveAspectRatio="none": a line/area chart has no inherent aspect ratio to
   // protect (x is time, y is an independent unit) — stretching to exactly fill
@@ -377,7 +420,7 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // explicit CSS height (e.g. grid-lens-power-chart-card's max_height) whose aspect
   // ratio doesn't match the viewBox gets letterboxed: the default "xMidYMid meet"
   // scales uniformly and pads the mismatch as empty space above/below the plot.
-  return `<svg viewBox="0 0 ${g.w} ${g.h}" preserveAspectRatio="none" class="chart-svg" role="img"><defs>${defs}</defs>${bands}${grid}${zero}${xt}${now}${paths}`
+  return `<svg viewBox="0 0 ${g.w} ${g.h}" preserveAspectRatio="none" class="chart-svg" role="img"><defs>${defs}</defs>${bands}${grid}${zero}${rgrid}${xt}${now}${paths}`
     + `<line class="xhair" x1="0" x2="0" y1="${g.mt}" y2="${g.h - g.mb}" stroke="var(--ink2)" stroke-width="1" opacity="0"/></svg>`;
 }
 

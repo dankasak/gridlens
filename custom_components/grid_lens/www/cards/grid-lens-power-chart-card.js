@@ -12,8 +12,8 @@
  *   max_width: null   // cap (px) on how wide the card grows; set 0/null to fill its container
  */
 import {
-  GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor,
-} from './grid-lens-chart-common.js?v=20260816a';
+  GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor, clampPct, fmtPct,
+} from './grid-lens-chart-common.js?v=20260828a';
 
 // Free-energy shading (see _freeEnergyBands). CSS custom props rather than literals so
 // both bands follow the viewer's light/dark theme like every other colour on this card;
@@ -26,6 +26,11 @@ const FREE_IMPORT = 'var(--free-import)';
 class GridLensPowerChartCard extends GridLensChartCardBase {
   get title() { return 'Power — measured & forecast (kW)'; }
   get wantsEnergyHistory() { return true; }
+  // Pulls measured SOC into this._actual for the right-axis overlay. Planned SOC comes
+  // from the trajectory itself (soc_percent) and needs no entity, so an install whose
+  // soc_entity doesn't resolve still gets the planned curve — it just loses the
+  // measured one, exactly as the standalone SOC card already degrades.
+  get wantsSocHistory() { return true; }
 
   // Caps how tall this card can grow — paired with Power Flow's own max_height so
   // neither one is happy to fill most of the screen on a wide viewport.
@@ -47,8 +52,8 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       // Free-energy band washes. Amber-ish for wasted surplus (it's a "you're throwing
       // this away" warning) and teal for a free-import window (a good thing, and the
       // same family this project's charts already use for sell/credit).
-      + ` :host { --free-spill:#f97316; --free-import:#0d9488; }`
-      + ` :host(.dark) { --free-spill:#fb923c; --free-import:#2dd4bf; }`
+      + ` :host { --free-spill:#f97316; --free-import:#0d9488; --soc:#0284c7; }`
+      + ` :host(.dark) { --free-spill:#fb923c; --free-import:#2dd4bf; --soc:#38bdf8; }`
       // Click-to-isolate legend entries (see _legendItem()/_wireLegendToggle()). `.dim`
       // is opacity only, not display:none — the entry stays clickable so switching
       // isolation straight to a different series (or back to "all") is one click, not two.
@@ -127,6 +132,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       ${this._legendItem('grid', '<span class="swatch" style="background:var(--gridflow)"></span>', 'Grid (+import / -export)')}
       ${this._legendItem('battery', '<span class="swatch" style="background:var(--battery)"></span>', 'Battery (+charge / -discharge)')}
       ${deferLegend}
+      ${this._legendItem('soc', '<i style="border-top:3px dashed var(--soc)"></i>', 'SOC % (right axis)')}
       ${bandLegend}
       <span style="color:var(--muted)">— thin = measured</span>
     `;
@@ -235,6 +241,14 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
         // otherwise get smoothPath'd into the exact same diagonal-ramp artifact as the
         // forecast series above, just drawn from real sensor data instead of planned data.
         ...dnames.map((nm, i) => ({ points: actualDefer[i], group: `defer_${i}`, color: this._deferColor(i), actual: true, area: true, step: true })),
+        // SOC on its own 0-100% right axis. Deliberately unlike every other series here:
+        // no area fill (its baseline would be the LEFT axis' zero, which means nothing on
+        // a percentage scale), heavier stroke, and drawn last so it sits above every
+        // wash. One hue for both, told apart by dash — planned dashed, measured solid,
+        // the same shape language the standalone SOC card uses — because adding two new
+        // hues to a chart that already carries ten was the opposite of standing out.
+        { key: 'soc_percent', group: 'soc', color: 'var(--soc)', axis: 'right', dash: true, width: 3.5 },
+        { points: this._actual, group: 'soc', color: 'var(--soc)', axis: 'right', width: 3 },
       ],
     };
   }
@@ -244,15 +258,30 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     // Isolated to one legend group (see _wireLegendToggle): drop every other series
     // rather than just dimming them, so the y-axis also rescales to that series' own
     // range — a small signal like Battery is otherwise squashed flat next to Solar/Load.
-    if (this._isolatedGroup) series = series.filter((s) => s.group === this._isolatedGroup);
+    // SOC survives isolation of any OTHER group. Isolating exists to rescale the kW axis
+    // to one series; SOC is on a separate axis, so keeping it costs that nothing, and it
+    // is context for whatever you just isolated ("battery charges here — does SOC agree?").
+    // Isolating SOC itself still shows SOC alone.
+    if (this._isolatedGroup) {
+      series = series.filter((s) => s.group === this._isolatedGroup
+        || (this._isolatedGroup !== 'soc' && s.group === 'soc'));
+    }
     // Taller than the other line charts (default 160) so this pairs visually with the
     // Power Flow card next to it in the dashboard section, which is roughly square.
     // symmetric: true — grid/battery are signed (import/charge positive, export/discharge
     // negative), so the y-axis is forced to [-m, m] and 0 sits at the vertical centre
     // instead of hugging the bottom the way an all-positive chart would.
+    const hasSoc = series.some((s) => s.group === 'soc');
     return multiLineChart(this._traj, this._timeScale(), series, {
       fmt: (v) => v.toFixed(1), height: 480, symmetric: true,
       bands: this._freeEnergyBands(),
+      // Ticks and axis line are drawn in --soc, the same colour as the curves, so it is
+      // visually unambiguous which scale SOC is read against — the one real hazard of a
+      // secondary axis is taking a value off the wrong side.
+      rightAxis: hasSoc ? {
+        min: 0, max: 100, ticks: [0, 25, 50, 75, 100],
+        fmt: (v) => `${v}%`, label: 'SOC', color: 'var(--soc)',
+      } : null,
     });
   }
 
@@ -268,6 +297,19 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
   // Charging/Discharging wording for the same entities.
   _signedRow(v, posLabel, negLabel, colorVar) {
     return `<span class="k" style="color:var(${colorVar})">${v >= 0 ? posLabel : negLabel}</span> ${Math.abs(v).toFixed(2)}`;
+  }
+
+  // Measured SOC nearest a hovered time. this._actual is the SOC history the base class
+  // fetches for wantsSocHistory (percent), NOT this._actualEnergy (kW) — different units,
+  // deliberately different fields.
+  _socRow(bestMs, best) {
+    const meas = this._nearest(this._actual, bestMs);
+    const plan = best && best.soc_percent != null ? clampPct(best.soc_percent) : null;
+    if (plan == null && meas == null) return '';
+    const parts = [];
+    if (plan != null) parts.push(`<span class="k" style="color:var(--soc)">SOC plan</span> ${fmtPct(plan)}`);
+    if (meas != null) parts.push(`<span class="k" style="color:var(--soc)">measured</span> ${fmtPct(meas)}`);
+    return `<div>${parts.join(' · ')}</div>`;
   }
 
   _tooltipHtml(bestMs, best, isHistory) {
@@ -289,6 +331,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
         `<div><span class="k" style="color:var(--solar)">sun</span> ${(actualSolar || 0).toFixed(2)} · <span class="k" style="color:var(--load)">load</span> ${(actualLoad || 0).toFixed(2)} kW</div>` +
         `<div>${this._signedRow(actualGrid || 0, 'buy', 'sell', '--gridflow')} · ${this._signedRow(actualBattery || 0, 'charge', 'discharge', '--battery')} kW</div>` +
         deferRows +
+        this._socRow(bestMs, null) +
         `<div style="font-size:10px;color:var(--muted);margin-top:4px">Historical data only (no forecast)</div>`;
     }
     if (!best) return `<b>${fmtHour(bestMs)}</b><div style="font-size:11px;color:var(--muted)">No data available</div>`;
@@ -302,6 +345,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
         const v = actualDefer[i] != null ? actualDefer[i] : (+best['defer_' + i] || 0) * kwScale;
         return v > 0.01 ? `<div><span class="k" style="color:${this._deferColor(i)}">${esc(nm)}</span> ${v.toFixed(2)} kW</div>` : '';
       }).join('')
+      + this._socRow(bestMs, best)
       // Name the shaded band the cursor is sitting in, so the wash isn't just decoration.
       + this._bandNote(best, kwScale);
   }

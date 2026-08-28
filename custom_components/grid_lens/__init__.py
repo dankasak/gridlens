@@ -125,6 +125,7 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
         # no entry to resolve real entity ids against, fall back to a bare card.
         return [{
             "type": "panel", "title": "Plan Comparison", "path": "plan-comparison",
+            "icon": "mdi:scale-balance",
             "cards": [{"type": "custom:grid-lens-card"}],
         }]
     # One shared "Grid Lens" dashboard, so a multi-entry install just gets the
@@ -142,6 +143,10 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
     current_plan_cost = eid(f"{entry.entry_id}_current_plan_cost")
     plan_comparison_view = {
         "type": "panel", "title": "Plan Comparison", "path": "plan-comparison",
+        # An icon, like every other view — HA shows the icon in the tab strip and
+        # falls back to the title text when there isn't one, which left this the
+        # only wordy tab in the dashboard.
+        "icon": "mdi:scale-balance",
         "cards": [{
             "type": "custom:grid-lens-card",
             **({"entity": current_plan_cost} if current_plan_cost else {}),
@@ -454,6 +459,50 @@ def _plan_from_history(entries: list, start_date) -> str | None:
     return active
 
 
+# Files this integration once shipped from www/ and must never serve again. An update
+# — HACS, or sync-to-ha.sh's `cp -r` — copies files in and never deletes, so removing a
+# file from the repo does NOT remove it from an existing install. It sits there being
+# served forever by the /grid_lens static path, which exposes the whole www/ tree.
+#
+# That is not merely untidy for a gated asset. grid-lens-powerflow-card.js was moved to
+# gridlens-api and put behind PowerflowIconView's entitlement check (commit 109d515),
+# but every install that updated across that commit kept the pre-gating copy at
+# /grid_lens/cards/grid-lens-powerflow-card.js — outside the gate, reachable by anyone
+# who knows the URL. Found 2026-08-28 on the dev rig, still dated Aug 2.
+#
+# Only ever exact filenames under www/, never globs or paths: this deletes from the
+# user's filesystem, so it must be impossible for it to reach anything but a name
+# written here deliberately.
+_WITHDRAWN_WWW_FILES = (
+    "cards/grid-lens-powerflow-card.js",   # gated 2026-08-02; served via /api/grid_lens
+)
+
+
+def _prune_withdrawn_www_files(www_path) -> None:
+    """Delete withdrawn files left behind in www/ by an in-place update.
+
+    Blocking file I/O — call via async_add_executor_job. Never raises: a failure here
+    must not stop the integration setting up, and the file simply stays until next time.
+    """
+    import pathlib
+    root = pathlib.Path(www_path).resolve()
+    for rel in _WITHDRAWN_WWW_FILES:
+        try:
+            target = (root / rel).resolve()
+            # Refuse anything that escapes www/ — a defence against a bad edit to the
+            # tuple above, not against a hostile one (this is our own source).
+            if not target.is_relative_to(root) or not target.is_file():
+                continue
+            target.unlink()
+            # warning, not debug: this is the only signal that an install was exposed,
+            # and debug is off by default so it would never be seen.
+            _LOGGER.warning(
+                "Grid Lens: removed withdrawn file %s from www/ — it was left behind by "
+                "an in-place update and was being served outside its access check", rel)
+        except Exception as e:  # noqa: BLE001 - never block setup on a cleanup step
+            _LOGGER.warning("Grid Lens: could not remove withdrawn file %s: %s", rel, e)
+
+
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up the Grid Lens component."""
     import pathlib
@@ -462,11 +511,14 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 
     # Serve www/ directly from the integration directory
-    www_path = str(pathlib.Path(__file__).parent / "www")
+    www_path = pathlib.Path(__file__).parent / "www"
+    # Prune withdrawn files BEFORE the directory is exposed, so there is never a
+    # window in which a stale one is reachable.
+    await hass.async_add_executor_job(_prune_withdrawn_www_files, www_path)
     try:
         from homeassistant.components.http import StaticPathConfig
         await hass.http.async_register_static_paths(
-            [StaticPathConfig("/grid_lens", www_path, False)]
+            [StaticPathConfig("/grid_lens", str(www_path), False)]
         )
     except Exception as e:
         _LOGGER.warning("Could not register static path for Grid Lens: %s", e)
@@ -478,7 +530,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260820f"
+    _CARD_VERSION = "20260828b"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",

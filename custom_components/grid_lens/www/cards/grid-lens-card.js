@@ -10,6 +10,8 @@ class GridLensCard extends HTMLElement {
     this._endDate = '';
     this._chartScale = 1.0;
     this._showHistory = false;
+    this._retailerFilter = '';   // live retailer search box, applied as the user types
+
     this._history = null;
     this._editingId = null;
     this._addingNew = false;
@@ -350,6 +352,32 @@ class GridLensCard extends HTMLElement {
     } catch (e) { console.error('deleteHistoryEntry:', e); }
   }
 
+  /** Show only plans whose retailer matches the search box. Presentational
+   *  only — nothing is removed from this._data, so chart scaling stays global
+   *  and the History panel still sees every plan. */
+  _applyRetailerFilter() {
+    if (!this.shadowRoot) return;
+    const needle = (this._retailerFilter || '').trim().toLowerCase();
+    const cards = this.shadowRoot.querySelectorAll('.plan-card[data-retailer]');
+    let shown = 0;
+    cards.forEach((el) => {
+      const hit = !needle
+        || (el.getAttribute('data-retailer') || '').toLowerCase().includes(needle);
+      el.hidden = !hit;
+      if (hit) shown++;
+    });
+    // Placeholders stand in for plans not yet priced, and there is no way to
+    // know their retailer — showing them under an active filter would claim a
+    // match we cannot support.
+    this.shadowRoot.querySelectorAll('.plan-card.skeleton')
+      .forEach((el) => { el.hidden = !!needle; });
+
+    const count = this.shadowRoot.getElementById('epc-filter-count');
+    if (count) {
+      count.textContent = needle ? `${shown} of ${cards.length}` : '';
+    }
+  }
+
   renderHistoryPanel(planNames) {
     if (this._history === null) {
       return '<div style="padding:24px;text-align:center;color:var(--secondary-text-color)">Loading…</div>';
@@ -408,6 +436,12 @@ class GridLensCard extends HTMLElement {
 
   render() {
     if (!this._config || !this._connected) return;
+
+    // render() replaces the whole shadow root, so remember whether the user was
+    // mid-type in the filter box and restore focus afterwards. Streaming 'plan'
+    // events re-render this card once per plan priced.
+    this._filterHadFocus =
+      this.shadowRoot?.activeElement?.id === 'epc-retailer';
 
     const showBreakdown = this._config.show_breakdown !== false;
     const showCharts = this._config.show_charts !== false;
@@ -494,6 +528,22 @@ class GridLensCard extends HTMLElement {
           margin-top: 12px;
         }
         .strategy-title { font-size: 12px; font-weight: 600; margin-bottom: 6px; color: var(--primary-text-color); }
+        .retailer-filter { display: inline-flex; align-items: center; gap: 6px; }
+        .retailer-filter input {
+          font: inherit;
+          padding: 4px 8px;
+          min-width: 150px;
+          border: 1px solid var(--divider-color, #ccc);
+          border-radius: 4px;
+          background: var(--card-background-color, #fff);
+          color: var(--primary-text-color);
+        }
+        .retailer-filter input:focus {
+          outline: none;
+          border-color: var(--primary-color, #03a9f4);
+        }
+        .filter-count { font-size: 12px; color: var(--secondary-text-color); white-space: nowrap; }
+        .plan-card[hidden] { display: none; }
         .strategy-text { font-size: 12px; color: var(--secondary-text-color); line-height: 1.4; white-space: pre-line; }
         .error { padding: 16px; color: var(--error-color); text-align: center; }
         .loading { padding: 16px; text-align: center; color: var(--secondary-text-color); }
@@ -583,6 +633,13 @@ class GridLensCard extends HTMLElement {
       </ha-card>`;
       return;
     }
+
+    const _esc = (t) => String(t).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // Plan keys are "Retailer - Plan Name"; the retailer is everything before the
+    // FIRST " - ", because plan names contain the separator too ("Standing Offer -
+    // Time of Use", "Origin Go Variable Ongoing - New & Move Customers only").
+    const _retailerOf = (key) => String(key).split(' - ')[0].trim();
 
     const planDetails = this._data.plan_details || {};
     const currentPlanTotalFallback = this._data.current_plan_total || 0;
@@ -920,7 +977,7 @@ class GridLensCard extends HTMLElement {
         </div>` : '';
 
       return `
-        <div class="plan-card${isCurrentPlan ? ' current-plan' : ''}">
+        <div class="plan-card${isCurrentPlan ? ' current-plan' : ''}" data-retailer="${_esc(_retailerOf(planName))}">
           <div class="plan-title">${planName}</div>
           <div class="cost-display" style="background:${bannerColor}">
             <div class="cost-amount">$${total.toFixed(2)}</div>
@@ -931,6 +988,11 @@ class GridLensCard extends HTMLElement {
           ${strategyHtml}
         </div>`;
     }).join('');
+
+    // Autocomplete over the retailers actually present, so the box suggests
+    // "EnergyAustralia" rather than making the user guess the exact spelling.
+    const _retailerOptions = [...new Set(planNames.map(_retailerOf))].sort(
+      (a, b) => a.localeCompare(b));
 
     const _busy = this._streamPhase !== null;
     const dateControlsHtml = `
@@ -951,6 +1013,15 @@ class GridLensCard extends HTMLElement {
         ${(this._plansDone > 0 && this._plansTotal > 0) ? `
           <span class="stream-label">${this._plansDone}/${this._plansTotal} plans</span>
           <span class="stream-track"><span class="stream-bar" style="width:${Math.round(this._plansDone/this._plansTotal*100)}%"></span></span>` : ''}
+        <span class="retailer-filter">
+          <input type="search" id="epc-retailer" list="epc-retailer-list"
+                 placeholder="Filter retailer…" autocomplete="off"
+                 value="${_esc(this._retailerFilter)}">
+          <datalist id="epc-retailer-list">
+            ${_retailerOptions.map(r => `<option value="${_esc(r)}"></option>`).join('')}
+          </datalist>
+          <span class="filter-count" id="epc-filter-count"></span>
+        </span>
         <button id="epc-history-btn" class="nav-btn${this._showHistory ? ' active' : ''}">History</button>
         <a href="/api/grid_lens/diagnostic_export" download class="nav-btn" title="Download diagnostic zip for bug reporting" style="text-decoration:none;">&#8659; Diagnostic</a>
       </div>`;
@@ -976,6 +1047,35 @@ class GridLensCard extends HTMLElement {
         ${dateControlsHtml}
         ${bodyHtml}
       </ha-card>`;
+
+    this._applyRetailerFilter();
+
+    const _filterBox = this.shadowRoot.getElementById('epc-retailer');
+    if (_filterBox) {
+      // Filtering hides DOM nodes instead of re-rendering. A re-render would
+      // replace the <input> mid-keystroke, losing focus and caret position on
+      // every character typed — and the streaming 'plan' events re-render this
+      // card dozens of times during a calculation, so that is not hypothetical.
+      _filterBox.addEventListener('input', (ev) => {
+        this._retailerFilter = ev.target.value;
+        this._applyRetailerFilter();
+      });
+      // type="search" clears via the native ✕ and via Escape; both fire 'input'
+      // in Chromium but Escape does not in Firefox, so handle it explicitly.
+      _filterBox.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape' && this._retailerFilter) {
+          ev.preventDefault();
+          ev.target.value = '';
+          this._retailerFilter = '';
+          this._applyRetailerFilter();
+        }
+      });
+      if (this._filterHadFocus) {
+        _filterBox.focus();
+        const n = _filterBox.value.length;
+        try { _filterBox.setSelectionRange(n, n); } catch (_) {}
+      }
+    }
 
     const shiftMonth = (dateStr, delta) => {
       if (!dateStr) return dateStr;

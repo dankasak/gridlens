@@ -53,7 +53,33 @@ dashboard's period picker calls). The old `grid_lens.calculate_period` service i
 **deprecated and raises** — it is still registered, so it looks callable, but
 `_calculate_and_populate_sensors` throws `HomeAssistantError` before returning anything.
 
-**Files:** `plan_calculator.py`, `retailer_plans.py`, `sensor.py`, `plan_sensors.py`.
+**Retailer filter (`grid-lens-card.js`, 2026-08-28).** A type-to-filter search box in the
+comparison toolbar, with a `<datalist>` of the retailers actually present so it suggests
+"EnergyAustralia" rather than making the user guess the spelling, plus an "N of M" count
+while a filter is active. Escape or the native ✕ clears it. Added because the NSW catalogue
+reached 93 plans and the page became unreadable.
+
+It **hides DOM nodes rather than re-rendering** — re-rendering on each keystroke would
+replace the `<input>` being typed into and lose focus and caret position every character,
+and the streaming `plan` events already re-render the card once per plan priced (`render()`
+restores focus if the box had it). Filtering is purely presentational: nothing is removed
+from `this._data`, so chart scaling stays global across all plans and the History panel
+still sees every one. Skeleton placeholders hide while a filter is active — their retailer
+is not known yet, so showing them would claim a match that cannot be supported.
+
+⚠ **The retailer is the segment before the FIRST `" - "`.** Plan names contain the
+separator too (`Alinta Energy - Standing Offer - Time of Use`), so splitting on the last
+one, or on every one, gets it wrong. Verified against all 93 live keys: 18 retailers
+parsed, matching the API's own 18 exactly, 0 malformed.
+
+**Plan keys must be unique** — `plan_costs` and `plan_details` are dicts keyed on
+`"{retailer} - {plan_name}"`, so two plans sharing one display name means the second
+overwrites the first. `_duplicate_plan_keys()` / `_plan_key()` in `plan_calculator.py`
+suffix the slug onto any contested key as a structural guard; the plan data itself carries
+the tariff variant (`Residential Netflix Plan (Single Rate)`) so the guard stays dormant.
+
+**Files:** `plan_calculator.py`, `retailer_plans.py`, `sensor.py`, `plan_sensors.py`,
+`www/cards/grid-lens-card.js`.
 
 **Plan data** comes from the private `gridlens-api` (MySQL, temporally versioned —
 `slug@date` rows). The HA side never sees another user's data and never sends usage data
@@ -667,9 +693,28 @@ convention, never a hardcoded entity id — so they work unmodified on any insta
 |---|---|
 | `grid-lens-card` | Full plan comparison (the Plan Comparison view). |
 | `grid-lens-powerflow-card` | **Gated** — live radial energy flow: solar / grid / battery / home + one node per deferrable load, animated flow balls, live buy/sell price, greedy badges. Requires the Battery Control + Power Flow add-on; see §12. `load_power_entity`/`grid_power_entity`/`battery_power_entity`/`battery_discharge_power_entity` are auto-populated in the seeded dashboard straight from the same `load_power_sensor`/`grid_power_sensor`/`battery_charge_power_sensor`/`battery_discharge_power_sensor` config_flow already collects (Sensors/Battery setup steps) — no separate onboarding needed; `solar_power_entity` auto-discovers from HA's own Energy Dashboard prefs; `ev_power_entity`/`ev_active_entity` remain manual-only (no config_flow counterpart — only needed when the EV isn't already represented as a regular deferrable load). |
-| `grid-lens-power-chart-card` | Measured & forecast power (kW) — solar, load, signed grid, signed battery, per-device deferrable, plus free-energy shading. Click a legend name to isolate that series (forecast + measured pair, y-axis rescales to it); click it again to restore every series. |
+| `grid-lens-power-chart-card` | Measured & forecast power (kW) — solar, load, signed grid, signed battery, per-device deferrable, plus free-energy shading, **plus battery SOC on a right-hand 0–100% axis** (2026-08-28). Click a legend name to isolate that series (forecast + measured pair, y-axis rescales to it); click it again to restore every series. SOC is exempt from isolation — it sits on its own axis, so keeping it costs the kW rescale nothing and it is context for whatever you isolated. |
 | `grid-lens-price-chart-card` | Import/export rate trajectory. |
-| `grid-lens-soc-chart-card` | Battery SOC curve. |
+
+**Secondary axis (`multiLineChart`, `opts.rightAxis` + `series[].axis: 'right'`).** Added so
+SOC could share the Power Flow chart. A right-axis series is excluded from the left axis'
+min/max — otherwise a 0–100 percentage stretches a kW axis to +100 and flattens every real
+flow — and never draws an area fill, because the fill baseline is the *left* axis' zero and
+means nothing on a percentage scale. Right-axis series draw last, above every wash.
+
+⚠ **The hazard of a secondary axis is reading a value off the wrong scale**, and the power
+chart is `symmetric: true` (0 kW at the vertical centre, since grid and battery are signed),
+so 50% SOC sits exactly on the 0 kW line. Mitigated by making SOC unmistakably its own
+thing: a dedicated `--soc` hue used for the curves *and* the right-hand ticks, axis line and
+`SOC` caption; no area fill when everything else has one; the heaviest stroke on the chart;
+and no right-hand gridlines, so the horizontal rules keep meaning the left axis only.
+Planned is dashed and measured solid — the same shape language the standalone SOC card uses
+— rather than two new hues on a chart already carrying ten.
+
+Callers passing no `rightAxis` are byte-for-byte unchanged (verified against the previous
+`multiLineChart` across five series shapes with the clock frozen).
+
+| `grid-lens-soc-chart-card` | Battery SOC curve, planned vs measured, full height. Kept alongside the Power Flow chart's SOC overlay on purpose: the overlay is at-a-glance context next to dispatch, this is the divergence diagnostic for whether control is actually tracking the plan. |
 | `grid-lens-cash-chart-card` | Cumulative cost/credit. |
 | `grid-lens-dispatch-chart-card` | Planned EMS mode timeline. |
 | `grid-lens-advisory-card` | Plan status header (plan name/solver/last-run time, status badge), control-mode timeline, deferrable-load recommendations. `compact: true` config renders just the header — used as a slim "optimiser & plan" status bar at the top of the Power Flow view; `title` config overrides the header text in that mode. |
@@ -825,6 +870,27 @@ tick. The switches are plain polled entities and are the only surface that track
 ---
 
 ## 12. Account, tiers, entitlement
+
+⚠ **Withdrawing a file from `www/` does not remove it from existing installs, and
+`/grid_lens` serves that whole tree.** An in-place update — HACS, or `sync-to-ha.sh`'s
+`cp -r` — copies files in and never deletes. `grid-lens-powerflow-card.js` was moved to
+`gridlens-api` behind `PowerflowIconView`'s entitlement check on 2026-08-02, but every
+install that updated across that commit kept the pre-gating copy at
+`/grid_lens/cards/grid-lens-powerflow-card.js`, **outside the gate and reachable by anyone
+with the URL**. Found on the dev rig 2026-08-28, still dated Aug 2. The Lovelace resource
+had correctly pointed at the gated `/api/` path the whole time — nothing referenced the old
+file, it was simply still on disk being served.
+
+`_WITHDRAWN_WWW_FILES` in `__init__.py` lists exact relative filenames the integration once
+shipped and must never serve again; `_prune_withdrawn_www_files()` deletes them **before**
+the static path is registered, so there is no window in which one is reachable, and logs at
+`warning` — the only signal an install was ever exposed. Exact filenames only, never globs
+or paths, with an `is_relative_to()` guard, because this unlinks from the user's filesystem.
+
+**Gating a card is therefore a two-part change:** move it to `gridlens-api/app/cards/` *and*
+add its old `www/` filename to `_WITHDRAWN_WWW_FILES`. Doing only the first leaves every
+existing install serving it ungated. Covered by `tests/test_withdrawn_www_prune.py`.
+
 
 - **Free** — model your own current plan. No API key needed; the integration registers the
   installation automatically.
