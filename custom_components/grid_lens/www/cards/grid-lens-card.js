@@ -86,8 +86,17 @@ class GridLensCard extends HTMLElement {
     if (endDate)   this._endDate   = endDate.substring(0, 10);
     this._showStreamProgress();
 
-    const params = (startDate && endDate)
-      ? `?start_date=${startDate}&end_date=${endDate}` : '';
+    // Callers (epc-calc / prev / next) pass bare "YYYY-MM-DD" strings. Without a
+    // time component the backend parses both as midnight, so the end date's whole
+    // day (the last day of the billing period) contributes zero usage/supply-charge
+    // — a full calendar day short of what the user's paper bill covers. Widen bare
+    // dates to the full local day so the range is inclusive of both endpoints.
+    const withTime = (d, suffix) => (d && d.length === 10) ? `${d}T${suffix}` : d;
+    const rangeStart = withTime(startDate, '00:00:00');
+    const rangeEnd   = withTime(endDate,   '23:59:59');
+
+    const params = (rangeStart && rangeEnd)
+      ? `?start_date=${rangeStart}&end_date=${rangeEnd}` : '';
     const src = new EventSource(`/api/grid_lens/plan_stream${params}`);
     this._activeSource = src;
 
