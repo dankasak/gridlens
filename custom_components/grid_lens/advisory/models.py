@@ -83,6 +83,11 @@ class AdvisoryResult:
     # install's actual battery ceiling without hardcoding any inverter brand's entities.
     battery_max_charge_kw: float = 0.0
     battery_max_discharge_kw: float = 0.0
+    # Day-0 SOC ceiling status for deferrable devices with SOC tracking enabled (see
+    # CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT / battery_optimizer.py's ev_soc_idx) — one dict
+    # per tracked device: {name, sensor_id, initial_percent, max_percent,
+    # day0_final_percent, day0_charge_kwh}. Empty for installs with none configured.
+    ev_soc_status: list[dict] = field(default_factory=list)
 
     def to_attributes(self) -> dict[str, Any]:
         """Shape for a HA sensor's attributes (JSON-serialisable)."""
@@ -101,4 +106,5 @@ class AdvisoryResult:
             "conditional_credits": self.conditional_credits,
             "battery_max_charge_kw": self.battery_max_charge_kw,
             "battery_max_discharge_kw": self.battery_max_discharge_kw,
+            "ev_soc_status": self.ev_soc_status,
         }

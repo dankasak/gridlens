@@ -265,6 +265,20 @@ MODULATING_UNPLUGGED_STATES = frozenset(
 # not configured; the Power Flow card only shows a SOC figure + history link for devices
 # that have one set, same as it already does for the home battery's soc_entity.
 CONF_DEFERRABLE_LOAD_SOC_SENSORS = "deferrable_load_soc_sensors"  # list of sensor IDs ("" = none)
+# Optional per-device SOC ceiling + capacity, parallel to sensors — lets the LIVE
+# advisory/control optimizer stop scheduling further charge once a device's own SOC
+# sensor (above) nears a configured maximum, freeing that energy for other deferrable
+# loads or export rather than pushing the device past a limit its owner set on purpose
+# (e.g. an EV charged to 90% for battery longevity — not GridLens's call to override).
+# capacity_kwh converts the percentage ceiling into the kWh the LP reasons in; 0.0 (not
+# provided) leaves the device on the plain daily_kwh mechanism, unchanged. Only
+# advisory/coordinator.py's _deferrable_for_horizon wires in a live SOC reading and
+# activates this — plan_calculator.py's plan-comparison backtest never does (there is
+# no "current battery state" for a hypothetical past period), so it always falls
+# through to today's behaviour regardless of these being set. See
+# battery_optimizer.py's module docstring for the LP mechanics.
+CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT = "deferrable_load_soc_max_percent"    # list of float (100 = no cap)
+CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH = "deferrable_load_soc_capacity_kwh"  # list of float (0 = not provided)
 # Optional per-device Controlled Load register wiring, parallel to sensors. "" = not
 # wired to controlled load (default, same as today's behaviour). "controlled_load_1" /
 # "controlled_load_2" means this device's energy is physically switched via that DNSP

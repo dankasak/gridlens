@@ -16,6 +16,21 @@ from homeassistant.helpers import instance_id, selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import homeassistant.helpers.config_validation as cv
 
+from .deferrable_loads import (
+    CONTROL_MODULATING,
+    CONTROL_NONE,
+    CONTROL_ONOFF,
+    DECLARED,
+    ESTIMATED,
+    MONITORED,
+    apply_control_style,
+    clear_controlled_load,
+    clear_soc,
+    control_style,
+    new_load,
+    read_loads,
+    write_loads,
+)
 from .const import (
     DOMAIN,
     CONF_ENERGY_SENSOR,
@@ -52,6 +67,8 @@ from .const import (
     CONF_DEFERRABLE_LOAD_MIN_CURRENT,
     CONF_DEFERRABLE_LOAD_PLUG_SENSOR,
     CONF_DEFERRABLE_LOAD_SOC_SENSORS,
+    CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT,
+    CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH,
     CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD,
     CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE,
     DEFERRABLE_LOAD_DUMMY_SLOTS,
@@ -612,6 +629,8 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             for key, blank in (
                 (CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE, ""),
                 (CONF_DEFERRABLE_LOAD_SOC_SENSORS, ""),
+                (CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT, 100.0),
+                (CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH, 0.0),
                 (CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD, ""),
                 (CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE, False),
                 (CONF_DEFERRABLE_LOAD_SETPOINT, ""),
@@ -988,8 +1007,21 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         self._sensor_data: dict = {}
         self._discovered: dict = {}
         self._device_options: list = []
-        self._has_cl1: bool = False
-        self._has_cl2: bool = False
+        # Seeded from the entry, not left False: async_step_controlled_load overwrites
+        # these on the full-reconfigure path, but jumping straight to the loads wizard
+        # from the menu never runs that step — and False there would silently hide every
+        # Controlled Load question from a household that has one.
+        self._has_cl1: bool = bool(config_entry.data.get(CONF_HAS_CONTROLLED_LOAD_1, False))
+        self._has_cl2: bool = bool(config_entry.data.get(CONF_HAS_CONTROLLED_LOAD_2, False))
+        # Deferrable-load wizard state — see the "deferrable loads" section below.
+        # `None` (not `[]`) means "not read from the entry yet"; an install with no
+        # loads configured is a legitimate empty list.
+        self._loads: list | None = None
+        self._editing: int | None = None
+        self._load_steps: list[str] = []
+        # True when the wizard was entered straight from the menu, so "save and
+        # continue" saves and exits instead of walking on to the plan/API steps.
+        self._loads_only: bool = False
 
     async def async_step_init(self, user_input=None):
         """Entry point for Configure — a menu so a quick task (pasting a new API
@@ -997,8 +1029,14 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         reconfigure wizard from the top just to reach the field at the end."""
         return self.async_show_menu(
             step_id="init",
-            menu_options=["api_key", "full_reconfigure"],
+            menu_options=["deferrable_loads", "api_key", "full_reconfigure"],
         )
+
+    async def async_step_deferrable_loads(self, user_input=None):
+        """Jump straight to the loads wizard. Editing one appliance shouldn't mean
+        walking back through energy sensors, battery specs and the plan picker."""
+        self._loads_only = True
+        return await self.async_step_loads()
 
     async def async_step_full_reconfigure(self, user_input=None):
         """The pre-existing full wizard, now reached via the menu above instead
@@ -1010,7 +1048,7 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
 
         Network/meter fact set by the DNSP, not the retail plan — same
         self-declare pattern as CONF_HAS_DEMAND_TARIFF. Answered here (before
-        devices) so async_step_device_power below can offer the
+        devices) so the per-load wizard below can offer the
         wired_to_controlled_load dropdown only for registers the household
         actually has. Stored on self rather than self._sensor_data because
         async_step_sensors below replaces self._sensor_data wholesale.
@@ -1150,7 +1188,7 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 self._sensor_data = {**self._sensor_data, **user_input}
                 if has_battery:
                     return await self.async_step_inverter()
-                return await self.async_step_devices()
+                return await self.async_step_loads()
 
         return self.async_show_form(
             step_id="battery",
@@ -1169,7 +1207,7 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 CONF_INVERTER_BRAND: brand,
                 CONF_INVERTER_TRANSPORT: transport,
             }
-            return await self.async_step_devices()
+            return await self.async_step_loads()
 
         detected = detect_inverter_brand(self.hass)
         description_placeholders = {
@@ -1185,525 +1223,611 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             description_placeholders=description_placeholders,
         )
 
-    async def async_step_devices(self, user_input=None):
-        """Select which Energy Dashboard appliances are deferrable loads."""
-        entry_data = self._config_entry.data
+    # ------------------------------------------------------------------ deferrable loads
+    #
+    # One wizard per load, asking only what that load's kind and control style actually
+    # use. This replaces four steps that between them rendered every field for every
+    # load on two enormous forms: `device_power` alone showed 14 fields per selected
+    # device (translations/en.json carried 140 pre-baked labels, ten slots' worth, each
+    # one prefixed with the device name because there was no other way to say which
+    # device a field belonged to), and `declared_loads` / `estimated_loads` drew a fixed
+    # 2 and 3 slots whether or not they were used.
+    #
+    # A forecast-only appliance now answers three questions. A modulating EV charger
+    # still answers all of them, but across short titled steps instead of buried in a
+    # fifty-field screen next to the dishwasher's.
+    #
+    # State: `self._loads` is the working list (one dict per load, see
+    # deferrable_loads.py), read once on entering the hub and written back to the
+    # parallel arrays only on "save and continue". `self._editing` indexes the load
+    # being edited; `self._load_steps` is the queue of sub-steps that load's answers
+    # earned, walked by `_next_load_step`.
+
+    async def async_step_loads(self, user_input=None):
+        """Hub: list the configured deferrable loads, pick one to edit, or add one."""
+        if self._loads is None:
+            self._loads = read_loads(self._config_entry.data)
         if not self._device_options:
             self._device_options = await _discover_dashboard_devices(self.hass)
 
-        if not self._device_options:
+        if user_input is not None:
+            action = str(user_input.get("action") or "done")
+            if action == "add":
+                return await self.async_step_load_kind()
+            if action == "load_power":
+                return await self.async_step_load_power()
+            if action.startswith("edit:"):
+                self._editing = int(action.split(":", 1)[1])
+                return await self._open_load_detail()
+            # "done" — drop any load abandoned without an identity (added, then the
+            # wizard was walked past without naming it) and flatten back to the
+            # parallel arrays every consumer reads.
+            keep = [
+                load for load in self._loads
+                if (load.get("sensor") if load.get("kind") == MONITORED else load.get("name"))
+            ]
+            self._sensor_data.update(write_loads(keep))
+            if self._loads_only:
+                # Merge over the entry's own data — _sensor_data holds only what this
+                # wizard touched, and replacing data with it alone would wipe the rest.
+                self.hass.config_entries.async_update_entry(
+                    self._config_entry,
+                    data={**self._config_entry.data, **self._sensor_data},
+                )
+                return self.async_create_entry(title="", data={})
             return await self.async_step_current_plan()
 
-        if user_input is not None:
-            self._sensor_data.update(user_input)
-            return await self.async_step_device_power()
+        options = [
+            {"value": f"edit:{i}", "label": self._load_label(load)}
+            for i, load in enumerate(self._loads)
+        ]
+        options.append({"value": "add", "label": "➕ Add a deferrable load"})
+        if any(load.get("kind") == ESTIMATED for load in self._loads):
+            options.append(
+                {"value": "load_power", "label": "⚙ House load sensor (used to estimate loads)"}
+            )
+        options.append({"value": "done", "label": "✓ Save and continue"})
 
-        current = entry_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
-        # Drop any previously-saved sensor no longer offered by the discovery scan
-        # (e.g. renamed/deleted since last configured) — an invalid default fails
-        # SelectSelector validation for the whole field, blocking new selections too.
-        valid_values = {opt["value"] for opt in self._device_options}
-        current = [c for c in current if c in valid_values]
+        summary = (
+            "\n".join(f"• {self._load_label(load)}" for load in self._loads)
+            if self._loads
+            else "No deferrable loads configured yet."
+        )
+        return self.async_show_form(
+            step_id="loads",
+            data_schema=vol.Schema({
+                vol.Optional("action", default="done"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=options,
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                ),
+            }),
+            description_placeholders={"summary": summary},
+        )
+
+    def _load_display_name(self, load) -> str:
+        """Human name for a load — the Energy Dashboard's label for a monitored sensor
+        (that rename lives on the dashboard, not the entity), else the entity's own
+        friendly name, else what the user typed."""
+        if load.get("kind") != MONITORED:
+            return str(load.get("name") or "Unnamed load")
+        sensor = load.get("sensor", "")
+        for opt in self._device_options:
+            if opt.get("value") == sensor:
+                return str(opt.get("label", sensor)).split(" (")[0]
+        state = self.hass.states.get(sensor)
+        if state:
+            return state.attributes.get("friendly_name", sensor)
+        return sensor
+
+    def _load_label(self, load) -> str:
+        """One line per load for the hub list: name, then how it is wired, so the list
+        answers "which one do I need to fix" without opening each in turn."""
+        name = self._load_display_name(load)
+        kind = load.get("kind")
+        if kind == MONITORED:
+            style = {
+                CONTROL_MODULATING: "modulating",
+                CONTROL_ONOFF: "on/off",
+            }.get(control_style(load), "forecast only")
+            bits = [f"metered, {style}", f"{load.get('max_kw', 3.5):g} kW"]
+        elif kind == DECLARED:
+            bits = [
+                "declared",
+                f"{load.get('daily_kwh', 0.0):g} kWh/day",
+                f"{load.get('max_kw', 3.5):g} kW",
+            ]
+        else:
+            bits = ["estimated", f"~{load.get('est_kw', 1.0):g} kW"]
+        if load.get("controlled_load"):
+            bits.append(load["controlled_load"].replace("_", " ").title())
+        return f"{name} — {', '.join(bits)}"
+
+    async def async_step_load_kind(self, user_input=None):
+        """Which kind of load is being added. The distinction that decides every
+        following question is what Home Assistant can already see and do: an energy
+        sensor, a controllable entity, or neither."""
+        menu_options = []
+        if self._device_options:
+            menu_options.append("load_add_monitored")
+        menu_options += ["load_add_estimated", "load_add_declared"]
+        return self.async_show_menu(step_id="load_kind", menu_options=menu_options)
+
+    async def async_step_load_add_monitored(self, user_input=None):
+        """Pick the Energy Dashboard device this load is measured by."""
+        taken = {
+            load.get("sensor") for load in self._loads if load.get("kind") == MONITORED
+        }
+        available = [opt for opt in self._device_options if opt["value"] not in taken]
+        if not available:
+            # Every discovered device is already configured — nothing to add, so say so
+            # rather than showing an empty picker.
+            return await self.async_step_loads()
+
+        if user_input is not None:
+            self._loads.append(new_load(MONITORED, sensor=user_input["sensor"]))
+            self._editing = len(self._loads) - 1
+            return await self._open_load_detail()
 
         return self.async_show_form(
-            step_id="devices",
+            step_id="load_add_monitored",
             data_schema=vol.Schema({
-                vol.Optional(CONF_DEFERRABLE_LOAD_SENSORS, default=current): selector.SelectSelector(
+                vol.Required("sensor"): selector.SelectSelector(
                     selector.SelectSelectorConfig(
-                        options=self._device_options,
-                        multiple=True,
+                        options=available,
                         mode=selector.SelectSelectorMode.LIST,
                     )
                 ),
             }),
         )
 
-    async def async_step_device_power(self, user_input=None):
-        """Capture max power draw for each selected deferrable load. Availability
-        windows are no longer set here — paint them on the Deferrable Loads dashboard
-        card's weekly schedule (a device is unrestricted, any hour, until you do)."""
-        entry_data = self._config_entry.data
-        selected = self._sensor_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
-        if not selected:
-            return await self.async_step_declared_loads()
+    async def async_step_load_add_declared(self, user_input=None):
+        self._loads.append(new_load(DECLARED))
+        self._editing = len(self._loads) - 1
+        return await self._open_load_detail()
 
-        existing_max_kw = entry_data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
-        existing_switches = entry_data.get(CONF_DEFERRABLE_LOAD_SWITCHES, [])
-        existing_climate_modes = entry_data.get(CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE, [])
-        existing_soc = entry_data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, [])
-        existing_cl = entry_data.get(CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD, [])
-        existing_in_agg = entry_data.get(CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE, [])
-        # Modulating-control fields — absent from every config entry saved before this
-        # change, hence `.get(KEY, [])`: an old entry just yields empty lists here, and
-        # every device below falls through to its "not modulating" default, unchanged
-        # from what it did before this feature existed.
-        existing_setpoint = entry_data.get(CONF_DEFERRABLE_LOAD_SETPOINT, [])
-        existing_setpoint_unit = entry_data.get(CONF_DEFERRABLE_LOAD_SETPOINT_UNIT, [])
-        existing_phases = entry_data.get(CONF_DEFERRABLE_LOAD_PHASES, [])
-        existing_voltage = entry_data.get(CONF_DEFERRABLE_LOAD_VOLTAGE, [])
-        existing_min_current = entry_data.get(CONF_DEFERRABLE_LOAD_MIN_CURRENT, [])
-        existing_plug_sensor = entry_data.get(CONF_DEFERRABLE_LOAD_PLUG_SENSOR, [])
-        # Existing lists are keyed by position in the previously saved sensor
-        # list; map by sensor_id so reordering/removing devices keeps defaults.
-        prev_sensors = entry_data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
-        prev_kw = {s: existing_max_kw[i] for i, s in enumerate(prev_sensors) if i < len(existing_max_kw)}
-        prev_switch = {
-            s: existing_switches[i]
-            for i, s in enumerate(prev_sensors)
-            if i < len(existing_switches) and existing_switches[i]
-        }
-        prev_climate_mode = {
-            s: existing_climate_modes[i]
-            for i, s in enumerate(prev_sensors)
-            if i < len(existing_climate_modes) and existing_climate_modes[i]
-        }
-        prev_soc = {
-            s: existing_soc[i]
-            for i, s in enumerate(prev_sensors)
-            if i < len(existing_soc) and existing_soc[i]
-        }
-        prev_cl = {
-            s: existing_cl[i]
-            for i, s in enumerate(prev_sensors)
-            if i < len(existing_cl) and existing_cl[i]
-        }
-        prev_in_agg = {
-            s: existing_in_agg[i]
-            for i, s in enumerate(prev_sensors)
-            if i < len(existing_in_agg)
-        }
-        prev_setpoint = {
-            s: existing_setpoint[i]
-            for i, s in enumerate(prev_sensors)
-            if i < len(existing_setpoint) and existing_setpoint[i]
-        }
-        prev_setpoint_unit = {
-            s: existing_setpoint_unit[i]
-            for i, s in enumerate(prev_sensors)
-            if i < len(existing_setpoint_unit)
-        }
-        prev_phases = {
-            s: existing_phases[i]
-            for i, s in enumerate(prev_sensors)
-            if i < len(existing_phases)
-        }
-        prev_voltage = {
-            s: existing_voltage[i]
-            for i, s in enumerate(prev_sensors)
-            if i < len(existing_voltage)
-        }
-        prev_min_current = {
-            s: existing_min_current[i]
-            for i, s in enumerate(prev_sensors)
-            if i < len(existing_min_current)
-        }
-        prev_plug_sensor = {
-            s: existing_plug_sensor[i]
-            for i, s in enumerate(prev_sensors)
-            if i < len(existing_plug_sensor) and existing_plug_sensor[i]
-        }
+    async def async_step_load_add_estimated(self, user_input=None):
+        self._loads.append(new_load(ESTIMATED))
+        self._editing = len(self._loads) - 1
+        return await self._open_load_detail()
+
+    def _cl_register_options(self) -> list[dict]:
+        """Controlled Load registers the household declared in async_step_controlled_load.
+        Empty when they declared none, which is what suppresses every CL question."""
+        options = []
+        if self._has_cl1:
+            options.append({"value": "controlled_load_1", "label": "Controlled Load 1"})
+        if self._has_cl2:
+            options.append({"value": "controlled_load_2", "label": "Controlled Load 2"})
+        return options
+
+    async def _next_load_step(self):
+        """Run the next sub-step this load's answers earned, or return to the hub."""
+        if self._load_steps:
+            step = self._load_steps.pop(0)
+            return await getattr(self, f"async_step_load_{step}")()
+        return await self.async_step_loads()
+
+    async def _open_load_detail(self):
+        """Show the detail form for whichever kind the load being edited is."""
+        kind = self._loads[self._editing]["kind"]
+        return await getattr(self, f"async_step_load_detail_{kind}")()
+
+    # Three step ids over one implementation. The fields differ per kind, so the titles
+    # and help text must too — a shared "load_detail" step would have shown a declared
+    # load's form under a monitored load's heading, which is the near-duplicate-step
+    # problem that made Declared vs Estimated Loads confusable in the first place.
+    async def async_step_load_detail_monitored(self, user_input=None):
+        return await self._async_load_detail("load_detail_monitored", user_input)
+
+    async def async_step_load_detail_declared(self, user_input=None):
+        return await self._async_load_detail("load_detail_declared", user_input)
+
+    async def async_step_load_detail_estimated(self, user_input=None):
+        return await self._async_load_detail("load_detail_estimated", user_input)
+
+    async def _async_load_detail(self, step_id, user_input=None):
+        """The one form every load gets. Its fields depend on the load's kind, and its
+        answers decide which follow-up steps run."""
+        load = self._loads[self._editing]
+        kind = load["kind"]
+        cl_options = self._cl_register_options()
+        errors: dict[str, str] = {}
 
         if user_input is not None:
-            max_kw_list = [float(user_input.get(f"max_kw_{i}", 3.5)) for i in range(len(selected))]
-            switches_list = [
-                str(user_input.get(f"switch_{i}", "") or "") for i in range(len(selected))
-            ]
-            climate_mode_list = [
-                str(user_input.get(f"climate_on_mode_{i}", "") or "") for i in range(len(selected))
-            ]
-            soc_list = [
-                str(user_input.get(f"soc_{i}", "") or "") for i in range(len(selected))
-            ]
-            cl_list = [
-                str(user_input.get(f"cl_{i}", "") or "") for i in range(len(selected))
-            ]
-            in_agg_list = [
-                bool(user_input.get(f"in_aggregate_{i}", False)) for i in range(len(selected))
-            ]
-            # Modulating ("type 2") control, per device — same fields/coercion as the
-            # setup-flow version of this step; see that copy's comment for the full
-            # rationale. Unlike the entity-selector fields above, there's no
-            # stale-vs-fresh ambiguity to worry about here: the form always re-asserts
-            # a value (defaulting to "not modulating") on every save through this step.
-            setpoint_list = [
-                str(user_input.get(f"setpoint_{i}", "") or "") for i in range(len(selected))
-            ]
-            setpoint_unit_list = [
-                str(user_input.get(f"setpoint_unit_{i}", "") or "") for i in range(len(selected))
-            ]
-            phases_list = [
-                int(user_input.get(f"phases_{i}", 0) or 0) for i in range(len(selected))
-            ]
-            voltage_list = [
-                float(user_input.get(f"voltage_{i}", 0.0) or 0.0) for i in range(len(selected))
-            ]
-            min_current_list = [
-                float(user_input.get(f"min_current_{i}", 0.0) or 0.0) for i in range(len(selected))
-            ]
-            plug_sensor_list = [
-                str(user_input.get(f"plug_sensor_{i}", "") or "") for i in range(len(selected))
-            ]
-            self._sensor_data[CONF_DEFERRABLE_LOAD_MAX_KW] = max_kw_list
-            self._sensor_data[CONF_DEFERRABLE_LOAD_SWITCHES] = switches_list
-            self._sensor_data[CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE] = climate_mode_list
-            self._sensor_data[CONF_DEFERRABLE_LOAD_SOC_SENSORS] = soc_list
-            self._sensor_data[CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD] = cl_list
-            self._sensor_data[CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE] = in_agg_list
-            self._sensor_data[CONF_DEFERRABLE_LOAD_SETPOINT] = setpoint_list
-            self._sensor_data[CONF_DEFERRABLE_LOAD_SETPOINT_UNIT] = setpoint_unit_list
-            self._sensor_data[CONF_DEFERRABLE_LOAD_PHASES] = phases_list
-            self._sensor_data[CONF_DEFERRABLE_LOAD_VOLTAGE] = voltage_list
-            self._sensor_data[CONF_DEFERRABLE_LOAD_MIN_CURRENT] = min_current_list
-            self._sensor_data[CONF_DEFERRABLE_LOAD_PLUG_SENSOR] = plug_sensor_list
-            return await self.async_step_declared_loads()
+            if user_input.get("remove"):
+                del self._loads[self._editing]
+                self._editing = None
+                return await self.async_step_loads()
 
-        # Controlled Load register choices, gated on the flags collected in
-        # async_step_controlled_load. Offered per-device below only if non-empty.
-        cl_register_options = []
-        if self._has_cl1:
-            cl_register_options.append({"value": "controlled_load_1", "label": "Controlled Load 1"})
-        if self._has_cl2:
-            cl_register_options.append({"value": "controlled_load_2", "label": "Controlled Load 2"})
+            if kind == MONITORED:
+                load["max_kw"] = float(user_input.get("max_kw", 3.5))
+                style = str(user_input.get("control_style", CONTROL_NONE))
+                apply_control_style(load, style)
+                self._load_steps = []
+                if style != CONTROL_NONE:
+                    self._load_steps.append("control")
+                if style == CONTROL_MODULATING:
+                    self._load_steps.append("modulating")
+                if user_input.get("has_soc"):
+                    self._load_steps.append("soc")
+                else:
+                    clear_soc(load)
+            elif kind == DECLARED:
+                name = str(user_input.get("name", "") or "").strip()
+                if not name:
+                    errors["name"] = "load_name_required"
+                elif self._name_taken(name):
+                    errors["name"] = "load_duplicate_name"
+                spec = str(user_input.get("hours", "all") or "all").strip()
+                if not errors:
+                    try:
+                        parse_hours_spec(spec)
+                    except ValueError:
+                        errors["hours"] = "invalid_hours"
+                if not errors:
+                    load["name"] = name
+                    load["daily_kwh"] = float(user_input.get("daily_kwh", 0.0) or 0.0)
+                    load["max_kw"] = float(user_input.get("max_kw", 3.5))
+                    load["hours"] = spec
+                    self._load_steps = []
+            else:  # ESTIMATED
+                name = str(user_input.get("name", "") or "").strip()
+                control = str(user_input.get("control", "") or "")
+                if not name:
+                    errors["name"] = "load_name_required"
+                elif self._name_taken(name):
+                    errors["name"] = "load_duplicate_name"
+                # A slot with a name but no control entity is silently inert —
+                # `_ensure_load_estimators` skips it, and nothing tells the user. The
+                # old fixed-slot form let this through and it cost a real
+                # misconfiguration (Daikin AC, 2026-08-06, control/kw/auto all set with
+                # a blank name). Here both are required, so it cannot be saved half-done.
+                if not control:
+                    errors["control"] = "load_control_required"
+                if not errors:
+                    load["name"] = name
+                    load["control"] = control
+                    load["est_kw"] = float(user_input.get("est_kw", 1.0) or 1.0)
+                    load["auto"] = bool(user_input.get("auto", False))
+                    self._load_steps = []
 
-        schema_dict = {}
-        device_lines = []
-        name_placeholders: dict[str, str] = {}
-        for i, sensor_id in enumerate(selected):
-            state = self.hass.states.get(sensor_id)
-            name = state.attributes.get("friendly_name", sensor_id) if state else sensor_id
-            device_lines.append(f"{i + 1}. {name}")
-            # Substituted into each field's own label below (see strings.json's
-            # "{device_N_name} — ..." labels) so the form shows the actual device name
-            # instead of "Device N".
-            name_placeholders[f"device_{i}_name"] = name
-            default_kw = prev_kw.get(sensor_id, 3.5)
-            schema_dict[vol.Optional(f"max_kw_{i}", default=default_kw)] = selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=0.1, max=100.0, step=0.1,
-                    unit_of_measurement="kW",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
-            )
-            # Optional control switch; pre-fill the previously saved one (vol.Optional with
-            # no default when unset, so the field renders empty rather than forcing a value).
-            prev_sw = prev_switch.get(sensor_id)
-            switch_key = (
-                vol.Optional(f"switch_{i}", default=prev_sw)
-                if prev_sw else vol.Optional(f"switch_{i}")
-            )
-            schema_dict[switch_key] = selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["switch", "climate"])
-            )
-            # Only relevant if the control entity above is a climate.* one that doesn't
-            # support climate.turn_on/turn_off (most do) — which hvac_mode to command for
-            # "on". Ignored otherwise.
-            schema_dict[vol.Optional(
-                f"climate_on_mode_{i}", default=prev_climate_mode.get(sensor_id, "")
-            )] = selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=[
-                        {"value": "", "label": "Auto (turn_on / restore last mode)"},
-                        {"value": "cool", "label": "Cool"},
-                        {"value": "heat", "label": "Heat"},
-                        {"value": "heat_cool", "label": "Heat/Cool (auto)"},
-                        {"value": "dry", "label": "Dry"},
-                        {"value": "fan_only", "label": "Fan only"},
-                    ],
-                    mode=selector.SelectSelectorMode.DROPDOWN,
-                )
-            )
-            # Optional battery/EV SOC sensor; pre-fill the previously saved one, same pattern
-            # as the control switch above.
-            prev_soc_sensor = prev_soc.get(sensor_id)
-            soc_key = (
-                vol.Optional(f"soc_{i}", default=prev_soc_sensor)
-                if prev_soc_sensor else vol.Optional(f"soc_{i}")
-            )
-            schema_dict[soc_key] = selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="sensor")
-            )
-            # --- Modulating ("type 2") control — see the setup-flow copy of this step
-            # for the full rationale (same fields, same meaning). Pre-fill every value
-            # from the previously saved config, sensor_id-keyed like switch/soc above,
-            # so reordering or removing a device elsewhere in the wizard doesn't lose
-            # a household's charger tuning.
-            prev_setpoint_entity = prev_setpoint.get(sensor_id)
-            setpoint_key = (
-                vol.Optional(f"setpoint_{i}", default=prev_setpoint_entity)
-                if prev_setpoint_entity else vol.Optional(f"setpoint_{i}")
-            )
-            schema_dict[setpoint_key] = selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="number")
-            )
-            schema_dict[vol.Optional(
-                f"setpoint_unit_{i}", default=prev_setpoint_unit.get(sensor_id, ""),
-            )] = selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=[
-                        {"value": "", "label": "Auto (detect from the entity)"},
-                        {"value": "a", "label": "Amps (A)"},
-                        {"value": "w", "label": "Watts (W)"},
-                        {"value": "kw", "label": "Kilowatts (kW)"},
-                    ],
-                    mode=selector.SelectSelectorMode.DROPDOWN,
-                )
-            )
-            # Stored as int (see CONF_DEFERRABLE_LOAD_PHASES); the SelectSelector's own
-            # option values are strings, so re-stringify the saved default to match.
-            schema_dict[vol.Optional(
-                f"phases_{i}", default=str(prev_phases.get(sensor_id, 0)),
-            )] = selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=[
-                        {"value": "0", "label": "Auto-detect"},
-                        {"value": "1", "label": "Single phase"},
-                        {"value": "2", "label": "Two phase"},
-                        {"value": "3", "label": "Three phase"},
-                    ],
-                    mode=selector.SelectSelectorMode.DROPDOWN,
-                )
-            )
-            schema_dict[vol.Optional(
-                f"voltage_{i}", default=prev_voltage.get(sensor_id, 0.0),
-            )] = selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=0.0, max=500.0, step=1,
-                    unit_of_measurement="V",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
-            )
-            schema_dict[vol.Optional(
-                f"min_current_{i}", default=prev_min_current.get(sensor_id, 0.0),
-            )] = selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=0.0, max=32.0, step=0.1,
-                    unit_of_measurement="A",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
-            )
-            prev_plug = prev_plug_sensor.get(sensor_id)
-            plug_key = (
-                vol.Optional(f"plug_sensor_{i}", default=prev_plug)
-                if prev_plug else vol.Optional(f"plug_sensor_{i}")
-            )
-            schema_dict[plug_key] = selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["binary_sensor", "sensor"])
-            )
-            # Optional Controlled Load register wiring; only shown when the household
-            # declared at least one CL register in async_step_controlled_load.
-            # TODO: filter cl_register_options by which device types the network actually
-            # confirms for that register (NetworkIR.controlled_load_eligible_devices in
-            # the API's plan_transform.py / get_network_operators()) — no live network
-            # eligible-device lookup is wired into the config flow yet.
-            if cl_register_options:
-                schema_dict[vol.Optional(f"cl_{i}", default=prev_cl.get(sensor_id, ""))] = (
-                    selector.SelectSelector(
-                        selector.SelectSelectorConfig(
-                            options=[{"value": "", "label": "Not on controlled load"}] + cl_register_options,
-                            mode=selector.SelectSelectorMode.DROPDOWN,
-                        )
+            if not errors:
+                if cl_options and kind in (MONITORED, DECLARED):
+                    if user_input.get("on_controlled_load"):
+                        self._load_steps.append("cl")
+                    else:
+                        clear_controlled_load(load)
+                return await self._next_load_step()
+
+        # ---------------------------------------------------------------- render
+        schema: dict = {}
+        if kind == MONITORED:
+            schema[vol.Optional("max_kw", default=load.get("max_kw", 3.5))] = (
+                selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0.1, max=100.0, step=0.1,
+                        unit_of_measurement="kW",
+                        mode=selector.NumberSelectorMode.BOX,
                     )
                 )
-                schema_dict[vol.Optional(
-                    f"in_aggregate_{i}", default=prev_in_agg.get(sensor_id, False),
-                )] = selector.BooleanSelector()
+            )
+            schema[vol.Optional("control_style", default=control_style(load))] = (
+                selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            {"value": CONTROL_NONE,
+                             "label": "Forecast only — Grid Lens never switches it"},
+                            {"value": CONTROL_ONOFF,
+                             "label": "On/off — a switch or climate entity"},
+                            {"value": CONTROL_MODULATING,
+                             "label": "Modulating — a charger with an adjustable current/power setpoint"},
+                        ],
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                )
+            )
+            schema[vol.Optional("has_soc", default=bool(load.get("soc_sensor")))] = (
+                selector.BooleanSelector()
+            )
+        elif kind == DECLARED:
+            schema[vol.Required("name", default=load.get("name", ""))] = selector.TextSelector()
+            schema[vol.Optional("daily_kwh", default=load.get("daily_kwh", 0.0))] = (
+                selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0.0, max=100.0, step=0.1,
+                        unit_of_measurement="kWh/day",
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                )
+            )
+            schema[vol.Optional("max_kw", default=load.get("max_kw", 3.5))] = (
+                selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0.1, max=100.0, step=0.1,
+                        unit_of_measurement="kW",
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                )
+            )
+            schema[vol.Optional("hours", default=load.get("hours", "all"))] = (
+                selector.TextSelector()
+            )
+        else:  # ESTIMATED
+            schema[vol.Required("name", default=load.get("name", ""))] = selector.TextSelector()
+            prev_control = load.get("control", "")
+            control_key = (
+                vol.Required("control", default=prev_control)
+                if prev_control else vol.Required("control")
+            )
+            schema[control_key] = selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["switch", "climate"])
+            )
+            schema[vol.Optional("est_kw", default=load.get("est_kw", 1.0))] = (
+                selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0.05, max=20.0, step=0.05,
+                        unit_of_measurement="kW",
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                )
+            )
+            schema[vol.Optional("auto", default=bool(load.get("auto", False)))] = (
+                selector.BooleanSelector()
+            )
+
+        if cl_options and kind in (MONITORED, DECLARED):
+            schema[vol.Optional(
+                "on_controlled_load", default=bool(load.get("controlled_load")),
+            )] = selector.BooleanSelector()
+        schema[vol.Optional("remove", default=False)] = selector.BooleanSelector()
 
         return self.async_show_form(
-            step_id="device_power",
-            data_schema=vol.Schema(schema_dict),
-            description_placeholders={"devices": "\n".join(device_lines), **name_placeholders},
+            step_id=step_id,
+            data_schema=vol.Schema(schema),
+            errors=errors,
+            description_placeholders={"name": self._load_display_name(load)},
         )
 
-    async def async_step_declared_loads(self, user_input=None):
-        """Declare loads with no HA-visible energy sensor at all — see the setup-flow
-        docstring on this same step name for the full rationale (genuine Controlled
-        Load circuits normally have none)."""
-        entry_data = self._config_entry.data
-        existing_names = entry_data.get(CONF_DEFERRABLE_LOAD_DUMMY_NAMES, [])
-        existing_kwh = entry_data.get(CONF_DEFERRABLE_LOAD_DUMMY_KWH, [])
-        existing_max_kw = entry_data.get(CONF_DEFERRABLE_LOAD_DUMMY_MAX_KW, [])
-        existing_hours = entry_data.get(CONF_DEFERRABLE_LOAD_DUMMY_HOURS, [])
-        existing_cl = entry_data.get(CONF_DEFERRABLE_LOAD_DUMMY_CONTROLLED_LOAD, [])
-        existing_in_agg = entry_data.get(CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE, [])
+    def _name_taken(self, name: str) -> bool:
+        """Declared and estimated loads share one namespace — a duplicate name silently
+        merges two loads downstream, so reject it at the point of entry rather than
+        letting the old cross-step check catch it several screens later."""
+        lowered = name.strip().lower()
+        return any(
+            i != self._editing
+            and load.get("kind") in (DECLARED, ESTIMATED)
+            and str(load.get("name", "")).strip().lower() == lowered
+            for i, load in enumerate(self._loads)
+        )
 
-        errors: dict[str, str] = {}
+    async def async_step_load_control(self, user_input=None):
+        """Which entity Grid Lens turns on and off for this load."""
+        load = self._loads[self._editing]
+
         if user_input is not None:
-            names = [
-                str(user_input.get(f"name_{i}", "") or "").strip()
-                for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
-            ]
-            hours_list = [
-                str(user_input.get(f"hours_{i}", "all")).strip() or "all"
-                for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
-            ]
-            try:
-                for name, spec in zip(names, hours_list):
-                    if name:
-                        parse_hours_spec(spec)
-            except ValueError:
-                errors["base"] = "invalid_hours"
-            if not errors:
-                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_NAMES] = names
-                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_KWH] = [
-                    float(user_input.get(f"kwh_{i}", 0.0) or 0.0)
-                    for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
-                ]
-                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_MAX_KW] = [
-                    float(user_input.get(f"max_kw_{i}", 3.5))
-                    for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
-                ]
-                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_HOURS] = hours_list
-                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_CONTROLLED_LOAD] = [
-                    str(user_input.get(f"cl_{i}", "") or "")
-                    for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
-                ]
-                self._sensor_data[CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE] = [
-                    bool(user_input.get(f"in_aggregate_{i}", False))
-                    for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS)
-                ]
-                return await self.async_step_estimated_loads()
+            load["switch"] = str(user_input.get("switch", "") or "")
+            load["climate_on_mode"] = str(user_input.get("climate_on_mode", "") or "")
+            return await self._next_load_step()
 
-        cl_register_options = []
-        if self._has_cl1:
-            cl_register_options.append({"value": "controlled_load_1", "label": "Controlled Load 1"})
-        if self._has_cl2:
-            cl_register_options.append({"value": "controlled_load_2", "label": "Controlled Load 2"})
-
-        schema_dict = {}
-        for i in range(DEFERRABLE_LOAD_DUMMY_SLOTS):
-            schema_dict[vol.Optional(
-                f"name_{i}", default=existing_names[i] if i < len(existing_names) else "",
-            )] = selector.TextSelector()
-            schema_dict[vol.Optional(
-                f"kwh_{i}", default=existing_kwh[i] if i < len(existing_kwh) else 0.0,
-            )] = selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=0.0, max=100.0, step=0.1,
-                    unit_of_measurement="kWh/day",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
-            )
-            schema_dict[vol.Optional(
-                f"max_kw_{i}", default=existing_max_kw[i] if i < len(existing_max_kw) else 3.5,
-            )] = selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=0.1, max=100.0, step=0.1,
-                    unit_of_measurement="kW",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
-            )
-            schema_dict[vol.Optional(
-                f"hours_{i}", default=existing_hours[i] if i < len(existing_hours) else "all",
-            )] = selector.TextSelector()
-            if cl_register_options:
-                schema_dict[vol.Optional(
-                    f"cl_{i}", default=existing_cl[i] if i < len(existing_cl) else "",
-                )] = selector.SelectSelector(
+        prev = load.get("switch", "")
+        switch_key = (
+            vol.Required("switch", default=prev) if prev else vol.Required("switch")
+        )
+        return self.async_show_form(
+            step_id="load_control",
+            data_schema=vol.Schema({
+                switch_key: selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain=["switch", "climate"])
+                ),
+                # Only consulted for a climate.* entity that doesn't support
+                # climate.turn_on/turn_off (most do) — which hvac_mode means "on".
+                vol.Optional(
+                    "climate_on_mode", default=load.get("climate_on_mode", ""),
+                ): selector.SelectSelector(
                     selector.SelectSelectorConfig(
-                        options=[{"value": "", "label": "Not on controlled load"}] + cl_register_options,
+                        options=[
+                            {"value": "", "label": "Auto (turn_on / restore last mode)"},
+                            {"value": "cool", "label": "Cool"},
+                            {"value": "heat", "label": "Heat"},
+                            {"value": "heat_cool", "label": "Heat/Cool (auto)"},
+                            {"value": "dry", "label": "Dry"},
+                            {"value": "fan_only", "label": "Fan only"},
+                        ],
                         mode=selector.SelectSelectorMode.DROPDOWN,
                     )
-                )
-                schema_dict[vol.Optional(
-                    f"in_aggregate_{i}", default=existing_in_agg[i] if i < len(existing_in_agg) else False,
-                )] = selector.BooleanSelector()
-
-        return self.async_show_form(
-            step_id="declared_loads",
-            data_schema=vol.Schema(schema_dict),
-            errors=errors,
+                ),
+            }),
+            description_placeholders={"name": self._load_display_name(load)},
         )
 
-    async def async_step_estimated_loads(self, user_input=None):
-        """Devices with a control entity but no energy sensor at all — see the setup-flow
-        docstring on this same step name for the full rationale."""
-        entry_data = self._config_entry.data
-        existing_names = entry_data.get(CONF_DEFERRABLE_LOAD_EST_NAMES, [])
-        existing_control = entry_data.get(CONF_DEFERRABLE_LOAD_EST_CONTROL, [])
-        existing_kw = entry_data.get(CONF_DEFERRABLE_LOAD_EST_KW, [])
-        existing_auto = entry_data.get(CONF_DEFERRABLE_LOAD_EST_AUTO, [])
-        existing_load_power = entry_data.get(CONF_LOAD_POWER_SENSOR, "")
+    async def async_step_load_modulating(self, user_input=None):
+        """Setpoint wiring for a modulating ("type 2") load — an EV charger whose
+        current or power can be ramped rather than only switched."""
+        load = self._loads[self._editing]
 
-        errors: dict[str, str] = {}
         if user_input is not None:
-            est_names = [
-                str(user_input.get(f"est_name_{i}", "") or "").strip()
-                for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
-            ]
-            est_controls = [
-                str(user_input.get(f"est_control_{i}", "") or "")
-                for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
-            ]
-            # Same footgun as the setup-flow step: a slot with only a name or only a
-            # control entity is silently inert (_ensure_load_estimators skips it). Caught
-            # a real instance of this on 2026-08-06 — Daikin AC had control/kw/auto all
-            # configured with a blank name, so the slot never activated.
-            if any(bool(n) != bool(c) for n, c in zip(est_names, est_controls)):
-                errors["base"] = "estimated_load_name_control_mismatch"
-            # Same cross-step duplicate check as the setup flow — see its comment for the
-            # real incident this catches.
-            declared_names = {
-                str(n).strip().lower()
-                for n in self._sensor_data.get(CONF_DEFERRABLE_LOAD_DUMMY_NAMES, [])
-                if n
-            }
-            if not errors and any(
-                n.strip().lower() in declared_names for n in est_names if n
-            ):
-                errors["base"] = "estimated_load_duplicate_declared"
-            if not errors:
-                self._sensor_data[CONF_DEFERRABLE_LOAD_EST_NAMES] = est_names
-                self._sensor_data[CONF_DEFERRABLE_LOAD_EST_CONTROL] = est_controls
-                self._sensor_data[CONF_DEFERRABLE_LOAD_EST_KW] = [
-                    float(user_input.get(f"est_kw_{i}", 1.0) or 1.0)
-                    for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
-                ]
-                self._sensor_data[CONF_DEFERRABLE_LOAD_EST_AUTO] = [
-                    bool(user_input.get(f"est_auto_{i}", False))
-                    for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS)
-                ]
-                self._sensor_data[CONF_LOAD_POWER_SENSOR] = str(
-                    user_input.get("load_power_sensor", "") or ""
-                )
-                return await self.async_step_current_plan()
+            load["setpoint"] = str(user_input.get("setpoint", "") or "")
+            load["setpoint_unit"] = str(user_input.get("setpoint_unit", "") or "")
+            load["phases"] = int(user_input.get("phases", 0) or 0)
+            load["voltage"] = float(user_input.get("voltage", 0.0) or 0.0)
+            load["min_current"] = float(user_input.get("min_current", 0.0) or 0.0)
+            load["plug_sensor"] = str(user_input.get("plug_sensor", "") or "")
+            return await self._next_load_step()
 
-        schema_dict = {}
-        for i in range(DEFERRABLE_LOAD_ESTIMATED_SLOTS):
-            schema_dict[vol.Optional(
-                f"est_name_{i}", default=existing_names[i] if i < len(existing_names) else "",
-            )] = selector.TextSelector()
-            prev_control = existing_control[i] if i < len(existing_control) else ""
-            control_key = (
-                vol.Optional(f"est_control_{i}", default=prev_control)
-                if prev_control else vol.Optional(f"est_control_{i}")
-            )
-            schema_dict[control_key] = selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["switch", "climate"])
-            )
-            schema_dict[vol.Optional(
-                f"est_kw_{i}", default=existing_kw[i] if i < len(existing_kw) else 1.0,
-            )] = selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=0.05, max=20.0, step=0.05,
-                    unit_of_measurement="kW",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
-            )
-            schema_dict[vol.Optional(
-                f"est_auto_{i}", default=existing_auto[i] if i < len(existing_auto) else False,
-            )] = selector.BooleanSelector()
-        load_power_key = (
-            vol.Optional("load_power_sensor", default=existing_load_power)
-            if existing_load_power else vol.Optional("load_power_sensor")
+        prev_setpoint = load.get("setpoint", "")
+        setpoint_key = (
+            vol.Required("setpoint", default=prev_setpoint)
+            if prev_setpoint else vol.Required("setpoint")
         )
-        schema_dict[load_power_key] = selector.EntitySelector(
-            selector.EntitySelectorConfig(domain="sensor")
+        prev_plug = load.get("plug_sensor", "")
+        plug_key = (
+            vol.Optional("plug_sensor", default=prev_plug)
+            if prev_plug else vol.Optional("plug_sensor")
         )
+        return self.async_show_form(
+            step_id="load_modulating",
+            data_schema=vol.Schema({
+                setpoint_key: selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="number")
+                ),
+                vol.Optional(
+                    "setpoint_unit", default=load.get("setpoint_unit", ""),
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            {"value": "", "label": "Auto (detect from the entity)"},
+                            {"value": "a", "label": "Amps (A)"},
+                            {"value": "w", "label": "Watts (W)"},
+                            {"value": "kw", "label": "Kilowatts (kW)"},
+                        ],
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+                # Stored as int (see CONF_DEFERRABLE_LOAD_PHASES); SelectSelector option
+                # values are strings, so re-stringify the saved default to match.
+                vol.Optional(
+                    "phases", default=str(load.get("phases", 0)),
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            {"value": "0", "label": "Auto-detect"},
+                            {"value": "1", "label": "Single phase"},
+                            {"value": "2", "label": "Two phase"},
+                            {"value": "3", "label": "Three phase"},
+                        ],
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+                vol.Optional(
+                    "voltage", default=load.get("voltage", 0.0),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0.0, max=500.0, step=1,
+                        unit_of_measurement="V",
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                ),
+                vol.Optional(
+                    "min_current", default=load.get("min_current", 0.0),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0.0, max=32.0, step=0.1,
+                        unit_of_measurement="A",
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                ),
+                plug_key: selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain=["binary_sensor", "sensor"])
+                ),
+            }),
+            description_placeholders={"name": self._load_display_name(load)},
+        )
+
+    async def async_step_load_soc(self, user_input=None):
+        """State-of-charge tracking for a load with its own battery — lets the optimizer
+        stop scheduling charge once it nears the ceiling (an EV held at 90%, say),
+        freeing that energy for other loads or export."""
+        load = self._loads[self._editing]
+
+        if user_input is not None:
+            load["soc_sensor"] = str(user_input.get("soc_sensor", "") or "")
+            load["soc_max_percent"] = float(user_input.get("soc_max_percent", 100.0))
+            load["soc_capacity_kwh"] = float(user_input.get("soc_capacity_kwh", 0.0))
+            return await self._next_load_step()
+
+        prev = load.get("soc_sensor", "")
+        soc_key = (
+            vol.Required("soc_sensor", default=prev) if prev else vol.Required("soc_sensor")
+        )
+        return self.async_show_form(
+            step_id="load_soc",
+            data_schema=vol.Schema({
+                soc_key: selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="sensor")
+                ),
+                vol.Optional(
+                    "soc_max_percent", default=load.get("soc_max_percent", 100.0),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=1.0, max=100.0, step=1,
+                        unit_of_measurement="%",
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                ),
+                # The LP only activates SOC tracking when a sensor AND a positive
+                # capacity are both present (advisory/coordinator._deferrable_for_horizon).
+                vol.Optional(
+                    "soc_capacity_kwh", default=load.get("soc_capacity_kwh", 0.0),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0.0, max=500.0, step=0.1,
+                        unit_of_measurement="kWh",
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                ),
+            }),
+            description_placeholders={"name": self._load_display_name(load)},
+        )
+
+    async def async_step_load_cl(self, user_input=None):
+        """Which Controlled Load register this load is wired to.
+
+        TODO: filter these by the device types the network actually confirms for that
+        register (NetworkIR.controlled_load_eligible_devices in the API's
+        plan_transform.py) — no live eligible-device lookup is wired into the flow yet.
+        """
+        load = self._loads[self._editing]
+        cl_options = self._cl_register_options()
+
+        if user_input is not None:
+            load["controlled_load"] = str(user_input.get("controlled_load", "") or "")
+            load["in_aggregate"] = bool(user_input.get("in_aggregate", False))
+            return await self._next_load_step()
 
         return self.async_show_form(
-            step_id="estimated_loads",
-            data_schema=vol.Schema(schema_dict),
-            errors=errors,
+            step_id="load_cl",
+            data_schema=vol.Schema({
+                vol.Optional(
+                    "controlled_load",
+                    default=load.get("controlled_load", "") or cl_options[0]["value"],
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=cl_options,
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                ),
+                vol.Optional(
+                    "in_aggregate", default=bool(load.get("in_aggregate", False)),
+                ): selector.BooleanSelector(),
+            }),
+            description_placeholders={"name": self._load_display_name(load)},
+        )
+
+    async def async_step_load_power(self, user_input=None):
+        """Whole-house load power sensor. Not per-load: LoadEstimator subtracts the
+        other known draws from this to infer what an estimated load is using."""
+        if user_input is not None:
+            self._sensor_data[CONF_LOAD_POWER_SENSOR] = str(
+                user_input.get("load_power_sensor", "") or ""
+            )
+            return await self.async_step_loads()
+
+        existing = self._sensor_data.get(
+            CONF_LOAD_POWER_SENSOR, self._config_entry.data.get(CONF_LOAD_POWER_SENSOR, "")
+        )
+        key = (
+            vol.Optional("load_power_sensor", default=existing)
+            if existing else vol.Optional("load_power_sensor")
+        )
+        return self.async_show_form(
+            step_id="load_power",
+            data_schema=vol.Schema({
+                key: selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="sensor")
+                ),
+            }),
         )
 
     async def async_step_current_plan(self, user_input=None):

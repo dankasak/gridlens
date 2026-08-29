@@ -34,6 +34,9 @@ from .const import (
     CONF_MIN_EXPORT_PRICE,
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_MAX_KW,
+    CONF_DEFERRABLE_LOAD_SOC_SENSORS,
+    CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT,
+    CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH,
     CONF_DEFERRABLE_LOAD_SWITCHES,
     CONF_DEFERRABLE_LOAD_SETPOINT,
     CONF_DEFERRABLE_LOAD_MIN_CURRENT,
@@ -151,6 +154,17 @@ class PlanCalculator:
         self.deferrable_load_sensors: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
         self.deferrable_load_max_kw: list[float] = entry.data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
         self.deferrable_load_switches: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_SWITCHES, [])
+        # SOC ceiling config, carried through _get_deferrable_data so advisory/coordinator.py
+        # can add a LIVE reading on top (see CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT). Static
+        # config only here — this class's own LP use (plan-comparison backtest) never sets
+        # soc_initial_percent, so the LP's SOC-tracking path never activates for it.
+        self.deferrable_load_soc_sensors: list[str] = entry.data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, [])
+        self.deferrable_load_soc_max_percent: list[float] = entry.data.get(
+            CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT, []
+        )
+        self.deferrable_load_soc_capacity_kwh: list[float] = entry.data.get(
+            CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH, []
+        )
         # Modulating-load wiring, read only to derive each device's min_kw floor (below).
         # Absent from every config entry saved before that feature, hence the `or []`.
         self.deferrable_load_setpoint: list[str] = entry.data.get(
@@ -1875,6 +1889,21 @@ class PlanCalculator:
                 'max_kw': max_kw,
                 'min_kw': self._deferrable_min_kw(i),
                 'week': week,
+                # Static config only — see soc_initial_percent's docstring in
+                # battery_optimizer.optimize_hourly_schedule for why a live reading is
+                # never added here (this class's own LP use has no "now").
+                'soc_sensor_id': (
+                    self.deferrable_load_soc_sensors[i]
+                    if i < len(self.deferrable_load_soc_sensors) else ""
+                ) or None,
+                'soc_max_percent': (
+                    self.deferrable_load_soc_max_percent[i]
+                    if i < len(self.deferrable_load_soc_max_percent) else 100.0
+                ),
+                'soc_capacity_kwh': (
+                    self.deferrable_load_soc_capacity_kwh[i]
+                    if i < len(self.deferrable_load_soc_capacity_kwh) else 0.0
+                ),
             })
             _LOGGER.warning(
                 "Deferrable sensor %s (%s): %.2f kWh/day, max %.1f kW, hours %s",

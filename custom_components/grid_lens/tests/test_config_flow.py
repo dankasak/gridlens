@@ -172,6 +172,9 @@ def _bootstrap():
     pkg.__path__ = []
     sys.modules["gl"] = pkg
     _load(os.path.join(_COMPONENT, "const.py"), "gl.const", package="gl")
+    # Real module, not a stub — it is the seam config_flow reads/writes loads through,
+    # and stubbing it would test nothing. Pure Python, no HA imports, loads fine here.
+    _load(os.path.join(_COMPONENT, "deferrable_loads.py"), "gl.deferrable_loads", package="gl")
     inv = types.ModuleType("gl.inverters")
     inv.__path__ = []
     inv.INVERTER_BRANDS = {"sigenergy": {"mqtt": "Sigenergy (MQTT)"}}

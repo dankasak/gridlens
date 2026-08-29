@@ -115,7 +115,7 @@
         <h2 id="deferrable">Deferrable loads</h2>
         <p>A deferrable load is electricity usage you can shift to a cheaper time of day — for example an EV charger, pool pump, hot water system, or air conditioner.</p>
         <p>To include a deferrable load in the optimisation, you need a sensor that measures its consumption. Grid Lens will model what each plan would cost if you shifted that load to its cheapest window.</p>
-        <p>Configure deferrable loads under <strong>Settings → Devices &amp; Services → Grid Lens → Configure</strong> after setup.</p>
+        <p>Configure deferrable loads under <strong>Settings → Devices &amp; Services → Grid Lens → Configure → Deferrable loads</strong> after setup. You set up one appliance at a time, and Grid Lens only asks what that appliance actually needs — a pool pump it can’t switch takes three answers, while a modulating EV charger is walked through its setpoint and battery settings on their own screens.</p>
         <p>No consumption sensor at all for a controllable appliance (common for an IR-remote-controlled aircon)? Grid Lens can estimate one for you — see <strong>Estimated loads</strong> under <a href="#load-control">Load control</a> below.</p>
 
         <h2 id="schedules">Allowed run times</h2>
@@ -179,7 +179,7 @@
         </div>
 
         <h3 id="estimated-loads">Estimated loads</h3>
-        <p>Some controllable appliances have no way to report their energy use at all — the classic case is an air conditioner driven by an infrared blaster, which can only send commands, never read anything back. You can still add these under <strong>Grid Lens → Configure → Estimated loads</strong>: give it a name, its control entity, and a rough estimate of its power draw in kW.</p>
+        <p>Some controllable appliances have no way to report their energy use at all — the classic case is an air conditioner driven by an infrared blaster, which can only send commands, never read anything back. You can still add these under <strong>Grid Lens → Configure → Deferrable loads → Add a deferrable load</strong>, choosing <em>“No energy sensor, but I can switch it on and off from HA”</em>: give it a name, its control entity, and a rough estimate of its power draw in kW.</p>
         <p>Turn on <strong>auto-refine</strong> and point Grid Lens at a whole-house load power sensor, and it will quietly improve that estimate over time: whenever the appliance switches on, it compares your house's power draw just before and a few minutes after (long enough for a compressor to spin up) and folds a plausible reading into a running estimate. It learns from ordinary use — you don't need to do anything for it to collect data — and discards anything that looks unreliable (another controlled device changing state at the same time, an implausible jump). Leave auto-refine off, or skip the load power sensor, and it simply stays on your manual estimate.</p>
         <p>Once configured, an estimated load behaves exactly like any other deferrable load — it gets its own schedule, Today Boost, Greedy Consumption, and all the same controls above.</p>
         <div class="note">

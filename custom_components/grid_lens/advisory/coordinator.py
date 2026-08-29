@@ -347,6 +347,25 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             daily, maxkw = dev.get("daily_kwh", 0.0), dev.get("max_kw", 0.0)
             if daily <= 0 or maxkw <= 0:
                 continue
+            # SOC ceiling: only activates when BOTH a sensor and a positive capacity are
+            # configured (see CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT) AND that sensor gives a
+            # real live reading right now. A flaky/unavailable sensor just leaves this
+            # device on the plain daily_kwh mechanism for this tick rather than blocking the
+            # whole solve — same "every failure caught" rule as the rest of this module.
+            soc_kwargs = {}
+            soc_sensor_id = dev.get("soc_sensor_id")
+            capacity = float(dev.get("soc_capacity_kwh") or 0.0)
+            if soc_sensor_id and capacity > 0:
+                st = self.hass.states.get(soc_sensor_id)
+                if st is not None and st.state not in ("unknown", "unavailable", None):
+                    try:
+                        soc_kwargs = {
+                            "soc_capacity_kwh": capacity,
+                            "soc_initial_percent": float(st.state),
+                            "soc_max_percent": float(dev.get("soc_max_percent", 100.0) or 100.0),
+                        }
+                    except (TypeError, ValueError):
+                        pass
             week = None
             if store is not None:
                 try:
@@ -375,7 +394,8 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
                         # yet. See plan_calculator._deferrable_min_kw for why the floor is
                         # enforced in the controller instead.
                         "min_kw": dev.get("min_kw", 0.0),
-                        "name": dev.get("name"), "sensor_id": dev.get("sensor_id")})
+                        "name": dev.get("name"), "sensor_id": dev.get("sensor_id"),
+                        **soc_kwargs})
         return out
 
     # ------------------------------------------------------------- conditional credits

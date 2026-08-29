@@ -289,7 +289,9 @@ max kW, and when it's *allowed* to run; it decides *when*.
 
 **Config** (per device, parallel lists): `deferrable_load_sensors` (energy sensor — the join
 key), `..._max_kw`, `..._switches` (control entity, `""` = forecast-only — see below),
-`..._soc_sensors` (e.g. EV SOC). Availability windows are **not** set here — see §8; a device
+`..._soc_sensors` (e.g. EV SOC). The parallel-list shape is what every consumer reads, but
+nothing edits it directly any more: `deferrable_loads.py` presents it as one dict per load
+and the config flow works through that (§12b). Availability windows are **not** set here — see §8; a device
 is fully unrestricted (any hour) until the user paints a schedule on the dashboard card. (A
 static per-device `deferrable_load_hours` config-flow field used to seed this before the
 schedule card existed — removed 2026-08-02 as redundant with it.)
@@ -394,6 +396,44 @@ loads, never sensor wiring.
 **Naming.** Display names resolve via `resolve_device_name()`: entity-registry name → Energy
 Dashboard per-device label → trimmed entity id. The Energy Dashboard label is where a rename
 like "Hot Water" actually lives, so it wins over the raw registry name.
+
+**SOC ceiling (added 2026-08-29)** — for a device with the `..._soc_sensors` field above
+also set, two more per-device fields become meaningful: `deferrable_load_soc_max_percent`
+(default 100 = no cap) and `deferrable_load_soc_capacity_kwh` (default 0 = not provided,
+same as no cap). Together they let the **live advisory/control path only** (never the
+plan-comparison backtest, which has no "now") stop scheduling further charge once the
+device is close enough to the configured ceiling, freeing that energy for other deferrable
+loads or export — e.g. an EV normally charged to 90% for battery longevity no longer gets
+pushed to 100% just because its 14-day average says it usually needs that much.
+
+Mechanically: `advisory/coordinator.py::_deferrable_for_horizon` reads the sensor's LIVE
+state each tick and, if both fields are set and the reading is valid, adds
+`soc_capacity_kwh` / `soc_initial_percent` / `soc_max_percent` to that device's dict passed
+to the LP. `battery_optimizer.py` then gives that device a real SOC state variable — but
+**only across today's slots (day 0 of the horizon)**, not the whole multi-day horizon: this
+model has no forecast of the device's own energy consumption between charges (an EV's
+driving, specifically), so a naive "reach the ceiling every day" constraint would go
+infeasible the moment a later day started already full. Day 1+ stays on the plain flat
+`daily_kwh` mechanism, unchanged — acceptable because this is a rolling-horizon optimiser
+that re-solves every ~2 minutes, so a future day's schedule is always recomputed with fresh
+SOC data before it's ever acted on. Day 0's target is still a floor (charge at least the
+usual daily amount) clamped by real headroom under the ceiling, not just a hard cap — so a
+device far from its ceiling keeps its normal behaviour.
+
+Exposed for observability (no dashboard card built for this yet — a natural follow-up):
+`ev_soc_status` on the LP result / `AdvisoryResult` — one dict per SOC-tracked device
+(`name`, `sensor_id`, `initial_percent`, `max_percent`, `day0_final_percent`,
+`day0_charge_kwh`). A clamp caused by the ceiling (as opposed to the availability window)
+is tagged `reason: 'soc_ceiling'` in the existing `deferrable_clamped` notice and logged
+with its own message so it doesn't read as "widen your weekly schedule" (the availability-
+window clamp's advice, which wouldn't fix an SOC-ceiling clamp).
+
+**Files:** `const.py` (`CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT` /
+`CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH`), `config_flow.py` (the wizard's `load_soc` step,
+reached only when a load is marked as having its own battery — §12b), `plan_calculator.py` (`_get_deferrable_data` — static config passthrough only),
+`advisory/coordinator.py` (`_deferrable_for_horizon` — the live reading),
+`battery_optimizer.py` (`ev_soc_idx`/`ev_soc_specs` in `_lp_scipy`), `advisory/planner.py` +
+`advisory/models.py` (`ev_soc_status` passthrough).
 
 ---
 
@@ -1010,9 +1050,10 @@ I/O and its dropdown can never be empty. **Before 2026-08-21 there was no gate**
 outside NSW/Ausgrid filled in every screen and hit a required dropdown with zero options,
 no error and no way forward.
 
-**What setup deliberately does *not* ask** — all of it lives in **Configure → Reconfigure**
-(`GridLensOptionsFlow`, which still walks the full wizard) and all of it has a default that
-is right for most installs:
+**What setup deliberately does *not* ask** — all of it lives in the options flow
+(`GridLensOptionsFlow`; deferrable-load detail in the per-load wizard, §12b, everything else
+under **Reconfigure everything**) and all of it has a default that is right for most
+installs:
 
 - Controlled Load 1/2 (defaults false) — a DNSP/meter fact most people can't answer offhand,
   and it only gates a dropdown on the advanced load steps.
@@ -1024,8 +1065,8 @@ is right for most installs:
 - Per-device: climate on-mode, SOC sensor, controlled-load register, in-aggregate flag, and
   the whole modulating-control set (setpoint, unit, phases, voltage, min current, plug
   sensor) — §6a. Stored as aligned blank lists so downstream `zip`s stay index-safe.
-- Declared Loads and Estimated Loads (§5) — both advanced, and near-duplicates that
-  confused a real user in 2026-08-06.
+- Declared and estimated loads (§5) — both advanced. All three load kinds are now set up
+  in the per-load wizard, §12b.
 - API URL — now on the options flow's **API key & connection** step, where self-hosting
   belongs.
 
@@ -1096,8 +1137,92 @@ Raised with the user 2026-08-21; see `docs/GRIDLENS_CHECKLIST.md` for that day's
   predates this work and is contrary to §0's generic-design rule. Not changed here (live
   installs may lean on it); see `docs/GRIDLENS_CHECKLIST.md` 2026-08-21.
 
-**Tests.** `tests/test_config_flow.py` — 13 offline tests driving the flow end to end with
+**Tests.** `tests/test_config_flow.py` — 22 offline tests driving the flow end to end with
 stubbed HA + voluptuous (neither importable in this container).
+
+---
+
+## 12b. Deferrable-load wizard (the options flow)
+
+**What it does.** Configures deferrable loads one load at a time, asking only what that
+load's kind and control style actually use. Reached from **Settings → Devices & Services →
+Grid Lens → Configure → Deferrable loads**, or as part of **Reconfigure everything**.
+
+**Why it was rebuilt (2026-08-30).** The previous options flow put every field for every
+load on two enormous forms. `device_power` rendered **14 fields per selected device** —
+max kW, control entity, climate on-mode, SOC sensor, SOC ceiling, SOC capacity, setpoint,
+setpoint unit, phases, voltage, min current, plug sensor, CL register, in-aggregate — for a
+dishwasher as readily as for a modulating EV charger. Four loads made a 56-field screen, and
+`translations/en.json` carried **140 pre-baked labels** (ten slots × 14) each prefixed with
+`{device_N_name} —` because there was no other way to say which device a field belonged to.
+`declared_loads` and `estimated_loads` then drew a fixed 2 and 3 slots whether used or not.
+A forecast-only pool pump now answers **three** questions.
+
+**Screens** (`config_flow.py`, `GridLensOptionsFlow`):
+
+| Step | Asks | Shown when |
+|---|---|---|
+| `loads` | Hub — pick a load to edit, add one, or save | Always |
+| `load_kind` | Metered / controllable-but-unmetered / neither | Adding a load |
+| `load_add_monitored` | Which Energy-dashboard appliance | Adding a metered load |
+| `load_detail_monitored` | Max kW, control style, has-own-battery, [on CL] | Editing a metered load |
+| `load_detail_declared` | Name, daily kWh, max kW, hours, [on CL] | Editing a declared load |
+| `load_detail_estimated` | Name, control entity, est. kW, auto-refine | Editing an estimated load |
+| `load_control` | Control entity + climate on-mode | Control style is on/off or modulating |
+| `load_modulating` | Setpoint, unit, phases, voltage, min current, plug sensor | Control style is modulating |
+| `load_soc` | SOC sensor, charge ceiling, capacity | "Has its own battery" ticked |
+| `load_cl` | CL register, already-in-aggregate | "On a Controlled Load circuit" ticked |
+| `load_power` | Whole-house load power sensor | Offered when an estimated load exists |
+
+**Three load kinds, one namespace.** `monitored` (has an energy sensor), `estimated`
+(controllable but unmetered — `LoadEstimator` infers its draw), `declared` (neither; an
+estimated daily kWh the optimiser plans around but never actuates). The kind is chosen once,
+up front, from what HA can already see and do — which is the question that decides every
+field afterwards. Declared and estimated loads share a name namespace and a duplicate is now
+rejected **at the point of entry** rather than by a cross-step check several screens later.
+
+**Storage is unchanged.** `deferrable_loads.py` is the seam: `read_loads()` turns the 22
+parallel arrays into one dict per load, `write_loads()` turns them back index-aligned and
+equal-length. Nothing downstream (`plan_calculator.py`, `__init__.py`,
+`control/load_control_manager.py`, `sensor.py`, `number.py` — ~280 references) sees a
+difference, and no config-entry migration is needed. `control_style()` derives
+forecast-only / on-off / modulating from *which entities are set* rather than storing a new
+field, so entries written before the wizard classify correctly with no migration.
+
+**Things it fixes as a side effect:**
+
+- **Changing a load's control style now clears the fields the old style owned**
+  (`apply_control_style`). Previously, switching a modulating charger back to plain on/off
+  left its setpoint entity in the config, and `LoadControlManager` kept treating it as
+  modulating.
+- **An estimated load can no longer be saved half-configured.** Both name and control entity
+  are required; the old fixed-slot form let a name-without-control slot save silently inert,
+  which cost a real misconfiguration (Daikin AC, 2026-08-06).
+- **The 2-declared / 3-estimated slot caps are gone.** They were only ever a rendering
+  artifact of the fixed-slot forms — every consumer iterates whatever length it is handed.
+- **`Configure` no longer means walking the whole wizard.** The menu gained a direct
+  **Deferrable loads** entry; editing one appliance no longer means re-answering energy
+  sensors, battery specs and the plan picker. That path saves by merging over the entry's own
+  data, so untouched settings survive.
+- **Controlled-Load flags are seeded from the entry** in `GridLensOptionsFlow.__init__`
+  rather than defaulting to `False`. The direct path never runs `async_step_controlled_load`,
+  and `False` there would have silently hidden every CL question from a household that has a
+  CL register.
+
+**Known gaps.** The hub is a select-and-submit list, not one-click-per-load — HA menus
+require a static `async_step_*` per option, and a dynamic load list can't provide that. CL
+registers are still not filtered by the device types the network confirms for that register
+(`NetworkIR.controlled_load_eligible_devices`); no live eligible-device lookup is wired into
+the flow yet.
+
+**Files:** `deferrable_loads.py` (new — the accessor seam), `config_flow.py`
+(`GridLensOptionsFlow`, the `loads`/`load_*` steps), `strings.json` +
+`translations/en.json`.
+
+**Tests.** `tests/test_deferrable_wizard.py` — 21 offline tests: array round-tripping and
+index alignment, per-kind field sets, step chaining, style downgrades clearing stale fields,
+duplicate/half-configured rejection, the menu save path, and a pre-wizard entry with short
+arrays reading back on defaults.
 
 ---
 
@@ -1115,7 +1240,9 @@ real-data population partway through — see `VPP_CONTROLLED_LOAD_HANDOFF.md` be
 custom_components/grid_lens/
 ├── __init__.py              entry setup, _CARD_VERSION, _build_seed_views (dashboard seed)
 ├── const.py                 CONF_* keys, parse_hours_spec
-├── config_flow.py           setup + options (reconfigure) flows — §12a
+├── config_flow.py           setup flow — §12a; options flow + per-load wizard — §12b
+├── deferrable_loads.py      one-dict-per-load view over the parallel arrays the rest of
+│                            the code reads; the seam the wizard edits through — §12b
 ├── plan_calculator.py       plan cost engine
 ├── retailer_plans.py        plan fetch/cache from the API
 ├── battery_optimizer.py     the LP/MILP

@@ -179,6 +179,7 @@ class AdvisoryPlanner:
             conditional_credits=result.get("conditional_credits", {}),
             battery_max_charge_kw=self.optimizer.max_charge_rate_kw,
             battery_max_discharge_kw=self.optimizer.max_discharge_rate_kw,
+            ev_soc_status=result.get("ev_soc_status", []),
         )
 
     @staticmethod

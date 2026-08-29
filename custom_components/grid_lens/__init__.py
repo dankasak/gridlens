@@ -1517,6 +1517,8 @@ async def _ensure_load_estimators(hass: HomeAssistant, entry: ConfigEntry) -> tu
         CONF_DEFERRABLE_LOAD_EST_NAMES,
         CONF_DEFERRABLE_LOAD_MAX_KW,
         CONF_DEFERRABLE_LOAD_SOC_SENSORS,
+        CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT,
+        CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH,
         CONF_DEFERRABLE_LOAD_SWITCHES,
         CONF_LOAD_POWER_SENSOR,
     )
@@ -1532,13 +1534,16 @@ async def _ensure_load_estimators(hass: HomeAssistant, entry: ConfigEntry) -> tu
     switches_list = list(entry.data.get(CONF_DEFERRABLE_LOAD_SWITCHES, []) or [])
     climate_mode_list = list(entry.data.get(CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE, []) or [])
     soc_list = list(entry.data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, []) or [])
+    soc_max_percent_list = list(entry.data.get(CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT, []) or [])
+    soc_capacity_list = list(entry.data.get(CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH, []) or [])
     cl_list = list(entry.data.get(CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD, []) or [])
     in_agg_list = list(entry.data.get(CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE, []) or [])
     # Every parallel list must stay the same length as `sensors` — relied on throughout
     # plan_calculator.py/LoadControlManager (index i always means "device i").
     _pairs = (
         (max_kw_list, 3.5), (switches_list, ""), (climate_mode_list, ""),
-        (soc_list, ""), (cl_list, ""), (in_agg_list, False),
+        (soc_list, ""), (soc_max_percent_list, 100.0), (soc_capacity_list, 0.0),
+        (cl_list, ""), (in_agg_list, False),
     )
     for lst, fill in _pairs:
         lst.extend([fill] * (len(sensors) - len(lst)))
@@ -1603,6 +1608,8 @@ async def _ensure_load_estimators(hass: HomeAssistant, entry: ConfigEntry) -> tu
             switches_list.append(control)
             climate_mode_list.append("")
             soc_list.append("")
+            soc_max_percent_list.append(100.0)
+            soc_capacity_list.append(0.0)
             cl_list.append("")
             in_agg_list.append(False)
             changed = True
@@ -1615,6 +1622,8 @@ async def _ensure_load_estimators(hass: HomeAssistant, entry: ConfigEntry) -> tu
             CONF_DEFERRABLE_LOAD_SWITCHES: switches_list,
             CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE: climate_mode_list,
             CONF_DEFERRABLE_LOAD_SOC_SENSORS: soc_list,
+            CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT: soc_max_percent_list,
+            CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH: soc_capacity_list,
             CONF_DEFERRABLE_LOAD_CONTROLLED_LOAD: cl_list,
             CONF_DEFERRABLE_LOAD_CL_IN_AGGREGATE: in_agg_list,
         })
