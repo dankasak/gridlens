@@ -13,7 +13,7 @@
  */
 import {
   GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor, clampPct, fmtPct,
-} from './grid-lens-chart-common.js?v=20260830a';
+} from './grid-lens-chart-common.js?v=20260830d';
 
 // Free-energy shading (see _freeEnergyBands). CSS custom props rather than literals so
 // both bands follow the viewer's light/dark theme like every other colour on this card;
@@ -77,12 +77,30 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
   // a dedicated colour pulled out of the rotation) — see deferColorFor() in chart-common.js.
   _deferColor(i) { return deferColorFor(this._deferNames, i); }
 
+  // Scans for the `deferrable_loads` attribute the integration publishes (whichever
+  // sensor exposes it — same auto-discovery pattern as _resolveDeferLoads() in
+  // grid-lens-powerflow-card.js — or the explicit deferrable_source_entity override).
+  // Shared by _deferPowerEntities() and _deferGreedyEntities() below so both key off
+  // exactly the same attribute scan.
+  _deferrableLoadsAttr() {
+    const hass = this._hass;
+    if (!hass) return null;
+    const src = this._config.deferrable_source_entity;
+    if (src && hass.states[src]) {
+      const a = hass.states[src].attributes.deferrable_loads;
+      return Array.isArray(a) ? a : null;
+    }
+    for (const eid of Object.keys(hass.states)) {
+      if (!eid.startsWith('sensor.')) continue;
+      const a = hass.states[eid].attributes;
+      if (a && Array.isArray(a.deferrable_loads)) return a.deferrable_loads;
+    }
+    return null;
+  }
+
   // Real power sensors for the configured deferrable devices, keyed by each device's
   // configured energy entity_id (matches GridLensChartCardBase._deferSensorIds — the
-  // dispatch sensor's own per-device join key). Sourced from the `deferrable_loads`
-  // attribute the integration publishes (energy_entity + auto-discovered power_entity) —
-  // same auto-discovery pattern as _resolveDeferLoads() in grid-lens-powerflow-card.js,
-  // scanning for any sensor exposing it rather than assuming a fixed entity id.
+  // dispatch sensor's own per-device join key).
   //
   // Deliberately NOT keyed by name: both this attribute's `name` and the dispatch sensor's
   // deferrable_names now go through the same resolve_device_name priority (entity-registry
@@ -90,23 +108,26 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
   // user is still free to rename one entity and not the other, so the energy entity_id
   // (the actual join key) is the only join that's guaranteed not to silently match nothing.
   _deferPowerEntities() {
-    const hass = this._hass;
-    if (!hass) return {};
-    let attr = null;
-    const src = this._config.deferrable_source_entity;
-    if (src && hass.states[src]) {
-      attr = hass.states[src].attributes.deferrable_loads;
-    } else {
-      for (const eid of Object.keys(hass.states)) {
-        if (!eid.startsWith('sensor.')) continue;
-        const a = hass.states[eid].attributes;
-        if (a && Array.isArray(a.deferrable_loads)) { attr = a.deferrable_loads; break; }
-      }
-    }
+    const attr = this._deferrableLoadsAttr();
     if (!Array.isArray(attr)) return {};
     const byId = {};
     for (const d of attr) {
       if (d && d.energy_entity && d.power_entity) byId[d.energy_entity] = d.power_entity;
+    }
+    return byId;
+  }
+
+  // Each device's GreedyEnergyTracker sensor (cumulative kWh added only while Greedy
+  // Consumption was actually driving it — see greedy_energy.py and sensor.py's
+  // _build_deferrable_loads), keyed the same way as _deferPowerEntities() above. Absent
+  // (falsy greedy_energy_entity) for a device with no controller — forecast-only/
+  // declared loads can never be greedy-driven, so they simply never get a hatch band.
+  _deferGreedyEntities() {
+    const attr = this._deferrableLoadsAttr();
+    if (!Array.isArray(attr)) return {};
+    const byId = {};
+    for (const d of attr) {
+      if (d && d.energy_entity && d.greedy_energy_entity) byId[d.energy_entity] = d.greedy_energy_entity;
     }
     return byId;
   }
@@ -134,9 +155,13 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     const bands = this._visibleBands();
     const hasSpill = bands.some((b) => b.kind === 'spill');
     const hasFree = bands.some((b) => b.kind === 'free_import');
+    const hasGreedy = bands.some((b) => b.kind === 'greedy');
     const bandLegend =
       (hasSpill ? `<span><span class="swatch" style="background:${FREE_SPILL};opacity:.55"></span>Free energy wasted</span>` : '')
-      + (hasFree ? `<span><span class="swatch" style="background:${FREE_IMPORT};opacity:.55"></span>Free import window</span>` : '');
+      + (hasFree ? `<span><span class="swatch" style="background:${FREE_IMPORT};opacity:.55"></span>Free import window</span>` : '')
+      // Neutral hatch preview — the actual hatch is drawn in each device's own colour on
+      // the chart, so the legend swatch is generic rather than picking one device's hue.
+      + (hasGreedy ? `<span><span class="swatch" style="background-image:repeating-linear-gradient(45deg,var(--ink) 0,var(--ink) 2px,transparent 2px,transparent 4px);opacity:.65"></span>Greedy-driven (hatched)</span>` : '');
     return `
       ${this._legendItem('solar', '<span class="swatch" style="background:var(--solar)"></span>', 'Solar')}
       ${this._legendItem('load', '<span class="swatch" style="background:var(--load)"></span>', 'Load')}
@@ -180,7 +205,30 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     const traj = this._traj || [];
     if (!traj.length) return [];
     const { t0, t1 } = this._timeScale();
-    return this._freeEnergyBands().filter((b) => b.t1 > t0 && b.t0 < t1);
+    return [...this._freeEnergyBands(), ...this._greedyBands()].filter((b) => b.t1 > t0 && b.t0 < t1);
+  }
+
+  // Stretches where a deferrable device's MEASURED consumption was actually driven by
+  // Greedy Consumption rather than the plan or a manual command — computed from each
+  // device's GreedyEnergyTracker sensor history (_fetchGreedyBands()), never the
+  // trajectory (that's a plan/forecast concept; this is what really happened, so it's
+  // drawn hatched rather than as a flat wash like the plan's own bands above — it must
+  // never read as one of those even when a device's own colour happens to repeat).
+  // `group` matches the device's own legend/isolation group (see _energySeries()) so
+  // isolating one device's line also isolates its hatch.
+  _greedyBands() {
+    const dnames = this._deferNames || [];
+    const byDevice = this._greedyBandsByDevice || [];
+    const out = [];
+    dnames.forEach((nm, i) => {
+      for (const b of (byDevice[i] || [])) {
+        out.push({
+          t0: b.t0, t1: b.t1, kind: 'greedy', group: `defer_${i}`,
+          color: this._deferColor(i), pattern: 'diagonal', opacity: 0.5,
+        });
+      }
+    });
+    return out;
   }
 
   _freeEnergyBands() {
@@ -215,6 +263,73 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
   // Net grid flow for a trajectory row: +import / -export, one line instead of two —
   // matches the powerflow card's own grid_power_entity sign convention.
   _gridNet(row) { return (+row.buy_kwh || 0) - (+row.sell_kwh || 0); }
+
+  // Rides GridLensChartCardBase's own throttled fetch cadence (60s, gated on
+  // wantsEnergyHistory/wantsSocHistory) — the greedy hatch is refreshed alongside every
+  // other "actual" series rather than on its own timer.
+  async _fetchActual(hass, curSoc) {
+    await super._fetchActual(hass, curSoc);
+    await this._fetchGreedyBands(hass).catch(() => {});
+  }
+
+  // Per-device stretches where Greedy Consumption actually drove the device, read from
+  // each device's GreedyEnergyTracker sensor (a cumulative kWh counter that only ever
+  // rises while greedy_reason was truthy — see greedy_energy.py's accumulate()). HA
+  // history only tells us WHEN the counter ticked up, not the underlying power sample's
+  // own resolution, so — same "a value holds from its own timestamp until the next
+  // recorded change" convention _series()/stepValueAt() already use elsewhere in this
+  // file — an increase between two consecutive samples is treated as genuine greedy
+  // consumption for the WHOLE interval between them, not just the instant it was
+  // recorded. Populates this._greedyBandsByDevice (parallel to this._deferNames), one
+  // array of {t0,t1} per device.
+  async _fetchGreedyBands(hass) {
+    const greedyMap = this._deferGreedyEntities();
+    const sids = this._deferSensorIds || [];
+    const eids = sids.map((sid) => greedyMap[sid]).filter(Boolean);
+    if (!eids.length) { this._greedyBandsByDevice = []; return; }
+    let start;
+    if (this._viewMode === 'today') {
+      const now = new Date();
+      start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    } else {
+      start = new Date(new Date(this._traj[0].start).getTime() - VIEW_BACK_MS);
+    }
+    const end = new Date();
+    const uniq = [...new Set(eids)];
+    const url = `history/period/${start.toISOString()}?filter_entity_id=${uniq.join(',')}`
+      + `&end_time=${encodeURIComponent(end.toISOString())}&minimal_response&significant_changes_only`;
+    const res = await hass.callApi('GET', url);
+    const byId = {};
+    for (const arr of (res || [])) {
+      if (arr && arr.length && arr[0].entity_id) byId[arr[0].entity_id] = arr;
+    }
+    this._greedyBandsByDevice = sids.map((sid) => {
+      const eid = greedyMap[sid];
+      const rows = eid ? byId[eid] : null;
+      if (!rows || rows.length < 2) return [];
+      const pts = rows
+        .map((r) => ({ t: new Date(r.last_changed || r.lu).getTime(), v: parseFloat(r.state) }))
+        .filter((p) => !isNaN(p.v))
+        .sort((a, b) => a.t - b.t);
+      const out = [];
+      for (let i = 1; i < pts.length; i++) {
+        if (pts[i].v > pts[i - 1].v + 1e-6) out.push({ t0: pts[i - 1].t, t1: pts[i].t });
+      }
+      // A device that's been continuously greedy for hours reports a state change
+      // roughly every minute, which would otherwise produce hundreds of abutting
+      // 1-minute rects (and as many redundant pattern defs) instead of one clean band —
+      // merge touching intervals, same as _freeEnergyBands()'s own same-kind merge.
+      const merged = [];
+      for (const b of out) {
+        const prev = merged[merged.length - 1];
+        if (prev && Math.abs(prev.t1 - b.t0) < 1000) prev.t1 = b.t1;
+        else merged.push({ ...b });
+      }
+      return merged;
+    });
+    this._sig = '';
+    this._paint();
+  }
 
   _energySeries() {
     const dnames = this._deferNames || [];
@@ -283,9 +398,15 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     // negative), so the y-axis is forced to [-m, m] and 0 sits at the vertical centre
     // instead of hugging the bottom the way an all-positive chart would.
     const hasSoc = series.some((s) => s.group === 'soc');
+    // Isolating a device also isolates its greedy hatch; isolating anything else (a
+    // flow, or SOC) hides every device hatch since none of them are the isolated signal.
+    let greedyBands = this._greedyBands();
+    if (this._isolatedGroup) {
+      greedyBands = greedyBands.filter((b) => b.group === this._isolatedGroup);
+    }
     return multiLineChart(this._traj, this._timeScale(), series, {
       fmt: (v) => v.toFixed(1), height: 480, symmetric: true,
-      bands: this._freeEnergyBands(),
+      bands: [...this._freeEnergyBands(), ...greedyBands],
       // Ticks and axis line are drawn in --soc, the same colour as the curves, so it is
       // visually unambiguous which scale SOC is read against — the one real hazard of a
       // secondary axis is taking a value off the wrong side.
@@ -308,6 +429,13 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
   // Charging/Discharging wording for the same entities.
   _signedRow(v, posLabel, negLabel, colorVar) {
     return `<span class="k" style="color:var(${colorVar})">${v >= 0 ? posLabel : negLabel}</span> ${Math.abs(v).toFixed(2)}`;
+  }
+
+  // Whether device i's greedy hatch covers a given hovered moment — see
+  // _fetchGreedyBands()/_greedyBands(). Used to annotate the tooltip's per-device row so
+  // hovering the hatch explains itself in words, not just colour.
+  _isGreedyAt(i, ms) {
+    return ((this._greedyBandsByDevice || [])[i] || []).some((b) => ms >= b.t0 && ms < b.t1);
   }
 
   // Measured SOC nearest a hovered time. this._actual is the SOC history the base class
@@ -336,7 +464,8 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       }
       const deferRows = (this._deferNames || []).map((nm, i) => {
         const v = actualDefer[i];
-        return v != null && v > 0.01 ? `<div><span class="k" style="color:${this._deferColor(i)}">${esc(nm)}</span> ${v.toFixed(2)} kW</div>` : '';
+        const g = this._isGreedyAt(i, bestMs) ? ' <span style="color:var(--muted)">(greedy)</span>' : '';
+        return v != null && v > 0.01 ? `<div><span class="k" style="color:${this._deferColor(i)}">${esc(nm)}</span> ${v.toFixed(2)} kW${g}</div>` : '';
       }).join('');
       return `<b>${fmtHour(bestMs)}</b>` +
         `<div><span class="k" style="color:var(--solar)">sun</span> ${(actualSolar || 0).toFixed(2)} · <span class="k" style="color:var(--load)">load</span> ${(actualLoad || 0).toFixed(2)} kW</div>` +
@@ -354,7 +483,8 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       `<div>${this._signedRow(gridKw, 'buy', 'sell', '--gridflow')} · ${this._signedRow(battKw, 'charge', 'discharge', '--battery')} kW</div>` +
       (this._deferNames || []).map((nm, i) => {
         const v = actualDefer[i] != null ? actualDefer[i] : (+best['defer_' + i] || 0) * kwScale;
-        return v > 0.01 ? `<div><span class="k" style="color:${this._deferColor(i)}">${esc(nm)}</span> ${v.toFixed(2)} kW</div>` : '';
+        const g = this._isGreedyAt(i, bestMs) ? ' <span style="color:var(--muted)">(greedy)</span>' : '';
+        return v > 0.01 ? `<div><span class="k" style="color:${this._deferColor(i)}">${esc(nm)}</span> ${v.toFixed(2)} kW${g}</div>` : '';
       }).join('')
       + this._socRow(bestMs, best)
       // Name the shaded band the cursor is sitting in, so the wash isn't just decoration.

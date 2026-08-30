@@ -327,6 +327,14 @@ class CurrentPlanCostSensor(GridLensSensorBase):
         power_estimators = self.hass.data.get(DOMAIN, {}).get(
             f"{self._entry.entry_id}_power_estimators", {}
         )
+        # Keyed by device index, same as power_estimators above — see
+        # __init__.py._ensure_greedy_trackers. Only a controllable device (on/off or
+        # modulating) ever gets a tracker, so a forecast-only/declared load simply has no
+        # entry here and greedy_energy_entity stays None for it below (correct: nothing
+        # decides on/off for it, so Greedy Consumption could never have driven it).
+        greedy_trackers = self.hass.data.get(DOMAIN, {}).get(
+            f"{self._entry.entry_id}_greedy_trackers", {}
+        )
         sched_store = self.hass.data.get(DOMAIN, {}).get(
             f"{self._entry.entry_id}_deferrable_schedules"
         )
@@ -403,6 +411,17 @@ class CurrentPlanCostSensor(GridLensSensorBase):
                 # none saved) and the config-derived default it would revert to.
                 "schedule": schedule,
                 "default_schedule": default_week,
+                # This device's per-index GreedyEnergyTracker sensor (cumulative kWh
+                # added only while Greedy Consumption was actually driving it — see
+                # greedy_energy.py), if one exists. Consumed by the Power Flow card's
+                # power chart to shade the measured portion of this device's line
+                # wherever it was greedy-driven rather than plan/manual — see
+                # grid-lens-power-chart-card.js's _greedyBands().
+                "greedy_energy_entity": (
+                    greedy_trackers[i].sensor_entity_id
+                    if i in greedy_trackers and greedy_trackers[i].sensor_entity_id
+                    else None
+                ),
             })
         return out
 

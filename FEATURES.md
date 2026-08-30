@@ -763,6 +763,21 @@ feature (or predates the device being configured) has nothing to exclude, and th
 checkbox will silently produce the same result as unchecked for that period. This is
 expected, not a bug — there is no way to know retroactively which past energy was greedy.
 
+**Power chart hatch (added 2026-08-30).** The Power Flow view's power chart
+(`grid-lens-power-chart-card.js`) shades the *measured* portion of a deferrable device's
+line/area with diagonal stripes wherever this tracker's sensor shows it was actually
+greedy-driven, using the tracker's own colour so it never gets confused with the plan's
+free-energy bands above. Sourced from `sensor.py::_build_deferrable_loads`'s new
+`greedy_energy_entity` field (joined the same way `power_entity` already is) — history is
+fetched separately from the base class's power/SOC fetch (`_fetchGreedyBands()`, riding
+its same throttled cadence) since a cumulative counter needs delta-between-samples logic,
+not the "read as an instantaneous reading" treatment every other actual series gets. A
+device with no controller (forecast-only/declared) has no tracker and so is never hatched
+— consistent with the tracker itself never existing for it (see above). Hovering a hatched
+stretch appends "(greedy)" to that device's tooltip row; the legend only advertises the
+hatch when one is actually in view (same pattern as the free-energy bands' own legend
+entries).
+
 ---
 
 ## 8. Weekly schedules (allowed run times)

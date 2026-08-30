@@ -312,67 +312,12 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
     grid += `<line x1="${g.ml}" y1="${y}" x2="${g.w - g.mr}" y2="${y}" stroke="var(--grid)"/>`;
     grid += `<text x="${g.ml - 5}" y="${y + 3}" text-anchor="end" font-size="9" fill="var(--muted)">${fmt(v)}</text>`;
   }
-  // Optional shaded time bands drawn UNDER everything (grid lines included), from
-  // opts.bands = [{ t0, t1, color, opacity? }] in epoch-ms. Used to mark stretches the
-  // plan itself flags as special — currently "free energy the plan expects to waste"
-  // (see grid-lens-power-chart-card). Clipped to the visible window and skipped when
-  // they'd collapse to nothing, so a caller can hand over the whole trajectory's worth
-  // of bands regardless of which view range is selected.
-  let bands = '';
-  for (const b of (opts.bands || [])) {
-    const bs = Math.max(b.t0, t0), be = Math.min(b.t1, t1);
-    if (!(be > bs)) continue;
-    const x0 = X(bs), x1 = X(be);
-    if (x1 - x0 < 0.5) continue;
-    bands += `<rect x="${x0.toFixed(1)}" y="${g.mt}" width="${(x1 - x0).toFixed(1)}"`
-      + ` height="${(g.h - g.mb - g.mt).toFixed(1)}" fill="${b.color}"`
-      + ` opacity="${b.opacity != null ? b.opacity : 0.16}"/>`;
-  }
-  // Right-axis ticks are drawn in the axis' own colour, and its series is drawn in that
-  // same colour, because the one real hazard of a secondary axis is a reader taking a
-  // value off the wrong scale. Colour is what ties a curve to the axis it belongs to;
-  // no gridlines are emitted for it, so the horizontal rules keep meaning the LEFT axis
-  // only. A caption sits above the top tick to name the unit outright.
-  let rgrid = '';
-  if (rax) {
-    const rc = rax.color || 'var(--ink2)';
-    const rfmt = rax.fmt || ((v) => String(v));
-    for (const v of (rax.ticks || [rax.min, (rax.min + rax.max) / 2, rax.max])) {
-      const y = RY(v);
-      rgrid += `<text x="${g.w - g.mr + 6}" y="${y + 3}" text-anchor="start" font-size="9" fill="${rc}">${rfmt(v)}</text>`;
-      rgrid += `<line x1="${g.w - g.mr}" y1="${y}" x2="${g.w - g.mr + 3}" y2="${y}" stroke="${rc}" stroke-width="1"/>`;
-    }
-    rgrid += `<line x1="${g.w - g.mr}" y1="${g.mt}" x2="${g.w - g.mr}" y2="${g.h - g.mb}" stroke="${rc}" stroke-width="1" opacity="0.5"/>`;
-    if (rax.label) {
-      rgrid += `<text x="${g.w - g.mr + 4}" y="${g.mt - 2}" text-anchor="start" font-size="9" fill="${rc}">${rax.label}</text>`;
-    }
-  }
-  const xt = xAxisTicks(X, t0, t1, g.h - g.mb, 9);
-  const nowX = X(Math.min(Date.now(), t1));
-  const now = `<line x1="${nowX}" y1="${g.mt}" x2="${nowX}" y2="${g.h - g.mb}" stroke="var(--now-line)" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.65"/>`;
-  const zero = (yMin < 0) ? `<line x1="${g.ml}" y1="${Y(0)}" x2="${g.w - g.mr}" y2="${Y(0)}" stroke="var(--axis)"/>` : '';
-  let defs = '', paths = '';
+  // Geometry for every series, hoisted above the bands block below: a pattern:'diagonal'
+  // band needs to clip itself to a specific series' own actual-area shape (see there for
+  // why), so that shape has to exist before bands are drawn. Was previously computed
+  // much later (right before the area-fill/line-stroke passes) — moved up, not
+  // duplicated; nothing below here needs it before this new use.
   const base = Y(Math.max(yMin, 0));
-  // A forecast/planned area fill only washes the future (right of "now") — but only on
-  // a chart that also draws a measured `actual` series: there, the past portion of the
-  // forecast fill was stacking a second same-colour wash on top of the actual series'
-  // own fill (which already only spans its own t0→now data), reading as one solid
-  // continuous block even where nothing measured ran. A chart with no actual series at
-  // all (e.g. the cash chart's cumulative-cost line) has nothing to show in its place,
-  // so it keeps shading the full range as before. The forecast *line* itself still
-  // draws full-width (unclipped) so a planned-vs-actual comparison is still possible —
-  // only the fill is ever cut off.
-  const hasActual = series.some((s) => s.actual);
-  const futureClipId = 'futureclip';
-  if (hasActual) {
-    defs += `<clipPath id="${futureClipId}"><rect x="${nowX.toFixed(1)}" y="0" width="${Math.max(0, g.w - nowX).toFixed(1)}" height="${g.h}"/></clipPath>`;
-  }
-  // Two-pass render. Pass 1 collects each series' path geometry plus its "size"
-  // (Σ|v| ≈ the area its fill would cover). Pass 2 emits gradient fills back-to-front
-  // ordered LARGEST first, so a big series' wash sits behind the smaller ones and every
-  // blend stays visible instead of the last-drawn fill burying the rest. Pass 3 emits
-  // all line strokes in caller order, above every fill (a line must never be hidden
-  // under another series' wash).
   const geo = [];
   series.forEach((s, si) => {
     const rp = raw[si];
@@ -399,6 +344,97 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
     }
     geo.push({ s, si, d, pts, rightX, mag: rp.reduce((a, p) => a + Math.abs(p.v), 0) });
   });
+
+  // Optional shaded time bands drawn UNDER everything (grid lines included), from
+  // opts.bands = [{ t0, t1, color, opacity?, pattern?, group? }] in epoch-ms. Used to
+  // mark stretches the plan itself flags as special — "free energy the plan expects to
+  // waste" (see grid-lens-power-chart-card) — or, with pattern:'diagonal', a stretch
+  // measured data attributes to something other than the plan (currently: a deferrable
+  // device's Greedy-Consumption-driven consumption, same file). Clipped to the visible
+  // window and skipped when they'd collapse to nothing, so a caller can hand over the
+  // whole trajectory's worth of bands regardless of which view range is selected.
+  // Pattern defs are keyed by colour+opacity, not by band index — a continuously
+  // greedy device can report a state change every ~60s, and without this a multi-hour
+  // stretch would emit one redundant (but visually identical) <pattern> per rect
+  // instead of every rect for that device sharing a single def.
+  let bands = '', bandDefs = '', bandPatternIds = {};
+  (opts.bands || []).forEach((b, bi) => {
+    const bs = Math.max(b.t0, t0), be = Math.min(b.t1, t1);
+    if (!(be > bs)) return;
+    const x0 = X(bs), x1 = X(be);
+    if (x1 - x0 < 0.5) return;
+    const op = b.opacity != null ? b.opacity : 0.16;
+    const rectAttrs = `x="${x0.toFixed(1)}" y="${g.mt}" width="${(x1 - x0).toFixed(1)}"`
+      + ` height="${(g.h - g.mb - g.mt).toFixed(1)}"`;
+    if (b.pattern === 'diagonal') {
+      // Hatch rather than a flat wash — reserved for a signal that isn't the plan's own
+      // (a device's Greedy-Consumption-driven stretch), so it must never read like one
+      // of the flat-wash bands above even when it happens to share a device's colour.
+      // Clipped to that device's own ACTUAL (measured) area shape — a plain full-height
+      // rect would visually hatch every OTHER series drawn behind it too (Solar, Load…),
+      // which is wrong: only that device's own consumption was greedy-driven.
+      const g2 = geo.find((x) => x.s.group === b.group && x.s.actual);
+      if (!g2) return;  // nothing measured for this device at this time — nothing to hatch
+      const patKey = `${b.color}|${op}`;
+      let pid = bandPatternIds[patKey];
+      if (!pid) {
+        pid = `bandhatch${Object.keys(bandPatternIds).length}`;
+        bandPatternIds[patKey] = pid;
+        bandDefs += `<pattern id="${pid}" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">`
+          + `<rect width="8" height="8" fill="${b.color}" opacity="${(op * 0.4).toFixed(2)}"/>`
+          + `<line x1="0" y1="0" x2="0" y2="8" stroke="${b.color}" stroke-width="4" opacity="${op}"/>`
+          + `</pattern>`;
+      }
+      const clipId = `bandclip${bi}`;
+      bandDefs += `<clipPath id="${clipId}"><path d="${g2.d} L${g2.rightX.toFixed(1)},${base.toFixed(1)} L${g2.pts[0][0].toFixed(1)},${base.toFixed(1)} Z"/></clipPath>`;
+      bands += `<rect ${rectAttrs} fill="url(#${pid})" clip-path="url(#${clipId})"/>`;
+      return;
+    }
+    bands += `<rect ${rectAttrs} fill="${b.color}" opacity="${op}"/>`;
+  });
+  // Right-axis ticks are drawn in the axis' own colour, and its series is drawn in that
+  // same colour, because the one real hazard of a secondary axis is a reader taking a
+  // value off the wrong scale. Colour is what ties a curve to the axis it belongs to;
+  // no gridlines are emitted for it, so the horizontal rules keep meaning the LEFT axis
+  // only. A caption sits above the top tick to name the unit outright.
+  let rgrid = '';
+  if (rax) {
+    const rc = rax.color || 'var(--ink2)';
+    const rfmt = rax.fmt || ((v) => String(v));
+    for (const v of (rax.ticks || [rax.min, (rax.min + rax.max) / 2, rax.max])) {
+      const y = RY(v);
+      rgrid += `<text x="${g.w - g.mr + 6}" y="${y + 3}" text-anchor="start" font-size="9" fill="${rc}">${rfmt(v)}</text>`;
+      rgrid += `<line x1="${g.w - g.mr}" y1="${y}" x2="${g.w - g.mr + 3}" y2="${y}" stroke="${rc}" stroke-width="1"/>`;
+    }
+    rgrid += `<line x1="${g.w - g.mr}" y1="${g.mt}" x2="${g.w - g.mr}" y2="${g.h - g.mb}" stroke="${rc}" stroke-width="1" opacity="0.5"/>`;
+    if (rax.label) {
+      rgrid += `<text x="${g.w - g.mr + 4}" y="${g.mt - 2}" text-anchor="start" font-size="9" fill="${rc}">${rax.label}</text>`;
+    }
+  }
+  const xt = xAxisTicks(X, t0, t1, g.h - g.mb, 9);
+  const nowX = X(Math.min(Date.now(), t1));
+  const now = `<line x1="${nowX}" y1="${g.mt}" x2="${nowX}" y2="${g.h - g.mb}" stroke="var(--now-line)" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.65"/>`;
+  const zero = (yMin < 0) ? `<line x1="${g.ml}" y1="${Y(0)}" x2="${g.w - g.mr}" y2="${Y(0)}" stroke="var(--axis)"/>` : '';
+  let defs = '', paths = '';
+  // A forecast/planned area fill only washes the future (right of "now") — but only on
+  // a chart that also draws a measured `actual` series: there, the past portion of the
+  // forecast fill was stacking a second same-colour wash on top of the actual series'
+  // own fill (which already only spans its own t0→now data), reading as one solid
+  // continuous block even where nothing measured ran. A chart with no actual series at
+  // all (e.g. the cash chart's cumulative-cost line) has nothing to show in its place,
+  // so it keeps shading the full range as before. The forecast *line* itself still
+  // draws full-width (unclipped) so a planned-vs-actual comparison is still possible —
+  // only the fill is ever cut off.
+  const hasActual = series.some((s) => s.actual);
+  const futureClipId = 'futureclip';
+  if (hasActual) {
+    defs += `<clipPath id="${futureClipId}"><rect x="${nowX.toFixed(1)}" y="0" width="${Math.max(0, g.w - nowX).toFixed(1)}" height="${g.h}"/></clipPath>`;
+  }
+  // Fill/stroke render (geo itself was computed above, before the bands block).
+  // Pass 1 (gradient fills) goes back-to-front ordered LARGEST-Σ|v| first, so a big
+  // series' wash sits behind the smaller ones and every blend stays visible instead of
+  // the last-drawn fill burying the rest. Pass 2 emits all line strokes in caller order,
+  // above every fill (a line must never be hidden under another series' wash).
   // `base` is the LEFT axis' zero, so a right-axis series' fill would run to a baseline
   // that means nothing on its own scale. Right-axis series are line-only by construction.
   for (const g2 of geo.filter((x) => x.s.area && x.s.axis !== 'right').sort((a, b) => b.mag - a.mag)) {
@@ -420,7 +456,7 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // explicit CSS height (e.g. grid-lens-power-chart-card's max_height) whose aspect
   // ratio doesn't match the viewBox gets letterboxed: the default "xMidYMid meet"
   // scales uniformly and pads the mismatch as empty space above/below the plot.
-  return `<svg viewBox="0 0 ${g.w} ${g.h}" preserveAspectRatio="none" class="chart-svg" role="img"><defs>${defs}</defs>${bands}${grid}${zero}${rgrid}${xt}${now}${paths}`
+  return `<svg viewBox="0 0 ${g.w} ${g.h}" preserveAspectRatio="none" class="chart-svg" role="img"><defs>${bandDefs}${defs}</defs>${bands}${grid}${zero}${rgrid}${xt}${now}${paths}`
     + `<line class="xhair" x1="0" x2="0" y1="${g.mt}" y2="${g.h - g.mb}" stroke="var(--ink2)" stroke-width="1" opacity="0"/></svg>`;
 }
 
