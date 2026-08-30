@@ -245,7 +245,7 @@ class GridLensCard extends HTMLElement {
 
   renderStackedBarChart(profile, maxVal, scale = 1, deferrable_devices = []) {
     if (!profile || !profile.length) return '';
-    const DEVICE_COLORS = ['#7B1FA2','#0288D1','#00897B','#F57F17','#E53935','#5C6BC0'];
+    const DEVICE_COLORS = GridLensCard.DEVICE_COLORS;
     const W = 288, H = Math.round(70 * scale), BAR = 11, GAP = 1;
     const barScale = (H - 4) / (maxVal || 1);
     const bars = profile.map((slot, i) => {
@@ -255,7 +255,7 @@ class GridLensCard extends HTMLElement {
       const total = (slot.home_load_kwh||0) + perDev.reduce((s, v) => s + v, 0) || (slot.deferrable_kwh||0);
       const parts = [];
       if (homeH > 0.3) parts.push(
-        `<rect x="${x}" y="${H - homeH}" width="${BAR}" height="${homeH}" fill="#FF9800">` +
+        `<rect x="${x}" y="${H - homeH}" width="${BAR}" height="${homeH}" fill="${GridLensCard.HOUSEHOLD_COLOR}">` +
         `<title>${slot.hour}:00  Household ${(slot.home_load_kwh||0).toFixed(3)} kWh\nTotal ${total.toFixed(3)} kWh</title></rect>`
       );
       let stackTop = homeH;
@@ -294,7 +294,7 @@ class GridLensCard extends HTMLElement {
       const x = i * (BAR + GAP);
       const solH = Math.min(Math.max((slot.solar_kwh || 0) * barScale, 0), H - 4);
       if (solH < 0.3) return '';
-      return `<rect x="${x}" y="${H - solH}" width="${BAR}" height="${solH}" fill="#FDD835">` +
+      return `<rect x="${x}" y="${H - solH}" width="${BAR}" height="${solH}" fill="${GridLensCard.SOLAR_COLOR}">` +
              `<title>${slot.hour}:00  Solar ${(slot.solar_kwh||0).toFixed(3)} kWh</title></rect>`;
     }).join('');
     return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="display:block;height:${H}px">
@@ -315,14 +315,32 @@ class GridLensCard extends HTMLElement {
     return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="display:block;height:${H}px">
       <line x1="0" y1="${y80.toFixed(1)}" x2="${W}" y2="${y80.toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.5" stroke-dasharray="3,3"/>
       <line x1="0" y1="${y20.toFixed(1)}" x2="${W}" y2="${y20.toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.5" stroke-dasharray="3,3"/>
-      <polyline points="${pts}" fill="none" stroke="#00BCD4" stroke-width="1.5" stroke-linejoin="round"/>
+      <polyline points="${pts}" fill="none" stroke="${GridLensCard.SOC_COLOR}" stroke-width="1.5" stroke-linejoin="round"/>
       ${profile.map((slot, i) => {
         const x = i * (BAR + GAP) + BAR / 2;
         const y = H - (slot.soc_percent || 0) / 100 * (H - 4) - 2;
-        return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2" fill="#00BCD4">` +
+        return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2" fill="${GridLensCard.SOC_COLOR}">` +
                `<title>${slot.hour}:00  SOC ${(slot.soc_percent||0).toFixed(0)}%</title></circle>`;
       }).join('')}
     </svg>`;
+  }
+
+  // Diagonal hazard-stripe flag shown under an alternative plan's charts whenever
+  // "Exclude Greedy Consumption" is checked (see the checkbox's own tooltip and
+  // GRIDLENS_CHECKLIST.md 2026-08-30). That toggle subtracts each deferrable device's
+  // tracked opportunistic Greedy Consumption energy from its LP demand target before
+  // pricing every ALTERNATIVE plan — never the current plan, whose cost is always the
+  // real bill (plan_calculator._get_deferrable_data) — so an alternative plan's hourly
+  // profile and total shown while the toggle is on are a deliberately adjusted estimate,
+  // not this household's literal historical usage. User request 2026-08-30: make that
+  // adjustment visually obvious rather than something only the checkbox's tooltip says.
+  _greedyStripeHtml(isCurrentPlan) {
+    if (isCurrentPlan || !this._excludeGreedy) return '';
+    return `
+      <div class="greedy-stripe" title="Computed with each deferrable device's opportunistic Greedy Consumption energy subtracted from its demand target — an adjusted estimate for comparing plans, not this household's literal usage on this plan.">
+        <span class="greedy-stripe-icon">⚡</span>
+        Excludes Greedy Consumption — adjusted estimate
+      </div>`;
   }
 
   renderHourLabels() {
@@ -529,6 +547,21 @@ class GridLensCard extends HTMLElement {
         }
         .bill-fit { color: var(--success-color, #4CAF50); }
         .bill-note { font-size: 11px; color: var(--warning-color, #FF9800); font-style: italic; padding: 4px 0; }
+        /* Hazard-stripe flag shown under an alternative plan's charts whenever "Exclude
+           Greedy Consumption" is active — see _greedyStripeHtml(). Deliberately louder
+           than .bill-note's quiet italic caption: it's not a per-plan data quirk, it's a
+           statement that every number above was computed on an adjusted assumption. */
+        .greedy-stripe {
+          margin-top: 10px; padding: 7px 10px; border-radius: 6px;
+          font-size: 11px; font-weight: 600; color: var(--primary-text-color);
+          display: flex; align-items: center; gap: 6px; cursor: default;
+          border: 1px solid color-mix(in srgb, var(--warning-color, #FF9800) 50%, transparent);
+          background-image: repeating-linear-gradient(45deg,
+            color-mix(in srgb, var(--warning-color, #FF9800) 20%, transparent) 0,
+            color-mix(in srgb, var(--warning-color, #FF9800) 20%, transparent) 6px,
+            transparent 6px, transparent 12px);
+        }
+        .greedy-stripe-icon { font-size: 13px; flex: 0 0 auto; }
         .chart-section { margin-top: 14px; }
         .chart-label {
           font-size: 11px;
@@ -729,16 +762,18 @@ class GridLensCard extends HTMLElement {
       const savings = total - currentPlanTotal;
       const isCheaper = savings < -0.05;
 
-      // Banner colour: orange=current, cyan=cheapest, green=cheaper, red=more expensive
+      // Banner colour: amber=current, deep-cyan=cheapest, green=cheaper, red=more expensive
+      // — same hexes as the household/SOC/selling/spend chart roles below, kept in sync
+      // via the GridLensCard.*_COLOR statics (see their definition for why these values).
       let bannerColor;
       if (isCurrentPlan) {
-        bannerColor = '#FF9800';
+        bannerColor = GridLensCard.HOUSEHOLD_COLOR;
       } else if (Math.abs(total - minTotal) < 0.01) {
-        bannerColor = '#00BCD4';
+        bannerColor = GridLensCard.SOC_COLOR;
       } else if (isCheaper) {
-        bannerColor = '#4CAF50';
+        bannerColor = GridLensCard.SELLING_COLOR;
       } else {
-        bannerColor = '#EF5350';
+        bannerColor = GridLensCard.SPEND_COLOR;
       }
 
       let savingsLabel = '';
@@ -927,7 +962,7 @@ class GridLensCard extends HTMLElement {
       // ── Hourly charts ───────────────────────────────────────────────────
       let chartHtml = '';
       if (showCharts && profile && profile.length === 24) {
-        const DEVICE_COLORS = ['#7B1FA2','#0288D1','#00897B','#F57F17','#E53935','#5C6BC0'];
+        const DEVICE_COLORS = GridLensCard.DEVICE_COLORS;
         const deferrable_devices = _deferrable_devices;
         const maxKwh  = globalMaxKwh;
         const maxCost = globalMaxCost;
@@ -942,12 +977,12 @@ class GridLensCard extends HTMLElement {
           ? deferrable_devices.map((d, ii) =>
               `&nbsp;<span style="color:${DEVICE_COLORS[ii % DEVICE_COLORS.length]};font-weight:600">■ ${d.name}</span>`
             ).join('')
-          : (hasEv ? '&nbsp;<span style="color:#7B1FA2;font-weight:600">■ deferrable</span>' : '');
+          : (hasEv ? `&nbsp;<span style="color:${DEVICE_COLORS[0]};font-weight:600">■ deferrable</span>` : '');
 
         const loadChartHtml = (hasHomeLoad || hasEv) ? `
             <div class="chart-label" style="margin-top:10px">
               Avg hourly load &nbsp;
-              ${hasHomeLoad ? '<span style="color:#FF9800;font-weight:600">■ household</span>' : ''}
+              ${hasHomeLoad ? `<span style="color:${GridLensCard.HOUSEHOLD_COLOR};font-weight:600">■ household</span>` : ''}
               ${devLegend}
               &nbsp;(kWh)
             </div>
@@ -956,7 +991,7 @@ class GridLensCard extends HTMLElement {
         const solarChartHtml = hasSolar ? `
             <div class="chart-label" style="margin-top:10px">
               Avg hourly solar generation &nbsp;
-              <span style="color:#FDD835;font-weight:600;text-shadow:0 0 2px #999">■</span>
+              <span style="color:${GridLensCard.SOLAR_COLOR};font-weight:600;text-shadow:0 0 2px #999">■</span>
               <span style="font-weight:600"> solar</span>
               &nbsp;(kWh)
             </div>
@@ -974,18 +1009,19 @@ class GridLensCard extends HTMLElement {
             ${solarChartHtml}
             <div class="chart-label"${(hasHomeLoad || hasEv || hasSolar) ? ' style="margin-top:10px"' : ''}>
               Average hourly energy &nbsp;
-              <span style="color:#2196F3;font-weight:600">■ buying</span> ↑ &nbsp;
-              <span style="color:#4CAF50;font-weight:600">■ selling</span> ↓ &nbsp; (kWh)
+              <span style="color:${GridLensCard.BUYING_COLOR};font-weight:600">■ buying</span> ↑ &nbsp;
+              <span style="color:${GridLensCard.SELLING_COLOR};font-weight:600">■ selling</span> ↓ &nbsp; (kWh)
             </div>
-            ${this.renderDivergingChart(profile, 'import_kwh', 'export_kwh', maxKwh, '#2196F3', '#4CAF50', chartScale)}
+            ${this.renderDivergingChart(profile, 'import_kwh', 'export_kwh', maxKwh, GridLensCard.BUYING_COLOR, GridLensCard.SELLING_COLOR, chartScale)}
             <div class="chart-label" style="margin-top:10px">
               Average hourly cost &nbsp;
-              <span style="color:#EF5350;font-weight:600">■ spend</span> ↑ &nbsp;
-              <span style="color:#26A69A;font-weight:600">■ income</span> ↓ &nbsp; ($)
+              <span style="color:${GridLensCard.SPEND_COLOR};font-weight:600">■ spend</span> ↑ &nbsp;
+              <span style="color:${GridLensCard.INCOME_COLOR};font-weight:600">■ income</span> ↓ &nbsp; ($)
             </div>
-            ${this.renderDivergingChart(profile, 'import_cost', 'export_income', maxCost, '#EF5350', '#26A69A', chartScale)}
+            ${this.renderDivergingChart(profile, 'import_cost', 'export_income', maxCost, GridLensCard.SPEND_COLOR, GridLensCard.INCOME_COLOR, chartScale)}
             ${socChartHtml}
             ${this.renderHourLabels()}
+            ${this._greedyStripeHtml(isCurrentPlan)}
           </div>`;
       }
 
@@ -1232,6 +1268,29 @@ class GridLensCard extends HTMLElement {
 // Class-level response cache: persists across navigation within the same browser
 // session so that returning to the dashboard is instant.
 GridLensCard._cache = {};
+
+// Chart palette — single source of truth so the hourly-profile charts, their legends,
+// and the cost banner never disagree. Re-picked 2026-08-30 (dataviz skill's
+// validate_palette.js, OKLab CVD deltaE, --pairs all against every colour this card can
+// show at once — up to 6 device colours plus household/solar/buying/selling/spend/income/
+// SOC all render in the same plan-card, stacked vertically). The original values had real
+// clashes, not just theoretical ones: --spend (#EF5350) and the old selling green
+// (#4CAF50) were only 1.2 ΔE apart under deuteranopia — a red-vs-green pair on a page
+// about money — and DEVICE_COLORS reused near-identical blue/teal/orange/red to the
+// buying/income/household/spend roles it sits right above in the same card. See
+// GRIDLENS_CHECKLIST.md 2026-08-30 for the full before/after. Known accepted gap: SOC vs
+// device colour 0 clears the normal-vision floor but sits in the 6-8 CVD floor band
+// (WARN) — legal because every swatch on this card is always paired with a text label
+// (legend name, tooltip), so colour is never the sole identity cue.
+GridLensCard.HOUSEHOLD_COLOR = '#c49a1c';
+GridLensCard.SOLAR_COLOR = '#FDD835';
+GridLensCard.BUYING_COLOR = '#2196F3';
+GridLensCard.SELLING_COLOR = '#31d37d';
+GridLensCard.SPEND_COLOR = '#EF5350';
+GridLensCard.INCOME_COLOR = '#26A69A';
+GridLensCard.SOC_COLOR = '#046d9a';
+// Categorical — fixed order, one slot per configured deferrable device, never re-sorted.
+GridLensCard.DEVICE_COLORS = ['#7b247b', '#180ced', '#a91504', '#bc2fae', '#ff38eb', '#27920c'];
 
 customElements.define('grid-lens-card', GridLensCard);
 

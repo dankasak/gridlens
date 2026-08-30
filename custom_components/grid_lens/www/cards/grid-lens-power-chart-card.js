@@ -13,7 +13,7 @@
  */
 import {
   GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor, clampPct, fmtPct,
-} from './grid-lens-chart-common.js?v=20260828a';
+} from './grid-lens-chart-common.js?v=20260830a';
 
 // Free-energy shading (see _freeEnergyBands). CSS custom props rather than literals so
 // both bands follow the viewer's light/dark theme like every other colour on this card;
@@ -52,8 +52,19 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       // Free-energy band washes. Amber-ish for wasted surplus (it's a "you're throwing
       // this away" warning) and teal for a free-import window (a good thing, and the
       // same family this project's charts already use for sell/credit).
-      + ` :host { --free-spill:#f97316; --free-import:#0d9488; --soc:#0284c7; }`
-      + ` :host(.dark) { --free-spill:#fb923c; --free-import:#2dd4bf; --soc:#38bdf8; }`
+      //
+      // Re-picked 2026-08-30 (dataviz skill's validate_palette.js): the old values
+      // duplicated other series on this exact chart — --free-import was the literal
+      // same hex as --defer2 (a device line and a background band reading as one
+      // colour in the legend), and --free-spill sat only 2.0-2.7 ΔE from --solar under
+      // protanopia (both warm gold/orange), well below the 15 floor. New values clear
+      // 15+ against every series this chart can show at once (solar/gridflow/battery/
+      // soc/defer1-4) with margin; --free-spill's CVD separation from --solar lands in
+      // the 6-8 floor band (WARN, not FAIL) — legal because the band already carries a
+      // secondary encoding: a legend entry ("Free energy wasted") and a hover tooltip
+      // that names it in text (_bandNote), so colour is never the only cue.
+      + ` :host { --free-spill:#ff8d0a; --free-import:#0ccadf; --soc:#0284c7; }`
+      + ` :host(.dark) { --free-spill:#ffcc33; --free-import:#8fffff; --soc:#38bdf8; }`
       // Click-to-isolate legend entries (see _legendItem()/_wireLegendToggle()). `.dim`
       // is opacity only, not display:none — the entry stays clickable so switching
       // isolation straight to a different series (or back to "all") is one click, not two.

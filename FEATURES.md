@@ -160,6 +160,22 @@ the non-deferrable "other load" hour-of-day average (that must keep reflecting r
 energy flow regardless of *why* a device drew power). Has no effect on a period predating
 the tracker (§7's "no retroactive data" caveat) — expected, not a bug.
 
+**"Excludes Greedy Consumption" hazard stripe (added 2026-08-30).** While the checkbox
+above is checked, every *alternative* plan's card (never the current plan) shows a
+diagonal-stripe banner under its hourly charts (`grid-lens-card.js::_greedyStripeHtml`),
+flagging that its profile/total are the adjusted estimate described above rather than this
+household's literal usage on that plan. Purely presentational — no new data or config.
+
+**Chart colour palette (re-picked 2026-08-30).** Every chart-series colour in
+`grid-lens-card.js` (household/solar/buying/selling/spend/income/SOC + the per-device
+`DEVICE_COLORS` rotation) and in `grid-lens-chart-common.js`/`grid-lens-power-chart-card.js`
+(the Power Flow view's `--defer1-4`/`--free-spill`/`--free-import`) was re-validated with
+the dataviz skill's `validate_palette.js` (OKLab CVD deltaE, `--pairs all`) after a user
+report of near-duplicate colours on both pages — see `GRIDLENS_CHECKLIST.md` 2026-08-30 for
+the specific clashes found (a literal hex duplicate, a red-vs-green pair only 1.2 ΔE apart
+under deuteranopia) and the handful of pre-existing, lower-severity gaps left as documented,
+accepted limitations rather than cascading the redesign into cross-card-shared anchors.
+
 ---
 
 ## 2. The optimiser (layer 2 core)

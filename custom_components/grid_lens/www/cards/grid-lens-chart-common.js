@@ -468,7 +468,21 @@ export const STYLE = `
        chroma floor (it's a deliberately desaturated "pulled out of rotation" neutral, same
        exception already relied on by --idle above — legend + tooltip name labels carry the
        identity, not colour alone). */
-    --defer1:#e11d48; --defer2:#0d9488; --defer3:#7c3aed; --defer4:#ca8a04;
+    /* defer3/defer4 re-picked 2026-08-30 (dataviz skill's validate_palette.js, OKLab CVD
+       deltaE, --pairs all against solar/gridflow/battery/soc/free-spill/free-import/
+       defer1/defer2): the old #7c3aed (defer3) sat 13.8 ΔE from --gridflow's #8b7cf6 —
+       both purples, normal-vision floor requires >=15 — and #ca8a04 (defer4) sat 8.2 ΔE
+       from --solar's #9c8208 (both olive/gold), a near-duplicate on a chart that draws
+       both simultaneously. New values clear the 15 floor against every other series on
+       this chart with margin (defer3 vs soc 19.8, defer4 vs gridflow 28.0 — see
+       GRIDLENS_CHECKLIST.md). Known accepted gap: --defer1 vs --solar only clears 23.0
+       normal-vision but fails the deuteranopia floor (ΔE4.1 protan/deutan) — pre-existing,
+       shared with the Power Flow card's --c-def1, so not repointed here; mitigated by the
+       legend's text labels + hover tooltips (color is never the only cue for identity).
+       Same reasoning for --defer2 vs --soc (ΔE12.1, below the 15 floor but not a
+       duplicate) — --soc has its own right-axis, dashed forecast line and axis-coloured
+       ticks, a second independent disambiguator beyond just the legend text. */
+    --defer1:#e11d48; --defer2:#0d9488; --defer3:#1132d4; --defer4:#8b046e;
     --hotwater:#94a3b8;
   }
   :host(.dark) {
@@ -476,12 +490,12 @@ export const STYLE = `
     --fit:rgba(251,191,36,.22); --good:#10b981;
     --solar:#b8960a; --load:#f1f5f9; --gridflow:#a78bfa; --battery:#4ade80;
     --buy:#fb7185; --sell:#2dd4bf; --cum:#60a5fa;
-    /* --defer3 deliberately differs from the Power Flow card's own dark --c-def3 (#a78bfa) —
-       that value duplicates --c-grid in that card's own dark palette (a pre-existing bug,
-       fixed there too, see grid-lens-powerflow-card.js), not something to propagate here.
-       Same CVD-exception profile as light mode above (lightness-band non-issue + hotwater
-       chroma floor). */
-    --defer1:#fb7185; --defer2:#2dd4bf; --defer3:#8b5cf6; --defer4:#facc15;
+    /* defer3/defer4 re-picked 2026-08-30, same exercise as light mode above (old
+       #8b5cf6/#facc15 sat too close to --gridflow/--solar respectively). New values
+       validated the same way; --defer1-vs-solar and --defer2-vs-soc carry the same
+       accepted, documented gap as light mode (pre-existing/cross-card, mitigated by
+       legend text + soc's own right-axis treatment). */
+    --defer1:#fb7185; --defer2:#2dd4bf; --defer3:#6d57db; --defer4:#c32285;
     --hotwater:#cbd5e1;
   }
   .card { background:var(--surface); border:1px solid var(--border); border-radius:14px;
