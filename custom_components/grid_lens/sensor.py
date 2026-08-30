@@ -78,6 +78,15 @@ async def async_setup_entry(
         seen_power_ids.add(id(estimator))
         sensors.append(GridLensEstimatedPowerSensor(estimator, entry))
 
+    # Per-device Greedy Consumption energy trackers (greedy_energy.py) — one per
+    # controllable deferrable load, built in __init__.py._ensure_greedy_trackers after the
+    # load control manager exists. Feeds plan_calculator's "exclude greedy consumption"
+    # option (§7/§1 of FEATURES.md); also gives the user direct visibility into how much
+    # each device has run opportunistically.
+    greedy_trackers = hass.data[DOMAIN].get(f"{entry.entry_id}_greedy_trackers", {})
+    for tracker in greedy_trackers.values():
+        sensors.append(GridLensGreedyEnergySensor(tracker, entry))
+
     async_add_entities(sensors)
 
 
@@ -188,6 +197,45 @@ class GridLensEstimatedPowerSensor(SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return self._estimator.status()
+
+
+class GridLensGreedyEnergySensor(SensorEntity):
+    """Cumulative kWh a deferrable device has consumed while Greedy Consumption (§7) was
+    driving it, rather than the plan or a manual command. Backed by
+    greedy_energy.GreedyEnergyTracker, which owns and persists the number — this entity
+    just displays it, same split as GridLensEstimatedEnergySensor above. Tracked going
+    forward only from whenever this feature first sees the device; there is no retroactive
+    attribution for energy consumed before the tracker existed.
+    """
+
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = "kWh"
+    _attr_icon = "mdi:lightning-bolt-outline"
+
+    def __init__(self, tracker, entry: ConfigEntry) -> None:
+        self._tracker = tracker
+        self._entry = entry
+        self._attr_name = f"{tracker.name} Greedy Consumption"
+        self._attr_unique_id = f"{entry.entry_id}_{tracker.unique_id}"
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, self._entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Custom Integration",
+            "model": "Plan Analyzer",
+        }
+
+    @property
+    def native_value(self) -> float:
+        return round(self._tracker.running_kwh, 4)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"source_sensor": self._tracker.source_sensor_id}
 
 
 class CurrentPlanCostSensor(GridLensSensorBase):

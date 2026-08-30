@@ -530,7 +530,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260829b"
+    _CARD_VERSION = "20260830a"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -804,7 +804,10 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                         calculator.current_plan_override = _hist_plan
                         _LOGGER.info("History: current plan at %s is %s", start_date.date(), _hist_plan)
 
-                response_data = await calculator.calculate_plan_costs(start_date, end_date)
+                _exclude_greedy = request.query.get('exclude_greedy') == 'true'
+                response_data = await calculator.calculate_plan_costs(
+                    start_date, end_date, exclude_greedy=_exclude_greedy
+                )
                 _LOGGER.info(f"Custom date range calculation complete: {response_data.get('usage_days')} days")
                 return web.Response(
                     text=json.dumps(response_data),
@@ -1087,6 +1090,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
             start_date = _parse_date(request.query.get('start_date'))
             end_date   = _parse_date(request.query.get('end_date'))
+            exclude_greedy = request.query.get('exclude_greedy') == 'true'
 
             entries = self.hass.config_entries.async_entries(DOMAIN)
             if not entries:
@@ -1208,6 +1212,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 start_date, end_date,
                 on_plan_ready=on_plan_ready,
                 on_progress=on_fetch_progress,
+                exclude_greedy=exclude_greedy,
             )
             await send('complete', result)
             return resp
@@ -1685,6 +1690,63 @@ async def _ensure_load_estimators(hass: HomeAssistant, entry: ConfigEntry) -> tu
     return energy_estimators, power_estimators
 
 
+async def _ensure_greedy_trackers(hass: HomeAssistant, entry: ConfigEntry) -> dict:
+    """One GreedyEnergyTracker per deferrable-load index that LoadControlManager actually
+    drives — i.e. every key in its ``controllers`` dict, on/off and modulating alike. A
+    device with no control entity (forecast-only, or a declared/"dummy" load with no
+    sensor at all) never gets a controller and so never gets a tracker: nothing decides
+    on/off for it, so Greedy Consumption could never have driven it in the first place.
+
+    Must run after the LoadControlManager block in async_setup_entry, unlike
+    _ensure_load_estimators — eligibility (and the live greedy_reason read at each tick)
+    both come from hass.data[DOMAIN][f"{entry.entry_id}_load_control"].controllers, which
+    doesn't exist until that block has run. Returns {} if no controllable device exists.
+
+    See greedy_energy.py for the tracker itself and plan_calculator.py's
+    _get_deferrable_data for how its running_kwh feeds the "exclude greedy consumption"
+    plan-comparison option.
+    """
+    from homeassistant.helpers import entity_registry as er
+    from homeassistant.util import slugify
+
+    from .const import CONF_DEFERRABLE_LOAD_SENSORS
+    from .greedy_energy import GreedyEnergyStore, GreedyEnergyTracker
+
+    load_mgr = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_load_control")
+    if load_mgr is None or not load_mgr.controllers:
+        return {}
+
+    sensors: list = list(entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or [])
+    store = GreedyEnergyStore(hass, entry.entry_id)
+    ent_reg = er.async_get(hass)
+    trackers: dict = {}
+    for index, controller in load_mgr.controllers.items():
+        if index >= len(sensors) or not sensors[index]:
+            continue  # no energy sensor at this index — nothing to diff deltas against
+        tracker = GreedyEnergyTracker(
+            hass,
+            store=store,
+            index=index,
+            name=controller.name,
+            source_sensor_id=sensors[index],
+            controller=controller,
+        )
+        # Reserve the entity_id up front (same pattern as _ensure_load_estimators's
+        # power_sensor_entity_id) so plan_calculator.py can query this tracker's own
+        # recorder history without waiting for the sensor platform to create the entity.
+        unique_id = f"{entry.entry_id}_{tracker.unique_id}"
+        reg_entry = ent_reg.async_get_or_create(
+            "sensor", DOMAIN, unique_id,
+            suggested_object_id=f"{slugify(controller.name)}_greedy_consumption",
+            config_entry=entry,
+        )
+        tracker.sensor_entity_id = reg_entry.entity_id
+        await tracker.async_load()
+        tracker.start()
+        trackers[index] = tracker
+    return trackers
+
+
 async def _notify_unpainted_climate_schedules(hass: HomeAssistant, entry: ConfigEntry, sched_store) -> None:
     """Nudge for a climate.*-controlled deferrable load (aircon) with no painted weekly
     schedule (§8 in FEATURES.md).
@@ -1869,6 +1931,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except Exception as _load_err:  # noqa: BLE001
         _LOGGER.warning("Deferrable load control setup failed: %s", _load_err)
 
+    # Greedy Consumption energy trackers (greedy_energy.py) — must run AFTER the load
+    # control manager above, unlike _ensure_load_estimators: eligibility and the live
+    # greedy_reason read both come from LoadControlManager.controllers, which doesn't
+    # exist until here.
+    try:
+        hass.data[DOMAIN][f"{entry.entry_id}_greedy_trackers"] = (
+            await _ensure_greedy_trackers(hass, entry)
+        )
+    except Exception as _greedy_err:  # noqa: BLE001
+        _LOGGER.warning("Greedy energy tracker setup failed: %s", _greedy_err)
+
     # Register services
     from .services import async_setup_services
     await async_setup_services(hass, entry)
@@ -1928,6 +2001,15 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception:  # noqa: BLE001
             pass
 
+    # Stop each greedy-energy tracker's listener — same "just cancelling background work,
+    # no deadman" reasoning as the estimators above.
+    _greedy_trackers = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_greedy_trackers", {})
+    for _tracker in _greedy_trackers.values():
+        try:
+            _tracker.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         hass.data[DOMAIN].pop(entry.entry_id)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_advisory", None)
@@ -1937,6 +2019,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_schedules", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_load_estimators", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_power_estimators", None)
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_greedy_trackers", None)
 
     return unload_ok
 

@@ -144,6 +144,22 @@ GloBird's 0c import Free Window and 0c export No-Feed-in window). `_compute_bill
 separate `cap_labels` (import) and `export_cap_labels` (export) dicts for exactly this
 reason — don't merge them back into one shared dict. See the checklist entry.
 
+**"Exclude Greedy Consumption" checkbox (added 2026-08-30).** In the Plan Comparison
+toolbar (`grid-lens-card.js`, next to the retailer filter), **unchecked by default**. When
+checked, each deferrable device's `daily_kwh` target — the number fed to the LP when
+scoring *alternative* plans, `sensor_total / days` in `plan_calculator._get_deferrable_data`
+— has its tracked Greedy Consumption energy (§7) subtracted first, via
+`calculate_plan_costs(..., exclude_greedy=True)` → `?exclude_greedy=true` on
+`/api/grid_lens/plan_stream` and `/plan_data`. Rationale: Greedy Consumption (§7)
+opportunistically runs a device whenever the *current* plan makes energy momentarily free;
+left in, that inflated average gets re-asked of every alternative plan as if it were
+unconditional need, silently favouring whatever plan created the free windows the device
+exploited. **Deliberately does not touch**: the current plan's own actual-bill total (always
+real metered usage — see the previous entry), or the `combined`/base-load series used for
+the non-deferrable "other load" hour-of-day average (that must keep reflecting real physical
+energy flow regardless of *why* a device drew power). Has no effect on a period predating
+the tracker (§7's "no retroactive data" caveat) — expected, not a bug.
+
 ---
 
 ## 2. The optimiser (layer 2 core)
@@ -695,6 +711,41 @@ Three further changes make an empty field visible rather than silent:
 **Observability** — see §11.
 
 **Tuning knob:** `GREEDY_SURPLUS_LOOKAHEAD_HOURS = 4.0` in `load_control_manager.py`.
+
+**Greedy energy tracking (added 2026-08-30).** A per-device `sensor.*_<device>_greedy_consumption`
+entity — cumulative kWh the device drew while any of the three conditions above were
+actually driving it, as opposed to the plan or a manual command. Feeds §1's "exclude Greedy
+Consumption" plan-comparison option: without this, the `daily_kwh` figure fed to the LP for
+every *alternative* plan is inflated by whatever a device opportunistically ran only because
+the *current* plan happened to offer a free window — biasing the comparison toward the plan
+that created the free energy in the first place.
+
+**Files:** `greedy_energy_math.py` (pure accumulate/counter-reset logic, mirrors
+`load_estimate_math.py`'s split), `greedy_energy.py` (`GreedyEnergyStore` +
+`GreedyEnergyTracker` — persists via its own Store, same "manager persists, entity just
+displays it" split as `load_estimation.LoadEstimator`), `sensor.py`'s
+`GridLensGreedyEnergySensor`, `__init__.py::_ensure_greedy_trackers` (wiring — runs *after*
+`LoadControlManager` is built, unlike `_ensure_load_estimators`, since eligibility and the
+live `greedy_reason` read both come from `LoadControlManager.controllers`).
+
+One tracker per device index that has both a real/synthetic energy sensor
+(`deferrable_load_sensors[i]`) **and** a controller in `LoadControlManager.controllers` —
+forecast-only and declared/"dummy" loads never qualify, since nothing decides on/off for
+them so Greedy Consumption could never have driven them. Applied uniformly to on/off and
+modulating (§6a) controllers alike: on every change of the device's own energy sensor, the
+tracker attributes the *entire* delta since the last reading to "greedy" whenever
+`controller.greedy_reason` is truthy at that moment. This is a deliberate, coarse
+approximation — a modulating device's current can be a live blend of plan-driven and
+surplus-boosted power, and this tracker doesn't attempt to split that blend, only to decide
+whether *any* greedy influence was present. Same counter-reset guard as `LoadEstimator`'s
+own-meter sampling (a device reboot resetting its energy counter is discarded, not
+subtracted).
+
+⚠ **Tracked going forward only — no retroactive data.** The tracker starts at 0 kWh
+whenever a device first qualifies; a plan comparison over a period that predates this
+feature (or predates the device being configured) has nothing to exclude, and the §1
+checkbox will silently produce the same result as unchecked for that period. This is
+expected, not a bug — there is no way to know retroactively which past energy was greedy.
 
 ---
 

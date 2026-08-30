@@ -376,16 +376,21 @@ class PlanCalculator:
         end_date: datetime = None,
         on_plan_ready=None,  # async callable(plan_key, detail, meta) — called after each plan
         on_progress=None,    # async callable(message, step, total) — called after each data fetch
+        exclude_greedy: bool = False,
     ) -> dict[str, Any]:
         """Calculate costs for all plans based on historical usage.
-        
+
         With battery:
         - Current plan: Uses ACTUAL battery behavior from sensors
         - Alternative plans: Uses OPTIMIZED battery strategy
-        
+
         Args:
             start_date: Start of analysis period (defaults to 30 days ago)
             end_date: End of analysis period (defaults to now)
+            exclude_greedy: When True, each deferrable device's daily_kwh target (fed to
+                the LP for scoring ALTERNATIVE plans only — never the current plan's actual
+                bill, computed separately above) has its tracked Greedy Consumption energy
+                (greedy_energy.py) subtracted first. See _get_deferrable_data.
         """
         # Default to last 30 days if not specified (UTC-aware)
         if end_date is None:
@@ -527,7 +532,9 @@ class PlanCalculator:
         deferrable_loads: list[dict] = []
         deferrable_per_sensor_hod: list[dict] = []
         if self.deferrable_load_sensors:
-            deferrable_data, deferrable_loads, deferrable_per_sensor_hod = await self._get_deferrable_data(start_date, end_date)
+            deferrable_data, deferrable_loads, deferrable_per_sensor_hod = await self._get_deferrable_data(
+                start_date, end_date, exclude_greedy=exclude_greedy
+            )
             await _progress("Fetched deferrable load history")
             if deferrable_data:
                 deferrable_hod_avg = self._aggregate_kwh_by_hod(deferrable_data)
@@ -1794,7 +1801,7 @@ class PlanCalculator:
         return max(0.0, amps * volts * phases) / 1000.0
 
     async def _get_deferrable_data(
-        self, start_time: datetime, end_time: datetime
+        self, start_time: datetime, end_time: datetime, exclude_greedy: bool = False
     ) -> tuple[list[dict], list[dict], list[dict]]:
         """Fetch all deferrable load sensors.
 
@@ -1805,12 +1812,22 @@ class PlanCalculator:
               'daily_kwh', 'max_kw'
             - per_sensor_hod_avgs: list of {hour: avg_kwh} dicts, one per sensor,
               for per-device chart display on market-linked plan profiles
+
+        exclude_greedy: when True, each device's daily_kwh (below) has its tracked Greedy
+            Consumption energy (greedy_energy.py) subtracted first, so the LP isn't asked
+            to re-justify — for every ALTERNATIVE plan — demand that only existed because
+            the current plan made it momentarily free. combined_list/per_sensor_hod_avgs
+            (base-load subtraction, chart display) are deliberately NOT touched: those
+            must keep reflecting real physical energy flow. See FEATURES.md §1/§7.
         """
         from collections import defaultdict
         combined: dict = defaultdict(float)
         deferrable_loads: list[dict] = []
         per_sensor_hod_avgs: list[dict] = []
         days = max(1, round((end_time - start_time).total_seconds() / 86400))
+        greedy_trackers = self.hass.data.get(DOMAIN, {}).get(
+            f"{self.entry.entry_id}_greedy_trackers", {}
+        ) if exclude_greedy else {}
         # Same name resolution as sensor.py's _build_deferrable_loads (control switch
         # anchor first, then the Energy Dashboard's per-device label, e.g. "Hot Water")
         # so the power chart's legend/tooltip names match the power-flow card's — a raw
@@ -1868,7 +1885,21 @@ class PlanCalculator:
                 except Exception:  # noqa: BLE001 — a broken store must not kill the calc
                     week = None
 
-            daily_kwh = sensor_total / days
+            greedy_kwh = 0.0
+            tracker = greedy_trackers.get(i)
+            if tracker is not None and getattr(tracker, "sensor_entity_id", None):
+                greedy_raw = await self._get_usage_data(
+                    start_time, end_time, tracker.sensor_entity_id
+                )
+                greedy_kwh = sum(d["value"] for d in greedy_raw) if greedy_raw else 0.0
+                if greedy_kwh > 0.0:
+                    _LOGGER.info(
+                        "Deferrable %s: excluding %.2f kWh of tracked Greedy Consumption "
+                        "from its %.2f kWh alternative-plan target",
+                        sensor_id, greedy_kwh, sensor_total,
+                    )
+
+            daily_kwh = max(0.0, sensor_total - greedy_kwh) / days
             if week is not None:
                 from .schedule_grid import max_daily_hours
                 window_capacity = max_daily_hours(week) * max_kw

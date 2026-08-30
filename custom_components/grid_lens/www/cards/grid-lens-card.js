@@ -11,6 +11,7 @@ class GridLensCard extends HTMLElement {
     this._chartScale = 1.0;
     this._showHistory = false;
     this._retailerFilter = '';   // live retailer search box, applied as the user types
+    this._excludeGreedy = false; // "exclude greedy consumption" checkbox — see setConfig
 
     this._history = null;
     this._editingId = null;
@@ -34,6 +35,7 @@ class GridLensCard extends HTMLElement {
     try {
       if (!this._startDate) this._startDate = localStorage.getItem('epc-date-start') || '';
       if (!this._endDate)   this._endDate   = localStorage.getItem('epc-date-end')   || '';
+      if (!this._excludeGreedy) this._excludeGreedy = localStorage.getItem('epc-exclude-greedy') === 'true';
     } catch (_) {}
     this.render();
   }
@@ -55,7 +57,7 @@ class GridLensCard extends HTMLElement {
     if (!this._connected || this._fetching) return;
 
     // Return cached result instantly when navigating back to the card.
-    const cacheKey = `${startDate || ''}|${endDate || ''}`;
+    const cacheKey = `${startDate || ''}|${endDate || ''}|${this._excludeGreedy}`;
     if (!forceRefresh) {
       const hit = GridLensCard._cache[cacheKey];
       if (hit) {
@@ -95,8 +97,11 @@ class GridLensCard extends HTMLElement {
     const rangeStart = withTime(startDate, '00:00:00');
     const rangeEnd   = withTime(endDate,   '23:59:59');
 
-    const params = (rangeStart && rangeEnd)
+    let params = (rangeStart && rangeEnd)
       ? `?start_date=${rangeStart}&end_date=${rangeEnd}` : '';
+    if (this._excludeGreedy) {
+      params += params ? '&exclude_greedy=true' : '?exclude_greedy=true';
+    }
     const src = new EventSource(`/api/grid_lens/plan_stream${params}`);
     this._activeSource = src;
 
@@ -146,7 +151,7 @@ class GridLensCard extends HTMLElement {
       this._fetching    = false;
       const full = JSON.parse(e.data);
       this._data = full;
-      const cacheKey = `${startDate || ''}|${endDate || ''}`;
+      const cacheKey = `${startDate || ''}|${endDate || ''}|${this._excludeGreedy}`;
       GridLensCard._cache[cacheKey] = full;
       this._updateDatesFromData(startDate);
       this.render();
@@ -552,6 +557,12 @@ class GridLensCard extends HTMLElement {
           border-color: var(--primary-color, #03a9f4);
         }
         .filter-count { font-size: 12px; color: var(--secondary-text-color); white-space: nowrap; }
+        .greedy-toggle {
+          display: inline-flex; align-items: center; gap: 5px;
+          font-size: 12px; color: var(--secondary-text-color);
+          white-space: nowrap; cursor: pointer;
+        }
+        .greedy-toggle input[type="checkbox"] { margin: 0; cursor: pointer; }
         .plan-card[hidden] { display: none; }
         .strategy-text { font-size: 12px; color: var(--secondary-text-color); line-height: 1.4; white-space: pre-line; }
         .error { padding: 16px; color: var(--error-color); text-align: center; }
@@ -1031,6 +1042,11 @@ class GridLensCard extends HTMLElement {
           </datalist>
           <span class="filter-count" id="epc-filter-count"></span>
         </span>
+        <label class="greedy-toggle"
+               title="Only affects alternative plans below — your current plan's cost is always your real bill. Only counts Greedy Consumption energy tracked since this feature shipped; older periods have nothing to exclude yet.">
+          <input type="checkbox" id="epc-exclude-greedy" ${this._excludeGreedy ? 'checked' : ''} ${_busy ? 'disabled' : ''}>
+          Exclude Greedy Consumption
+        </label>
         <button id="epc-history-btn" class="nav-btn${this._showHistory ? ' active' : ''}">History</button>
         <a href="/api/grid_lens/diagnostic_export" download class="nav-btn" title="Download diagnostic zip for bug reporting" style="text-decoration:none;">&#8659; Diagnostic</a>
       </div>`;
@@ -1127,6 +1143,14 @@ class GridLensCard extends HTMLElement {
       const btn = this.shadowRoot.getElementById('epc-calc');
       if (btn) { btn.disabled = true; btn.textContent = 'Calculating…'; }
       this.fetchData(s, e, true); // forceRefresh — user explicitly requested
+    });
+
+    this.shadowRoot.getElementById('epc-exclude-greedy')?.addEventListener('change', (ev) => {
+      this._excludeGreedy = ev.target.checked;
+      try { localStorage.setItem('epc-exclude-greedy', String(this._excludeGreedy)); } catch (_) {}
+      const s = this.shadowRoot.getElementById('epc-start')?.value || this._startDate;
+      const e = this.shadowRoot.getElementById('epc-end')?.value   || this._endDate;
+      triggerFetch(s, e, 'epc-calc');
     });
 
     this.shadowRoot.getElementById('epc-zoom-in')?.addEventListener('click', () => {

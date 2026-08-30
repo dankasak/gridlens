@@ -93,7 +93,7 @@
         <h2 id="dashboard">View the dashboard</h2>
         <p>Grid Lens adds a <strong>Grid Lens</strong> dashboard to your Home Assistant sidebar automatically — no cards to add, no YAML. It has three views:</p>
         <ul>
-          <li><strong>Plan Comparison</strong> — cost across all modelled plans for a date range you choose, the optimal usage profile under each, and the estimated bill for the period. Type in the <strong>retailer filter</strong> at the top to narrow the list as you type.</li>
+          <li><strong>Plan Comparison</strong> — cost across all modelled plans for a date range you choose, the optimal usage profile under each, and the estimated bill for the period. Type in the <strong>retailer filter</strong> at the top to narrow the list as you type. The <strong>Exclude Greedy Consumption</strong> checkbox alongside it keeps opportunistic runs (see <a href="#greedy">Greedy Consumption</a>) out of what alternative plans are scored against, so a device that only ran extra because your current plan made it free doesn't make every other plan look worse than it is. Your own plan's cost is never affected — it's always your real bill.</li>
           <li><strong>Battery Plan</strong> — live energy flow, forecast vs. measured power, the battery state-of-charge curve, and the planned dispatch timeline.</li>
           <li><strong>Settings</strong> — deferrable load controls, allowed run times, and optimiser tuning.</li>
         </ul>
@@ -210,6 +210,7 @@
 
         <p>If it is blank and Greedy Consumption is on, the Deferrable Loads card says so &mdash; the appliance's greedy line reads <em>&ldquo;export is free, but no grid power sensor is set&rdquo;</em> rather than pretending it is still waiting for surplus.</p>
         <p>Note this is a <em>power</em> (W) sensor, not one of the cumulative kWh sensors from your Energy dashboard.</p>
+        <p>Grid Lens keeps a running <strong>Greedy Consumption</strong> energy sensor per appliance, tracked from the moment you enable it (there's no way to know retroactively what ran opportunistically before that). It's what powers the Plan Comparison page's <strong>Exclude Greedy Consumption</strong> checkbox — see <a href="#dashboard">View the dashboard</a>.</p>
 
         <h2 id="observability">Seeing why it acted</h2>
         <p>Anything that acts on your house should be able to explain itself. Every automated decision Grid Lens makes is visible on the dashboard:</p>
