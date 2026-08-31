@@ -528,13 +528,27 @@ def versioned_plans_from_history(plan_dict: dict, history: dict,
     overlapping the period become VersionedPlan wrappers built from the
     /plans/history payload ({plan_id: [{effective_from, effective_to, plan}]}).
     Plans absent from the history payload fall back to their current data.
+
+    A single overlapping version is NOT the same as "use current data": /plans/
+    history only returns versions that actually overlap [period_start,
+    period_end], so when a plan has rate history but the requested period falls
+    entirely inside one *older* segment, that segment is correctly the only
+    entry — and it must still be used verbatim, not swapped for plan_dict's
+    current/live snapshot (a different, later version). Using current data here
+    silently re-priced any wholly-historical period with today's rates whenever
+    exactly one historical segment matched — caught 2026-08-31 when a plan with
+    a 22 Jul rate change still showed the post-22-Jul rate for a 12-20 Jul bill.
     """
     result: list[RetailerPlan] = []
     for plan_id, plan_data in plan_dict.items():
         versions = (history or {}).get(plan_id) or []
-        if len(versions) <= 1:
+        if not versions:
             result.append(PlanFromData(
                 _prepare_plan_data(plan_id, plan_data, network_operators)))
+            continue
+        if len(versions) == 1:
+            result.append(PlanFromData(
+                _prepare_plan_data(plan_id, versions[0]["plan"], network_operators)))
             continue
         segments = [
             (v.get("effective_from"), v.get("effective_to"),
