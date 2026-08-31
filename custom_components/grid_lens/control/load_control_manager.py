@@ -38,6 +38,10 @@ from homeassistant.helpers.event import async_track_time_change
 from homeassistant.util import dt as dt_util
 
 from ..const import (
+    CONF_BATTERY_CHARGE_POWER_SENSOR,
+    CONF_BATTERY_MAX_DISCHARGE_RATE,
+    CONF_BATTERY_MIN_SOC,
+    CONF_BATTERY_SOC_SENSOR,
     CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE,
     CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_MIN_CURRENT,
@@ -107,6 +111,18 @@ class LoadControlManager:
         # Logged once per manager rather than every 5-minute tick, per CONF_GRID_POWER_SENSOR's
         # own "fails open, logs once" discipline.
         self._warned_no_grid_power = False
+
+        # Battery config for Greedy Consumption's forecast-surplus condition (see
+        # DeferrableLoadController's module docstring and _battery_headroom_w below). Reused
+        # verbatim from the LP optimiser's own battery config (plan_calculator.py) rather than
+        # a control-specific duplicate — same numbers, same source of truth. Gated on the two
+        # sensors being set, not a separate has_battery flag: an install with no battery has
+        # neither sensor configured either, so checking them directly is enough and avoids a
+        # second flag to keep in sync.
+        self._battery_soc_sensor: str = d.get(CONF_BATTERY_SOC_SENSOR) or ""
+        self._battery_charge_power_sensor: str = d.get(CONF_BATTERY_CHARGE_POWER_SENSOR) or ""
+        self._battery_min_soc: float = float(d.get(CONF_BATTERY_MIN_SOC, 10.0))
+        self._battery_max_discharge_rate_kw: float = float(d.get(CONF_BATTERY_MAX_DISCHARGE_RATE, 5.0))
 
         # One controller per device that has a control entity configured. Keyed by the
         # device's index in the deferrable lists, so DispatchInterval.deferrable_w[i] lines
@@ -414,8 +430,10 @@ class LoadControlManager:
         if controller.greedy_respects_schedule:
             schedule_allows = await self._schedule_allows_now(index, now)
         free_kwh, free_hours = (None, 0.0)
+        battery_headroom_w: Optional[float] = None
         if controller.greedy and controller.greedy_forecast_surplus:
             free_kwh, free_hours = self._forecast_free_kwh(index, now)
+            battery_headroom_w = self._battery_headroom_w()
         if controller.greedy and not self._grid_power_sensor and not self._warned_no_grid_power:
             # Greedy's export-surplus condition is the one that catches a house spilling
             # kilowatts at a $0 export price, and it is silently unavailable without this
@@ -441,6 +459,7 @@ class LoadControlManager:
                 schedule_allows=schedule_allows,
                 forecast_free_kwh=free_kwh,
                 forecast_hours=free_hours,
+                battery_headroom_w=battery_headroom_w,
             )
         except Exception as err:  # noqa: BLE001 — a bad device tick must not kill the timer
             _LOGGER.error("Load control tick failed for %s: %s", self.controllers[index].name, err)
@@ -642,6 +661,53 @@ class LoadControlManager:
         export-surplus condition. None if unconfigured/unavailable/unparseable — the
         controller treats that as "unknown", never guessing a value."""
         return self._read_power_w(self._grid_power_sensor)
+
+    def _read_percent(self, entity_id: str) -> Optional[float]:
+        """A plain 0-100 sensor reading (SOC), or None if unconfigured/unavailable."""
+        if not entity_id:
+            return None
+        st = self.hass.states.get(entity_id)
+        if st is None or st.state in ("unknown", "unavailable", None):
+            return None
+        try:
+            return float(st.state)
+        except (TypeError, ValueError):
+            return None
+
+    def _battery_headroom_w(self) -> Optional[float]:
+        """Battery discharge headroom (W) available right now without dropping SOC below
+        its configured minimum, or None if a battery isn't configured/readable.
+
+        Backs Greedy Consumption's forecast-surplus condition (see
+        ``DeferrableLoadController``'s module docstring): that condition pays for itself by
+        drawing the battery down now and letting the forecast spill refill it later, so it
+        must never be allowed to fire unless the battery can actually absorb the device's
+        full draw right now — otherwise firing is just real, unbuffered grid import wearing
+        a forecast's clothing.
+
+        None (never 0) whenever the SOC sensor or the signed charge-power sensor is missing
+        or unreadable — same fail-closed discipline as every other Greedy Consumption input;
+        a household with no battery configured must never have this silently read as
+        "unlimited headroom". 0.0 (a real, measured answer) once SOC is at or below the
+        configured minimum: there is a battery, it just has nothing spare to give.
+
+        ``_battery_charge_power_sensor`` is signed, positive = charging, negative =
+        discharging (same convention plan_calculator.py's battery backtest already uses) —
+        the discharging magnitude is netted off the rated max discharge rate to get what's
+        actually still free, not just what the battery is rated for.
+        """
+        if not self._battery_soc_sensor or not self._battery_charge_power_sensor:
+            return None
+        soc = self._read_percent(self._battery_soc_sensor)
+        if soc is None:
+            return None
+        if soc <= self._battery_min_soc:
+            return 0.0
+        charge_w = self._read_power_w(self._battery_charge_power_sensor)
+        if charge_w is None:
+            return None
+        discharging_w = max(0.0, -charge_w)
+        return max(0.0, self._battery_max_discharge_rate_kw * 1000.0 - discharging_w)
 
     def _read_device_power_w(self, index: int) -> Optional[float]:
         """Live power (W) device ``index`` is drawing right now, for the surplus term's

@@ -194,17 +194,19 @@
           <tbody>
             <tr><td>Free import</td><td>Your plan's import price for this window is zero.</td><td class="check">No</td></tr>
             <tr><td>Export surplus</td><td>Your feed-in price is zero <em>and</em> you're already exporting at least as much as this appliance draws — so running it can't create new grid import.</td><td class="check">No</td></tr>
-            <tr><td>Forecast surplus</td><td>Over the next few hours the plan expects to spill more free energy than this appliance could use running flat out for that entire window.</td><td>Yes — briefly</td></tr>
+            <tr><td>Forecast surplus</td><td>Over the next few hours the plan expects to spill more free energy than this appliance could use running flat out for that entire window &mdash; <em>and</em> your battery currently has enough charge and free discharge rate to actually supply the appliance, so it draws down the battery rather than the grid.</td><td class="check">No</td></tr>
           </tbody>
         </table>
         <p>The first two only fire once free energy is <em>already</em> flowing. That's often too late: mid-morning your battery absorbs every spare watt, so nothing looks free, even though the plan already knows the afternoon will spill far more than the appliance could ever consume. By the time surplus export actually appears, hours of run-time are gone.</p>
-        <p><strong>Forecast surplus</strong> fixes that by starting the load early. It's a separate opt-in because it's the one trigger that can draw a little priced grid power in the moment, in exchange for capturing a much larger forecast spill — on a house with a battery, that gap gets refilled by energy that would otherwise have been exported for nothing.</p>
-        <p>The bar is deliberately high: it only fires when the plan would still be wasting free energy <em>even with this appliance running continuously for the whole look-ahead window</em>. A little spare solar never trips it.</p>
+        <p><strong>Forecast surplus</strong> fixes that by starting the load early. It's a separate opt-in because it's the one trigger that fires ahead of any live signal — the other two only ever confirm energy that is already flowing. It is safe because it also checks, live, that your battery has enough charge and free discharge rate to supply the appliance right now: running it then draws the battery down instead of the grid, and that gap gets refilled by the very energy the forecast expects to spill. No battery configured (or its sensors not readable) simply means this trigger never fires — there's no buffer to safely bet on.</p>
+        <p>The forecast bar is also deliberately high: it only fires when the plan would still be wasting free energy <em>even with this appliance running continuously for the whole look-ahead window</em>. A little spare solar never trips it.</p>
         <div class="note">
           <strong>Optional guardrails:</strong> <em>Greedy Respects Schedule</em> confines greedy to the appliance's own allowed run times. And a manual override always wins — greedy is suppressed entirely while you have a load forced On or Off.
         </div>
         <h3>Setting up the export-surplus trigger</h3>
         <p>The <em>export surplus</em> trigger needs a <strong>live signed grid power sensor</strong> &mdash; positive when importing, negative when exporting &mdash; configured as <code>grid_power_sensor</code> under <strong>Grid Lens &rarr; Configure</strong>. Without it that one trigger simply never fires; the other two still work.</p>
+        <h3>Setting up the forecast-surplus trigger</h3>
+        <p>The <em>forecast surplus</em> trigger needs your <strong>battery SOC sensor</strong> and a <strong>live signed battery charge/discharge power sensor</strong> &mdash; positive when charging, negative when discharging &mdash; the same battery details Grid Lens already uses to plan your battery. Without both configured and readable, this trigger simply never fires; the other two still work.</p>
 
         <p>If you have already set up the <strong>Power Flow card</strong>, you have told Grid Lens this entity once and it is filled in for you &mdash; the card's <code>grid_power_entity</code> is the same reading with the same sign convention, so the setup form offers it back rather than asking twice. Otherwise the field starts blank: the other energy sensors come from your Home Assistant Energy dashboard, but that dashboard only records cumulative energy and has no live power reading to borrow.</p>
 

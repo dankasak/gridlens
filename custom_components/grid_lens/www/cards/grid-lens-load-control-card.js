@@ -645,6 +645,22 @@ class GridLensLoadControlCard extends HTMLElement {
       }
       return `<div class="greedy-line active">Greedy: ${label}${nums}${bar}</div>`;
     }
+    if (a.greedy_blocked === 'no_battery_headroom') {
+      // Also not self-clearing noise: the forecast bar is already full (free energy really
+      // is being wasted over the look-ahead) and greedy STILL won't act, because there's no
+      // battery configured/readable to safely draw the device's power from right now. Show
+      // the same progress bar as the "armed" case below so the forecast side reads
+      // identically — only the reason it can't act differs.
+      const have = a.forecast_free_kwh != null ? +a.forecast_free_kwh : null;
+      const need = a.forecast_needed_kwh != null ? +a.forecast_needed_kwh : null;
+      const nums = have != null && need ? ` (${have.toFixed(1)} of ${need.toFixed(1)} kWh)` : '';
+      return `<div class="greedy-line" data-tip="${esc('The forecast-surplus bar has cleared, but '
+        + 'this condition also needs the battery to have enough SOC and free discharge rate to '
+        + 'cover this device right now — otherwise turning it on would draw straight from the '
+        + 'grid. Configure a Battery SOC sensor and a signed Battery charge power sensor in '
+        + 'Grid Lens > Reconfigure > Battery, or wait for the battery to have headroom.')}" tabindex="0">`
+        + `Greedy: forecast surplus reached, but no battery headroom${nums}</div>`;
+    }
     if (a.greedy_blocked === 'no_grid_power') {
       // Distinct from the two "armed, but not right now" cases below it: this one is not a
       // condition that will clear on its own. Export is free RIGHT NOW and greedy still

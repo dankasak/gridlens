@@ -376,6 +376,7 @@ class ModulatingLoadController(DeferrableLoadController):
         schedule_allows: Optional[bool] = None,
         forecast_free_kwh: Optional[float] = None,
         forecast_hours: Optional[float] = None,
+        battery_headroom_w: Optional[float] = None,
     ) -> None:
         """Evaluate the plan and the greedy conditions for this slot — and write nothing.
 
@@ -393,11 +394,12 @@ class ModulatingLoadController(DeferrableLoadController):
             self._greedy_blocked = "override"
             self._greedy_free_kwh = None
             self._greedy_needed_kwh = None
+            self._greedy_battery_headroom_w = None
             return
 
         greedy_on = self._greedy_wants_on(
             import_rate, export_rate, grid_power_w, schedule_allows,
-            forecast_free_kwh, forecast_hours,
+            forecast_free_kwh, forecast_hours, battery_headroom_w,
         )
         self._planned_w = max(0.0, float(planned_w))
         self._want_on = greedy_on or self._planned_w > 0.0

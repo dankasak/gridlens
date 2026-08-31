@@ -302,9 +302,14 @@ class GridLensDeferrableGreedySurplusSwitch(RestoreEntity, SwitchEntity):
     the device could consume running flat out for that whole window.
 
     Separate from the master Greedy switch (and requires it) because this is the one
-    greedy condition that can genuinely cost money in the moment — the other two only
-    fire on energy that is already free right now, this one starts early to catch a spill
-    that hasn't arrived yet. Defaults OFF, like every other load-control opt-in.
+    greedy condition that fires ahead of any live signal — the other two only fire on
+    energy that is already free right now, this one starts early to catch a spill that
+    hasn't arrived yet. It is additionally gated on live battery headroom (see
+    LoadControlManager._battery_headroom_w / DeferrableLoadController's module docstring)
+    so it can only actually fire when the battery has enough SOC and free discharge rate to
+    supply the device right now — running now draws the battery down, not the grid, and the
+    forecast spill this bets on refills it later. No battery configured means no buffer, so
+    it never fires there. Defaults OFF, like every other load-control opt-in.
 
     Same deliberate simplification as the two greedy switches above: no manager
     state-listener wiring (that slot is owned by GridLensDeferrableLoadSwitch).

@@ -61,13 +61,20 @@ is SOC-guardrail- and inverter-HAL-specific):
   energy will be thrown away than this device could consume running flat out for that
   whole window, run it now.
 
-  This one is a genuine bet and is therefore separately opt-in: unlike the other two it
-  CAN create real, priced grid import in the moment, in exchange for capturing a much
-  larger forecast spill. The mechanism that makes it pay is the battery — running now
-  draws the battery down (or leaves it lower), and that hole is refilled by surplus that
-  would otherwise have been exported for nothing. The "could run flat out for the whole
-  window and still spill" threshold is what keeps it honest: a marginal, uncertain
-  surplus never trips it.
+  This one is opt-in on top of the master switch because it fires ahead of any live
+  signal, purely off the plan's forecast — the other two only ever confirm energy that is
+  already flowing. To keep it from ever creating real grid import, it is additionally
+  gated on live battery headroom (``battery_headroom_w``, computed by
+  ``LoadControlManager._battery_headroom_w`` from the configured battery SOC and charge
+  power sensors): it may only fire when the battery's current SOC is above its configured
+  minimum with enough free discharge rate to supply this device's full draw right now.
+  That's what makes the bet safe — running now draws the battery down rather than the
+  grid, and that hole is refilled by the forecast spill this condition is betting on. No
+  battery configured, or an unreadable SOC/charge sensor, means there is no buffer to draw
+  on, so the condition fails closed and simply never fires — same discipline as every
+  other Greedy Consumption input. The "could run flat out for the whole window and still
+  spill" threshold on the forecast side is unchanged and still has to clear first: a
+  marginal, uncertain surplus never trips this even when the battery has headroom to spare.
 """
 from __future__ import annotations
 
@@ -148,6 +155,7 @@ class DeferrableLoadController:
         self._greedy_blocked: Optional[str] = None
         self._greedy_free_kwh: Optional[float] = None
         self._greedy_needed_kwh: Optional[float] = None
+        self._greedy_battery_headroom_w: Optional[float] = None
 
     # ------------------------------------------------------------------ identity
     @property
@@ -195,6 +203,7 @@ class DeferrableLoadController:
         schedule_allows: Optional[bool],
         forecast_free_kwh: Optional[float] = None,
         forecast_hours: Optional[float] = None,
+        battery_headroom_w: Optional[float] = None,
     ) -> bool:
         """True if Greedy Consumption says "on" right now, independent of the plan.
 
@@ -214,6 +223,7 @@ class DeferrableLoadController:
         self._greedy_needed_kwh = (
             self.forecast_surplus_needed_kwh(forecast_hours) if forecast_hours else None
         )
+        self._greedy_battery_headroom_w = battery_headroom_w
         self._greedy_reason = None
         self._greedy_blocked = None
         if not self._greedy_enabled:
@@ -245,7 +255,7 @@ class DeferrableLoadController:
                     self._greedy_reason = "export_surplus"
                     self._greedy_blocked = None
                     return True
-        if self._forecast_surplus_wants_on(forecast_free_kwh, forecast_hours):
+        if self._forecast_surplus_wants_on(forecast_free_kwh, forecast_hours, battery_headroom_w):
             self._greedy_reason = "forecast_surplus"
             # A later condition firing supersedes the block recorded above — greedy is on,
             # so publishing a "blocked" reason alongside it would just be noise.
@@ -276,7 +286,10 @@ class DeferrableLoadController:
         return max(0.0, self.max_w) / 1000.0 * max(0.0, hours)
 
     def _forecast_surplus_wants_on(
-        self, forecast_free_kwh: Optional[float], forecast_hours: Optional[float]
+        self,
+        forecast_free_kwh: Optional[float],
+        forecast_hours: Optional[float],
+        battery_headroom_w: Optional[float] = None,
     ) -> bool:
         """Third greedy condition: the plan forecasts more free energy going to waste
         over the look-ahead than this device could possibly absorb (see module docstring).
@@ -287,13 +300,29 @@ class DeferrableLoadController:
         nominal look-ahead near the end of the plan horizon — so the bar scales down with
         it rather than becoming unreachable. Fails closed on missing inputs, like the
         other two conditions.
+
+        ``battery_headroom_w`` is the live battery discharge headroom (W)
+        ``LoadControlManager._battery_headroom_w`` computes from the configured battery
+        SOC and charge-power sensors — None when no battery is configured, or a reading
+        is unavailable. The forecast clearing its bar is necessary but not sufficient:
+        this condition may only actually fire when the battery can cover this device's
+        full draw right now, so it draws the battery down instead of the grid (see the
+        module docstring's "Forecast surplus" section). Records ``"no_battery_headroom"``
+        in ``_greedy_blocked`` when the forecast alone would have fired — otherwise a
+        battery that's flat or unconfigured makes this condition look silently inert
+        rather than "armed but can't safely act right now".
         """
         if not self._greedy_forecast_surplus:
             return False
         if forecast_free_kwh is None or not forecast_hours or forecast_hours <= 0.0:
             return False
         needed = self.forecast_surplus_needed_kwh(forecast_hours)
-        return needed > 0.0 and forecast_free_kwh >= needed
+        if not (needed > 0.0 and forecast_free_kwh >= needed):
+            return False
+        if battery_headroom_w is None or battery_headroom_w < self.max_w:
+            self._greedy_blocked = "no_battery_headroom"
+            return False
+        return True
 
     def _actual_state(self) -> Optional[bool]:
         st = self.hass.states.get(self.switch_entity_id)
@@ -325,6 +354,7 @@ class DeferrableLoadController:
         schedule_allows: Optional[bool] = None,
         forecast_free_kwh: Optional[float] = None,
         forecast_hours: Optional[float] = None,
+        battery_headroom_w: Optional[float] = None,
     ) -> None:
         """Reconcile the switch toward the plan (plus Greedy Consumption, if enabled)
         for this tick.
@@ -344,14 +374,23 @@ class DeferrableLoadController:
             self._greedy_blocked = "override"
             self._greedy_free_kwh = None
             self._greedy_needed_kwh = None
+            self._greedy_battery_headroom_w = None
             return
 
         greedy_on = self._greedy_wants_on(
             import_rate, export_rate, grid_power_w, schedule_allows,
-            forecast_free_kwh, forecast_hours,
+            forecast_free_kwh, forecast_hours, battery_headroom_w,
         )
-        want_on = greedy_on or self.desired_on(planned_w)
-        tag = "_greedy" if (want_on and greedy_on) else ""
+        plan_on = self.desired_on(planned_w)
+        if plan_on and self._greedy_reason is not None:
+            # The plan alone already wanted this device on this slot — greedy also
+            # matched, but it isn't WHY the device is running (the scheduler would have
+            # triggered this regardless), so don't attribute the run, or the energy it
+            # consumes, to greedy. Keeps the invariant status()/greedy_reason document:
+            # None = "greedy isn't the reason it's on; the plan is, or it's off."
+            self._greedy_reason = None
+        want_on = greedy_on or plan_on
+        tag = "_greedy" if self._greedy_reason else ""
 
         # First tick: establish a known state regardless of debounce.
         if self._commanded is None:
@@ -525,9 +564,12 @@ class DeferrableLoadController:
             "greedy_reason": self._greedy_reason,
             # Why greedy couldn't fire, when it couldn't: "schedule" (outside the device's
             # availability window with Respects Schedule on), "override" (a human has
-            # Force On/Off set), or "no_grid_power" (the export price is $0 but there is no
-            # readable grid power sensor, so the export-surplus condition can't be judged).
-            # None = greedy was free to fire and simply didn't match.
+            # Force On/Off set), "no_grid_power" (the export price is $0 but there is no
+            # readable grid power sensor, so the export-surplus condition can't be judged),
+            # or "no_battery_headroom" (the forecast-surplus bar cleared, but the battery
+            # has no configured/readable SOC-and-charge-sensor headroom to safely draw on,
+            # so firing would be real, unbuffered grid import). None = greedy was free to
+            # fire and simply didn't match.
             "greedy_blocked": self._greedy_blocked,
             # Forecast-surplus progress: free energy the plan expects to waste over the
             # look-ahead vs the bar it has to clear. Both None unless the forecast-surplus
@@ -537,6 +579,12 @@ class DeferrableLoadController:
             ),
             "forecast_needed_kwh": (
                 round(self._greedy_needed_kwh, 2) if self._greedy_needed_kwh is not None else None
+            ),
+            # Live battery discharge headroom (W) backing the forecast-surplus gate above.
+            # None = no battery configured, or the SOC/charge sensor couldn't be read.
+            "forecast_battery_headroom_w": (
+                round(self._greedy_battery_headroom_w, 1)
+                if self._greedy_battery_headroom_w is not None else None
             ),
             "note": self._note,
         }
