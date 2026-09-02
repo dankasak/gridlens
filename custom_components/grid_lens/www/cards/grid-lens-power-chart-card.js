@@ -23,6 +23,18 @@ import {
 const FREE_SPILL = 'var(--free-spill)';
 const FREE_IMPORT = 'var(--free-import)';
 
+// GreedyEnergyTracker's sensor only emits a new recorded sample when its cumulative
+// counter actually ticks up (greedy_energy.py's accumulate(), edge-triggered) — it never
+// writes a periodic "still greedy" heartbeat while flat. So a big gap between two
+// recorded samples (very often the synthetic "value at the start of the query window"
+// row through to the first real bump hours later) means the device was greedy for a
+// short stretch immediately before the second sample, not for the whole gap. Caps how
+// far _fetchGreedyBands() below can extend a band backward from its end — set to
+// LoadControlManager's default 5-minute tick (load_control_manager.py's
+// `interval_minutes`), since greedy_reason is only re-derived that often, so no single
+// step should ever need to represent more than that.
+const MAX_GREEDY_STEP_MS = 5 * 60 * 1000;
+
 class GridLensPowerChartCard extends GridLensChartCardBase {
   get title() { return 'Power — measured & forecast (kW)'; }
   get wantsEnergyHistory() { return true; }
@@ -276,12 +288,19 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
   // each device's GreedyEnergyTracker sensor (a cumulative kWh counter that only ever
   // rises while greedy_reason was truthy — see greedy_energy.py's accumulate()). HA
   // history only tells us WHEN the counter ticked up, not the underlying power sample's
-  // own resolution, so — same "a value holds from its own timestamp until the next
-  // recorded change" convention _series()/stepValueAt() already use elsewhere in this
-  // file — an increase between two consecutive samples is treated as genuine greedy
-  // consumption for the WHOLE interval between them, not just the instant it was
-  // recorded. Populates this._greedyBandsByDevice (parallel to this._deferNames), one
-  // array of {t0,t1} per device.
+  // own resolution, so an increase between two consecutive samples is treated as genuine
+  // greedy consumption ending at the later sample — but, unlike _series()/stepValueAt()'s
+  // "holds until the next recorded change" convention elsewhere in this file, NOT starting
+  // all the way back at the earlier one: this sensor is edge-triggered (a new sample only
+  // ever appears when the counter actually moves, never a periodic "still greedy"
+  // heartbeat), so a big gap between two samples is almost always a long quiet
+  // (non-greedy) stretch followed by a short greedy burst right before the later sample,
+  // not hours of continuous greedy. Confirmed against real data 2026-09-02: a single
+  // 0.02kWh bump at 14:30 after a flat overnight baseline was rendering as one band from
+  // midnight to 14:30, hatching an entire plan-driven charging session as "greedy". Each
+  // step's band is capped to MAX_GREEDY_STEP_MS ending at the later sample — see that
+  // constant's own comment. Populates this._greedyBandsByDevice (parallel to
+  // this._deferNames), one array of {t0,t1} per device.
   async _fetchGreedyBands(hass) {
     const greedyMap = this._deferGreedyEntities();
     const sids = this._deferSensorIds || [];
@@ -313,7 +332,9 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
         .sort((a, b) => a.t - b.t);
       const out = [];
       for (let i = 1; i < pts.length; i++) {
-        if (pts[i].v > pts[i - 1].v + 1e-6) out.push({ t0: pts[i - 1].t, t1: pts[i].t });
+        if (pts[i].v > pts[i - 1].v + 1e-6) {
+          out.push({ t0: Math.max(pts[i - 1].t, pts[i].t - MAX_GREEDY_STEP_MS), t1: pts[i].t });
+        }
       }
       // A device that's been continuously greedy for hours reports a state change
       // roughly every minute, which would otherwise produce hundreds of abutting

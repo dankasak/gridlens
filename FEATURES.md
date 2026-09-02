@@ -851,6 +851,24 @@ stretch appends "(greedy)" to that device's tooltip row; the legend only adverti
 hatch when one is actually in view (same pattern as the free-energy bands' own legend
 entries).
 
+⚠ **Band width is capped at `MAX_GREEDY_STEP_MS` (5 min) — fixed 2026-09-02, was painting
+whole plan-driven sessions as greedy.** The tracker sensor is edge-triggered: it only writes
+a new recorded sample when its counter actually ticks up, never a periodic "still greedy"
+heartbeat. `_fetchGreedyBands()` originally drew a band from the *previous* recorded sample
+straight through to the one where an increase was detected — correct for a genuinely
+continuous greedy run (which does emit dense ~60s samples that chain together), but wrong
+whenever the gap between two real samples is large: user-reported and confirmed live on
+2026-09-02 — a single 0.02 kWh bump at 14:30 after a flat overnight baseline (the day's only
+other "sample" was the synthetic value-at-midnight row HA's history API synthesizes for the
+query window's start) rendered as one band from midnight to 14:30, hatching an entire
+plan-driven EV charging session (14.7 kWh, ~all of it plan-attributed per the 2026-08-31
+fix) as if it were greedy. Each step's band now ends at the later sample but starts no
+earlier than `t1 - MAX_GREEDY_STEP_MS`, matching `LoadControlManager`'s 5-minute tick (no
+single step can represent more greedy duration than one tick's worth, since `greedy_reason`
+is only re-derived that often). Genuinely continuous stretches are unaffected — their
+samples are well under 5 minutes apart, so the cap never engages and the existing
+touching-interval merge still chains them into one long band.
+
 ---
 
 ## 8. Weekly schedules (allowed run times)
