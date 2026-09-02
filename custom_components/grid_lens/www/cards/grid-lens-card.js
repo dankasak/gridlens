@@ -355,6 +355,12 @@ class GridLensCard extends HTMLElement {
     return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
+  // Small "(2pm–8pm)" suffix for a period-based bill_items line — omitted
+  // entirely for flat/all-hours items (backend sends time_range: null there).
+  _timeRangeHtml(timeRange) {
+    return timeRange ? ` <span style="font-weight:400;opacity:0.65">(${this._esc(timeRange)})</span>` : '';
+  }
+
   async fetchHistory() {
     try {
       const res = await fetch('/api/grid_lens/plan_history');
@@ -825,7 +831,7 @@ class GridLensCard extends HTMLElement {
             const dm = bi.demand;
             rows += '<div class="bill-section-head">Demand charge</div>';
             rows += `<div class="breakdown-row">
-              <div class="breakdown-label">${dm.label}<br>
+              <div class="breakdown-label">${dm.label}${this._timeRangeHtml(dm.time_range)}<br>
                 <span style="font-size:11px;opacity:0.7">${dm.peak_kw.toFixed(2)}&thinsp;kW peak &times; ${(dm.rate_per_kw_per_day * 100).toFixed(2)}&thinsp;c/kW/day &times; ${dm.days}&thinsp;days</span>
               </div>
               <div class="breakdown-value">$${dm.amount.toFixed(2)}</div>
@@ -850,7 +856,7 @@ class GridLensCard extends HTMLElement {
           rows += '<div class="bill-section-head">Usage charges</div>';
           bi.energy_lines.forEach(line => {
             rows += `<div class="breakdown-row">
-              <div class="breakdown-label">${line.label}<br>
+              <div class="breakdown-label">${line.label}${this._timeRangeHtml(line.time_range)}<br>
                 <span style="font-size:11px;opacity:0.7">${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh</span>
               </div>
               <div class="breakdown-value">$${line.amount.toFixed(2)}</div>
@@ -867,7 +873,7 @@ class GridLensCard extends HTMLElement {
                 ? `${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh`
                 : `spot price &times; ${line.kwh.toFixed(1)}&thinsp;kWh`;
               rows += `<div class="breakdown-row bill-fit">
-                <div class="breakdown-label" style="color:inherit">${line.label}<br>
+                <div class="breakdown-label" style="color:inherit">${line.label}${this._timeRangeHtml(line.time_range)}<br>
                   <span style="font-size:11px;opacity:0.7">${rateLabel}</span>
                 </div>
                 <div class="breakdown-value" style="color:inherit">&minus;$${line.amount.toFixed(2)}</div>
@@ -917,7 +923,7 @@ class GridLensCard extends HTMLElement {
             rows += '<div class="bill-section-head bill-fit">Conditional credits</div>';
             Object.entries(bi.conditional_credits).forEach(([label, c]) => {
               rows += `<div class="breakdown-row bill-fit">
-                <div class="breakdown-label" style="color:inherit">${label}<br>
+                <div class="breakdown-label" style="color:inherit">${label}${this._timeRangeHtml(c.time_range)}<br>
                   <span style="font-size:11px;opacity:0.7">Earned ${c.days_earned}/${c.days_total}&thinsp;days</span>
                 </div>
                 <div class="breakdown-value" style="color:inherit">&minus;$${c.amount.toFixed(2)}</div>

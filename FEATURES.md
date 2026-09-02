@@ -78,7 +78,25 @@ overwrites the first. `_duplicate_plan_keys()` / `_plan_key()` in `plan_calculat
 suffix the slug onto any contested key as a structural guard; the plan data itself carries
 the tariff variant (`Residential Netflix Plan (Single Rate)`) so the guard stays dormant.
 
+**Network-tariff-code matching (2026-09-01).** Some plans are only valid on a specific DNSP
+network tariff — e.g. ENGIE's "VPP Advantage" exists as four separate stored plans
+(`engie_vpp_advantage`, `_ea111`, `_ea011`, `_ea025`), each restricted to one specific Ausgrid
+network tariff per its own fact sheet, with identical VPP/FiT terms but different supply
+charge, TOU rates, and demand-charge status. A plan carries this as
+`eligibility.required_network_tariff_codes` (comma-separated, e.g. `"EA116"`; `null`/absent
+= no restriction). The household enters their own code(s) — read off their bill, the same
+way this install's own network tariff was confirmed — via the "Network tariff code
+(optional)" field on the Current Plan step (initial setup **and** Reconfigure). Blank/unset
+means "don't know", which disables the filter entirely: every plan (gated or not) stays in
+the ranking. Once set, `calculate_plan_costs` drops any candidate plan whose required
+code(s) don't intersect the household's, **except** the plan the household is actually
+detected as being on (`_detect_current_plan`), which always stays priceable regardless of a
+tariff-code mismatch. **Local-only**: the household's own code never leaves their HA
+instance — it's not part of the `/register` payload or any other API call. A plan's own
+required code is public catalogue data, not customer data.
+
 **Files:** `plan_calculator.py`, `retailer_plans.py`, `sensor.py`, `plan_sensors.py`,
+`const.py` (`CONF_NETWORK_TARIFF_CODES`, `parse_network_tariff_codes`), `config_flow.py`,
 `www/cards/grid-lens-card.js`.
 
 **Plan data** comes from the private `gridlens-api` (MySQL, temporally versioned —

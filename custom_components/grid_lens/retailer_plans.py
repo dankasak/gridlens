@@ -9,6 +9,91 @@ from typing import Dict
 _LOGGER = logging.getLogger(__name__)
 
 
+def _format_clock(value) -> str:
+    """'HH:MM'[:SS] -> 12-hour clock string, e.g. '14:00' -> '2pm', '00:30' ->
+    '12:30am'. '24:00' folds to '12am' (end-of-day), matching how a customer
+    would read "10pm-12am" on a real bill."""
+    parts = str(value).split(":")
+    h = int(parts[0]) % 24
+    m = int(parts[1]) if len(parts) > 1 else 0
+    period = "am" if h < 12 else "pm"
+    h12 = h % 12 or 12
+    return f"{h12}:{m:02d}{period}" if m else f"{h12}{period}"
+
+
+def _hour_ints_to_ranges(hours: list) -> list:
+    """[14,15,16,19] -> [(14,17), (19,20)] — contiguous runs, end-exclusive."""
+    if not hours:
+        return []
+    hours = sorted(set(hours))
+    ranges = []
+    start = prev = hours[0]
+    for h in hours[1:]:
+        if h == prev + 1:
+            prev = h
+            continue
+        ranges.append((start, prev + 1))
+        start = prev = h
+    ranges.append((start, prev + 1))
+    return ranges
+
+
+def format_window_range(window: dict) -> str | None:
+    """Human time-range for one window dict, e.g. {'start': '14:00', 'end':
+    '20:00', 'days': 'weekdays'} -> '2pm-8pm (weekdays)'. Returns None for a
+    window with no real time restriction (hours == 'all', the flat-rate case)
+    so callers can tell "period-based" apart from "applies all day"."""
+    start, end = window.get("start"), window.get("end")
+    if start is not None and end is not None:
+        rng = f"{_format_clock(start)}–{_format_clock(end)}"
+    else:
+        hours = window.get("hours", "all")
+        if hours == "all" or not hours:
+            return None
+        rng = ", ".join(
+            f"{_format_clock(f'{h0:02d}:00')}–{_format_clock(f'{h1:02d}:00')}"
+            for h0, h1 in _hour_ints_to_ranges(list(hours))
+        )
+    days = window.get("days", "all")
+    if days and days != "all":
+        rng += f" ({days})"
+    return rng
+
+
+def _format_rate_time_range(rate_def: dict) -> str | None:
+    """Combine every window on a rate definition into one display string
+    (e.g. a Peak rate split into a morning and evening block), deduplicating
+    identical formatted windows (a weekday/weekend pair with the same hours
+    formats identically). None when the rate has no time restriction."""
+    parts = []
+    for w in rate_def.get("windows") or []:
+        r = format_window_range(w)
+        if r and r not in parts:
+            parts.append(r)
+    return "; ".join(parts) if parts else None
+
+
+def rate_time_ranges(rate_defs: list) -> dict:
+    """Map each declared rate value -> human time-range string, for
+    period-based (TOU) rates only — flat all-hours rates are simply absent
+    from the returned dict. Keyed by round(rate, 4) to match the rate_to_label
+    keying used throughout _compute_bill_items.
+
+    A capped rate's after-cap tier (rate_after_cap) shares its parent's
+    windows — the cap only splits pricing by kWh threshold, not by time — so
+    it's mapped to the same range string under its own rate-value key."""
+    out = {}
+    for rate_def in rate_defs or []:
+        if rate_def.get("rate") is None:
+            continue
+        rng = _format_rate_time_range(rate_def)
+        if rng:
+            out[round(float(rate_def["rate"]), 4)] = rng
+            if rate_def.get("rate_after_cap") is not None:
+                out[round(float(rate_def["rate_after_cap"]), 4)] = rng
+    return out
+
+
 class RetailerPlan(ABC):
     """Base class for electricity retailer plans."""
 
@@ -74,6 +159,12 @@ class RetailerPlan(ABC):
         touch (see _compute_bill_items's fit_lines)."""
         return []
 
+    def get_import_rate_defs(self) -> list:
+        """Raw import rate definitions (rate/label/windows per tier). Base
+        plans have none — used by bill-item labelling to attach a time range
+        to each TOU energy line (see _compute_bill_items's energy_lines)."""
+        return []
+
     def get_controlled_load_rate(self, register: str) -> dict | None:
         """Simple linear lookup of this plan's rate for a CL register
         ('controlled_load_1' | 'controlled_load_2'), or None if the plan
@@ -136,6 +227,13 @@ class PlanFromData(RetailerPlan):
             self.aemo_price_sensor = pea["aemo_sensor"]
         if "bpea" in pea:
             self.bpea = pea["bpea"]
+
+        # Network (DNSP) tariff code(s) this plan is restricted to, e.g. "EA116" or
+        # "EA116,EA030" — public catalogue data, not customer data. None means "no
+        # restriction"; plan_calculator only filters when both this AND the
+        # household's own configured code are set and don't intersect.
+        eligibility = plan_data.get("eligibility") or {}
+        self.required_network_tariff_codes = eligibility.get("required_network_tariff_codes")
 
         self._import_rates = plan_data.get("import_rates", [])
         self._export_rates = plan_data.get("export_rates", [])
@@ -289,6 +387,9 @@ class PlanFromData(RetailerPlan):
 
     def get_export_rate_defs(self) -> list:
         return list(self._export_rates)
+
+    def get_import_rate_defs(self) -> list:
+        return list(self._import_rates)
 
     def describe_strategy(self) -> str:
         return self._strategy
@@ -512,6 +613,9 @@ class VersionedPlan(RetailerPlan):
 
     def get_export_rate_defs(self) -> list:
         return self._latest.get_export_rate_defs()
+
+    def get_import_rate_defs(self) -> list:
+        return self._latest.get_import_rate_defs()
 
     def describe_strategy(self) -> str:
         return self._latest.describe_strategy()

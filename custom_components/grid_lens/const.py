@@ -393,6 +393,28 @@ def parse_hours_spec(spec: str | None) -> set[int] | None:
             hours.add(h)
     return hours or None
 
+# Household's own network (DNSP) tariff code(s), as printed on their bill (e.g. "EA116").
+# Comma-separated; blank/unset means "don't know" and disables the filter entirely — a
+# plan whose own required_network_tariff_codes doesn't match one of these is dropped from
+# the comparison ranking (see plan_calculator.calculate_plan_costs). Local-only: never sent
+# to the GridLens API, matching every other household-specific fact already collected here.
+CONF_NETWORK_TARIFF_CODES = "network_tariff_codes"
+
+
+def parse_network_tariff_codes(spec: str | None) -> set[str] | None:
+    """Parse a comma-separated network-tariff-code spec into a normalized set.
+
+    Returns None for blank/unset, meaning "don't filter" — the household hasn't
+    told us their code, so every plan (gated or not) stays in the comparison.
+    """
+    if spec is None:
+        return None
+    spec = spec.strip()
+    if not spec:
+        return None
+    codes = {part.strip().upper() for part in spec.split(",") if part.strip()}
+    return codes or None
+
 # Current plan (user's active retail plan)
 CONF_CURRENT_PLAN = "current_plan"
 

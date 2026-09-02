@@ -14,6 +14,7 @@ from .battery_optimizer import BatteryOptimizer
 from .retailer_plans import (
     plans_from_api_data, versioned_plans_from_history, build_rate_caps,
     build_conditional_credits, RetailerPlan, PlanFromData,
+    rate_time_ranges, format_window_range,
 )
 from .const import (
     DOMAIN,
@@ -49,6 +50,8 @@ from .const import (
     CONF_DEFERRABLE_LOAD_DUMMY_CONTROLLED_LOAD,
     CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE,
     CONF_HAS_DEMAND_TARIFF,
+    CONF_NETWORK_TARIFF_CODES,
+    parse_network_tariff_codes,
     DEFAULT_DEMAND_WINDOW_HOURS,
     DEFAULT_MIN_CHARGE_CURRENT_A,
     DEFAULT_SUPPLY_VOLTAGE,
@@ -185,7 +188,13 @@ class PlanCalculator:
         # with the sensor-backed devices above.
         self.declared_loads: list[dict] = self._parse_declared_loads(entry)
         self.current_plan_override: str | None = entry.data.get("current_plan")
-        
+
+        # Household's own network (DNSP) tariff code(s), parsed once. None = not
+        # configured = never filter (see calculate_plan_costs).
+        self.network_tariff_codes: set[str] | None = parse_network_tariff_codes(
+            entry.data.get(CONF_NETWORK_TARIFF_CODES)
+        )
+
         # Initialize battery optimizer if battery is configured
         self.battery_optimizer = None
         if self.has_battery:
@@ -245,6 +254,15 @@ class PlanCalculator:
         # Deterministic and order-independent: keyed on the slug, not on which
         # plan the iteration happened to reach first.
         return f"{key} [{getattr(plan, 'plan_id', '') or 'variant'}]"
+
+    @staticmethod
+    def _plan_required_codes(plan) -> set[str]:
+        """Parse `plan.required_network_tariff_codes` (comma-string or None) into a
+        normalized set. Empty set means "no requirement" — never filters."""
+        raw = getattr(plan, "required_network_tariff_codes", None)
+        if not raw:
+            return set()
+        return {c.strip().upper() for c in raw.split(",") if c.strip()}
 
     def _get_plans(self) -> list[RetailerPlan]:
         """Return plan objects from API data. Tier filtering is enforced by the API.
@@ -662,8 +680,23 @@ class PlanCalculator:
 
         _LOGGER.warning(f"Battery check: has_battery={self.has_battery}, optimizer={bool(self.battery_optimizer)}, solar_data={len(solar_data) if solar_data else 0} records")
 
+        # Network-tariff-code filter: drop plans gated to a DNSP tariff the household
+        # hasn't confirmed they're on. Only applies when BOTH sides are known — a plan
+        # with no requirement, or a household with no code configured, is never
+        # filtered. The household's actually-held plan is always kept regardless (it
+        # must always be priceable, tariff mismatch or not — _detect_current_plan
+        # already identified it from unfiltered _get_plans()).
+        _candidate_plans = self._get_plans()
+        if self.network_tariff_codes:
+            _candidate_plans = [
+                p for p in _candidate_plans
+                if self._plan_key(p, _dup_keys) == current_plan_name
+                or not self._plan_required_codes(p)
+                or self._plan_required_codes(p) & self.network_tariff_codes
+            ]
+
         all_plans_ordered = sorted(
-            self._get_plans(),
+            _candidate_plans,
             key=lambda p: 0 if self._plan_key(p, _dup_keys) == current_plan_name else 1,
         )
 
@@ -1077,6 +1110,7 @@ class PlanCalculator:
             'days': actual_days,
             'amount': round(peak_kw * rate * actual_days, 2),
             'window_hours': hours,
+            'time_range': format_window_range({'hours': hours, 'days': days_spec}),
             'source': source,
             'approximate': True,
         }
@@ -1245,6 +1279,7 @@ class PlanCalculator:
                     "amount": amount,
                     "days_earned": days_earned,
                     "days_total": days_total,
+                    "time_range": format_window_range(window),
                 }
         return round(total, 2), detail
 
@@ -1276,6 +1311,18 @@ class PlanCalculator:
         except ImportError:
             from backports.zoneinfo import ZoneInfo
         tz = ZoneInfo("Australia/Sydney")
+
+        # Human time-range per declared rate value (e.g. "2pm–8pm (weekdays)"),
+        # keyed the same way as rate_to_label below (round(rate, 4)) so every
+        # energy_lines/fit_lines branch can attach one with a single dict
+        # lookup. Flat all-hours rates are simply absent — see
+        # retailer_plans.rate_time_ranges.
+        import_time_ranges = rate_time_ranges(plan.get_import_rate_defs())
+        export_time_ranges = rate_time_ranges(plan.get_export_rate_defs())
+        credit_time_ranges = {
+            c.get('label', 'Conditional Credit'): format_window_range(c.get('window') or {})
+            for c in plan.get_conditional_credits()
+        }
 
         # Shared across the import and export sections below so a plan with a
         # capped rate on both directions (e.g. GloBird ZEROHERO) tracks each
@@ -1331,7 +1378,8 @@ class PlanCalculator:
                 energy_lines = [{'label': rate_to_label.get(rk, 'Energy'),
                                  'rate_c': round(rk * 100, 2),
                                  'kwh': round(tier_data[rk]['kwh'], 2),
-                                 'amount': round(tier_data[rk]['cost'], 2)}
+                                 'amount': round(tier_data[rk]['cost'], 2),
+                                 'time_range': import_time_ranges.get(rk)}
                                 for rk in all_rates]
                 # Deliberately NO reconciliation plug here. This used to force
                 # energy_lines[0] to absorb any gap between the summed rate×kWh and
@@ -1345,7 +1393,8 @@ class PlanCalculator:
             else:
                 energy_lines = [{'label': 'Energy', 'rate_c': 0,
                                  'kwh': round(total_import_kwh, 2),
-                                 'amount': round(import_cost_actual, 2)}]
+                                 'amount': round(import_cost_actual, 2),
+                                 'time_range': None}]
 
         elif lp_schedule:
             # LP-optimised plan: build energy lines from the LP schedule's per-slot
@@ -1409,11 +1458,13 @@ class PlanCalculator:
                         'rate_c': round(rk * 100, 2),
                         'kwh': round(tier_data[rk]['kwh'], 2),
                         'amount': round(tier_data[rk]['cost'], 2),
+                        'time_range': import_time_ranges.get(rk),
                     }
                     for rk in all_rates
                 ]
             else:
-                energy_lines = [{'label': 'Energy (grid)', 'rate_c': 0, 'kwh': 0.0, 'amount': 0.0}]
+                energy_lines = [{'label': 'Energy (grid)', 'rate_c': 0, 'kwh': 0.0, 'amount': 0.0,
+                                 'time_range': None}]
 
         else:
             # Historical fallback (no LP result available)
@@ -1433,7 +1484,8 @@ class PlanCalculator:
             n = len(sorted_rates)
             label_map = {}
             if n == 0:
-                energy_lines = [{'label': 'Energy (grid)', 'rate_c': 0, 'kwh': 0.0, 'amount': 0.0}]
+                energy_lines = [{'label': 'Energy (grid)', 'rate_c': 0, 'kwh': 0.0, 'amount': 0.0,
+                                 'time_range': None}]
             elif n == 1:
                 label_map[sorted_rates[0]] = 'Energy'
             elif n == 2:
@@ -1455,6 +1507,7 @@ class PlanCalculator:
                         'rate_c': round(rk * 100, 2),
                         'kwh': round(data['kwh'], 2),
                         'amount': round(data['cost'], 2),
+                        'time_range': import_time_ranges.get(rk),
                     }
                     for rk, data in tier_data.items()
                 ], key=lambda x: x['rate_c'], reverse=True)
@@ -1587,6 +1640,7 @@ class PlanCalculator:
                 'rate_c': round(rk * 100, 2) if rk >= 0 else None,
                 'kwh': round(fit_tier_data[rk]['kwh'], 2),
                 'amount': round(fit_tier_data[rk]['cost'], 2),
+                'time_range': export_time_ranges.get(rk) if rk >= 0 else None,
             }
             for rk in fit_all_rates
         ]
@@ -1639,6 +1693,7 @@ class PlanCalculator:
                     'amount': round(c.get('amount', 0.0), 2),
                     'days_earned': c.get('days_earned', 0),
                     'days_total': c.get('days_total', 0),
+                    'time_range': credit_time_ranges.get(label),
                 }
                 for label, c in conditional.items()
             }

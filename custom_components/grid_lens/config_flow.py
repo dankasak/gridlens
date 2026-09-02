@@ -86,6 +86,7 @@ from .const import (
     CONF_LOAD_POWER_SENSOR,
     CONF_CURRENT_PLAN,
     CONF_VPP_PROGRAM,
+    CONF_NETWORK_TARIFF_CODES,
     parse_hours_spec,
     CONF_GRIDLENS_EMAIL,
     CONF_GRIDLENS_API_URL,
@@ -700,6 +701,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             plan_id = user_input[CONF_CURRENT_PLAN]
             has_demand_tariff = user_input.get(CONF_HAS_DEMAND_TARIFF, False)
             vpp_program = user_input.get(CONF_VPP_PROGRAM) or None
+            network_tariff_codes = user_input.get(CONF_NETWORK_TARIFF_CODES, "")
             try:
                 ha_uuid = str(uuid.UUID(await instance_id.async_get(self.hass)))
                 self._ha_uuid = ha_uuid
@@ -721,6 +723,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             CONF_CURRENT_PLAN: plan_id,
                             CONF_HAS_DEMAND_TARIFF: has_demand_tariff,
                             CONF_VPP_PROGRAM: vpp_program,
+                            CONF_NETWORK_TARIFF_CODES: network_tariff_codes,
                             CONF_GRIDLENS_EMAIL: self._email,
                             CONF_GRIDLENS_API_URL: self._api_url,
                             CONF_GRIDLENS_API_KEY: self._api_key,
@@ -735,6 +738,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         self._sensor_data[CONF_CURRENT_PLAN] = plan_id
                         self._sensor_data[CONF_HAS_DEMAND_TARIFF] = has_demand_tariff
                         self._sensor_data[CONF_VPP_PROGRAM] = vpp_program
+                        self._sensor_data[CONF_NETWORK_TARIFF_CODES] = network_tariff_codes
                         recovered = await self._async_recover_api_key(ha_uuid)
                         if recovered:
                             self._api_key = recovered
@@ -775,6 +779,7 @@ class GridLensConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         mode=selector.SelectSelectorMode.DROPDOWN,
                     )
                 ),
+                vol.Optional(CONF_NETWORK_TARIFF_CODES, default=""): selector.TextSelector(),
             }),
             errors=errors,
         )
@@ -1898,6 +1903,10 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                     mode=selector.SelectSelectorMode.DROPDOWN,
                 )
             ),
+            vol.Optional(
+                CONF_NETWORK_TARIFF_CODES,
+                default=entry_data.get(CONF_NETWORK_TARIFF_CODES) or "",
+            ): selector.TextSelector(),
         })
 
         return self.async_show_form(
