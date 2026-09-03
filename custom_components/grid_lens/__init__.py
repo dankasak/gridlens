@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
 from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
@@ -25,6 +26,14 @@ PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.SWITCH, Platform.NUMBER, 
 
 _HISTORY_STORAGE_KEY = "grid_lens_plan_history"
 _HISTORY_STORAGE_VERSION = 1
+
+# GridLensCoordinator refresh cadence (set dynamically per run — see
+# _adjust_refresh_cadence). The heartbeat is only a backstop: it re-runs the full
+# comparison so plan data self-heals within half a day even if nothing else refreshes it
+# (the advisory coordinator's nudge is the fast path). The retry cadence applies while
+# plan data is unavailable or only came from the on-disk cache.
+_PLAN_HEARTBEAT = timedelta(hours=12)
+_PLAN_RETRY = timedelta(minutes=10)
 
 _DIAGNOSTIC_README = """\
 Grid Lens — Diagnostic Export
@@ -764,36 +773,19 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
             # Custom date range: recalculate on-the-fly and return directly.
             if start_date or end_date:
-                import aiohttp as _aiohttp
                 from .plan_calculator import PlanCalculator
-                from .const import CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL, CONF_STATE
+                from .plan_cache import async_fetch_plans
                 from homeassistant.helpers.storage import Store
                 entries = self.hass.config_entries.async_entries(DOMAIN)
                 entry_obj = entries[0] if entries else None
                 if not entry_obj:
                     return web.Response(text=json.dumps({'error': 'No entry'}), content_type='application/json', status=404)
-                _api_key = entry_obj.data.get(CONF_GRIDLENS_API_KEY, "")
-                _api_url = entry_obj.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
-                _state   = entry_obj.data.get(CONF_STATE, "NSW")
-                _network = entry_obj.data.get(CONF_DISTRIBUTOR, "")
-                _plan_data: dict = {}
-                _network_operators: dict = {}
-                try:
-                    _sess = async_get_clientsession(self.hass)
-                    _current_plan = entry_obj.data.get("current_plan", "")
-                    async with _sess.get(f"{_api_url}/plans",
-                                         params={"state": _state, "current_plan": _current_plan, "network": _network},
-                                         headers={"X-API-Key": _api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
-                                         timeout=_aiohttp.ClientTimeout(total=15)) as _r:
-                        if _r.status == 200:
-                            _resp_data = await _r.json()
-                            _plan_data = _resp_data.get("plans", {})
-                            _network_operators = _resp_data.get("network_operators", {})
-                except Exception as _exc:
-                    _LOGGER.warning("plan-rates: could not fetch plan data: %s", _exc)
+                # On-demand view: fall back to cached plans on a failed fetch, but stay
+                # silent on 402 (the background coordinator owns that notification).
+                _fetch = await async_fetch_plans(self.hass, entry_obj, notify_on_402=False)
                 calculator = PlanCalculator(self.hass, entry_obj)
-                calculator.plan_data = _plan_data
-                calculator.network_operators = _network_operators
+                calculator.plan_data = _fetch.plans
+                calculator.network_operators = _fetch.network_operators
 
                 # Derive which plan the user was actually on at start_date from change history.
                 if start_date:
@@ -1117,46 +1109,18 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 except Exception:
                     pass  # client disconnected
 
-            from .const import CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL, CONF_STATE
+            from .plan_cache import async_fetch_plans
 
-            api_key = entry_obj.data.get(CONF_GRIDLENS_API_KEY, "")
-            api_url = entry_obj.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
-            state   = entry_obj.data.get(CONF_STATE, "NSW")
-            network = entry_obj.data.get(CONF_DISTRIBUTOR, "")
-
-            # Fetch plan data from API — enforces tier (free → locked plan only).
-            _LOGGER.info("Fetching plans from API (state=%s, network=%s)", state, network)
-            plan_data: dict = {}
-            network_operators: dict = {}
-            try:
-                _session = async_get_clientsession(self.hass)
-                async with _session.get(
-                    f"{api_url}/plans",
-                    params={"state": state, "current_plan": entry_obj.data.get("current_plan", ""), "network": network},
-                    headers={"X-API-Key": api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as _r:
-                    if _r.status == 200:
-                        _resp = await _r.json()
-                        plan_data = _resp.get("plans", {})
-                        network_operators = _resp.get("network_operators", {})
-                        _LOGGER.info("Loaded %d plan(s) from API (tier=%s)", len(plan_data), _resp.get("tier"))
-                    elif _r.status == 402:
-                        _body = await _r.text()
-                        _LOGGER.warning("API /plans returned %s: %s", _r.status, _body[:200])
-                        persistent_notification.async_create(
-                            self.hass,
-                            "Your Grid Lens subscription has ended and the dashboard cannot show plan data. "
-                            "Please resubscribe at **gridlens.au/pricing** or reconfigure the integration "
-                            "to restore your original plan.",
-                            title="Grid Lens: Subscription Ended",
-                            notification_id="grid_lens_subscription_ended",
-                        )
-                    else:
-                        _body = await _r.text()
-                        _LOGGER.warning("API /plans returned %s: %s", _r.status, _body[:200])
-            except Exception as _exc:
-                _LOGGER.warning("Could not fetch plan data from API: %s", _exc)
+            # Resilient fetch (falls back to cached plans on a failed live call). Stays
+            # silent on 402 — the background coordinator owns the "subscription ended"
+            # notification so this on-demand view doesn't double-notify.
+            _LOGGER.info("Fetching plans for stream (entry=%s)", entry_obj.entry_id)
+            _fetch = await async_fetch_plans(self.hass, entry_obj, notify_on_402=False)
+            plan_data = _fetch.plans
+            network_operators = _fetch.network_operators
+            _LOGGER.info(
+                "Stream using %d plan(s) (source=%s)", len(plan_data), _fetch.source
+            )
 
             plans_total = len(plan_data) or 1
             plans_done  = 0
@@ -2033,7 +1997,11 @@ class GridLensCoordinator(DataUpdateCoordinator):
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=None,  # Manual refresh only — never auto-calculate
+            # Starts timer-less (startup + on-demand dashboard views drive the first
+            # runs); _adjust_refresh_cadence then sets a dynamic interval each run — a
+            # slow heartbeat when healthy, a fast retry while plan data is unavailable —
+            # so a failed startup fetch can no longer wedge things until the next restart.
+            update_interval=None,
         )
         self.entry = entry
         self.hass = hass
@@ -2042,53 +2010,29 @@ class GridLensCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self):
         """Fetch data from energy sensors and calculate plan comparisons."""
-        import aiohttp
         from .plan_calculator import PlanCalculator
-        from .const import CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL, CONF_STATE
+        from .plan_cache import async_fetch_plans
         from .entity_lookup import async_get_energy_dashboard_names
 
         self.energy_dashboard_names = await async_get_energy_dashboard_names(self.hass)
 
-        api_key = self.entry.data.get(CONF_GRIDLENS_API_KEY, "")
-        api_url = self.entry.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
-        state   = self.entry.data.get(CONF_STATE, "NSW")
-        network = self.entry.data.get(CONF_DISTRIBUTOR, "")
-
-        plan_data: dict = {}
-        network_operators: dict = {}
-        try:
-            import aiohttp as _aiohttp
-            _session = async_get_clientsession(self.hass)
-            async with _session.get(
-                f"{api_url}/plans",
-                params={"state": state, "current_plan": self.entry.data.get("current_plan", ""), "network": network},
-                headers={"X-API-Key": api_key, "User-Agent": "GridLens-HA-Integration/1.0"},
-                timeout=_aiohttp.ClientTimeout(total=15),
-            ) as _r:
-                if _r.status == 200:
-                    _resp = await _r.json()
-                    plan_data = _resp.get("plans", {})
-                    network_operators = _resp.get("network_operators", {})
-                elif _r.status == 402:
-                    _LOGGER.warning("Coordinator: API /plans returned 402 (subscription ended)")
-                    persistent_notification.async_create(
-                        self.hass,
-                        "Your Grid Lens subscription has ended and the dashboard cannot show plan data. "
-                        "Please resubscribe at **gridlens.au/pricing** or reconfigure the integration "
-                        "to restore your original plan.",
-                        title="Grid Lens: Subscription Ended",
-                        notification_id="grid_lens_subscription_ended",
-                    )
-                else:
-                    _LOGGER.warning("Coordinator: API /plans returned %s", _r.status)
-        except Exception as _exc:
-            _LOGGER.warning("Coordinator: could not fetch plan data: %s", _exc)
+        # Resilient fetch: a transient non-200 (Cloudflare 502 during an API redeploy is
+        # the common one) falls back to the last good payload on disk rather than an
+        # empty list. See plan_cache.py for why that matters here specifically.
+        fetch = await async_fetch_plans(self.hass, self.entry)
+        plan_data = fetch.plans
+        network_operators = fetch.network_operators
 
         self.calculator = PlanCalculator(self.hass, self.entry)
         self.calculator.plan_data = plan_data
         self.calculator.network_operators = network_operators
         result = await self.calculator.calculate_plan_costs()
-        _LOGGER.info(f"Plan calculation complete: {result.get('usage_days', 0)} days")
+        _LOGGER.info(
+            "Plan calculation complete: %s days (plans: %d, source: %s)",
+            result.get("usage_days", 0), len(plan_data), fetch.source,
+        )
+
+        self._adjust_refresh_cadence(fetch, result)
 
         # Build per-plan sensor data for CoordinatorEntity sensors
         plan_metrics = {}
@@ -2120,3 +2064,64 @@ class GridLensCoordinator(DataUpdateCoordinator):
 
         result["plan_metrics"] = plan_metrics
         return result
+
+    def _adjust_refresh_cadence(self, fetch, result) -> None:
+        """Pick the next refresh interval from how healthy this run was.
+
+        The coordinator has no fixed timer by default (``update_interval=None``) — the
+        old ``calculate_period`` service that used to drive it is deprecated and raises,
+        so on-demand dashboard views are the only thing that refreshes plan data. That
+        left a single failed fetch at startup wedging current-plan resolution until the
+        next HA restart. So:
+
+        * couldn't resolve the configured plan  → retry every ``_PLAN_RETRY``
+        * still waiting for the first day of usage history → also retry (harmless)
+        * healthy                                → slow ``_PLAN_HEARTBEAT`` so a *later*
+          outage still recovers on its own
+
+        Reassigning ``update_interval`` mid-run is honoured on the next schedule tick —
+        same dynamic-interval pattern AdvisoryCoordinator uses.
+        """
+        # Fresh install with no usage statistics yet: calculate_plan_costs returns early
+        # with no plan output. Retry, but it's not a plan-resolution failure.
+        if result.get("status") == "waiting_for_data":
+            self.update_interval = _PLAN_RETRY
+            return
+
+        configured = self.entry.data.get("current_plan", "")
+        resolved = bool(result.get("current_plan_name"))
+
+        if configured and not resolved:
+            if fetch.ok:
+                # Plans loaded, but the configured slug isn't among them: this is a
+                # "mapped plan not served" problem, not a transient outage — retrying
+                # won't fix it, so say so loudly rather than only logging a warning.
+                _LOGGER.error(
+                    "Configured current plan %r is not in the %d plan(s) from the API "
+                    "(source=%s); plan-dependent sensors and advisory mode stay "
+                    "unavailable until this is corrected",
+                    configured, len(fetch.plans), fetch.source,
+                )
+                persistent_notification.async_create(
+                    self.hass,
+                    f"Grid Lens could not find your configured plan (`{configured}`) in "
+                    "the plan list from the server. Reconfigure the integration and pick "
+                    "your current plan again, or contact support if it should be there.",
+                    title="Grid Lens: Current Plan Not Found",
+                    notification_id="grid_lens_current_plan_missing",
+                )
+            else:
+                _LOGGER.warning(
+                    "Plan data unavailable (fetch source=%s, status=%s) — retrying in %s",
+                    fetch.source, fetch.status, _PLAN_RETRY,
+                )
+            self.update_interval = _PLAN_RETRY
+        else:
+            persistent_notification.async_dismiss(
+                self.hass, "grid_lens_current_plan_missing"
+            )
+            # Resolved — but if it came from the on-disk cache, keep retrying at the
+            # faster cadence so we return to live data soon after the API recovers.
+            self.update_interval = (
+                _PLAN_HEARTBEAT if fetch.source == "live" else _PLAN_RETRY
+            )

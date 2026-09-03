@@ -40,6 +40,10 @@ STORE_VERSION = 1
 # enough that a blank card until the first live run is preferable.
 CACHE_MAX_AGE = timedelta(hours=12)
 META_REFRESH = timedelta(minutes=2)  # how often to refresh plan + load history
+# The main coordinator owns plan_data and has no fast self-retry when its startup fetch
+# fails. When we can't get a current plan, nudge it — but no more than this often, so a
+# genuinely misconfigured plan doesn't drive a recalc loop.
+MAIN_KICK_INTERVAL = timedelta(minutes=5)
 # 36h so the horizon always contains the NEXT export window (tomorrow's 17:30-19:30),
 # giving the optimizer a reason to STORE tomorrow-morning's solar instead of dumping it
 # to the grid at $0. A 24h horizon ends ~1h before that peak and produces nonsensical
@@ -62,6 +66,7 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         self._plan = None
         self._load_forecaster = FlatLoadForecaster()
         self._meta_refreshed = None
+        self._last_main_kick = None  # rate-limits _request_main_refresh()
         # Persists the last successful plan so the card can render it immediately after a
         # restart (see async_load_cached / _persist), rather than sitting blank until the
         # first live optimisation completes.
@@ -120,9 +125,36 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
                 pass
         return None
 
+    def _request_main_refresh(self) -> None:
+        """Ask the main plan-comparison coordinator to re-fetch, rate-limited.
+
+        Fire-and-forget: its recalc can take seconds and must not stall this tick.
+        ``async_request_refresh`` is itself debounced, so the interval here only stops
+        a misconfigured (never-resolvable) plan from queuing a recalc every few minutes
+        indefinitely.
+        """
+        main = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id)
+        if main is None or not hasattr(main, "async_request_refresh"):
+            return
+        now = dt_util.utcnow()
+        if self._last_main_kick and (now - self._last_main_kick) < MAIN_KICK_INTERVAL:
+            return
+        self._last_main_kick = now
+        _LOGGER.debug(
+            "Advisory: current plan unavailable — requesting main coordinator refresh"
+        )
+        self.entry.async_create_background_task(
+            self.hass, main.async_request_refresh(), name="grid_lens_advisory_kick_main"
+        )
+
     async def _refresh_meta(self) -> None:
         """Refresh the current plan + load history (infrequent)."""
         self._plan = self._current_plan()
+        if self._plan is None:
+            # Don't just spin on WAITING_INTERVAL forever — the main coordinator may be
+            # sitting on an empty plan_data from a failed startup fetch with nothing else
+            # about to refresh it. Nudge it (rate-limited).
+            self._request_main_refresh()
         # Deferrable params (and their hour-of-day energy) MUST be fetched before the base
         # load so we can subtract the double-counted deferrable energy out of it below.
         self._deferrable_params = await self._deferrable_device_params()

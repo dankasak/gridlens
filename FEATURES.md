@@ -194,6 +194,28 @@ the specific clashes found (a literal hex duplicate, a red-vs-green pair only 1.
 under deuteranopia) and the handful of pre-existing, lower-severity gaps left as documented,
 accepted limitations rather than cascading the redesign into cross-card-shared anchors.
 
+**Plan-data fetch resilience (added 2026-09-03).** All three call sites that pull the
+API's `/plans` payload — `GridLensCoordinator`, the `/plan_stream` SSE view and the
+custom-range branch of `/plan_data` — go through `plan_cache.py::async_fetch_plans`. It
+persists the last good payload per config entry (`.storage/grid_lens_plan_cache_<entry>`)
+and, on a failed live fetch (a Cloudflare 502 while the API LXC redeploys is the usual
+one), serves that cache for up to `CACHE_MAX_AGE` (14 days) instead of an empty list — a
+slightly stale list still resolves the plan the user holds, which is what unblocks the
+optimiser and advisory mode. A `402` (ended subscription) is never served from cache.
+`GridLensCoordinator` also now sets a **dynamic `update_interval`** each run
+(`_adjust_refresh_cadence`): a 12 h heartbeat when healthy so plan data self-heals even
+though the `calculate_period` service is gone, and a 10 min retry while the configured
+plan can't be resolved or only came from cache. If the configured plan slug is missing
+from a *non-empty* list (a "mapped plan not served" problem, not an outage) it raises a
+distinct persistent notification rather than retrying silently. `AdvisoryCoordinator`,
+which depends on the main coordinator's `plan_data`, nudges it via
+`async_request_refresh` (rate-limited to `MAIN_KICK_INTERVAL`, 5 min) whenever it can't
+get a current plan, instead of spinning on `WAITING_INTERVAL` until an unrelated refresh
+happens. Background: 2026-09-03, downstream of the gridlens-api boot-race incident, a
+single startup 502 left `current_plan_name` `None` and advisory mode stuck "waiting" for
+hours — see `GRIDLENS_CHECKLIST.md`.
+**Files:** `plan_cache.py` (new), `__init__.py` (`GridLensCoordinator`), `advisory/coordinator.py`.
+
 ---
 
 ## 2. The optimiser (layer 2 core)
