@@ -14,7 +14,7 @@ from .battery_optimizer import BatteryOptimizer
 from .retailer_plans import (
     plans_from_api_data, versioned_plans_from_history, build_rate_caps,
     build_conditional_credits, RetailerPlan, PlanFromData,
-    rate_time_ranges, format_window_range,
+    rate_time_ranges, format_window_range, cap_label_base,
 )
 from .const import (
     DOMAIN,
@@ -1352,15 +1352,16 @@ class PlanCalculator:
                 "quarter": "kWh/quarter", "year": "kWh/year",
                 "billing_period": "kWh/bill"}.get(cap_period, "kWh/day")
         pooled_note = " avg" if cap_application == "pooled" else ""
+        base = cap_label_base(label)
         parts = []
         if free_kwh > 1e-9:
             parts.append((rate, free_kwh))
             cap_labels.setdefault(round(rate, 4),
-                                  f"{label} (first {cap:g} {unit}{pooled_note})")
+                                  f"{base} (first {cap:g} {unit}{pooled_note})")
         if over_kwh > 1e-9:
             parts.append((after_rate, over_kwh))
             cap_labels.setdefault(round(after_rate, 4),
-                                  f"{label} (after {cap:g} {unit}{pooled_note})")
+                                  f"{base} (after {cap:g} {unit}{pooled_note})")
         return parts
 
     def _calculate_actual_conditional_credits(
@@ -1715,15 +1716,39 @@ class PlanCalculator:
                 fit_tier_data[-1.0]['kwh'] = total_export_kwh
                 fit_tier_data[-1.0]['cost'] = export_credit_actual
         elif lp_schedule and export_credit_actual is None:
-            # LP-optimised non-current plan: use per-step export credit from the solver.
+            # LP-optimised non-current plan: bucket each step's export by its
+            # explicit free/over-cap kWh split (export_cap_free_kwh /
+            # export_cap_over_kwh), same as the import energy_lines above — NOT by
+            # the step's blended export_rate. For a daily-capped FiT (e.g. EA
+            # BatteryEase: 8c first 10 kWh/day, 3c beyond) the solver reports a
+            # per-hour blended rate for whichever hour the day's cap boundary
+            # falls in, and that crossover lands in a different hour with a
+            # different free/over ratio each day — bucketing by the blended rate
+            # fragmented the FiT into a fistful of one-off "Solar Export" lines at
+            # rates that match nothing on the retailer's bill. The solver's own
+            # per-step credit is exp_free*free_rate + exp_over*over_rate, so
+            # bucketing the tranches reconciles to the same total.
             for step in lp_schedule:
                 exp = step.get('export_kwh', 0.0)
-                cred = step.get('export_credit', 0.0)
-                rate = step.get('export_rate', 0.0)
-                if exp > 1e-6 and rate > 0:
-                    rk = round(rate, 4)
-                    fit_tier_data[rk]['kwh']  += exp
-                    fit_tier_data[rk]['cost'] += cred
+                free = step.get('export_cap_free_kwh', 0.0)
+                over = step.get('export_cap_over_kwh', 0.0)
+                if free > 1e-9:
+                    rk = round(step.get('export_cap_free_rate', 0.0), 4)
+                    if rk > 0:
+                        fit_tier_data[rk]['kwh']  += free
+                        fit_tier_data[rk]['cost'] += free * rk
+                if over > 1e-9:
+                    rk = round(step.get('export_cap_over_rate', 0.0), 4)
+                    if rk > 0:
+                        fit_tier_data[rk]['kwh']  += over
+                        fit_tier_data[rk]['cost'] += over * rk
+                uncapped = exp - free - over
+                if uncapped > 1e-6:
+                    rate = step.get('export_rate', 0.0)
+                    if rate > 0:
+                        rk = round(rate, 4)
+                        fit_tier_data[rk]['kwh']  += uncapped
+                        fit_tier_data[rk]['cost'] += uncapped * rk
         else:
             # Current plan with fixed FiT (e.g. Flow Power): apply plan rate to actual export_data.
             #
@@ -1766,10 +1791,16 @@ class PlanCalculator:
         # Label every FiT tier the plan declares (even ones with zero export so
         # far), same precedence as energy_lines: the plan's own flat label first,
         # the cap-split "(first/after N kWh/day)" label wins when it applies.
+        # export_cap_labels is populated on the current-plan fixed-FiT path
+        # (_split_capped_kwh); opt_result['cap_labels'] carries the same
+        # free/after-cap labels for the LP path (build_rate_caps emits them for
+        # both directions) so a capped alt-plan FiT gets "(after N kWh/day)" on
+        # its post-cap line instead of a bare "Solar Export".
         fit_rate_to_label: dict = {
             round(float(r['rate']), 4): r.get('label', 'Solar Export')
             for r in plan.get_export_rate_defs() if r.get('rate') is not None
         }
+        fit_rate_to_label.update(opt_result.get('cap_labels', {}) if opt_result else {})
         fit_rate_to_label.update(export_cap_labels)
         fit_rate_to_label[-1.0] = 'Feed-in (spot price)'
 

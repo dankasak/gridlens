@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from datetime import date, datetime, timedelta
 from typing import Dict
@@ -71,6 +72,30 @@ def _format_rate_time_range(rate_def: dict) -> str | None:
         if r and r not in parts:
             parts.append(r)
     return "; ".join(parts) if parts else None
+
+
+_CAP_PARENTHETICAL_RE = re.compile(
+    r"\s*\([^()]*kwh[^()]*\)\s*$", re.IGNORECASE
+)
+
+
+def cap_label_base(label: str) -> str:
+    """Strip a trailing cap-describing parenthetical from a rate label so the
+    free/after-cap tier labels the bill builds from it don't double up.
+
+    A plan whose cap is expressed structurally (``daily_cap_kwh`` /
+    ``rate_after_cap``) still often carries a human-written hint in the label
+    itself — "Solar Feed-in Tariff (first 10kWh/day)". Both label paths
+    (``build_rate_caps`` for the LP breakdown, ``_split_capped_kwh`` for the
+    actual-usage one) then append "(first N kWh/day)" / "(after N kWh/day)",
+    yielding "…(first 10kWh/day) (first 10 kWh/day)". Called only where a cap is
+    known present, so a trailing "(… kWh …)" group is the cap hint, not a TOU
+    time-range like "Peak (3pm-9pm)" (no "kWh") — those are left alone.
+    """
+    if not label:
+        return label
+    stripped = _CAP_PARENTHETICAL_RE.sub("", label).strip()
+    return stripped or label
 
 
 def rate_time_ranges(rate_defs: list) -> dict:
@@ -662,17 +687,74 @@ class VersionedPlan(RetailerPlan):
     def get_export_rate_info(self, dt: datetime) -> Dict:
         return self._plan_at(dt).get_export_rate_info(dt)
 
+    @staticmethod
+    def _eff_suffix(eff_from, eff_to) -> str:
+        """Human 'until <date>' / 'from <date>' tag for a NON-current version's
+        rate line. A billing period that spans a retailer price change is priced
+        at both versions' rates; without this the older version's rate values
+        match no current tier and the bill renders them as a bare, unlabelled
+        'Energy' / 'Solar Export' line (see globird_solarplus, which changed
+        Off-Peak 31.13c→28.05c on 2026-08-12)."""
+        if eff_to is not None:
+            return f" (until {eff_to.day} {eff_to:%b %Y})"
+        if eff_from is not None:
+            return f" (from {eff_from.day} {eff_from:%b %Y})"
+        return ""
+
+    def _all_rate_defs(self, which: str) -> list:
+        """Every version's rate defs (``which`` = 'import'|'export'), oldest
+        first so a ``{round(rate, 4): label}`` map built downstream keeps the
+        CURRENT version's label on any rate value shared across versions. Tiers
+        from a superseded version carry an effectivity suffix, so a rate value
+        unique to an old version still renders with a meaningful name instead of
+        falling through to 'Energy'/'Solar Export'."""
+        getter = "get_import_rate_defs" if which == "import" else "get_export_rate_defs"
+        last = len(self._segments) - 1
+        out: list = []
+        for i, (eff_from, eff_to, p) in enumerate(self._segments):
+            suffix = "" if i == last else self._eff_suffix(eff_from, eff_to)
+            for rd in getattr(p, getter)():
+                rd = dict(rd)
+                if suffix and rd.get("label"):
+                    rd["label"] = f"{rd['label']}{suffix}"
+                out.append(rd)
+        return out
+
     def get_export_rate_defs(self) -> list:
-        return self._latest.get_export_rate_defs()
+        return self._all_rate_defs("export")
 
     def get_import_rate_defs(self) -> list:
-        return self._latest.get_import_rate_defs()
+        return self._all_rate_defs("import")
 
     def describe_strategy(self) -> str:
         return self._latest.describe_strategy()
 
     def get_display_breakdown(self, optimization_result: Dict) -> Dict:
-        return self._latest.get_display_breakdown(optimization_result)
+        bd = self._latest.get_display_breakdown(optimization_result)
+        if len(self._segments) > 1:
+            # Inject zero-kWh label anchors for import tiers that only a
+            # superseded version had, so _compute_bill_items can name an
+            # old-rate usage line (priced correctly by the date-aware LP) rather
+            # than fall back to a bare 'Energy'. Keyed by rounded rate value —
+            # the same key _compute_bill_items maps by — and skipped when the
+            # current version already covers that rate.
+            sections = bd.setdefault("sections", [])
+            seen = {round(float(s.get("rate") or 0.0), 4) for s in sections}
+            for eff_from, eff_to, p in self._segments[:-1]:
+                suffix = self._eff_suffix(eff_from, eff_to)
+                for rd in p.get_import_rate_defs():
+                    r = rd.get("rate")
+                    if r is None:
+                        continue
+                    rk = round(float(r), 4)
+                    if rk in seen:
+                        continue
+                    seen.add(rk)
+                    sections.append({
+                        "title": f"{rd.get('label', 'Energy')}{suffix}",
+                        "kwh": 0.0, "rate": float(r), "cost": 0.0,
+                    })
+        return bd
 
 
 def versioned_plans_from_history(plan_dict: dict, history: dict,
@@ -770,10 +852,11 @@ def build_rate_caps(
                      "billing_period": "kWh/bill"}.get(
                          info.get("cap_period") or "day", "kWh/day")
             _avg = " avg" if (info.get("cap_application") == "pooled") else ""
+            _base = cap_label_base(label)
             cap_labels.setdefault(round(info["rate"], 4),
-                                  f"{label} (first {cap:g} {_unit}{_avg})")
+                                  f"{_base} (first {cap:g} {_unit}{_avg})")
             cap_labels.setdefault(round(after, 4),
-                                  f"{label} (after {cap:g} {_unit}{_avg})")
+                                  f"{_base} (after {cap:g} {_unit}{_avg})")
         return list(groups.values())
 
     import_caps = _build(plan.get_import_rate_info)

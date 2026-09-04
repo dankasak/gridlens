@@ -183,12 +183,55 @@ point is letting a customer tick GloBird-ZEROHERO-style output off against their
 bill line by line to verify the product is pricing them correctly — don't reorder or
 re-blend sections without checking against a real bill sample first (see CLAUDE.md).
 
+⚠ **Gotcha — LP-path FiT tiers bucket by the free/over-cap split, not the blended rate**
+(fixed 2026-09-04). For an alternative (LP-scored) plan with a daily-capped FiT (EA
+BatteryEase: 8c first 10 kWh/day, 3c beyond), the solver reports a *blended* per-step
+`export_rate` for whichever hour the day's cap boundary falls in, and that crossover lands
+in a different hour with a different free/over ratio every day. Bucketing `fit.lines` by
+`round(export_rate, 4)` therefore fragmented the FiT into a handful of one-off "Solar
+Export" lines at rates printed on no real bill. `_compute_bill_items`'s LP branch now
+buckets each step's `export_cap_free_kwh` / `export_cap_over_kwh` at their explicit
+free/after-cap rates (exactly as the import `energy_lines` LP branch already did), and folds
+`opt_result['cap_labels']` into the FiT label map so the post-cap line reads
+"… (after N kWh/day)" instead of a bare "Solar Export". The two tranches still sum to the
+solver's own per-step `export_credit`, so the total is unchanged. See the checklist entry.
+
+⚠ **Gotcha — a structured cap plus a cap hint in the label text doubles up** (fixed
+2026-09-04). Both label paths (`build_rate_caps` for the LP breakdown, `_split_capped_kwh`
+for actual-usage) compose "`<label>` (first N kWh/day)" / "(after N kWh/day)" from the
+row's `daily_cap_kwh`. When the stored `label` *also* carries a human-written hint —
+"Solar Feed-in Tariff (first 10kWh/day)" — the result was "…(first 10kWh/day) (first 10
+kWh/day)". `cap_label_base()` (in `retailer_plans.py`) now strips a trailing
+"(… kWh …)" parenthetical from the base label before either path composes its tier labels;
+it only runs where a cap is known present, so a TOU time-range like "Peak (3pm-9pm)" (no
+"kWh") is left intact. This is a display-layer fix — the underlying plan data is untouched,
+so a label like BatteryEase's is still worth tidying in the editor, but no longer has to be.
+
 **Gotcha — capped-rate labels, now direction-scoped.** Label the free tier and the
 after-cap tier explicitly; a rate-value-keyed label dict silently merges on collision if two
 different tiers land on the same numeric rate — including *across* import and export (e.g.
 GloBird's 0c import Free Window and 0c export No-Feed-in window). `_compute_bill_items` uses
 separate `cap_labels` (import) and `export_cap_labels` (export) dicts for exactly this
 reason — don't merge them back into one shared dict. See the checklist entry.
+
+⚠ **Gotcha — a `VersionedPlan` bill spanning a retailer price change** (fixed 2026-09-04).
+When the comparison window straddles a plan's `effective_from` boundary (two `/plans/history`
+versions overlap the period), the date-aware LP correctly prices each hour at whichever
+version was in force — so the schedule carries rate values from *both* versions. But
+`_compute_bill_items` discovers rate→label mappings from `plan.get_display_breakdown()` /
+`get_import_rate_defs()` / `get_export_rate_defs()`, and `VersionedPlan` used to return only
+`self._latest` for all three. A rate value unique to the superseded version then matched no
+label and rendered as a bare **"Energy"** / **"Solar Export"** usage line (real case:
+`globird_solarplus`, Off-Peak 31.13c→28.05c on 2026-08-12 — the old 31.13c hours showed as
+"Energy"). Those three methods now return every version's tiers, with a
+`" (until <date>)"` / `" (from <date>)"` suffix on non-current ones (`_eff_suffix` /
+`_all_rate_defs` in `retailer_plans.py`), and `get_display_breakdown` injects a zero-kWh
+label anchor for any import tier only an old version had. Current-version labels still win on
+a shared rate value. Consequence: a plan that changed rates mid-period now shows two lines
+for the same tier at its two rates (e.g. "Off-Peak (until 12 Aug 2026)" 31.13c *and*
+"Off-Peak" 28.05c) — which is how a real bill spanning the change reads. Other affected
+plans: `energyaustralia_solar_max` (flat→3-rate TOU on 2026-08-17), `engie_solar_energy_plan`,
+`arc_energy`, `flow_power_flow_home` (export label changed), `red_energy_living_energy_saver`.
 
 **"Exclude Greedy Consumption" checkbox (added 2026-08-30).** In the Plan Comparison
 toolbar (`grid-lens-card.js`, next to the retailer filter), **unchecked by default**. When
