@@ -145,6 +145,21 @@ class RetailerPlan(ABC):
         # PEA support: set by PlanFromData when plan JSON includes a "pea" block.
         self.aemo_price_sensor: str | None = None
         self.bpea: float = 0.017
+        # spot_pricing: wholesale->retail transform for market-linked plans
+        # (Amber Smart Shift etc.). None => no model; when set, a dict of
+        # {region?, import:{adder_c_per_kwh, multiplier?, cap_c_per_kwh?},
+        #  export:{adder_c_per_kwh?, multiplier?, floor_c_per_kwh?}}.
+        # plan_calculator prices these plans per-5-min-interval against the
+        # AEMO RRP series instead of the static import_rates bands. See
+        # gridlens-api/docs/SPOT_PRICING_DESIGN.md.
+        self.spot_pricing: dict | None = None
+
+    @property
+    def has_spot_pricing(self) -> bool:
+        """True iff this plan carries a usable wholesale->retail spot model
+        (the import adder is the one required field)."""
+        sp = self.spot_pricing
+        return bool(sp and (sp.get("import") or {}).get("adder_c_per_kwh") is not None)
 
     @abstractmethod
     def get_import_rate(self, dt: datetime) -> float:
@@ -264,6 +279,12 @@ class PlanFromData(RetailerPlan):
             self.aemo_price_sensor = pea["aemo_sensor"]
         if "bpea" in pea:
             self.bpea = pea["bpea"]
+
+        # spot_pricing: only retained when the required import adder is present,
+        # so has_spot_pricing is a simple truthiness check downstream.
+        spot = plan_data.get("spot_pricing") or {}
+        if (spot.get("import") or {}).get("adder_c_per_kwh") is not None:
+            self.spot_pricing = spot
 
         # Network (DNSP) tariff code(s) this plan is restricted to, e.g. "EA116" or
         # "EA116,EA030" — public catalogue data, not customer data. None means "no

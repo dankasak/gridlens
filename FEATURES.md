@@ -173,6 +173,23 @@ actual data, just sourced from a live feed rather than a static tariff. That sen
 path doesn't yet itemise per-tier (no per-interval FiT/energy_lines split for it) — a known
 gap, not a silent wrong number: it reports one clearly-labelled total instead of guessing.
 
+**Spot pricing for market-linked *alternatives*** (`spot_pricing` block, 2026-09-04 —
+`gridlens-api/docs/SPOT_PRICING_DESIGN.md`). A market-linked plan being *ranked* (not held)
+used to be scored from its static `"(estimate)"` rate bands and a flat default FiT — which
+carry no negative prices, no evening spikes, and none of the plan's spot export credit, so
+Amber's fixed *Solar Sharer* standing offer would out-rank Amber *Smart Shift* on a
+solar+battery install. When a plan carries a `spot_pricing` block (`region`, `import`/`export`
+`adder_c_per_kwh` + `multiplier` + optional `cap`/`floor` — served as seven `spot_*` columns
+on `plans`), `plan_calculator` fetches the real AEMO regional reference price once
+(`_resolve_aemo_rrp_sensor` → `sensor.aemo_nem_<region>1_current_5min_period_price`, auto-
+discovered; needs the `aemo_nem` integration), turns it into a per-clock-hour retail
+import/export series (`_spot_retail_rates`: `rrp × multiplier + adder`, clamped per 5-min
+interval), and prices that plan's LP path and no-battery path from it. Falls back to the
+estimate bands for any hour with no RRP (pre-recorder-retention, ~90 days; or `aemo_nem`
+absent). The **bill-breakdown line items** for such a plan are still shown from the estimate
+bands with a `spot_note` saying the ranked total is the real wholesale-priced one — per-line
+spot itemisation is Phase 2.
+
 **Bill breakdown mirrors a real retailer bill, on purpose.** The "our bill breakdown" card
 (`grid-lens-card.js`) orders and labels its rows to match how an Australian electricity bill
 actually reads — fixed charges (supply/subscription/demand/controlled load) first, usage

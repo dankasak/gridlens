@@ -51,6 +51,7 @@ from .const import (
     CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE,
     CONF_HAS_DEMAND_TARIFF,
     CONF_NETWORK_TARIFF_CODES,
+    CONF_STATE,
     parse_network_tariff_codes,
     DEFAULT_DEMAND_WINDOW_HOURS,
     DEFAULT_MIN_CHARGE_CURRENT_A,
@@ -124,6 +125,9 @@ class PlanCalculator:
         self.grid_export_sensor = entry.data.get(CONF_GRID_EXPORT_SENSOR)
         self.import_price_sensor = entry.data.get(CONF_IMPORT_PRICE_SENSOR)
         self.export_price_sensor = entry.data.get(CONF_EXPORT_PRICE_SENSOR)
+        # Household NEM state — used to resolve the AEMO regional reference price
+        # sensor for market-linked (spot) plans when the plan doesn't name a region.
+        self.state = entry.data.get(CONF_STATE, "NSW")
         # Whether the customer is on a network demand tariff. Only when True do
         # plans carrying a demand charge have it billed (see _compute_demand_charge).
         self.has_demand_tariff = entry.data.get(CONF_HAS_DEMAND_TARIFF, False)
@@ -440,6 +444,8 @@ class PlanCalculator:
             _fetch_total += 1
         if any(getattr(p, 'aemo_price_sensor', None) for p in self._get_plans()):
             _fetch_total += 1
+        if any(getattr(p, 'has_spot_pricing', False) for p in self._get_plans()):
+            _fetch_total += 1
         if self.import_price_sensor:
             _fetch_total += 1
         if self.export_price_sensor:
@@ -647,6 +653,47 @@ class PlanCalculator:
         if _pea_plans_with_sensor:
             await _progress("Fetched AEMO spot price history")
 
+        # Spot pricing (market-linked plans, e.g. Amber Smart Shift): fetch the
+        # AEMO regional reference price (RRP) once and build a per-plan retail
+        # rate series from each plan's wholesale->retail transform. Without this,
+        # market-linked ALTERNATIVES are priced from static "(estimate)" bands
+        # that carry no spot volatility and a fictional flat export rate — which
+        # is why Amber's Solar Sharer standing offer was out-ranking Smart Shift.
+        # See gridlens-api/docs/SPOT_PRICING_DESIGN.md.
+        # spot_retail: plan_key -> (import_by_hour, export_by_hour), each
+        # {hour_utc (datetime) -> $/kWh}. Absent hours fall back to plan rates.
+        spot_retail: dict = {}
+        _spot_plans = [p for p in self._get_plans() if getattr(p, 'has_spot_pricing', False)]
+        if _spot_plans:
+            _rrp_cache: dict[str, list[dict]] = {}
+            for _sp_plan in _spot_plans:
+                _sp_key = self._plan_key(_sp_plan, _dup_keys)
+                aemo_sensor = self._resolve_aemo_rrp_sensor(_sp_plan)
+                if not aemo_sensor:
+                    _LOGGER.warning(
+                        "Spot plan %s: no AEMO RRP sensor found (install has no "
+                        "aemo_nem 5-min price sensor?) — falling back to estimate bands",
+                        _sp_key)
+                    continue
+                if aemo_sensor not in _rrp_cache:
+                    _rrp_cache[aemo_sensor] = await self._fetch_5min_prices(
+                        aemo_sensor, start_date, end_date)
+                rrp = _rrp_cache[aemo_sensor]
+                if not rrp:
+                    _LOGGER.warning(
+                        "Spot plan %s: %s has no history for the period — "
+                        "falling back to estimate bands", _sp_key, aemo_sensor)
+                    continue
+                spot_retail[_sp_key] = self._spot_retail_rates(_sp_plan, rrp)
+                _LOGGER.warning(
+                    "Spot pricing for %s from %s: %d hourly retail slots "
+                    "(import avg %.1fc, export avg %.1fc)",
+                    _sp_key, aemo_sensor, len(spot_retail[_sp_key][0]),
+                    100 * (sum(spot_retail[_sp_key][0].values()) / max(1, len(spot_retail[_sp_key][0]))),
+                    100 * (sum(spot_retail[_sp_key][1].values()) / max(1, len(spot_retail[_sp_key][1]))),
+                )
+            await _progress("Fetched AEMO spot price history")
+
         # Pre-fetch everything needed for per-plan hourly profiles and bill items
         # so these can be computed inside the plan loop (enabling streaming callbacks).
         avg_import_prices = {}
@@ -745,6 +792,7 @@ class PlanCalculator:
                     base_load_data,
                     grid_export_data,
                     deferrable_loads=deferrable_loads,
+                    spot_series=spot_retail.get(plan_key),
                 )
                 fixed_credit = getattr(plan, 'fixed_daily_credit', 0.0) * actual_days
                 plan_costs[plan_key] = cost - fixed_credit
@@ -757,7 +805,8 @@ class PlanCalculator:
                 }
             else:
                 _LOGGER.warning(f"Using SIMPLE calculation for {plan_key}")
-                cost = self._calculate_plan_cost_simple(usage_data, plan)
+                cost = self._calculate_plan_cost_simple(
+                    usage_data, plan, spot_series=spot_retail.get(plan_key))
                 fixed_credit = getattr(plan, 'fixed_daily_credit', 0.0) * actual_days
                 plan_costs[plan_key] = cost - fixed_credit
                 plan_optimization_results[plan_key] = {
@@ -857,6 +906,7 @@ class PlanCalculator:
                         pea_result=pea_results.get(plan_key),
                         export_fine_data=export_fine_data,
                         cl_devices=cl_devices,
+                        is_spot_priced=bool(spot_retail.get(plan_key)),
                     )
 
             # The current plan's headline cost now comes from actual metered usage
@@ -1437,6 +1487,7 @@ class PlanCalculator:
         pea_result: dict = None,
         export_fine_data: list[dict] = None,
         cl_devices: list[dict] = None,
+        is_spot_priced: bool = False,
     ) -> dict:
         """Return itemised bill breakdown matching Australian electricity bill format.
 
@@ -1907,7 +1958,18 @@ class PlanCalculator:
 
         if comparison_total is not None and abs(comparison_total - net_total) > 0.50:
             saving = round(net_total - comparison_total, 2)
-            if saving > 0:
+            if is_spot_priced:
+                # The line items above are still priced from this plan's static
+                # "(estimate)" bands; the ranked headline (comparison_total) is
+                # priced from the real AEMO RRP series. Don't attribute that gap
+                # to battery optimisation — say what it is. Per-line spot pricing
+                # of this breakdown is Phase 2 (SPOT_PRICING_DESIGN.md §5.6).
+                result['spot_note'] = (
+                    f'Ranked cost ${comparison_total:.2f} is priced from real '
+                    f'wholesale (AEMO) prices for every interval. The line items '
+                    f'below are indicative only — this plan has no fixed tariff.'
+                )
+            elif saving > 0:
                 result['optimisation_note'] = (
                     f'Battery optimisation saves ${saving:.2f}'
                     f' (optimised total: ${comparison_total:.2f})'
@@ -2265,6 +2327,91 @@ class PlanCalculator:
         except Exception as exc:
             _LOGGER.warning("Could not fetch 5-min prices for %s: %s", sensor_id, exc)
             return []
+
+    # NEM region -> the AEMO NEM 5-min RRP sensor id the aemo_nem integration
+    # exposes. Only NEM regions exist (WA/NT are not in the NEM and have no RRP).
+    _AEMO_REGION_SENSOR = {
+        "NSW": "sensor.aemo_nem_nsw1_current_5min_period_price",
+        "VIC": "sensor.aemo_nem_vic1_current_5min_period_price",
+        "QLD": "sensor.aemo_nem_qld1_current_5min_period_price",
+        "SA":  "sensor.aemo_nem_sa1_current_5min_period_price",
+        "TAS": "sensor.aemo_nem_tas1_current_5min_period_price",
+        "NSW1": "sensor.aemo_nem_nsw1_current_5min_period_price",
+        "VIC1": "sensor.aemo_nem_vic1_current_5min_period_price",
+        "QLD1": "sensor.aemo_nem_qld1_current_5min_period_price",
+        "SA1":  "sensor.aemo_nem_sa1_current_5min_period_price",
+        "TAS1": "sensor.aemo_nem_tas1_current_5min_period_price",
+    }
+
+    def _resolve_aemo_rrp_sensor(self, plan) -> str | None:
+        """AEMO 5-min regional reference price sensor for a spot-priced plan.
+        Order: the plan's spot_pricing.region -> the household state -> discover
+        any aemo_nem 5-min price sensor present. Returns None when the install
+        has no such sensor (the plan then falls back to its estimate bands)."""
+        region = (plan.spot_pricing or {}).get("region") or self.state or "NSW"
+        guess = self._AEMO_REGION_SENSOR.get(str(region).upper())
+        if guess and self.hass.states.get(guess) is not None:
+            return guess
+        # Auto-discovery: any aemo_nem 5-minute price sensor, $/kWh.
+        for st in self.hass.states.async_all("sensor"):
+            eid = st.entity_id
+            if "aemo" in eid and "5min" in eid and "price" in eid:
+                if st.attributes.get("unit_of_measurement") in ("$/kWh", "AUD/kWh"):
+                    return eid
+        return guess if guess is not None else None
+
+    def _spot_retail_rates(self, plan, rrp_5min: list[dict]) -> tuple[dict, dict]:
+        """Turn a raw 5-min RRP series into per-clock-hour retail import/export
+        rate maps using ``plan.spot_pricing``'s wholesale->retail transform.
+
+        For each 5-min interval:
+            retail_import = clamp(rrp * import.multiplier + import.adder,  max=import.cap)
+            retail_export = clamp(rrp * export.multiplier + export.adder,  min=export.floor)
+        then average the intervals within each clock hour. The per-interval clamp
+        (rather than clamping the hour mean) keeps a price-protection cap biting
+        on the spike intervals it's meant to, and lets a negative-price interval
+        pull the export credit negative — Amber charges to export then.
+
+        Returns ({hour_utc: $/kWh}, {hour_utc: $/kWh}); hours with no RRP sample
+        are simply absent, and the caller falls back to the plan's own rates.
+        """
+        sp = plan.spot_pricing or {}
+        imp = sp.get("import") or {}
+        exp = sp.get("export") or {}
+
+        def _c(v):  # cents/kWh -> $/kWh, tolerating None
+            return None if v is None else float(v) / 100.0
+
+        imp_add = _c(imp.get("adder_c_per_kwh")) or 0.0
+        imp_mult = float(imp["multiplier"]) if imp.get("multiplier") is not None else 1.0
+        imp_cap = _c(imp.get("cap_c_per_kwh"))
+        exp_add = _c(exp.get("adder_c_per_kwh")) or 0.0
+        exp_mult = float(exp["multiplier"]) if exp.get("multiplier") is not None else 1.0
+        exp_floor = _c(exp.get("floor_c_per_kwh"))
+
+        from collections import defaultdict
+        buckets: dict = defaultdict(list)
+        for d in rrp_5min:
+            h = d["timestamp"].replace(minute=0, second=0, microsecond=0)
+            buckets[h].append(d["value"])
+
+        import_by_hour: dict = {}
+        export_by_hour: dict = {}
+        for h, prices in buckets.items():
+            imp_sum = exp_sum = 0.0
+            for p in prices:
+                ri = p * imp_mult + imp_add
+                if imp_cap is not None and ri > imp_cap:
+                    ri = imp_cap
+                re = p * exp_mult + exp_add
+                if exp_floor is not None and re < exp_floor:
+                    re = exp_floor
+                imp_sum += ri
+                exp_sum += re
+            n = len(prices)
+            import_by_hour[h] = imp_sum / n
+            export_by_hour[h] = exp_sum / n
+        return import_by_hour, export_by_hour
 
     @staticmethod
     def _compute_pea_credit(
@@ -2893,18 +3040,27 @@ class PlanCalculator:
         load_data: list[dict],
         export_data: list[dict],
         deferrable_loads: list[dict] = None,
+        spot_series: "tuple[dict, dict] | None" = None,
     ) -> Tuple[float, Dict]:
         """Calculate plan cost with OPTIMIZED battery usage.
-        
+
         This shows what the cost WOULD BE if you optimally used your battery
         for this particular plan's rate structure.
-        
+
+        ``spot_series`` — for a market-linked plan, ``(import_by_hour,
+        export_by_hour)`` maps ({hour_utc: $/kWh}) built from the real AEMO RRP
+        series by ``_spot_retail_rates``. When given, the LP prices each hour
+        from these instead of the plan's static ``get_import_rate`` /
+        ``get_export_rate`` bands (an hour missing from the map — pre-history or
+        a data gap — still falls back to the band). This is what lets the
+        optimiser see negative-price troughs and evening spikes.
+
         Returns:
             Tuple of (total_cost, optimization_result)
         """
         if not self.battery_optimizer:
             _LOGGER.warning("No battery optimizer - falling back to standard calculation")
-            return self._calculate_plan_cost_simple(load_data, plan), {}
+            return self._calculate_plan_cost_simple(load_data, plan, spot_series=spot_series), {}
 
         # Use historical grid_import as load and solar as generation.
         # This answers: "given the same net grid exchange pattern, what is the optimal
@@ -3000,10 +3156,19 @@ class PlanCalculator:
         local_dows: list[int] = []  # weekday per LP hour (0=Mon), for weekly schedules
         _dp_rate_sum, _dp_rate_n = 0.0, 0          # for the blended per-season rate
         _dp_inseason_dates: set = set()            # distinct in-season local dates
+        _spot_imp, _spot_exp = spot_series if spot_series else (None, None)
         for hour_idx in range(T):
             local_dt = (start_time + timedelta(hours=hour_idx)).astimezone(tz)
-            hourly_import_rates.append(plan.get_import_rate(local_dt))
-            hourly_export_rates.append(plan.get_export_rate(local_dt))
+            if _spot_imp is not None:
+                _hk = (start_time + timedelta(hours=hour_idx)).astimezone(timezone.utc).replace(
+                    minute=0, second=0, microsecond=0)
+                hourly_import_rates.append(
+                    _spot_imp[_hk] if _hk in _spot_imp else plan.get_import_rate(local_dt))
+                hourly_export_rates.append(
+                    _spot_exp[_hk] if _hk in _spot_exp else plan.get_export_rate(local_dt))
+            else:
+                hourly_import_rates.append(plan.get_import_rate(local_dt))
+                hourly_export_rates.append(plan.get_export_rate(local_dt))
             local_hods.append(local_dt.hour)
             local_dows.append(local_dt.weekday())
             if demand_predicate:
@@ -3158,33 +3323,41 @@ class PlanCalculator:
         return total_cost, result
 
     def _calculate_plan_cost_simple(
-        self, usage_data: list[dict], plan: RetailerPlan
+        self, usage_data: list[dict], plan: RetailerPlan,
+        spot_series: "tuple[dict, dict] | None" = None,
     ) -> float:
         """Calculate plan cost without battery optimization.
-        
+
         Args:
             usage_data: Historical usage data
             plan: RetailerPlan instance
-            
+            spot_series: for a market-linked plan, ``(import_by_hour, _)`` from
+                ``_spot_retail_rates`` — when given, each interval's import is
+                priced at the real retail-from-RRP rate for its clock hour
+                instead of the plan's static ``_split_capped_kwh`` bands (an
+                hour missing from the map falls back to the bands). Export is
+                not priced on this no-battery path for any plan today.
+
         Returns:
             Total cost for the plan
         """
         if not usage_data:
             return 0.0
-        
+
         total_cost = 0.0
-        
+
         # Calculate days in period
         first_timestamp = min(d["timestamp"] for d in usage_data)
         last_timestamp = max(d["timestamp"] for d in usage_data)
         days = (last_timestamp - first_timestamp).days + 1
-        
+
         # Add daily supply charges
         total_cost += plan.daily_supply_charge * days
-        
+
         # Calculate usage costs using plan's rate structure (cap-aware: splits
         # kWh across a capped rate's free portion and its post-cap rate once
         # daily_cap_kwh is exceeded for that calendar day).
+        _spot_imp = spot_series[0] if spot_series else None
         total_kwh = 0
         daily_used: dict = {}
         cap_labels: dict = {}
@@ -3193,10 +3366,17 @@ class PlanCalculator:
             kwh = usage["value"]
             total_kwh += kwh
 
+            if _spot_imp is not None:
+                _hk = timestamp.astimezone(timezone.utc).replace(
+                    minute=0, second=0, microsecond=0)
+                if _hk in _spot_imp:
+                    total_cost += kwh * _spot_imp[_hk]
+                    continue  # spot-priced: cap tiers don't apply to a market rate
+
             for rate, part_kwh in self._split_capped_kwh(
                     plan, "import", timestamp, kwh, daily_used, cap_labels):
                 total_cost += part_kwh * rate
-        
+
         _LOGGER.debug(
             f"Plan {plan.retailer} - {plan.plan_name}: {total_kwh:.2f} kWh, "
             f"supply: ${plan.daily_supply_charge * days:.2f}, total: ${total_cost:.2f}"
