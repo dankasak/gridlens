@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import statistics
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -823,6 +824,7 @@ class PlanCalculator:
                     slot['home_load_kwh'] = round(home_load_hod_avg.get(h, 0.0), 4)
                     slot['solar_kwh']     = round(solar_hod_avg.get(h, 0.0), 4)
                 plan_optimization_results[plan_key]['hourly_profile'] = lp_day_profile
+                plan_optimization_results[plan_key]['spikes'] = opt_result.get('spikes') or []
             else:
                 profile = self._build_plan_hourly_profile(
                     hourly_day_profile, plan, avg_import_prices, avg_export_prices, start_date
@@ -3348,6 +3350,64 @@ class PlanCalculator:
                 'deferrable_per_device': [round(s['deferrable_per_device'][ii] / n, 4) for ii in range(N)],
             })
         result['day_profile'] = day_profile
+
+        # Spikes: real historical intervals where this spot-priced plan's rate
+        # went above 2x its own period-median — "Amber shines here" moments that
+        # the hour-of-day averaged day_profile above dilutes into invisibility
+        # (one spike day blended with ~29 ordinary days at the same hour-of-day).
+        # Detected on the RAW schedule (one row per actual historical hour, real
+        # dispatch), not the averaged profile, so the reported kWh/$ are what
+        # really happened at that hour — not an average.
+        #
+        # Only meaningful for spot-priced plans (spot_series is not None): a
+        # fixed/TOU plan's "spike" is just its scheduled peak window, which
+        # recurs every day and isn't a spike in this sense.
+        #
+        # Median (not mean) as the "normal" baseline — a mean gets dragged up by
+        # the very spikes being detected (self-defeating: a noisy month could
+        # inflate "normal" past the spikes it should be flagging) and dragged
+        # down by negative-price troughs, which are common and not spikes.
+        #
+        # Import and export are evaluated independently: export = RRP - a small
+        # adder, so a wholesale spike shows up as a roughly proportional spike in
+        # the export rate; import = RRP + a much larger fixed adder (network +
+        # env + fees + margin), which dilutes the same wholesale spike's RATIO
+        # relative to the (higher) import baseline — so under this "2x the
+        # baseline" rule, export spikes are expected to be more common than
+        # import spikes. That's a real property of retail tariff construction,
+        # not a detection bug.
+        spikes: list[dict] = []
+        if spot_series is not None and result.get('schedule'):
+            imp_all = [s.get('import_rate', 0.0) for s in result['schedule']]
+            exp_all = [s.get('export_rate', 0.0) for s in result['schedule']]
+            imp_median = statistics.median(imp_all) if imp_all else 0.0
+            exp_median = statistics.median(exp_all) if exp_all else 0.0
+            imp_threshold = imp_median * 2 if imp_median > 0 else None
+            exp_threshold = exp_median * 2 if exp_median > 0 else None
+            for step in result['schedule']:
+                ir = step.get('import_rate', 0.0)
+                er = step.get('export_rate', 0.0)
+                is_imp = imp_threshold is not None and ir > imp_threshold
+                is_exp = exp_threshold is not None and er > exp_threshold
+                if not (is_imp or is_exp):
+                    continue
+                spike_dt = (start_time + timedelta(hours=step['hour'])).astimezone(tz)
+                direction = 'both' if (is_imp and is_exp) else ('import' if is_imp else 'export')
+                spikes.append({
+                    'timestamp':     spike_dt.isoformat(),
+                    'direction':     direction,
+                    'import_rate':   round(ir, 4),
+                    'export_rate':   round(er, 4),
+                    'import_kwh':    round(step.get('import_kwh', 0.0), 3),
+                    'export_kwh':    round(step.get('export_kwh', 0.0), 3),
+                    'import_cost':   round(step.get('import_cost', 0.0), 3),
+                    'export_credit': round(step.get('export_credit', 0.0), 3),
+                })
+            # Highest-rate first; cap the payload (a genuinely noisy month can
+            # have dozens) — the card shows a handful with a "+N more" count.
+            spikes.sort(key=lambda s: max(s['import_rate'], s['export_rate']), reverse=True)
+            spikes = spikes[:25]
+        result['spikes'] = spikes
 
         # Add daily supply charges
         days = len(hourly_solar) / 24

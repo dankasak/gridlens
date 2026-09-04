@@ -343,6 +343,62 @@ class GridLensCard extends HTMLElement {
     </svg>`;
   }
 
+  // "Wed 20 Aug, 10pm" — compact enough for a one-line spike row.
+  _fmtSpikeTime(iso) {
+    try {
+      const d = new Date(iso);
+      const day = d.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' });
+      let h = d.getHours();
+      const ampm = h >= 12 ? 'pm' : 'am';
+      h = h % 12; if (h === 0) h = 12;
+      return `${day}, ${h}${ampm}`;
+    } catch (e) { return ''; }
+  }
+
+  // Real historical intervals a spot-priced plan's rate cleared 2x its own
+  // period-median — see plan_calculator._calculate_plan_cost_with_battery_
+  // optimization's "Spikes" comment for why these are detected on the raw
+  // schedule rather than the (hour-of-day averaged) profile a single spike
+  // would otherwise vanish into. `spikes` is pre-sorted highest-rate-first.
+  renderSpikes(spikes) {
+    if (!spikes || !spikes.length) return '';
+    const SHOW = 6;
+    const rows = spikes.slice(0, SHOW).map(sp => {
+      const when = this._fmtSpikeTime(sp.timestamp);
+      let color, label, rateTxt, amtTxt;
+      if (sp.direction === 'both') {
+        color = GridLensCard.SOC_COLOR;
+        label = 'Buy &amp; sell';
+        rateTxt = `${(sp.import_rate * 100).toFixed(1)}c / ${(sp.export_rate * 100).toFixed(1)}c`;
+        amtTxt = `$${sp.export_credit.toFixed(2)}`;
+      } else if (sp.direction === 'export') {
+        color = GridLensCard.INCOME_COLOR;
+        label = 'Sell';
+        rateTxt = `${(sp.export_rate * 100).toFixed(1)}c/kWh`;
+        amtTxt = `$${sp.export_credit.toFixed(2)}`;
+      } else {
+        color = GridLensCard.SPEND_COLOR;
+        label = 'Buy';
+        rateTxt = `${(sp.import_rate * 100).toFixed(1)}c/kWh`;
+        amtTxt = `$${sp.import_cost.toFixed(2)}`;
+      }
+      return `<div class="spike-row">
+        <span class="spike-dot" style="background:${color}"></span>
+        <span class="spike-label" style="color:${color}">${label} ${rateTxt}</span>
+        <span class="spike-when">${when}</span>
+        <span class="spike-amt" style="color:${color}">${amtTxt}</span>
+      </div>`;
+    }).join('');
+    const more = spikes.length > SHOW
+      ? `<div class="spike-more">+${spikes.length - SHOW} more this period</div>` : '';
+    return `
+      <div class="spike-section">
+        <div class="chart-label" style="margin-top:10px">⚡ Spikes (&gt;2&times; normal price)</div>
+        ${rows}
+        ${more}
+      </div>`;
+  }
+
   renderSocChart(profile, scale = 1) {
     if (!profile || !profile.length) return '';
     const W = 288, H = Math.round(50 * scale), BAR = 11, GAP = 1;
@@ -600,6 +656,13 @@ class GridLensCard extends HTMLElement {
         /* Quieter than .bill-note — informational, not a caveat: this plan is
            variable-rate, so the lines above are period averages by design. */
         .bill-spot-note { font-size: 11px; color: var(--secondary-text-color); font-style: italic; padding: 4px 0; }
+        .spike-section { margin-top: 4px; }
+        .spike-row { display: flex; align-items: center; gap: 6px; font-size: 11px; padding: 2px 0; }
+        .spike-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }
+        .spike-label { font-weight: 600; white-space: nowrap; }
+        .spike-when { color: var(--secondary-text-color); margin-left: auto; white-space: nowrap; }
+        .spike-amt { font-weight: 600; min-width: 46px; text-align: right; white-space: nowrap; }
+        .spike-more { font-size: 11px; color: var(--secondary-text-color); font-style: italic; padding: 2px 0; }
         /* Hazard-stripe flag shown under an alternative plan's charts whenever "Exclude
            Greedy Consumption" is active — see _greedyStripeHtml(). Deliberately louder
            than .bill-note's quiet italic caption: it's not a per-plan data quirk, it's a
@@ -1079,6 +1142,8 @@ class GridLensCard extends HTMLElement {
             </div>
             ${this.renderRateChart(profile, chartScale)}` : '';
 
+        const spikesHtml = this.renderSpikes(details.spikes);
+
         chartHtml = `
           <div class="chart-section">
             ${loadChartHtml}
@@ -1096,6 +1161,7 @@ class GridLensCard extends HTMLElement {
             </div>
             ${this.renderDivergingChart(profile, 'import_cost', 'export_income', maxCost, GridLensCard.SPEND_COLOR, GridLensCard.INCOME_COLOR, chartScale)}
             ${rateChartHtml}
+            ${spikesHtml}
             ${socChartHtml}
             ${this.renderHourLabels()}
             ${this._greedyStripeHtml(isCurrentPlan)}
