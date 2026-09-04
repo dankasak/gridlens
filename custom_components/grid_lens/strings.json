@@ -105,12 +105,12 @@
         "description": "Select the electricity plan you are currently on.\n\nThis creates your **free Grid Lens account**, which compares your current plan against itself so you can see your cost breakdown.\n\n[Upgrade at gridlens.au/pricing](https://gridlens.au/pricing) to compare against all available plans on your network and find out if you could be paying less.",
         "data": {
           "current_plan": "Current plan",
-          "has_demand_tariff": "I'm on a demand tariff",
+          "has_demand_tariff": "My network bills a demand charge",
           "vpp_program": "VPP bolt-on program (optional)",
           "network_tariff_codes": "Network tariff code (optional)"
         },
         "data_description": {
-          "has_demand_tariff": "Tick this if your network bills a demand (peak kW) charge. It's set by your distributor based on your meter — check your bill for a 'demand' line in $/kW. When on, plans that include a demand charge have it added to the estimate, and the battery optimiser shaves your peak to reduce it.",
+          "has_demand_tariff": "Tick this if your *current* network bills a demand (peak kW) charge — it's set by your distributor based on your meter, so check your bill for a 'demand' line in $/kW. This only affects plans priced against your network's demand charge. A plan whose own tariff is a demand tariff (e.g. Amber's demand-tariff variant) always includes it. When a demand charge applies, the battery optimiser also shaves your peak to reduce it.",
           "vpp_program": "If you're enrolled in a retailer VPP credit program on top of your plan (e.g. AGL Bring Your Own Battery), select it here. This is independent of your plan choice — switching plans with the same retailer won't affect it. Leave as 'None / not enrolled' if you're not in one.",
           "network_tariff_codes": "Some plans only apply to a specific network tariff (found on your bill, e.g. 'EA116'). Enter your code(s), comma-separated, to hide plans that don't match. Leave blank if you don't know it — nothing is filtered until you set this, and it's never sent to Grid Lens."
         }
@@ -311,12 +311,12 @@
         "description": "Select the electricity plan you are currently on.",
         "data": {
           "current_plan": "Current plan",
-          "has_demand_tariff": "I'm on a demand tariff",
+          "has_demand_tariff": "My network bills a demand charge",
           "vpp_program": "VPP bolt-on program (optional)",
           "network_tariff_codes": "Network tariff code (optional)"
         },
         "data_description": {
-          "has_demand_tariff": "Tick this if your network bills a demand (peak kW) charge. It's set by your distributor based on your meter — check your bill for a 'demand' line in $/kW. When on, plans that include a demand charge have it added to the estimate, and the battery optimiser shaves your peak to reduce it.",
+          "has_demand_tariff": "Tick this if your *current* network bills a demand (peak kW) charge — it's set by your distributor based on your meter, so check your bill for a 'demand' line in $/kW. This only affects plans priced against your network's demand charge. A plan whose own tariff is a demand tariff (e.g. Amber's demand-tariff variant) always includes it. When a demand charge applies, the battery optimiser also shaves your peak to reduce it.",
           "vpp_program": "If you're enrolled in a retailer VPP credit program on top of your plan (e.g. AGL Bring Your Own Battery), select it here. Independent of your plan choice. Leave as 'None / not enrolled' if you're not in one.",
           "network_tariff_codes": "Some plans only apply to a specific network tariff (found on your bill, e.g. 'EA116'). Enter your code(s), comma-separated, to hide plans that don't match. Leave blank if you don't know it — nothing is filtered until you set this, and it's never sent to Grid Lens."
         }

@@ -119,7 +119,13 @@ rate or window differences are separate entries. Sourced from the retailer's CDR
 `retailer_plans.PlanFromData` parses it (`demand_period_covers`/`demand_rate_at`
 helpers); a **non-empty** list overrides the network-level `demand_window` /
 `demand_charge_per_kw_per_day` entirely, an **empty** one keeps the legacy single
-network charge. The bill breakdown (`grid-lens-card.js`) shows **one line per period**,
+network charge. A `demand_periods` plan's charge is **always priced** in the
+comparison and fed to the optimiser — it's part of that plan's tariff structure,
+so choosing the plan means being on it — *regardless* of the `has_demand_tariff`
+config toggle (which is a fact about the customer's *current* DNSP meter and gates
+only the legacy network-level charge). Without this, a demand-tariff plan variant
+(e.g. Amber's "Smart Shift: Demand Tariff") would rank identically to its
+non-demand sibling for anyone not currently on a demand meter. The bill breakdown (`grid-lens-card.js`) shows **one line per period**,
 each with its own peak-kW, rate and in-season day count — matching how the retailer
 itemises each season. `_compute_demand_charge_periods` in `plan_calculator.py` computes
 the current-plan lines from actual metered usage per season; alternative plans get one

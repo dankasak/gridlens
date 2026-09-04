@@ -124,10 +124,13 @@ CONF_DISTRIBUTOR = "distributor"
 CONF_STATE = "state"
 CONF_POSTCODE = "postcode"
 
-# Whether the customer is on a network demand tariff (peak-kW charges).
-# This is set by the DNSP based on the customer's NMI/meter, not by the retail
-# plan, so we can't infer it — the user tells us. When True, plans that carry a
-# demand charge (charges.demand_charge_per_kw_per_day) have it billed.
+# Whether the customer's *current* meter is on a network demand tariff class
+# (peak-kW charges). Set by the DNSP based on the NMI/meter, not by the retail
+# plan, so we can't infer it — the user tells us. This gates only the LEGACY
+# network-level demand charge (charges.demand_charge_per_kw_per_day, merged from
+# the shared networks row). A plan that carries its own `demand_periods` list
+# stipulates the demand charge as part of its tariff structure and is priced
+# regardless of this toggle — see plan_calculator._compute_demand_charge.
 CONF_HAS_DEMAND_TARIFF = "has_demand_tariff"
 
 # Default demand window when a plan defines a demand charge but no explicit

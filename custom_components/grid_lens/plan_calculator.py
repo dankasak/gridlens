@@ -1046,9 +1046,6 @@ class PlanCalculator:
         window (1 kWh over 1 h = 1 kW average). Sub-hourly spikes are averaged
         out, so this is a lower bound on the true metered demand.
 
-        Only applies when the customer is on a demand tariff (config toggle) and
-        the plan actually carries a demand charge.
-
         Two shapes come back:
         - legacy single line ``{label, peak_kw, rate_per_kw_per_day, days,
           amount, ...}`` — a plan on the network-level demand charge
@@ -1056,9 +1053,18 @@ class PlanCalculator:
         - per-season ``{label, amount, days, approximate, source, lines:[...]}``
           — a plan carrying ``demand_periods`` (one sub-line per season/window,
           each itemised the way the retailer's bill does). ``amount`` is the sum.
+
+        Gating: a plan carrying its own ``demand_periods`` stipulates the demand
+        charge as part of its tariff structure — choosing the plan *is* being on
+        that structure — so it's always priced, whatever ``has_demand_tariff``
+        says. That config toggle is a fact about the customer's *current* DNSP
+        meter/tariff class and gates only the LEGACY network-level charge below
+        (which comes from the shared ``networks`` row). Without this split, a
+        demand-tariff plan variant (e.g. Amber's "Smart Shift: Demand Tariff",
+        whose only difference from plain "Smart Shift" is the demand charge)
+        would rank identically to its non-demand sibling for anyone not currently
+        on a demand meter — understating it exactly where it matters.
         """
-        if not self.has_demand_tariff:
-            return None
         if not getattr(plan, 'demand_charge_active', False):
             return None
 
@@ -1067,6 +1073,10 @@ class PlanCalculator:
             return self._compute_demand_charge_periods(
                 plan, periods, usage_data, opt_result, actual_days, tz, prefer_actual)
 
+        # Legacy network-level demand charge: only bills if the customer's own
+        # meter is on a demand tariff class (they tell us via the config toggle).
+        if not self.has_demand_tariff:
+            return None
         rate = getattr(plan, 'demand_charge_per_kw_per_day', 0.0) or 0.0
         if rate <= 0:
             return None
@@ -2912,14 +2922,17 @@ class PlanCalculator:
             from backports.zoneinfo import ZoneInfo
         tz = ZoneInfo("Australia/Sydney")
 
-        # Demand-charge peak-shaving inputs (only when the user is on a demand
-        # tariff and this plan carries one). Build a per-LP-hour window mask so
+        # Demand-charge peak-shaving inputs. Build a per-LP-hour window mask so
         # the optimiser lowers the peak grid import inside the metered window.
+        # A plan carrying `demand_periods` stipulates its own demand charge, so
+        # it's fed to the LP regardless of `has_demand_tariff` (same reasoning as
+        # _compute_demand_charge — that toggle gates only the legacy
+        # network-level charge below).
         demand_rate = 0.0
         demand_predicate = None
         demand_days_in_season = 0.0
         _demand_periods = getattr(plan, 'demand_periods', None) or []
-        if self.has_demand_tariff and getattr(plan, 'demand_charge_active', False):
+        if getattr(plan, 'demand_charge_active', False):
             if _demand_periods:
                 # Per-season demand charge: in-window iff SOME period covers this
                 # slot's date+time+day-type. The LP still solves a single peak
@@ -2932,7 +2945,7 @@ class PlanCalculator:
 
                 def demand_predicate(local_dt, _c=_covers, _p=_demand_periods):
                     return bool(_c) and any(_c(pd, local_dt) for pd in _p)
-            elif getattr(plan, 'demand_charge_per_kw_per_day', 0.0) > 0:
+            elif self.has_demand_tariff and getattr(plan, 'demand_charge_per_kw_per_day', 0.0) > 0:
                 demand_rate = plan.demand_charge_per_kw_per_day
                 window = getattr(plan, 'demand_window', None) or {}
                 whours = window.get('hours', DEFAULT_DEMAND_WINDOW_HOURS)

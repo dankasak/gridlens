@@ -205,6 +205,15 @@ def test_coordinator_demand_inputs_season_aware_for_demand_periods():
     check("legacy single-window path still there for network-level demand charges",
           "demand_window_predicate(hours, days_spec)" in body
           and "legacy_rate" in body)
+    # A demand_periods plan is modelled regardless of the has_demand_tariff
+    # toggle; the toggle now guards only the legacy (elif) branch.
+    check("early-return no longer requires CONF_HAS_DEMAND_TARIFF up front",
+          "if not getattr(plan, \"demand_charge_active\", False):" in body)
+    pre_periods = body.split("if periods:")[0]
+    check("toggle not checked before the demand_periods branch",
+          "CONF_HAS_DEMAND_TARIFF" not in pre_periods)
+    check("toggle gates the legacy elif only",
+          "elif not (self._cfg(CONF_HAS_DEMAND_TARIFF, False) and legacy_rate > 0):" in body)
 
 
 def test_advisory_current_plan_merges_operator_demand_fields():
@@ -258,7 +267,7 @@ def test_planner_forwards_and_summarises_demand():
 
 
 # --------------------------------------------- plan comparison (re-verify, no regress)
-def _compute_demand_charge():
+def _compute_demand_charge(has_demand_tariff=True):
     """PlanCalculator._compute_demand_charge (+ _compute_demand_charge_periods),
     lifted out of the HA-importing module."""
     src = open(os.path.join(_COMPONENT, "plan_calculator.py")).read()
@@ -270,7 +279,7 @@ def _compute_demand_charge():
             "3pm-9pm" if not w or w.get("start") else "3pm-9pm"),
         "timedelta": dt.timedelta,
     }
-    exec("class C:\n    has_demand_tariff = True\n" + src[i:j], ns)
+    exec(f"class C:\n    has_demand_tariff = {has_demand_tariff!r}\n" + src[i:j], ns)
     return ns["C"]()
 
 
@@ -301,6 +310,64 @@ def test_plan_comparison_demand_charge_arithmetic():
         demand_window = None
     check("a non-demand plan gets no line",
           c._compute_demand_charge(_Flat(), [], {"demand_peak_kw": 9.0}, 30, None) is None)
+
+
+def test_has_demand_tariff_gates_only_the_legacy_charge():
+    """`has_demand_tariff` (the customer's current-meter toggle) gates the legacy
+    network-level charge only. A plan carrying its own demand_periods is priced
+    regardless — choosing that plan IS being on a demand tariff, so its cost
+    must not vanish just because the customer's current meter isn't a demand one
+    (Amber "Smart Shift: Demand Tariff" would otherwise tie plain "Smart Shift").
+    """
+    off = _compute_demand_charge(has_demand_tariff=False)
+
+    # legacy network-level plan, toggle off -> no line
+    check("legacy demand charge suppressed when toggle off",
+          off._compute_demand_charge(_Plan(), [], {"demand_peak_kw": 4.0}, 30, None) is None)
+
+    # demand_periods plan, toggle off -> STILL priced
+    tz = dt.timezone(dt.timedelta(hours=11))
+
+    class _PeriodsPlan:
+        demand_charge_active = True
+        demand_charge_per_kw_per_day = 0.0
+        demand_window = None
+        demand_periods = [{
+            "rate_per_kw_per_day": 0.43434, "days": "all",
+            "start": "15:00:00", "end": "21:00:00",
+            "season_label": "Summer", "season": {"start": "11-01", "end": "03-31"},
+        }]
+
+        @staticmethod
+        def demand_period_covers(period, d):
+            s = period["season"]
+            probe = f"{d.month:02d}-{d.day:02d}"
+            in_season = (s["start"] <= probe <= s["end"]) if s["start"] <= s["end"] \
+                else (probe >= s["start"] or probe <= s["end"])
+            return in_season and 15 <= d.hour < 21
+
+    usage = [{"timestamp": dt.datetime(2026, 1, 10, 18, tzinfo=tz), "value": 5.0}]
+    out = off._compute_demand_charge(_PeriodsPlan(), usage, None, 31, tz, prefer_actual=True)
+    check("demand_periods plan still priced with toggle off", out is not None)
+    summer = next((ln for ln in (out or {}).get("lines", []) if ln["label"] == "Summer"), None)
+    check("Summer line present and non-zero", summer is not None and summer["amount"] > 0,
+          summer)
+
+
+def test_lp_feed_demand_periods_not_gated_by_toggle():
+    """Source pin: the LP-feed demand block keys on demand_charge_active, and the
+    has_demand_tariff check now guards only the legacy (elif) branch."""
+    src = open(os.path.join(_COMPONENT, "plan_calculator.py")).read()
+    i = src.index("# Demand-charge peak-shaving inputs")
+    body = src[i:i + 1600]
+    check("outer guard is demand_charge_active, not the toggle",
+          "if getattr(plan, 'demand_charge_active', False):" in body)
+    check("demand_periods branch has no has_demand_tariff check",
+          "if _demand_periods:" in body
+          and "self.has_demand_tariff" not in body.split("if _demand_periods:")[1]
+              .split("elif")[0])
+    check("legacy elif still gated by has_demand_tariff",
+          "elif self.has_demand_tariff and getattr(plan, 'demand_charge_per_kw_per_day'" in body)
 
 
 def _load_rp():

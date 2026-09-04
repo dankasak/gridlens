@@ -519,19 +519,23 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
     async def _demand_inputs(self, bundle):
         """(rate, window_mask, month_to_date_peak_kw, days_remaining) for the LP.
 
-        (0.0, None, 0.0, 0.0) — a no-op for the optimizer — unless the customer
-        is on a demand tariff (the DNSP-meter config toggle) AND the current
-        plan actually carries a demand charge. See ``advisory/demand.py`` for
-        why the LP needs the last two numbers on a rolling horizon.
+        (0.0, None, 0.0, 0.0) — a no-op for the optimizer — unless the current
+        plan actually carries a demand charge. A plan with its own
+        ``demand_periods`` is modelled regardless of the ``has_demand_tariff``
+        config toggle (choosing that plan *is* being on a demand tariff); the
+        toggle gates only the LEGACY network-level charge. See
+        ``advisory/demand.py`` for why the LP needs the last two numbers on a
+        rolling horizon.
         """
         plan = self._plan
-        if not (self._cfg(CONF_HAS_DEMAND_TARIFF, False)
-                and getattr(plan, "demand_charge_active", False)):
+        if not getattr(plan, "demand_charge_active", False):
             return 0.0, None, 0.0, 0.0
 
         periods = getattr(plan, "demand_periods", None) or []
         legacy_rate = getattr(plan, "demand_charge_per_kw_per_day", 0.0) or 0.0
-        if not periods and legacy_rate <= 0:
+        if periods:
+            pass  # plan-stipulated demand structure — model it, toggle or not
+        elif not (self._cfg(CONF_HAS_DEMAND_TARIFF, False) and legacy_rate > 0):
             return 0.0, None, 0.0, 0.0
 
         try:
