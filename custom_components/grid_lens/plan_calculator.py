@@ -3289,6 +3289,7 @@ class PlanCalculator:
         start_local_hour = start_time.astimezone(tz).hour
         hour_sums: dict = {h: {'import_kwh': 0.0, 'export_kwh': 0.0,
                                 'import_cost': 0.0, 'export_credit': 0.0,
+                                'import_rate_sum': 0.0, 'export_rate_sum': 0.0,
                                 'charge_kwh': 0.0, 'discharge_kwh': 0.0,
                                 'soc_percent': 0.0, 'deferrable_kwh': 0.0,
                                 'solar_kwh': 0.0,
@@ -3303,6 +3304,17 @@ class PlanCalculator:
             s['export_kwh']      += step.get('export_kwh', 0)
             s['import_cost']     += step.get('import_cost', 0)
             s['export_credit']   += step.get('export_credit', 0)
+            # The plan's actual per-interval rate (what it charged/paid THAT hour),
+            # not cost/kwh — cost/kwh is 0 in any hour the LP happened not to
+            # import/export, which for a battery-covered plan is roughly half the
+            # day and leaves the price line full of gaps and misleading bridge
+            # segments (2026-09-05: owner reported the buy line looking broken next
+            # to a "working" sell line — same derivation, just gappier on THIS
+            # plan). step['import_rate']/['export_rate'] is set by the optimizer for
+            # every hour regardless of dispatch, so summing it gives a continuous
+            # price curve for both directions.
+            s['import_rate_sum'] += step.get('import_rate', 0)
+            s['export_rate_sum'] += step.get('export_rate', 0)
             s['charge_kwh']      += step.get('charge_kwh', 0)
             s['discharge_kwh']   += step.get('discharge_kwh', 0)
             s['soc_percent']     += step.get('soc_percent', 0)
@@ -3326,8 +3338,8 @@ class PlanCalculator:
                 'export_kwh':            round(exp_kwh,  4),
                 'import_cost':           round(imp_cost, 4),
                 'export_income':         round(exp_cred, 4),
-                'import_rate':           round(imp_cost / imp_kwh, 4) if imp_kwh > 0 else 0,
-                'export_rate':           round(exp_cred / exp_kwh, 4) if exp_kwh > 0 else 0,
+                'import_rate':           round(s['import_rate_sum'] / n, 4),
+                'export_rate':           round(s['export_rate_sum'] / n, 4),
                 'charge_kwh':            round(s['charge_kwh']     / n, 4),
                 'discharge_kwh':         round(s['discharge_kwh']  / n, 4),
                 'soc_percent':           round(s['soc_percent']    / n, 1),
