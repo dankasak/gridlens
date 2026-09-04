@@ -59,6 +59,11 @@ comparison toolbar, with a `<datalist>` of the retailers actually present so it 
 while a filter is active. Escape or the native ✕ clears it. Added because the NSW catalogue
 reached 93 plans and the page became unreadable.
 
+The plan the user is currently on is **always shown regardless of the filter** (matched by
+the `.current-plan` class, not its retailer) so there is always a baseline in view for the
+filtered alternatives to be compared against, even when the active plan's retailer doesn't
+match the search box. It still counts toward the "N of M" total.
+
 It **hides DOM nodes rather than re-rendering** — re-rendering on each keystroke would
 replace the `<input>` being typed into and lose focus and caret position every character,
 and the streaming `plan` events already re-render the card once per plan priced (`render()`

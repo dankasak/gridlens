@@ -390,7 +390,9 @@ class GridLensCard extends HTMLElement {
     } catch (e) { console.error('deleteHistoryEntry:', e); }
   }
 
-  /** Show only plans whose retailer matches the search box. Presentational
+  /** Show only plans whose retailer matches the search box, plus the plan the
+   *  user is currently on — which stays visible under any filter so there's
+   *  always a baseline to compare the shown alternatives against. Presentational
    *  only — nothing is removed from this._data, so chart scaling stays global
    *  and the History panel still sees every plan. */
   _applyRetailerFilter() {
@@ -400,6 +402,7 @@ class GridLensCard extends HTMLElement {
     let shown = 0;
     cards.forEach((el) => {
       const hit = !needle
+        || el.classList.contains('current-plan')
         || (el.getAttribute('data-retailer') || '').toLowerCase().includes(needle);
       el.hidden = !hit;
       if (hit) shown++;
