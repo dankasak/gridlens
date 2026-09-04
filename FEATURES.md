@@ -186,9 +186,18 @@ discovered; needs the `aemo_nem` integration), turns it into a per-clock-hour re
 import/export series (`_spot_retail_rates`: `rrp × multiplier + adder`, clamped per 5-min
 interval), and prices that plan's LP path and no-battery path from it. Falls back to the
 estimate bands for any hour with no RRP (pre-recorder-retention, ~90 days; or `aemo_nem`
-absent). The **bill-breakdown line items** for such a plan are still shown from the estimate
-bands with a `spot_note` saying the ranked total is the real wholesale-priced one — per-line
-spot itemisation is Phase 2.
+absent).
+
+The **bill breakdown** for a spot plan collapses to a single *"Spot import (period average)"*
+usage line and a single *"Spot feed-in (period average)"* credit line — each the period
+total at the c/kWh that actually resulted — rather than the dozens of one-off rate-bucketed
+lines a per-hour-varying rate would otherwise produce (nothing on a real Amber bill looks
+like that). A quiet `spot_note` says the plan is variable-rate. The per-hour rate *shape*
+is on the new **"Average hourly price"** chart in the plan card (`renderRateChart` in
+`grid-lens-card.js`): buy-rate and sell-rate polylines in c/kWh across the day, with a zero
+line when the spot export price goes negative. Shown for any plan whose rate moves more
+than 2c across the day (spot and TOU), sitting just below the existing "Average hourly cost"
+(spend/income $) chart.
 
 **Bill breakdown mirrors a real retailer bill, on purpose.** The "our bill breakdown" card
 (`grid-lens-card.js`) orders and labels its rows to match how an Australian electricity bill

@@ -1588,6 +1588,26 @@ class PlanCalculator:
                                  'amount': round(import_cost_actual, 2),
                                  'time_range': None}]
 
+        elif lp_schedule and is_spot_priced:
+            # Market-linked plan (Amber Smart Shift etc.): every LP hour is priced
+            # at a different retail-from-RRP rate, so bucketing by rate value would
+            # fragment "usage charges" into dozens of one-off lines that match
+            # nothing on a real Amber bill (Amber itemises a single period total).
+            # Collapse to one line at the period-average c/kWh. The per-hour rate
+            # detail is on the "Average hourly price" chart instead.
+            total_import_kwh = sum(s.get('import_kwh', 0.0) for s in lp_schedule)
+            total_import_cost = sum(s.get('import_cost', 0.0) for s in lp_schedule)
+            total_export_kwh = opt_result.get('total_export_kwh', 0.0)
+            avg_c = (round(total_import_cost / total_import_kwh * 100, 2)
+                     if total_import_kwh > 1e-9 else 0.0)
+            energy_lines = [{
+                'label': 'Spot import (period average)',
+                'rate_c': avg_c,
+                'kwh': round(total_import_kwh, 2),
+                'amount': round(total_import_cost, 2),
+                'time_range': None,
+            }]
+
         elif lp_schedule:
             # LP-optimised plan: build energy lines from the LP schedule's per-slot
             # import_rate (which correctly applies weekday/weekend rates).  To also
@@ -1759,6 +1779,7 @@ class PlanCalculator:
         # a real bill — the whole point being to let a customer tick this off
         # against their actual retailer bill line by line.
         fit_tier_data: dict = defaultdict(lambda: {'kwh': 0.0, 'cost': 0.0})
+        _spot_fit_avg_c = None  # set on the LP spot path, for a labelled average line
         if export_credit_actual is not None and getattr(plan, 'spot_export_pricing', False):
             # Spot-priced export for the current plan (e.g. Amber): use sensor's
             # actual credit as a single line — there's no fixed rate/window to
@@ -1766,6 +1787,15 @@ class PlanCalculator:
             if total_export_kwh > 1e-9:
                 fit_tier_data[-1.0]['kwh'] = total_export_kwh
                 fit_tier_data[-1.0]['cost'] = export_credit_actual
+        elif lp_schedule and export_credit_actual is None and is_spot_priced:
+            # LP-optimised market-linked plan: one spot feed-in line at the
+            # period-average c/kWh (same reasoning as the import branch above).
+            tot_kwh = sum(s.get('export_kwh', 0.0) for s in lp_schedule)
+            tot_cost = sum(s.get('export_credit', 0.0) for s in lp_schedule)
+            if tot_kwh > 1e-9:
+                fit_tier_data[-1.0]['kwh'] = tot_kwh
+                fit_tier_data[-1.0]['cost'] = tot_cost
+                _spot_fit_avg_c = round(tot_cost / tot_kwh * 100, 2)
         elif lp_schedule and export_credit_actual is None:
             # LP-optimised non-current plan: bucket each step's export by its
             # explicit free/over-cap kWh split (export_cap_free_kwh /
@@ -1858,8 +1888,11 @@ class PlanCalculator:
         fit_all_rates = sorted(fit_tier_data.keys(), reverse=True)
         fit_lines = [
             {
-                'label': fit_rate_to_label.get(rk, 'Solar Export'),
-                'rate_c': round(rk * 100, 2) if rk >= 0 else None,
+                'label': ('Spot feed-in (period average)'
+                          if (rk == -1.0 and _spot_fit_avg_c is not None)
+                          else fit_rate_to_label.get(rk, 'Solar Export')),
+                'rate_c': (_spot_fit_avg_c if (rk == -1.0 and _spot_fit_avg_c is not None)
+                           else (round(rk * 100, 2) if rk >= 0 else None)),
                 'kwh': round(fit_tier_data[rk]['kwh'], 2),
                 'amount': round(fit_tier_data[rk]['cost'], 2),
                 'time_range': export_time_ranges.get(rk) if rk >= 0 else None,
@@ -1956,20 +1989,21 @@ class PlanCalculator:
             'total': net_total,
         }
 
-        if comparison_total is not None and abs(comparison_total - net_total) > 0.50:
+        if is_spot_priced:
+            # This plan has no fixed tariff — import and export follow the live
+            # wholesale (AEMO) price every 5 minutes. The usage / feed-in lines
+            # above are the period totals at the average c/kWh that actually
+            # resulted; the "Average hourly price" chart shows how much the rate
+            # moved. Not a "battery optimisation saving" note — the whole bill is
+            # already spot-priced.
+            result['spot_note'] = (
+                'Variable-rate plan: import and export track the live wholesale '
+                'price. Figures above are period totals at the average rate that '
+                'resulted; see the hourly price chart for the range.'
+            )
+        elif comparison_total is not None and abs(comparison_total - net_total) > 0.50:
             saving = round(net_total - comparison_total, 2)
-            if is_spot_priced:
-                # The line items above are still priced from this plan's static
-                # "(estimate)" bands; the ranked headline (comparison_total) is
-                # priced from the real AEMO RRP series. Don't attribute that gap
-                # to battery optimisation — say what it is. Per-line spot pricing
-                # of this breakdown is Phase 2 (SPOT_PRICING_DESIGN.md §5.6).
-                result['spot_note'] = (
-                    f'Ranked cost ${comparison_total:.2f} is priced from real '
-                    f'wholesale (AEMO) prices for every interval. The line items '
-                    f'below are indicative only — this plan has no fixed tariff.'
-                )
-            elif saving > 0:
+            if saving > 0:
                 result['optimisation_note'] = (
                     f'Battery optimisation saves ${saving:.2f}'
                     f' (optimised total: ${comparison_total:.2f})'

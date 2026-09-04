@@ -302,6 +302,47 @@ class GridLensCard extends HTMLElement {
     </svg>`;
   }
 
+  // Average hourly buy/sell PRICE (c/kWh) over the day. Two polylines —
+  // import rate and export rate — on a shared c/kWh axis, with a zero line
+  // when the export price goes negative (spot plans: you pay to export).
+  // Rates come from the profile slots (import_cost/import_kwh etc.), so an
+  // hour with no grid flow at all reports 0; those points are dropped and
+  // the line bridges the gap rather than diving to zero.
+  renderRateChart(profile, scale = 1) {
+    if (!profile || !profile.length) return '';
+    const W = 288, H = Math.round(58 * scale), BAR = 11, GAP = 1, PAD = 3;
+    const imp = profile.map(s => (s.import_rate || 0) * 100);
+    const exp = profile.map(s => (s.export_rate || 0) * 100);
+    const vals = [...imp, ...exp].filter(v => v !== 0);
+    if (!vals.length) return '';
+    let hi = Math.max(...vals, 0), lo = Math.min(...vals, 0);
+    if (hi - lo < 1) hi = lo + 1;                 // avoid a flat/degenerate axis
+    const y = c => H - PAD - ((c - lo) / (hi - lo)) * (H - 2 * PAD);
+    const line = (series, color) => {
+      const pts = series
+        .map((c, i) => (c === 0 ? null : `${(i * (BAR + GAP) + BAR / 2).toFixed(1)},${y(c).toFixed(1)}`))
+        .filter(Boolean).join(' ');
+      if (!pts) return '';
+      return `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round"/>`;
+    };
+    const dots = (series, color, label) => series.map((c, i) => {
+      if (c === 0) return '';
+      const x = i * (BAR + GAP) + BAR / 2;
+      return `<circle cx="${x.toFixed(1)}" cy="${y(c).toFixed(1)}" r="1.8" fill="${color}">` +
+             `<title>${profile[i].hour}:00  ${label} ${c.toFixed(1)} c/kWh</title></circle>`;
+    }).join('');
+    const zeroLine = lo < 0
+      ? `<line x1="0" y1="${y(0).toFixed(1)}" x2="${W}" y2="${y(0).toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.8"/>`
+      : '';
+    return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="display:block;height:${H}px">
+      ${zeroLine}
+      ${line(imp, GridLensCard.SPEND_COLOR)}
+      ${line(exp, GridLensCard.INCOME_COLOR)}
+      ${dots(imp, GridLensCard.SPEND_COLOR, 'buy')}
+      ${dots(exp, GridLensCard.INCOME_COLOR, 'sell')}
+    </svg>`;
+  }
+
   renderSocChart(profile, scale = 1) {
     if (!profile || !profile.length) return '';
     const W = 288, H = Math.round(50 * scale), BAR = 11, GAP = 1;
@@ -556,6 +597,9 @@ class GridLensCard extends HTMLElement {
         }
         .bill-fit { color: var(--success-color, #4CAF50); }
         .bill-note { font-size: 11px; color: var(--warning-color, #FF9800); font-style: italic; padding: 4px 0; }
+        /* Quieter than .bill-note — informational, not a caveat: this plan is
+           variable-rate, so the lines above are period averages by design. */
+        .bill-spot-note { font-size: 11px; color: var(--secondary-text-color); font-style: italic; padding: 4px 0; }
         /* Hazard-stripe flag shown under an alternative plan's charts whenever "Exclude
            Greedy Consumption" is active — see _greedyStripeHtml(). Deliberately louder
            than .bill-note's quiet italic caption: it's not a per-plan data quirk, it's a
@@ -951,6 +995,9 @@ class GridLensCard extends HTMLElement {
           if (bi.optimisation_note) {
             rows += `<div class="bill-note">${bi.optimisation_note}</div>`;
           }
+          if (bi.spot_note) {
+            rows += `<div class="bill-spot-note">${bi.spot_note}</div>`;
+          }
 
           breakdownHtml = `<div class="breakdown-section">${rows}</div>`;
 
@@ -1018,6 +1065,20 @@ class GridLensCard extends HTMLElement {
             </div>
             ${this.renderSocChart(profile, chartScale)}` : '';
 
+        // Price chart: only worth showing when the rate actually moves across
+        // the day (spot / TOU plans). A flat single-rate plan would just draw a
+        // straight line, so skip it there.
+        const _impRates = profile.map(s => s.import_rate || 0).filter(v => v > 0);
+        const _rateSpread = _impRates.length
+          ? Math.max(..._impRates) - Math.min(..._impRates) : 0;
+        const rateChartHtml = _rateSpread > 0.02 ? `
+            <div class="chart-label" style="margin-top:10px">
+              Average hourly price &nbsp;
+              <span style="color:${GridLensCard.SPEND_COLOR};font-weight:600">■ buy</span> &nbsp;
+              <span style="color:${GridLensCard.INCOME_COLOR};font-weight:600">■ sell</span> &nbsp; (c/kWh)
+            </div>
+            ${this.renderRateChart(profile, chartScale)}` : '';
+
         chartHtml = `
           <div class="chart-section">
             ${loadChartHtml}
@@ -1034,6 +1095,7 @@ class GridLensCard extends HTMLElement {
               <span style="color:${GridLensCard.INCOME_COLOR};font-weight:600">■ income</span> ↓ &nbsp; ($)
             </div>
             ${this.renderDivergingChart(profile, 'import_cost', 'export_income', maxCost, GridLensCard.SPEND_COLOR, GridLensCard.INCOME_COLOR, chartScale)}
+            ${rateChartHtml}
             ${socChartHtml}
             ${this.renderHourLabels()}
             ${this._greedyStripeHtml(isCurrentPlan)}
