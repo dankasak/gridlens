@@ -197,7 +197,33 @@ is on the new **"Average hourly price"** chart in the plan card (`renderRateChar
 `grid-lens-card.js`): buy-rate and sell-rate polylines in c/kWh across the day, with a zero
 line when the spot export price goes negative. Shown for any plan whose rate moves more
 than 2c across the day (spot and TOU), sitting just below the existing "Average hourly cost"
-(spend/income $) chart.
+(spend/income $) chart. The chart's rate values are the true per-interval rate the plan
+priced against that hour of day (averaged across the whole comparison period), not
+`cost/kwh` — the latter is 0 in any hour the LP didn't happen to import/export, which for a
+battery-covered plan is roughly half the day and left one side of the chart full of gaps
+(2026-09-05, found because the buy line looked broken next to a "working" sell line — same
+derivation, just gappier on the plan being viewed).
+
+**Spikes callout** (2026-09-05). The hourly charts above are hour-of-day *averages* across
+the whole comparison period, so a single spike day is diluted into ~30 days' worth of the
+same hour and becomes visually invisible — even though the ranked total and the LP's
+dispatch already fully capture it (confirmed by inspecting the raw, un-averaged schedule:
+the optimiser discharges to its max rate and drains SOC to floor specifically in the
+highest-rate hours). A **"⚡ Spikes (>2× normal price)"** list under the price chart surfaces
+these explicitly: real historical intervals where a spot plan's import or export rate
+cleared 2x that direction's own period *median* (median, not mean, so the threshold isn't
+dragged up by the very spikes it's meant to catch), detected on the raw LP schedule so the
+date/rate/kWh/$ shown are what actually happened — not an average. Shows direction (buy /
+sell / both), rate, the $ actually captured that hour (can be $0 — the battery only has so
+much energy, so the optimiser may have held it for an even better hour instead, and the list
+says so honestly rather than implying every spike was monetised), and when. Export spikes
+dominate the list under a strict 2x rule: export tracks the wholesale price almost 1:1 (a
+small subtracted fee), so a wholesale spike shows up near-proportionally, while import
+carries a large fixed adder (network + environmental + fees + margin) on top that dilutes
+the same spike's *ratio* relative to the higher baseline — a property of retail tariff
+construction, not a detection bug. Only computed for spot-priced plans; capped at 25, top 6
+shown with a count. `plan_calculator._calculate_plan_cost_with_battery_optimization`
+("Spikes" comment) / `renderSpikes` in `grid-lens-card.js`.
 
 **Bill breakdown mirrors a real retailer bill, on purpose.** The "our bill breakdown" card
 (`grid-lens-card.js`) orders and labels its rows to match how an Australian electricity bill
