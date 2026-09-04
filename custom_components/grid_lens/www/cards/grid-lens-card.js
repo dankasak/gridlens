@@ -826,16 +826,22 @@ class GridLensCard extends HTMLElement {
             </div>`;
           }
 
-          // Demand charge (peak-kW), only present when on a demand tariff
+          // Demand charge (peak-kW), only present when on a demand tariff.
+          // `dm.lines` = per-season sub-lines (a plan carrying demand_periods,
+          // itemised the way the retailer bills each season); otherwise a
+          // single flat line (the network-level demand charge).
           if (bi.demand) {
             const dm = bi.demand;
             rows += '<div class="bill-section-head">Demand charge</div>';
-            rows += `<div class="breakdown-row">
-              <div class="breakdown-label">${dm.label}${this._timeRangeHtml(dm.time_range)}<br>
-                <span style="font-size:11px;opacity:0.7">${dm.peak_kw.toFixed(2)}&thinsp;kW peak &times; ${(dm.rate_per_kw_per_day * 100).toFixed(2)}&thinsp;c/kW/day &times; ${dm.days}&thinsp;days</span>
-              </div>
-              <div class="breakdown-value">$${dm.amount.toFixed(2)}</div>
-            </div>`;
+            const dmLines = (dm.lines && dm.lines.length) ? dm.lines : [dm];
+            dmLines.forEach(ln => {
+              rows += `<div class="breakdown-row">
+                <div class="breakdown-label">${ln.label}${this._timeRangeHtml(ln.time_range)}<br>
+                  <span style="font-size:11px;opacity:0.7">${(ln.peak_kw || 0).toFixed(2)}&thinsp;kW peak &times; ${((ln.rate_per_kw_per_day || 0) * 100).toFixed(2)}&thinsp;c/kW/day &times; ${ln.days}&thinsp;days</span>
+                </div>
+                <div class="breakdown-value">$${(ln.amount || 0).toFixed(2)}</div>
+              </div>`;
+            });
           }
 
           // Controlled Load — device(s) wired to a CL register, priced separately

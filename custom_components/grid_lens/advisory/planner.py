@@ -66,6 +66,8 @@ class AdvisoryPlanner:
         deferrable_loads: Optional[list[dict]] = None,
         demand_rate: float = 0.0,
         demand_window_mask: Optional[list[int]] = None,
+        demand_peak_kw_month_to_date: float = 0.0,
+        demand_days_remaining: float = 0.0,
         import_caps: Optional[list[dict]] = None,
         export_caps: Optional[list[dict]] = None,
         conditional_credits: Optional[list[dict]] = None,
@@ -83,6 +85,8 @@ class AdvisoryPlanner:
             deferrable_loads=deferrable_loads or [],
             demand_rate=demand_rate,
             demand_window_mask=demand_window_mask,
+            demand_peak_kw_month_to_date=demand_peak_kw_month_to_date,
+            demand_days_remaining=demand_days_remaining,
             timestep_hours=dt_h,
             soc_reward=self.soc_reward,
             no_grid_charge=self.no_grid_charge,
@@ -163,6 +167,19 @@ class AdvisoryPlanner:
                 row[f"defer_{j}"] = round(per_dev[j], 3) if j < len(per_dev) else 0.0
             trajectory.append(row)
 
+        demand_summary = None
+        if demand_rate and demand_window_mask and any(demand_window_mask):
+            demand_summary = {
+                "planned_peak_kw": (
+                    round(result["demand_peak_kw"], 3)
+                    if result.get("demand_peak_kw") is not None else None
+                ),
+                "prior_peak_kw": round(float(demand_peak_kw_month_to_date), 3),
+                "rate_per_kw_per_day": round(float(demand_rate), 5),
+                "days_remaining": round(float(demand_days_remaining), 1),
+                "window_slots": sum(1 for m in demand_window_mask if m),
+            }
+
         return AdvisoryResult(
             generated_at=dt_util.now(),
             start=bundle.start,
@@ -180,6 +197,7 @@ class AdvisoryPlanner:
             battery_max_charge_kw=self.optimizer.max_charge_rate_kw,
             battery_max_discharge_kw=self.optimizer.max_discharge_rate_kw,
             ev_soc_status=result.get("ev_soc_status", []),
+            demand=demand_summary,
         )
 
     @staticmethod

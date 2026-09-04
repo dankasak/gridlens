@@ -8,7 +8,7 @@ must never disturb the rest of the integration.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import statistics_during_period
@@ -19,8 +19,15 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from ..battery_optimizer import BatteryOptimizer
-from ..const import DOMAIN
+from ..const import CONF_HAS_DEMAND_TARIFF, DEFAULT_DEMAND_WINDOW_HOURS, DOMAIN
 from ..schedule_grid import rolling_window_hours
+from .demand import (
+    billing_days_remaining,
+    days_to_season_end,
+    demand_window_predicate,
+    month_start_local,
+    peak_from_hourly_samples,
+)
 from .forecast import FlatLoadForecaster, ForecastProvider, HourOfDayLoadForecaster
 from .load_history import build_hour_of_day_load
 from .planner import AdvisoryPlanner
@@ -108,11 +115,19 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         if not plan_data:
             return None
 
-        from ..retailer_plans import PlanFromData
+        from ..retailer_plans import PlanFromData, _prepare_plan_data
 
         plan_id = self.entry.data.get("current_plan")
         if plan_id and plan_id in plan_data:
-            return PlanFromData(plan_data[plan_id])
+            # Merge the network operator's demand-charge / controlled-load fields
+            # in the same way the comparison path does (plans_from_api_data) —
+            # PlanFromData on the raw dict alone leaves demand_charge_per_kw_per_day
+            # at 0 and demand_window None, so the advisory LP could never shave a
+            # demand peak on a demand-tariff plan.
+            network_operators = getattr(calc, "network_operators", None) or {}
+            return PlanFromData(
+                _prepare_plan_data(plan_id, plan_data[plan_id], network_operators)
+            )
 
         # Secondary: match the main coordinator's detected name. Never guess plans[0].
         current_name = (main.data or {}).get("current_plan_name") if main and main.data else None
@@ -500,6 +515,130 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         values = [r["sum"] for r in (stats or {}).get(sensor_id, []) if r.get("sum") is not None]
         return any((cur - prev) > threshold_kwh for prev, cur in zip(values, values[1:]))
 
+    # ------------------------------------------------------------- demand charge
+    async def _demand_inputs(self, bundle):
+        """(rate, window_mask, month_to_date_peak_kw, days_remaining) for the LP.
+
+        (0.0, None, 0.0, 0.0) — a no-op for the optimizer — unless the customer
+        is on a demand tariff (the DNSP-meter config toggle) AND the current
+        plan actually carries a demand charge. See ``advisory/demand.py`` for
+        why the LP needs the last two numbers on a rolling horizon.
+        """
+        plan = self._plan
+        if not (self._cfg(CONF_HAS_DEMAND_TARIFF, False)
+                and getattr(plan, "demand_charge_active", False)):
+            return 0.0, None, 0.0, 0.0
+
+        periods = getattr(plan, "demand_periods", None) or []
+        legacy_rate = getattr(plan, "demand_charge_per_kw_per_day", 0.0) or 0.0
+        if not periods and legacy_rate <= 0:
+            return 0.0, None, 0.0, 0.0
+
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:  # pragma: no cover
+            from backports.zoneinfo import ZoneInfo
+        tz = ZoneInfo("Australia/Sydney")
+
+        start_local = bundle.start.astimezone(tz)
+        now_local = dt_util.now().astimezone(tz)
+
+        if periods:
+            # Per-season demand charge: in-window iff SOME period covers the
+            # slot's date+time+day-type. The advisory horizon is 24–48 h so it
+            # almost always sits in one season; the LP still solves a single
+            # peak var, priced at that season's rate (a day-weighted blend over
+            # in-window horizon slots if the horizon straddles a boundary) and
+            # over min(days left in the billing month, days left in the season)
+            # — a peak set now only bills until whichever ends first.
+            def pred(local_dt):
+                return any(plan.demand_period_covers(pd, local_dt) for pd in periods)
+
+            mask = [
+                1 if pred(start_local + timedelta(minutes=t * bundle.slot_minutes)) else 0
+                for t in range(bundle.slots)
+            ]
+            rate_sum = rate_n = 0
+            for t in range(bundle.slots):
+                slot_dt = start_local + timedelta(minutes=t * bundle.slot_minutes)
+                if mask[t]:
+                    r = plan.demand_rate_at(slot_dt)
+                    if r:
+                        rate_sum += r
+                        rate_n += 1
+            rate = (rate_sum / rate_n) if rate_n else 0.0
+
+            month_left = billing_days_remaining(now_local)
+            season_left = None
+            for pd in periods:
+                if plan._in_season(pd, now_local):  # today's MM-DD is in this season
+                    s = days_to_season_end(now_local, (pd.get("season") or {}).get("end"))
+                    if s is not None:
+                        season_left = s if season_left is None else min(season_left, s)
+            days_remaining = float(month_left if season_left is None
+                                   else min(month_left, season_left))
+            win_desc = "per-season"
+        else:
+            rate = legacy_rate
+            window = getattr(plan, "demand_window", None) or {}
+            hours = window.get("hours", DEFAULT_DEMAND_WINDOW_HOURS)
+            days_spec = window.get("days", "weekdays")
+            pred = demand_window_predicate(hours, days_spec)
+            mask = [
+                1 if pred(start_local + timedelta(minutes=t * bundle.slot_minutes)) else 0
+                for t in range(bundle.slots)
+            ]
+            days_remaining = float(billing_days_remaining(now_local))
+            win_desc = f"{hours}/{days_spec}"
+
+        mtd_peak = await self._demand_peak_month_to_date(pred, now_local, tz)
+
+        _LOGGER.info(
+            "demand: rate=%.4f $/kW/day, window %s, month-to-date peak=%.2f kW, "
+            "%.0f day(s) priced",
+            rate, win_desc, mtd_peak, days_remaining,
+        )
+        return rate, mask, mtd_peak, days_remaining
+
+    async def _demand_peak_month_to_date(self, pred, now_local, tz) -> float:
+        """Highest in-window grid import (kWh/h ~= kW) already recorded this
+        calendar month, from HA's hourly ``sum`` statistics for the import
+        energy sensor. 0.0 when there's no sensor / no history — the LP then
+        just has no floor, which is safe (it only ever ADDS a floor)."""
+        sensor_id = self._cfg("energy_sensor", None)
+        if not sensor_id:
+            return 0.0
+        month_start = month_start_local(now_local)
+        try:
+            stats = await get_instance(self.hass).async_add_executor_job(
+                statistics_during_period,
+                self.hass, month_start.astimezone(timezone.utc),
+                now_local.astimezone(timezone.utc), {sensor_id}, "hour", None, {"sum"},
+            )
+        except Exception as exc:  # noqa: BLE001 — fail open: no floor beats a crash
+            _LOGGER.warning("demand: could not read %s history: %s", sensor_id, exc)
+            return 0.0
+
+        samples: list[tuple] = []
+        prev = None
+        for r in (stats or {}).get(sensor_id, []):
+            s = r.get("sum")
+            if s is None:
+                continue
+            st = r.get("start")
+            if isinstance(st, (int, float)):
+                local = datetime.fromtimestamp(st, tz)
+            elif st is not None:
+                local = dt_util.as_utc(st).astimezone(tz)
+            else:
+                continue
+            if prev is not None:
+                # The delta over [prev, cur] is the energy used in prev's clock
+                # hour — attribute it there for the window test.
+                samples.append((prev[0], s - prev[1]))
+            prev = (local, s)
+        return peak_from_hourly_samples(samples, pred)
+
     # ------------------------------------------------------------------ cache
     async def async_load_cached(self) -> None:
         """Seed ``self.data`` from the last persisted plan so the card renders the
@@ -632,9 +771,20 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         )
         min_export_price = cents / 100.0
         deferrable_loads = await self._deferrable_for_horizon(bundle)
+        # Demand-charge peak shaving on a demand tariff: give the LP the metered
+        # window, the peak already locked in for this billing period (a floor —
+        # no point shaving below it) and the days still to run (what a new peak
+        # actually costs). No-op tuple otherwise. See advisory/demand.py.
+        demand_rate, demand_window_mask, demand_mtd_peak, demand_days_left = (
+            await self._demand_inputs(bundle)
+        )
         result = AdvisoryPlanner(optimizer, min_export_price=min_export_price).plan(
             bundle, initial_soc_percent=soc,
             deferrable_loads=deferrable_loads,
+            demand_rate=demand_rate,
+            demand_window_mask=demand_window_mask,
+            demand_peak_kw_month_to_date=demand_mtd_peak,
+            demand_days_remaining=demand_days_left,
             import_caps=import_caps,
             export_caps=export_caps,
             conditional_credits=conditional_credits,

@@ -1048,11 +1048,27 @@ class PlanCalculator:
 
         Only applies when the customer is on a demand tariff (config toggle) and
         the plan actually carries a demand charge.
+
+        Two shapes come back:
+        - legacy single line ``{label, peak_kw, rate_per_kw_per_day, days,
+          amount, ...}`` — a plan on the network-level demand charge
+          (``demand_window`` + ``demand_charge_per_kw_per_day``);
+        - per-season ``{label, amount, days, approximate, source, lines:[...]}``
+          — a plan carrying ``demand_periods`` (one sub-line per season/window,
+          each itemised the way the retailer's bill does). ``amount`` is the sum.
         """
         if not self.has_demand_tariff:
             return None
+        if not getattr(plan, 'demand_charge_active', False):
+            return None
+
+        periods = getattr(plan, 'demand_periods', None) or []
+        if periods:
+            return self._compute_demand_charge_periods(
+                plan, periods, usage_data, opt_result, actual_days, tz, prefer_actual)
+
         rate = getattr(plan, 'demand_charge_per_kw_per_day', 0.0) or 0.0
-        if rate <= 0 or not getattr(plan, 'demand_charge_active', False):
+        if rate <= 0:
             return None
 
         window = getattr(plan, 'demand_window', None) or {}
@@ -1112,6 +1128,120 @@ class PlanCalculator:
             'window_hours': hours,
             'time_range': format_window_range({'hours': hours, 'days': days_spec}),
             'source': source,
+            'approximate': True,
+        }
+
+    def _compute_demand_charge_periods(
+        self, plan, periods: list[dict], usage_data: list[dict],
+        opt_result: dict | None, actual_days: int, tz, prefer_actual: bool,
+    ) -> dict:
+        """Per-season demand charge — one bill sub-line per ``demand_periods``
+        entry, itemised the way the retailer bills it. The current plan
+        (``prefer_actual``) gets exact per-period peak-kW from actual metered
+        usage; alternative plans get a single blended line off the LP dispatch
+        (the LP schedule has no dates, so it can't be split by season).
+        """
+        # Billing span (local dates) — for counting how many days each season
+        # actually covers in this bill.
+        span_dates = sorted({d['timestamp'].astimezone(tz).date()
+                             for d in (usage_data or [])})
+        span_start = span_dates[0] if span_dates else None
+        span_end = span_dates[-1] if span_dates else None
+
+        def season_days(period: dict) -> int:
+            if span_start is None:
+                return actual_days
+            season = period.get('season')
+            if not season or not season.get('start') or not season.get('end'):
+                return (span_end - span_start).days + 1
+            n, day = 0, span_start
+            while day <= span_end:
+                probe = f"{day.month:02d}-{day.day:02d}"
+                s, e = season['start'], season['end']
+                if (s <= probe <= e) if s <= e else (probe >= s or probe <= e):
+                    n += 1
+                day += timedelta(days=1)
+            return n
+
+        covers = getattr(plan, 'demand_period_covers', None)
+
+        def in_period(period: dict, local_dt) -> bool:
+            if covers:
+                return covers(period, local_dt)
+            return True  # non-PlanFromData stand-in: no filtering
+
+        lines: list[dict] = []
+        if prefer_actual or not opt_result:
+            # Current plan: exact per-period peak from actual metered usage.
+            source = 'usage'
+            for period in periods:
+                peak = 0.0
+                for d in (usage_data or []):
+                    if in_period(period, d['timestamp'].astimezone(tz)):
+                        peak = max(peak, d['value'])
+                days = season_days(period)
+                rate = float(period.get('rate_per_kw_per_day') or 0.0)
+                lines.append({
+                    'label': period.get('season_label') or 'Demand charge',
+                    'peak_kw': round(peak, 3),
+                    'rate_per_kw_per_day': round(rate, 5),
+                    'days': days,
+                    'amount': round(peak * rate * days, 2),
+                    'time_range': format_window_range(period),
+                    'season': period.get('season'),
+                    'source': source,
+                    'approximate': True,
+                })
+        else:
+            # Alternative plan: the LP solved one peak against a union window
+            # mask; report it as a single blended line (rate = day-weighted mean
+            # across the seasons this bill touches). Exact per-season shaping of
+            # the LP is deferred — see OPEN_ITEMS.
+            source = 'optimised-lp' if opt_result.get('demand_peak_kw') is not None else 'optimised'
+            peak = opt_result.get('demand_peak_kw')
+            if peak is None:
+                # Union of every period's hours-of-day (LP schedule steps carry
+                # only an hour index, no date, so season can't be applied here).
+                union_hours: set[int] = set()
+                for period in periods:
+                    ph = period.get('hours')
+                    if ph == 'all':
+                        union_hours = set(range(24))
+                        break
+                    if ph:
+                        union_hours |= set(ph)
+                    elif period.get('start') and period.get('end'):
+                        sh = int(str(period['start']).split(':')[0])
+                        eh = int(str(period['end']).split(':')[0])
+                        union_hours |= (set(range(sh, eh)) if eh > sh
+                                        else set(range(sh, 24)) | set(range(0, eh)))
+                peak = 0.0
+                for step in opt_result.get('schedule', []) or []:
+                    if (step.get('hour', 0) % 24) in union_hours:
+                        peak = max(peak, step.get('import_kwh', 0.0))
+            tot_days = sum(season_days(p) for p in periods) or actual_days
+            blended_rate = (
+                sum(float(p.get('rate_per_kw_per_day') or 0.0) * season_days(p) for p in periods)
+                / tot_days) if tot_days else 0.0
+            lines.append({
+                'label': 'Demand charge',
+                'peak_kw': round(float(peak), 3),
+                'rate_per_kw_per_day': round(blended_rate, 5),
+                'days': tot_days,
+                'amount': round(float(peak) * blended_rate * tot_days, 2),
+                'time_range': None,
+                'source': source,
+                'approximate': True,
+                'blended': True,
+            })
+
+        amount = round(sum(l['amount'] for l in lines), 2)
+        return {
+            'label': 'Demand charge',
+            'amount': amount,
+            'days': actual_days,
+            'lines': lines,
+            'source': lines[0]['source'] if lines else 'usage',
             'approximate': True,
         }
 
@@ -2787,30 +2917,45 @@ class PlanCalculator:
         # the optimiser lowers the peak grid import inside the metered window.
         demand_rate = 0.0
         demand_predicate = None
-        if (self.has_demand_tariff
-                and getattr(plan, 'demand_charge_active', False)
-                and getattr(plan, 'demand_charge_per_kw_per_day', 0.0) > 0):
-            demand_rate = plan.demand_charge_per_kw_per_day
-            window = getattr(plan, 'demand_window', None) or {}
-            whours = window.get('hours', DEFAULT_DEMAND_WINDOW_HOURS)
-            days_spec = window.get('days', 'weekdays')
+        demand_days_in_season = 0.0
+        _demand_periods = getattr(plan, 'demand_periods', None) or []
+        if self.has_demand_tariff and getattr(plan, 'demand_charge_active', False):
+            if _demand_periods:
+                # Per-season demand charge: in-window iff SOME period covers this
+                # slot's date+time+day-type. The LP still solves a single peak
+                # var, so it's priced at a day-weighted blended rate over the
+                # seasons the horizon touches (exact per-season peak vars are a
+                # later refinement — see OPEN_ITEMS). `_rate_at` gives the
+                # covering period's rate for the blend.
+                _covers = getattr(plan, 'demand_period_covers', None)
+                _rate_at = getattr(plan, 'demand_rate_at', None)
 
-            def demand_predicate(local_dt):
-                h_ok = True if whours == 'all' else (local_dt.hour in whours)
-                wd = local_dt.weekday()
-                if days_spec == 'all':
-                    d_ok = True
-                elif days_spec == 'weekends':
-                    d_ok = wd >= 5
-                else:
-                    d_ok = wd < 5  # weekdays (default)
-                return h_ok and d_ok
+                def demand_predicate(local_dt, _c=_covers, _p=_demand_periods):
+                    return bool(_c) and any(_c(pd, local_dt) for pd in _p)
+            elif getattr(plan, 'demand_charge_per_kw_per_day', 0.0) > 0:
+                demand_rate = plan.demand_charge_per_kw_per_day
+                window = getattr(plan, 'demand_window', None) or {}
+                whours = window.get('hours', DEFAULT_DEMAND_WINDOW_HOURS)
+                days_spec = window.get('days', 'weekdays')
+
+                def demand_predicate(local_dt):
+                    h_ok = True if whours == 'all' else (local_dt.hour in whours)
+                    wd = local_dt.weekday()
+                    if days_spec == 'all':
+                        d_ok = True
+                    elif days_spec == 'weekends':
+                        d_ok = wd >= 5
+                    else:
+                        d_ok = wd < 5  # weekdays (default)
+                    return h_ok and d_ok
 
         hourly_import_rates = []
         hourly_export_rates = []
         local_hods = []  # local hour-of-day per LP hour, for availability masks
         demand_window_mask = [] if demand_predicate else None
         local_dows: list[int] = []  # weekday per LP hour (0=Mon), for weekly schedules
+        _dp_rate_sum, _dp_rate_n = 0.0, 0          # for the blended per-season rate
+        _dp_inseason_dates: set = set()            # distinct in-season local dates
         for hour_idx in range(T):
             local_dt = (start_time + timedelta(hours=hour_idx)).astimezone(tz)
             hourly_import_rates.append(plan.get_import_rate(local_dt))
@@ -2818,7 +2963,18 @@ class PlanCalculator:
             local_hods.append(local_dt.hour)
             local_dows.append(local_dt.weekday())
             if demand_predicate:
-                demand_window_mask.append(1 if demand_predicate(local_dt) else 0)
+                in_win = demand_predicate(local_dt)
+                demand_window_mask.append(1 if in_win else 0)
+                if _demand_periods and in_win:
+                    _dp_inseason_dates.add(local_dt.date())
+                    if _rate_at:
+                        r = _rate_at(local_dt)
+                        if r:
+                            _dp_rate_sum += r
+                            _dp_rate_n += 1
+        if _demand_periods and demand_predicate:
+            demand_rate = (_dp_rate_sum / _dp_rate_n) if _dp_rate_n else 0.0
+            demand_days_in_season = float(len(_dp_inseason_dates))
 
         # Capped rate windows (e.g. GloBird ZEROHERO's 50 kWh/day free-import window,
         # or a capped Super Export credit) — without this the LP would treat the free
@@ -2860,6 +3016,12 @@ class PlanCalculator:
                 deferrable_loads=lp_deferrable_loads,
                 demand_rate=demand_rate,
                 demand_window_mask=demand_window_mask,
+                # Per-season plans: price the shaved peak over the in-season days
+                # the horizon actually covers, not every horizon day (a demand
+                # charge that only applies ~5 months/yr would otherwise be
+                # over-valued ~2.4x on a full-year comparison solve). 0.0 keeps
+                # the LP's default (n_days) for the legacy single-window path.
+                demand_days_remaining=demand_days_in_season,
                 import_caps=import_caps,
                 export_caps=export_caps,
                 conditional_credits=conditional_credits,

@@ -88,6 +88,12 @@ class AdvisoryResult:
     # per tracked device: {name, sensor_id, initial_percent, max_percent,
     # day0_final_percent, day0_charge_kwh}. Empty for installs with none configured.
     ev_soc_status: list[dict] = field(default_factory=list)
+    # Demand-charge peak-shaving summary, or None when the plan carries no demand
+    # charge / the user isn't on a demand tariff. {planned_peak_kw: the in-window
+    # peak the LP settled on over the horizon; prior_peak_kw: the peak already
+    # locked in for this billing period before the horizon; rate_per_kw_per_day;
+    # days_remaining: days left in the (calendar-month) billing period; window}.
+    demand: dict | None = None
 
     def to_attributes(self) -> dict[str, Any]:
         """Shape for a HA sensor's attributes (JSON-serialisable)."""
@@ -107,4 +113,5 @@ class AdvisoryResult:
             "battery_max_charge_kw": self.battery_max_charge_kw,
             "battery_max_discharge_kw": self.battery_max_discharge_kw,
             "ev_soc_status": self.ev_soc_status,
+            "demand": self.demand,
         }

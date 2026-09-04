@@ -79,6 +79,8 @@ def _install_stubs() -> None:
     opt.BatteryOptimizer = type("BatteryOptimizer", (), {})
     const = _mod("gl.const")
     const.DOMAIN = "grid_lens"
+    const.CONF_HAS_DEMAND_TARIFF = "has_demand_tariff"
+    const.DEFAULT_DEMAND_WINDOW_HOURS = [15, 16, 17, 18, 19, 20]
     forecast = _mod("gl.advisory.forecast")
     forecast.FlatLoadForecaster = type("FlatLoadForecaster", (), {})
     forecast.ForecastProvider = type("ForecastProvider", (), {})
@@ -101,6 +103,14 @@ def _install_stubs() -> None:
     sg = importlib.util.module_from_spec(sg_spec)
     sys.modules["gl.schedule_grid"] = sg
     sg_spec.loader.exec_module(sg)
+
+    # advisory/demand.py is import-free too — load the real module.
+    dm_spec = importlib.util.spec_from_file_location(
+        "gl.advisory.demand", os.path.join(_COMPONENT, "advisory", "demand.py")
+    )
+    dm = importlib.util.module_from_spec(dm_spec)
+    sys.modules["gl.advisory.demand"] = dm
+    dm_spec.loader.exec_module(dm)
 
 
 def _load_coordinator():

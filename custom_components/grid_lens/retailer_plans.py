@@ -218,6 +218,18 @@ class PlanFromData(RetailerPlan):
         # the calculator falls back to DEFAULT_DEMAND_WINDOW_HOURS.
         self.demand_window = plan_data.get("demand_window") or None
 
+        # Per-plan, per-season demand charges (API "demand_periods", from the
+        # plan_demand_periods table). A list of
+        #   {season_label?, season:{start,end}?, rate_per_kw_per_day, days,
+        #    start, end, hours}
+        # entries — one per (season, window). A split high season is two entries
+        # with the same season_label; per-season rate/window differences are
+        # separate entries too. NON-EMPTY overrides demand_window /
+        # demand_charge_per_kw_per_day entirely; EMPTY keeps the legacy single
+        # network-level demand charge (demand_charge_active + the network
+        # operator's demand_window/rate merged in by _prepare_plan_data).
+        self.demand_periods = plan_data.get("demand_periods") or []
+
         vpp = plan_data.get("vpp") or {}
         mc = vpp.get("monthly_credit", 0.0)
         self.fixed_daily_credit = mc / 30.44 if mc else 0.0
@@ -295,6 +307,42 @@ class PlanFromData(RetailerPlan):
         if start <= end:
             return start <= probe <= end
         return probe >= start or probe <= end
+
+    @staticmethod
+    def _days_spec_ok(days_spec: str, weekday: int) -> bool:
+        """weekday: 0=Mon .. 6=Sun. days_spec: 'all'|'weekends'|anything else(=weekdays)."""
+        if days_spec == "all":
+            return True
+        if days_spec == "weekends":
+            return weekday >= 5
+        return weekday < 5
+
+    def demand_period_covers(self, period: dict, dt: datetime) -> bool:
+        """True iff ``dt`` falls inside this demand period's season range AND
+        time window AND day-type. ``period`` is one entry of self.demand_periods.
+        A period with no window (start/end/hours all absent — a NEEDS_FACT_SHEET
+        derivation) counts as season+day only, so the charge still applies."""
+        if not self._in_season(period, dt):
+            return False
+        if not self._days_spec_ok(period.get("days", "weekdays"), dt.weekday()):
+            return False
+        start, end = period.get("start"), period.get("end")
+        if start and end:
+            return self._in_time_range(start, end, dt.hour * 60 + dt.minute)
+        hours = period.get("hours")
+        if hours and hours != "all":
+            return dt.hour in set(hours)
+        return True
+
+    def demand_rate_at(self, dt: datetime) -> float:
+        """$/kW/day in force at ``dt`` from self.demand_periods, or 0.0 when no
+        period covers it. Only meaningful when self.demand_periods is non-empty."""
+        for p in self.demand_periods:
+            if self.demand_period_covers(p, dt):
+                r = p.get("rate_per_kw_per_day")
+                if r:
+                    return float(r)
+        return 0.0
 
     @staticmethod
     def _in_window(window: dict, dt: datetime) -> bool:
@@ -506,7 +554,10 @@ def _prepare_plan_data(plan_id: str, plan_data: dict,
     if network_operators:
         network_key = data.get("network", "").lower()
         operator = network_operators.get(network_key) or {}
-        if operator and data.get("flags", {}).get("demand_charge_active"):
+        # Skip the network-level fallback entirely when the plan carries its own
+        # per-season demand_periods — those override the single network rate/window.
+        if (operator and data.get("flags", {}).get("demand_charge_active")
+                and not data.get("demand_periods")):
             data.setdefault("charges", {})
             if "demand_charge_per_kw_per_day" not in data["charges"]:
                 data["charges"]["demand_charge_per_kw_per_day"] = operator.get("demand_charge_per_kw_per_day", 0.0)

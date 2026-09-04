@@ -104,10 +104,27 @@ required code is public catalogue data, not customer data.
 out; the API only *delivers plan definitions*. See `PRIVACY_DATA_INVENTORY.md` in the API
 repo.
 
-**Rate structures modelled:** flat, TOU (multi-window, per-weekday), demand tariffs,
-controlled load, tiered/capped rates (free-then-paid blocks), conditional daily
-credits (e.g. "stay under X kWh in this window, get $1"), feed-in tariffs including
-wholesale-linked ones, supply charges.
+**Rate structures modelled:** flat, TOU (multi-window, per-weekday), demand tariffs
+(network-level *or* per-plan per-season — see below), controlled load, tiered/capped
+rates (free-then-paid blocks), conditional daily credits (e.g. "stay under X kWh in
+this window, get $1"), feed-in tariffs including wholesale-linked ones, supply charges.
+
+**Per-season demand charges (`demand_periods`).** A plan may carry its own list of
+demand-charge periods instead of relying on the shared network rate: each entry is one
+`(season, window)` with its own `$/kW/day`, `days` and time window. A split high season
+(e.g. Nov–Mar **and** Jun–Aug) is two entries with the same `season_label`; per-season
+rate or window differences are separate entries. Sourced from the retailer's CDR PRD
+`demandCharges` (`prd_sync.py` `prd_demand_periods()`), stored in the API's
+`plan_demand_periods` table, served under the plan JSON's `demand_periods` key.
+`retailer_plans.PlanFromData` parses it (`demand_period_covers`/`demand_rate_at`
+helpers); a **non-empty** list overrides the network-level `demand_window` /
+`demand_charge_per_kw_per_day` entirely, an **empty** one keeps the legacy single
+network charge. The bill breakdown (`grid-lens-card.js`) shows **one line per period**,
+each with its own peak-kW, rate and in-season day count — matching how the retailer
+itemises each season. `_compute_demand_charge_periods` in `plan_calculator.py` computes
+the current-plan lines from actual metered usage per season; alternative plans get one
+blended line off the LP dispatch (the LP schedule has no dates, so it can't be split by
+season — an exact per-season LP form is deferred).
 
 **Cap semantics — `cap_period` + `cap_application`** (`plan_rates`, added 2026-08-26).
 `daily_cap_kwh` gives a cap's size; these two say what it means:
@@ -259,6 +276,27 @@ at 20 kWh/h and any bigger hour made every plan unsolvable. Kept finite: an unbo
 lets a plan with FiT above its import rate farm unlimited arbitrage.
 
 **Notable modelling decisions** (each has a checklist entry with the reasoning):
+- **Peak-demand shaving** — on a demand tariff the LP adds a peak-kW variable `P`,
+  constrained `P ≥ grid import` in every in-window slot and priced in the objective, so it
+  discharges the battery / shifts deferrable load out of the window to lower the peak. Two
+  refinements for the **rolling** advisory horizon (a demand charge is billed on the single
+  highest in-window demand over the whole *billing month*, not per horizon):
+  `demand_peak_kw_month_to_date` (from the import sensor's hourly stats since the 1st)
+  becomes a floor on `P` — no point shaving below a peak already locked in this month — and
+  `demand_days_remaining` (calendar-month assumption) prices `P` at `rate × days-left`, the
+  true marginal cost of setting a *new* peak. For a **legacy** (network-level) demand
+  charge both default to 0, which is exactly right for plan comparison: that path solves
+  one LP over the whole period, so the objective's `rate × n_days` fallback is already the
+  exact bill. For a **`demand_periods`** plan the comparison path instead passes
+  `demand_days_remaining` = the number of in-season days the horizon actually covers (so a
+  charge that only applies ~5 months/yr isn't priced over all 365), and `demand_rate` = a
+  day-weighted blend of the covering periods' rates; the LP's single `P` var is unchanged.
+  The **rolling advisory** path (`advisory/coordinator.py` `_demand_inputs`) is
+  `demand_periods`-aware too: the per-slot mask uses `PlanFromData.demand_period_covers`
+  (season, window, day), `demand_rate` is the covering periods' blend over in-window
+  horizon slots, and the peak var is priced over `min(days left in the billing month, days
+  left in the active season)` (`advisory/demand.py` `days_to_season_end`). The result
+  carries a `demand` summary.
 - **Soft terminal SOC** — energy left in the battery at horizon end is valued at the
   horizon's mean export rate, instead of a hard "return to starting SOC" constraint. Kills
   the phantom end-of-horizon charge burst without enabling fake arbitrage.
@@ -287,6 +325,10 @@ consume it.
 | `sensor.*_next_action` | charge / discharge / self_use. |
 | `sensor.*_soc_now`, `sensor.*_planned_end_soc` | SOC tiles. |
 | `sensor.*_plan_net_cost` | Net $ over the horizon under the plan. |
+
+The `planned_dispatch` sensor also carries a `demand` attribute on a demand tariff:
+`{planned_peak_kw, prior_peak_kw, rate_per_kw_per_day, days_remaining, window_slots}` —
+`null` for plans without a demand charge.
 
 **Files:** `advisory/coordinator.py`, `advisory/dispatch_sensor.py`, `advisory/models.py`.
 

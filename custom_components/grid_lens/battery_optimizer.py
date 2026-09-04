@@ -312,6 +312,8 @@ class BatteryOptimizer:
         deferrable_loads: List[Dict] = None,
         demand_rate: float = 0.0,
         demand_window_mask: List[int] = None,
+        demand_peak_kw_month_to_date: float = 0.0,
+        demand_days_remaining: float = 0.0,
         timestep_hours: float = 1.0,
         soc_reward: float = 0.0,
         export_penalty: float = 0.0,
@@ -392,6 +394,23 @@ class BatteryOptimizer:
         the battery or shifting deferrable loads out of the window). Left at the
         default (rate 0 / mask None) the model behaves exactly as before.
 
+        demand_peak_kw_month_to_date / demand_days_remaining refine that for a
+        SHORT rolling horizon (advisory / live control), where the horizon is a
+        day or two but the demand charge is billed on the single highest
+        in-window demand over the whole billing period:
+          - demand_peak_kw_month_to_date — the highest in-window grid-import kW
+            already recorded this billing period. Becomes a lower bound on the
+            peak variable, so the LP won't spend battery cycles shaving below a
+            peak that is already locked in for this month's bill.
+          - demand_days_remaining — days from the horizon start to the end of
+            the billing period. The peak variable is priced at
+            demand_rate × demand_days_remaining (the true marginal cost of
+            raising this month's peak) instead of demand_rate × horizon-days.
+        Both default to 0, which is the correct value for PLAN COMPARISON: that
+        path solves one LP over the entire period, so month-to-date is 0 at the
+        start and the horizon already spans the whole billing period (the
+        objective then falls back to demand_rate × n_days, unchanged).
+
         import_caps / export_caps: optional list of capped-rate-window descriptors, each
           {'daily_cap_kwh': float, 'rate_after_cap': float, 'hour_mask': list[int] len T}
           (1 = this LP hour falls inside the window). Within a window, cumulative import
@@ -430,6 +449,8 @@ class BatteryOptimizer:
         try:
             return self._lp_optimize(solar, load, r_imp, r_exp, E0, T, deferrable_loads,
                                      demand_rate=demand_rate, demand_window_mask=dmask,
+                                     demand_peak_kw_month_to_date=demand_peak_kw_month_to_date,
+                                     demand_days_remaining=demand_days_remaining,
                                      timestep_hours=timestep_hours,
                                      soc_reward=soc_reward, export_penalty=export_penalty,
                                      no_grid_charge=no_grid_charge,
@@ -480,7 +501,9 @@ class BatteryOptimizer:
     # ------------------------------------------------------------------
 
     def _lp_optimize(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads,
-                     demand_rate=0.0, demand_window_mask=None, timestep_hours=1.0,
+                     demand_rate=0.0, demand_window_mask=None,
+                     demand_peak_kw_month_to_date=0.0, demand_days_remaining=0.0,
+                     timestep_hours=1.0,
                      soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
                      terminal_soc_value=None, import_caps=None, export_caps=None,
                      conditional_credits=None, min_export_price=0.0):
@@ -516,6 +539,8 @@ class BatteryOptimizer:
             return self._lp_scipy(solar, load, r_imp, r_exp, E0, T, deferrable_loads,
                                   demand_rate=demand_rate,
                                   demand_window_mask=demand_window_mask,
+                                  demand_peak_kw_month_to_date=demand_peak_kw_month_to_date,
+                                  demand_days_remaining=demand_days_remaining,
                                   timestep_hours=timestep_hours,
                                   soc_reward=soc_reward, export_penalty=export_penalty,
                                   no_grid_charge=no_grid_charge,
@@ -551,7 +576,9 @@ class BatteryOptimizer:
     # simultaneous import/export to a single direction.
 
     def _lp_scipy(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads,
-                  demand_rate=0.0, demand_window_mask=None, timestep_hours=1.0,
+                  demand_rate=0.0, demand_window_mask=None,
+                  demand_peak_kw_month_to_date=0.0, demand_days_remaining=0.0,
+                  timestep_hours=1.0,
                   soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
                   terminal_soc_value=None, import_caps=None, export_caps=None,
                   conditional_credits=None, min_export_price=0.0):
@@ -718,7 +745,14 @@ class BatteryOptimizer:
         c_obj[I:I+T] = r_imp
         c_obj[X:X+T] = [-r for r in r_exp_priced]
         if demand_active:
-            c_obj[P_idx] = demand_rate * n_days
+            # Price the peak at its true marginal cost: the number of days the
+            # billing period still has to run (rolling-horizon advisory passes
+            # this), falling back to the horizon length for the plan-comparison
+            # path, which solves the whole period in one go.
+            demand_days = (demand_days_remaining
+                           if demand_days_remaining and demand_days_remaining > 0
+                           else n_days)
+            c_obj[P_idx] = demand_rate * demand_days
         # Degeneracy regularizers (tiny, << the price signal). export_penalty makes a
         # $0-value export cost a hair, so the LP prefers to CHARGE surplus solar rather
         # than dump it. soc_reward gives stored energy a tiny intrinsic value, so the LP
@@ -767,6 +801,11 @@ class BatteryOptimizer:
         lb = np.zeros(n)
         ub = np.full(n, np.inf)
         ub[I:I+T] = M
+        if demand_active and demand_peak_kw_month_to_date and demand_peak_kw_month_to_date > 0:
+            # A peak already set earlier in the billing period is sunk cost — the
+            # bill is billed on max(peak so far, peak in this horizon), so clamp
+            # the peak variable's floor and let the LP only fight NEW peaks.
+            lb[P_idx] = float(demand_peak_kw_month_to_date)
         # Per-slot energy caps = rated power × slot length (kWh).
         ub[C:C+T] = self.max_charge_rate_kw * dt
         ub[D:D+T] = self.max_discharge_rate_kw * dt
@@ -1281,6 +1320,11 @@ class BatteryOptimizer:
             'net_cost':            total_import_cost - total_export_credit,
             'final_soc_percent':   max(0.0, soc_vals[T-1]) / self.capacity_kwh * 100.0,
             'demand_peak_kw':      (max(0.0, x[P_idx]) if demand_active else None),
+            # The peak already locked in for this billing period before the
+            # horizon (0 on the plan-comparison path). Lets a caller tell a
+            # genuinely-new peak from one the LP could not have avoided.
+            'demand_peak_kw_prior': (float(demand_peak_kw_month_to_date)
+                                     if demand_active else None),
             'conditional_credits': conditional_credit_totals,
             # Per-device notices where a daily target had to be reduced to what the
             # device's availability window can physically deliver — surfaced on the
