@@ -13,7 +13,7 @@
  */
 import {
   GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor, clampPct, fmtPct,
-} from './grid-lens-chart-common.js?v=20260830d';
+} from './grid-lens-chart-common.js?v=20260907a';
 
 // Free-energy shading (see _freeEnergyBands). CSS custom props rather than literals so
 // both bands follow the viewer's light/dark theme like every other colour on this card;
@@ -182,7 +182,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       ${deferLegend}
       ${this._legendItem('soc', '<i style="border-top:3px dashed var(--soc)"></i>', 'SOC % (right axis)')}
       ${bandLegend}
-      <span style="color:var(--muted)">— thin = measured</span>
+      <span style="color:var(--muted)">— thin = measured${dnames.some((_, i) => (this._traj || []).some((r) => r[`defer_${i}_soc`] != null)) ? ' · dashed device line = its SOC %, faint flat line = SOC ceiling' : ''}</span>
     `;
   }
 
@@ -352,6 +352,48 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     this._paint();
   }
 
+  // The day-0 SOC-ceiling status for device i, matched by the configured energy entity_id
+  // (deferrable_sensor_ids) rather than the display name — names are labels and can
+  // collide, sensor_id is the same join key every other resolver on these cards uses.
+  // null for a device with no SOC model, or before the sensor has published ev_soc_status.
+  _evSocFor(i) {
+    const sid = (this._deferSensorIds || [])[i];
+    if (!sid) return null;
+    return (this._evSocStatus || []).find((e) => e && e.sensor_id === sid) || null;
+  }
+
+  // Right-axis series for any deferrable load with an SOC model: its own predicted SOC
+  // curve in the device's colour, plus — only when the plan's SOC ceiling is what's
+  // cutting the charge short (soc_limited) — a fainter flat line at that ceiling, so the
+  // curve is visibly flattening against something named. Both are planned values, hence
+  // pointsForecast (run to the view's right edge, not clipped at "now"). Grouped with the
+  // device so isolating its legend entry keeps its SOC curve on screen too.
+  _deviceSocSeries() {
+    const traj = this._traj || [];
+    if (!traj.length) return [];
+    const out = [];
+    (this._deferNames || []).forEach((nm, i) => {
+      const key = `defer_${i}_soc`;
+      const pts = traj.filter((r) => r[key] != null).map((r) => ({ t: new Date(r.start), v: +r[key] }));
+      if (pts.length < 2) return;
+      const color = this._deferColor(i);
+      out.push({
+        points: pts, pointsForecast: true, group: `defer_${i}`,
+        color, axis: 'right', dash: true, width: 2,
+      });
+      const st = this._evSocFor(i);
+      if (st && st.soc_limited && Number.isFinite(+st.max_percent)) {
+        out.push({
+          points: [{ t: new Date(traj[0].start), v: +st.max_percent },
+                   { t: pts[pts.length - 1].t, v: +st.max_percent }],
+          pointsForecast: true, group: `defer_${i}`,
+          color, axis: 'right', dash: true, width: 1.25, opacity: 0.45,
+        });
+      }
+    });
+    return out;
+  }
+
   _energySeries() {
     const dnames = this._deferNames || [];
     const kwScale = 3600000 / this._timeScale().step;
@@ -396,6 +438,9 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
         // hues to a chart that already carries ten was the opposite of standing out.
         { key: 'soc_percent', group: 'soc', color: 'var(--soc)', axis: 'right', dash: true, width: 3.5 },
         { points: this._actual, group: 'soc', color: 'var(--soc)', axis: 'right', width: 3 },
+        // Per-device predicted SOC (EV etc.) + its ceiling line — same right axis. Drawn
+        // after battery SOC so a device curve sits on top of it where they overlap.
+        ...this._deviceSocSeries(),
       ],
     };
   }
@@ -508,8 +553,28 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
         return v > 0.01 ? `<div><span class="k" style="color:${this._deferColor(i)}">${esc(nm)}</span> ${v.toFixed(2)} kW${g}</div>` : '';
       }).join('')
       + this._socRow(bestMs, best)
+      + this._deferSocNote(best)
       // Name the shaded band the cursor is sitting in, so the wash isn't just decoration.
       + this._bandNote(best, kwScale);
+  }
+
+  // Per-device predicted SOC in the tooltip, with a callout when the SOC ceiling is what
+  // holds the charge back for that device (soc_limited) — the number a user needs to
+  // reconcile "avg 15 kWh/day" against "only ~10 kWh scheduled today".
+  _deferSocNote(best) {
+    if (!best) return '';
+    return (this._deferNames || []).map((nm, i) => {
+      const pct = best[`defer_${i}_soc`];
+      if (pct == null) return '';
+      const st = this._evSocFor(i);
+      const color = this._deferColor(i);
+      let s = `<div><span class="k" style="color:${color}">${esc(nm)} SOC</span> ${(+pct).toFixed(0)}%`;
+      if (st && st.soc_limited && Number.isFinite(+st.unmet_kwh)) {
+        s += ` <span style="color:var(--muted)">— capped at ${(+st.max_percent).toFixed(0)}%, `
+          + `${(+st.unmet_kwh).toFixed(1)} kWh held back by the ceiling</span>`;
+      }
+      return s + '</div>';
+    }).join('');
   }
 
   _bandNote(row, kwScale) {

@@ -36,7 +36,7 @@
  */
 import {
   STYLE, esc, fmtTime, fmtDayHour, modeLabel, MODE_COLORS, execMode, reasonFor, deferColorFor,
-} from './grid-lens-chart-common.js?v=20260830d';
+} from './grid-lens-chart-common.js?v=20260907a';
 
 class GridLensAdvisoryCard extends HTMLElement {
   constructor() {

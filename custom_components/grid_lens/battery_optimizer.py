@@ -906,6 +906,7 @@ class BatteryOptimizer:
         clamped: dict[int, dict] = {}
         first_target: dict[int, float] = {}
         ev_day0_target: dict[int, float] = {}  # device idx -> floor kWh for day 0 (SOC path)
+        ev_day0_requested: dict[int, float] = {}  # device idx -> UN-clamped day-0 target (SOC path)
         eq_row = 2 * T
         for i, dev in enumerate(deferrable_loads):
             mask = dev.get('hour_mask')
@@ -931,6 +932,7 @@ class BatteryOptimizer:
                     )
                     ev_target = min(requested, deliverable, headroom)
                     ev_day0_target[i] = ev_target
+                    ev_day0_requested[i] = requested
                     first_target.setdefault(i, ev_target)
                     if requested - ev_target > 1e-6:
                         clamped[i] = {
@@ -1218,6 +1220,23 @@ class BatteryOptimizer:
             total_import_cost = sum(r['import_cost'] for r in schedule)
             total_export_credit = sum(r['export_credit'] for r in schedule)
 
+        # Per-slot predicted SOC for each SOC-tracked device, integrated from the FINAL
+        # (post-consolidation) per-device energy so the curve a card plots lines up with the
+        # deferrable bars drawn beside it — reading x[ev_soc_idx+t] straight would give the
+        # pre-consolidation trajectory instead. Day 0 only: past day0_slots the device is
+        # back on the flat daily_kwh mechanism, which has no notion of the ceiling and would
+        # walk SOC past 100%. Keyed by device index (sparse — only SOC-tracked devices).
+        for i, spec in ev_soc_specs.items():
+            soc_kwh = spec['initial_kwh']
+            for t in range(min(day0_slots, len(schedule))):
+                row = schedule[t]
+                per_dev = row.get('deferrable_per_device') or []
+                e = per_dev[i] if i < len(per_dev) else 0.0
+                soc_kwh = min(spec['max_kwh'], soc_kwh + spec['eta'] * e)
+                row.setdefault('deferrable_soc_percent', {})[i] = round(
+                    soc_kwh / spec['capacity_kwh'] * 100.0, 2
+                )
+
         # Show the EFFECTIVE (post-clamp) target, not just the requested one — the
         # unqualified requested figure made a window-clamped boost look like it had
         # been applied in full.
@@ -1300,15 +1319,34 @@ class BatteryOptimizer:
             spec = ev_soc_specs[i]
             dev = deferrable_loads[i]
             final_kwh = max(0.0, x[idx + day0_slots - 1])
+            day0_charge = sum(max(0.0, x[(5 + i) * T + t]) for t in range(day0_slots))
+            # The un-clamped day-0 target (a typical day's charge, from the 14-day average
+            # or a Today Boost) vs what actually fit under the ceiling. soc_limited is the
+            # flag both cards key off: the device reached its configured ceiling AND we
+            # wanted to put more in. unmet_kwh is that shortfall (plug-side kWh);
+            # target_percent is where SOC would have landed without the ceiling, which the
+            # power chart shades the gap up to.
+            requested_kwh = ev_day0_requested.get(i, day0_charge)
+            unmet_kwh = max(0.0, requested_kwh - day0_charge)
+            ceiling_hit = final_kwh >= spec['max_kwh'] - 1e-6
+            soc_limited = bool(ceiling_hit and unmet_kwh > 1e-3)
+            target_percent = min(
+                100.0,
+                spec['initial_percent']
+                + requested_kwh * spec['eta'] / spec['capacity_kwh'] * 100.0,
+            )
             ev_soc_status.append({
                 'name': dev.get('name') or f"device {i}",
                 'sensor_id': dev.get('sensor_id'),
+                'capacity_kwh': spec['capacity_kwh'],
                 'initial_percent': spec['initial_percent'],
                 'max_percent': spec['max_percent'],
                 'day0_final_percent': final_kwh / spec['capacity_kwh'] * 100.0,
-                'day0_charge_kwh': sum(
-                    max(0.0, x[(5 + i) * T + t]) for t in range(day0_slots)
-                ),
+                'day0_charge_kwh': day0_charge,
+                'target_kwh': requested_kwh,
+                'target_percent': target_percent,
+                'unmet_kwh': unmet_kwh,
+                'soc_limited': soc_limited,
             })
 
         return {

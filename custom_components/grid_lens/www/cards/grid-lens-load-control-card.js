@@ -67,7 +67,7 @@
  *   type: custom:grid-lens-load-control-card
  *   title: Deferrable Loads          (optional)
  */
-import { STYLE, esc, multiLineChart } from './grid-lens-chart-common.js?v=20260830d';
+import { STYLE, esc, multiLineChart } from './grid-lens-chart-common.js?v=20260907a';
 
 const HISTORY_DAYS = 14;
 const HISTORY_REFRESH_MS = 15 * 60000;
@@ -151,6 +151,24 @@ class GridLensLoadControlCard extends HTMLElement {
       if (a && Array.isArray(a.deferrable_loads)) return a.deferrable_loads;
     }
     return [];
+  }
+
+  // Day-0 SOC-ceiling status for a device, from whichever sensor publishes the
+  // `ev_soc_status` attribute (the planned_dispatch sensor — same auto-discovery style as
+  // _resolveDevices above). Matched to the row by `sensor_id` (the configured energy
+  // entity), and only returned when the ceiling is actually holding the charge back
+  // (`soc_limited`) — so a device charging freely below its cap shows no chip.
+  _socCapFor(energyEntity) {
+    const hass = this._hass;
+    if (!hass || !energyEntity) return null;
+    for (const eid of Object.keys(hass.states)) {
+      if (!eid.startsWith('sensor.')) continue;
+      const a = hass.states[eid].attributes;
+      if (!a || !Array.isArray(a.ev_soc_status)) continue;
+      const st = a.ev_soc_status.find((e) => e && e.sensor_id === energyEntity);
+      if (st && st.soc_limited) return st;
+    }
+    return null;
   }
 
   _controlSwitchFor(phys) {
@@ -378,8 +396,10 @@ class GridLensLoadControlCard extends HTMLElement {
       // device, which never repaints from this alone.
       const est = this._estimatorFor(d);
       const estA = est && est.attrs;
+      const sc = this._socCapFor(d.energy_entity);
       return [
         r.device.energy_entity,
+        sc ? `${sc.day0_charge_kwh}|${sc.target_kwh}|${sc.max_percent}|${sc.initial_percent}` : '',
         // greedy_reason / forecast_free_kwh live in the control switch's ATTRIBUTES and
         // move while its state stays "on", so they need to be in the signature or the
         // greedy status line would freeze at whatever it said on the last state change.
@@ -424,6 +444,12 @@ class GridLensLoadControlCard extends HTMLElement {
         .row .greedy-line { font-size: 11px; color: var(--ink2); opacity: .8; margin-top: 1px;
                             display: flex; align-items: center; gap: 6px; }
         .row .greedy-line.active { color: var(--good); opacity: 1; }
+        /* "SOC-limited" line — same meta-line shape as .greedy-line, tinted like .boost.over
+           (the "your input can't fully apply" colour) since it's the same class of message:
+           the schedule is doing less than the numbers next to it suggest, and here's why. */
+        .row .soc-cap { font-size: 11px; color: var(--buy); opacity: .9; margin-top: 1px;
+                        display: flex; align-items: center; gap: 5px; }
+        .row .soc-cap ha-icon { --mdc-icon-size: 14px; }
         /* Progress toward the forecast-surplus trigger: the bar is the point — a number
            pair alone doesn't convey "nearly there" at a glance. */
         .gbar { flex: 0 0 auto; width: 42px; height: 4px; border-radius: 2px;
@@ -766,6 +792,32 @@ class GridLensLoadControlCard extends HTMLElement {
       </div>`;
   }
 
+  // "SOC-limited" chip — shown next to the sparkline (the 14-day average it appears to
+  // contradict) when the plan's SOC ceiling is why today's scheduled charge is short.
+  // Reads straight off the planned_dispatch sensor's ev_soc_status (see _socCapFor), so
+  // no per-install config. Absent for every device charging freely below its cap, and for
+  // every device with no SOC model at all.
+  _socCapHtml(d) {
+    const st = this._socCapFor(d.energy_entity);
+    if (!st) return '';
+    const got = Number(st.day0_charge_kwh);
+    const want = Number(st.target_kwh);
+    const unmet = Number(st.unmet_kwh);
+    const cap = Number(st.max_percent);
+    const soc = Number(st.initial_percent);
+    const nums = [got, want, cap].every(Number.isFinite);
+    const body = nums ? `${got.toFixed(1)} of ~${want.toFixed(1)} kWh` : 'charge capped';
+    const tip = nums
+      ? `This load's battery is at ${soc.toFixed(0)}% and Grid Lens charges it only to ${cap.toFixed(0)}%. `
+        + `That leaves ~${got.toFixed(1)} kWh of room today — below the ~${want.toFixed(1)} kWh a typical `
+        + `day adds, so about ${unmet.toFixed(1)} kWh isn't being scheduled. Raise this load's `
+        + `Max SOC % in the Grid Lens integration's Reconfigure flow to schedule more.`
+      : `Grid Lens's SOC ceiling for this load is limiting today's scheduled charge.`;
+    return `<div class="soc-cap" tabindex="0" data-tip="${esc(tip)}">
+      <ha-icon icon="mdi:battery-lock"></ha-icon><span>SOC-limited · ${body}</span>
+    </div>`;
+  }
+
   // 14-day daily-kWh bar sparkline for a device's energy sensor — a quick visual answer
   // to "what does this thing normally use per day?" right next to the Today Boost input
   // it informs. Undefined cache entry = still loading (blank placeholder, no layout
@@ -916,6 +968,10 @@ class GridLensLoadControlCard extends HTMLElement {
       // Third meta line, modulating devices only: why the current is where it is right
       // now (plan/surplus/override/plugged-in) — see _modulationLine above.
       const modLine = this._modulationLine(a, d);
+      // Fourth meta line: "SOC-limited" — the plan's SOC ceiling is why today's scheduled
+      // charge falls short of the 14-day average shown in the sparkline. '' for every
+      // device charging freely below its cap or with no SOC model — see _socCapHtml.
+      const socCapLine = this._socCapHtml(d);
 
       // Control area: a fully-wired device gets the real segmented control (or a plain
       // toggle fallback if the override select hasn't appeared yet); a device with no
@@ -1036,6 +1092,7 @@ class GridLensLoadControlCard extends HTMLElement {
             <div class="meta${isErr ? ' err' : ''}">${meta}</div>
             ${greedyLine}
             ${modLine}
+            ${socCapLine}
           </div>
           ${sparkHtml}
           ${boostHtml}

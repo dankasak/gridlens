@@ -165,6 +165,13 @@ class AdvisoryPlanner:
             per_dev = step.get("deferrable_per_device", []) or []
             for j in range(len(defer_names)):
                 row[f"defer_{j}"] = round(per_dev[j], 3) if j < len(per_dev) else 0.0
+            # Predicted per-device SOC (%) — present only on day-0 slots of a device that
+            # has an SOC model (soc_capacity_kwh + a live reading), so the power chart can
+            # draw its own SOC curve on the right axis and stop it at the end of day 0.
+            soc_map = step.get("deferrable_soc_percent") or {}
+            for j, pct in soc_map.items():
+                if pct is not None and 0 <= j < len(defer_names):
+                    row[f"defer_{j}_soc"] = round(pct, 1)
             trajectory.append(row)
 
         demand_summary = None

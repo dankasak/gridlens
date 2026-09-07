@@ -281,7 +281,10 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // the right edge and (since the SVG doesn't clip) visibly overflow the card.
   const raw = series.map(s => {
     if (s.points) return (s.points || [])
-      .filter(p => p.t.getTime() >= t0 && p.t.getTime() <= nowMs + 60000)
+      // `pointsForecast` series carry planned (future) values, so they run to the view's
+      // right edge like a `key` series — the default clip at `now` is for measured
+      // overlays whose last point is the real data boundary.
+      .filter(p => p.t.getTime() >= t0 && p.t.getTime() <= (s.pointsForecast ? t1 : nowMs + 60000))
       .map(p => ({ ms: p.t.getTime(), v: p.v }));
     return traj
       .filter(row => { const ms = new Date(row.start).getTime(); return ms >= t0 && ms <= t1; })
@@ -448,7 +451,8 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   const byAxis = [...geo.filter((x) => x.s.axis !== 'right'), ...geo.filter((x) => x.s.axis === 'right')];
   for (const { s, d } of byAxis) {
     const w = s.width || (s.actual ? 1.75 : 2.5);
-    paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${w}" opacity="${s.actual ? 0.9 : 1}" stroke-linejoin="round" stroke-linecap="round" ${s.dash ? 'stroke-dasharray="5 4"' : ''}/>`;
+    const op = s.opacity != null ? s.opacity : (s.actual ? 0.9 : 1);
+    paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${w}" opacity="${op}" stroke-linejoin="round" stroke-linecap="round" ${s.dash ? 'stroke-dasharray="5 4"' : ''}/>`;
   }
   // preserveAspectRatio="none": a line/area chart has no inherent aspect ratio to
   // protect (x is time, y is an independent unit) — stretching to exactly fill
@@ -639,6 +643,11 @@ export class GridLensChartCardBase extends HTMLElement {
     this._traj = Array.isArray(a.trajectory) ? a.trajectory : null;
     this._deferNames = Array.isArray(a.deferrable_names) ? a.deferrable_names : [];
     this._deferMaxKw = Array.isArray(a.deferrable_max_kw) ? a.deferrable_max_kw : [];
+    // Per-device SOC-ceiling status (day 0) — one entry per deferrable load with an SOC
+    // model; carries soc_limited / unmet_kwh / target_percent for the power chart's
+    // ceiling line and the Load Control card's SOC-limited chip. Empty on installs with
+    // no SOC-tracked load.
+    this._evSocStatus = Array.isArray(a.ev_soc_status) ? a.ev_soc_status : [];
     // Join key for matching a trajectory device slot to its real power sensor — see
     // _deferPowerEntities() in grid-lens-power-chart-card.js. Not the same string as
     // deferrable_names (that's a display label; this is the configured energy entity_id).

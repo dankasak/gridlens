@@ -640,20 +640,44 @@ SOC data before it's ever acted on. Day 0's target is still a floor (charge at l
 usual daily amount) clamped by real headroom under the ceiling, not just a hard cap — so a
 device far from its ceiling keeps its normal behaviour.
 
-Exposed for observability (no dashboard card built for this yet — a natural follow-up):
-`ev_soc_status` on the LP result / `AdvisoryResult` — one dict per SOC-tracked device
-(`name`, `sensor_id`, `initial_percent`, `max_percent`, `day0_final_percent`,
-`day0_charge_kwh`). A clamp caused by the ceiling (as opposed to the availability window)
-is tagged `reason: 'soc_ceiling'` in the existing `deferrable_clamped` notice and logged
-with its own message so it doesn't read as "widen your weekly schedule" (the availability-
-window clamp's advice, which wouldn't fix an SOC-ceiling clamp).
+**Observability (added 2026-09-07).** `ev_soc_status` on the LP result / `AdvisoryResult`
+/ the `planned_dispatch` sensor — one dict per SOC-tracked device: `name`, `sensor_id`,
+`capacity_kwh`, `initial_percent`, `max_percent`, `day0_final_percent`, `day0_charge_kwh`,
+`target_kwh` (the un-clamped day-0 target — 14-day average or Today Boost), `target_percent`
+(where SOC would have landed without the ceiling), `unmet_kwh` (`target_kwh − day0_charge_kwh`),
+and `soc_limited` — `true` when the device reached its ceiling **and** more was wanted, i.e.
+the ceiling is genuinely what shortened the cycle (not the availability window). The
+`planned_dispatch` `trajectory` also carries a per-slot `defer_<i>_soc` (predicted SOC %,
+day-0 slots only) for each SOC-tracked device, integrated from the post-consolidation
+per-device energy so it lines up with the deferrable bars a card draws.
+
+Two cards surface it:
+- **`grid-lens-power-chart-card`** — a dashed per-device SOC curve on the existing 0–100%
+  right axis, in the device's colour, grouped with that device so isolating its legend
+  entry keeps the curve. When `soc_limited`, a fainter flat line marks the ceiling the
+  curve is flattening against, and the hover tooltip adds `… SOC 90% — capped at 90%,
+  N kWh held back by the ceiling`.
+- **`grid-lens-load-control-card`** — a "SOC-limited · `<got>` of ~`<target>` kWh" line on
+  the device's row (next to the 14-day sparkline it appears to contradict), shown only
+  while `soc_limited`; the tooltip explains the headroom maths and points at Max SOC % in
+  Reconfigure.
+
+A clamp caused by the ceiling (as opposed to the availability window) is also tagged
+`reason: 'soc_ceiling'` in the existing `deferrable_clamped` notice and logged with its own
+message so it doesn't read as "widen your weekly schedule" (the availability-window clamp's
+advice, which wouldn't fix an SOC-ceiling clamp).
 
 **Files:** `const.py` (`CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT` /
 `CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH`), `config_flow.py` (the wizard's `load_soc` step,
 reached only when a load is marked as having its own battery — §12b), `plan_calculator.py` (`_get_deferrable_data` — static config passthrough only),
 `advisory/coordinator.py` (`_deferrable_for_horizon` — the live reading),
-`battery_optimizer.py` (`ev_soc_idx`/`ev_soc_specs` in `_lp_scipy`), `advisory/planner.py` +
-`advisory/models.py` (`ev_soc_status` passthrough).
+`battery_optimizer.py` (`ev_soc_idx`/`ev_soc_specs` in `_lp_scipy`; `ev_day0_requested`,
+per-slot `deferrable_soc_percent`, and the enriched `ev_soc_status` incl. `soc_limited`),
+`advisory/planner.py` (`defer_<i>_soc` trajectory keys) + `advisory/models.py`
+(`ev_soc_status` passthrough), `www/cards/grid-lens-chart-common.js` (`_evSocStatus`,
+`multiLineChart` `pointsForecast` / `s.opacity`), `www/cards/grid-lens-power-chart-card.js`
+(`_deviceSocSeries`/`_deferSocNote`), `www/cards/grid-lens-load-control-card.js`
+(`_socCapFor`/`_socCapHtml`).
 
 ---
 
@@ -1112,7 +1136,7 @@ convention, never a hardcoded entity id — so they work unmodified on any insta
 |---|---|
 | `grid-lens-card` | Full plan comparison (the Plan Comparison view). |
 | `grid-lens-powerflow-card` | **Gated** — live radial energy flow: solar / grid / battery / home + one node per deferrable load, animated flow balls, live buy/sell price, greedy badges. Requires the Battery Control + Power Flow add-on; see §12. `load_power_entity`/`grid_power_entity`/`battery_power_entity`/`battery_discharge_power_entity` are auto-populated in the seeded dashboard straight from the same `load_power_sensor`/`grid_power_sensor`/`battery_charge_power_sensor`/`battery_discharge_power_sensor` config_flow already collects (Sensors/Battery setup steps) — no separate onboarding needed; `solar_power_entity` auto-discovers from HA's own Energy Dashboard prefs; `ev_power_entity`/`ev_active_entity` remain manual-only (no config_flow counterpart — only needed when the EV isn't already represented as a regular deferrable load). |
-| `grid-lens-power-chart-card` | Measured & forecast power (kW) — solar, load, signed grid, signed battery, per-device deferrable, plus free-energy shading, **plus battery SOC on a right-hand 0–100% axis** (2026-08-28). Click a legend name to isolate that series (forecast + measured pair, y-axis rescales to it); click it again to restore every series. SOC is exempt from isolation — it sits on its own axis, so keeping it costs the kW rescale nothing and it is context for whatever you isolated. |
+| `grid-lens-power-chart-card` | Measured & forecast power (kW) — solar, load, signed grid, signed battery, per-device deferrable, plus free-energy shading, **plus battery SOC on a right-hand 0–100% axis** (2026-08-28), **plus a per-device predicted SOC curve on that same axis for any deferrable load with an SOC model** (2026-09-07) — dashed, in the device's colour, grouped with the device; when the plan's SOC ceiling is shortening that device's charge (`soc_limited`) a faint flat line marks the ceiling and the tooltip names the kWh held back. Click a legend name to isolate that series (forecast + measured pair, y-axis rescales to it); click it again to restore every series. SOC is exempt from isolation — it sits on its own axis, so keeping it costs the kW rescale nothing and it is context for whatever you isolated. |
 | `grid-lens-price-chart-card` | Import/export rate trajectory. |
 
 **Secondary axis (`multiLineChart`, `opts.rightAxis` + `series[].axis: 'right'`).** Added so
@@ -1275,7 +1299,7 @@ that?" has to be answerable from the dashboard alone.
 |---|---|
 | `switch.*_battery_control` attributes | Applied action/power, last tick, plan age, degraded state, note. |
 | `switch.*_<device>_control` attributes | Commanded state, threshold, override, all three greedy toggles, **`greedy_reason`**, **`greedy_blocked`**, **`forecast_free_kwh` / `forecast_needed_kwh` / `forecast_battery_headroom_w`**, note. Modulating devices add `control_type`, `setpoint_entity`, `min_w`/`cap_w`, `commanded_w`/`commanded_setpoint`, `plugged_in`, `last_write`, `modulation_source`. |
-| **Load Control card** | Per row: control state, and a live greedy line — the firing reason, or why it's blocked (including **"export is free, but no grid power sensor is set"**, §7 — the only blocked state that will *never* clear on its own, so it names the fix rather than reading as "not yet"), or the **forecast-surplus progress bar** (`6.2 / 8.0 kWh`, hover/focus tooltip explains it). Shown both while armed and tracking toward the trigger, and after it's fired (condition 3 held it on) — the same bar, capped at 100%, rather than only appearing pre-trigger. For a modulating device (§6a): live amps + kW, the max-current ceiling input, and a one-line "why" — `modulation_source` (plan / surplus / override / off) and `plugged_in`. "Why is my car charging at 8 A right now?" must be answerable from the row. |
+| **Load Control card** | Per row: control state, and a live greedy line — the firing reason, or why it's blocked (including **"export is free, but no grid power sensor is set"**, §7 — the only blocked state that will *never* clear on its own, so it names the fix rather than reading as "not yet"), or the **forecast-surplus progress bar** (`6.2 / 8.0 kWh`, hover/focus tooltip explains it). Shown both while armed and tracking toward the trigger, and after it's fired (condition 3 held it on) — the same bar, capped at 100%, rather than only appearing pre-trigger. For a modulating device (§6a): live amps + kW, the max-current ceiling input, and a one-line "why" — `modulation_source` (plan / surplus / override / off) and `plugged_in`. "Why is my car charging at 8 A right now?" must be answerable from the row. A device whose SOC ceiling is why today's scheduled charge falls short of its 14-day average (`ev_soc_status.soc_limited`) gets a **"SOC-limited · `<got>` of ~`<target>` kWh"** line next to that average, tooltip explaining the headroom maths and pointing at Max SOC % in Reconfigure (2026-09-07). |
 | **Load Control card → Estimator panel** | Per-device toggle (rows backed by a `LoadEstimator`, §5, only) expanding: current estimate/seed kW/sample count/calibration source, a convergence chart of the estimate over time, and the last 8 accept/reject decisions with why (`implausible`, `contaminated`, own-meter `too_short`/`counter_reset`). "Why does this estimate look wrong?" must be answerable without `ha core logs`. |
 | **Power Flow card** | A badge on a load node while *greedy*, not the plan, is holding it on — leaf for the two instantaneous reasons, sun-alert for forecast surplus, with the kWh figures in the tooltip. |
 | **Power Chart card** | Free-energy time bands: **orange = free energy being wasted** (plan exports into a ≤$0 export price), **teal = free import window**. Legend appears only when a band is in view; the crosshair tooltip names the band. |
