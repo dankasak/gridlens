@@ -10,10 +10,13 @@
  *   solar_power_entity, load_power_entity, grid_power_entity, battery_power_entity   (optional, have defaults)
  *   max_height: 420   // fixed height (px) for the chart; set 0/null for natural (aspect-ratio) height
  *   max_width: null   // cap (px) on how wide the card grows; set 0/null to fill its container
+ *   show_forecast_history: false  // true = draw the forecast line across the past too (for
+ *                                 // plan-vs-actual comparison). Default cuts it at "now" so
+ *                                 // the past shows measured data only.
  */
 import {
   GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor, clampPct, fmtPct,
-} from './grid-lens-chart-common.js?v=20260907a';
+} from './grid-lens-chart-common.js?v=20260908c';
 
 // Free-energy shading (see _freeEnergyBands). CSS custom props rather than literals so
 // both bands follow the viewer's light/dark theme like every other colour on this card;
@@ -38,6 +41,9 @@ const MAX_GREEDY_STEP_MS = 5 * 60 * 1000;
 class GridLensPowerChartCard extends GridLensChartCardBase {
   get title() { return 'Power — measured & forecast (kW)'; }
   get wantsEnergyHistory() { return true; }
+  // This chart draws a continuous measured overlay, so the crosshair should read it at the
+  // exact hovered time up to "now" instead of snapping back to the last 30-min slot.
+  get continuousMeasuredPast() { return true; }
   // Pulls measured SOC into this._actual for the right-axis overlay. Planned SOC comes
   // from the trajectory itself (soc_percent) and needs no entity, so an install whose
   // soc_entity doesn't resolve still gets the planned curve — it just loses the
@@ -472,6 +478,10 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     }
     return multiLineChart(this._traj, this._timeScale(), series, {
       fmt: (v) => v.toFixed(1), height: 480, symmetric: true,
+      // Left of "now" shows the measured overlay only — the forecast line is cut at the
+      // divider so it can't be mistaken for real-time data. Set show_forecast_history: true
+      // to keep the plan's line drawn across the past for plan-vs-actual comparison.
+      clipForecastPastLine: this._config.show_forecast_history !== true,
       bands: [...this._freeEnergyBands(), ...greedyBands],
       // Ticks and axis line are drawn in --soc, the same colour as the curves, so it is
       // visually unambiguous which scale SOC is read against — the one real hazard of a
@@ -538,7 +548,10 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
         `<div>${this._signedRow(actualGrid || 0, 'buy', 'sell', '--gridflow')} · ${this._signedRow(actualBattery || 0, 'charge', 'discharge', '--battery')} kW</div>` +
         deferRows +
         this._socRow(bestMs, null) +
-        `<div style="font-size:10px;color:var(--muted);margin-top:4px">Historical data only (no forecast)</div>`;
+        `<div style="font-size:10px;color:var(--muted);margin-top:4px">${
+          bestMs < new Date((this._traj[0] || {}).start || 0).getTime()
+            ? 'Historical data only (no forecast)' : 'Measured'
+        }</div>`;
     }
     if (!best) return `<b>${fmtHour(bestMs)}</b><div style="font-size:11px;color:var(--muted)">No data available</div>`;
     const { kwScale } = this._energySeries();

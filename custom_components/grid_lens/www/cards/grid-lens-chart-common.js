@@ -29,18 +29,41 @@ export const VIEW_BACK_MS = 2 * 3600000;    // show 2h of history to the left of
 // ~3 idle hours until the next kept (and coincidentally also off) sample. Time buckets can't
 // do that — each bucket is a fixed wall-clock slice, so the transition survives in whichever
 // bucket it actually falls into, capping the worst-case error at one bucket width.
-export function ds(pts, max = 160) {
+// `opts.peak` (used by the power chart's measured kW series): also keep each bucket's
+// largest-magnitude sample, inserted in time order just before that bucket's closing
+// sample, when it's a real excursion the closing sample doesn't already represent
+// (>1.2x and >0.3 bigger in absolute value). Without it a short transient — a 4-minute
+// 12 kW solar burst dropped into one ~4-minute bucket — is represented only by whatever
+// the bucket happened to end on and then splined away entirely. Left off for monotone-ish
+// series (SOC, cumulative cash) where "highest value in the bucket" would bias the curve
+// upward rather than preserve a feature.
+export function ds(pts, max = 160, opts = {}) {
   if (!pts || pts.length <= max) return pts || [];
   const t0 = pts[0].t.getTime(), t1 = pts[pts.length - 1].t.getTime();
   if (t1 <= t0) return [pts[0], pts[pts.length - 1]];
   const bucketMs = (t1 - t0) / max;
+  const peak = !!opts.peak;
   const out = [];
-  let bucket = -1;
+  let bucket = -1, bExtreme = null;
+  const flushExtreme = () => {
+    if (!bExtreme) return;
+    const last = out[out.length - 1];
+    if (bExtreme === last) return;
+    const a = Math.abs(bExtreme.v), b = Math.abs(last ? last.v : 0);
+    if (a > b + 0.3 && a > b * 1.2) out.splice(out.length - 1, 0, bExtreme);
+    bExtreme = null;
+  };
   for (const p of pts) {
     const b = Math.min(max - 1, Math.floor((p.t.getTime() - t0) / bucketMs));
-    if (b !== bucket) { out.push(p); bucket = b; }
-    else { out[out.length - 1] = p; }
+    if (b !== bucket) {
+      if (peak) flushExtreme();
+      out.push(p); bucket = b; bExtreme = p;
+    } else {
+      out[out.length - 1] = p;
+      if (peak && Math.abs(p.v) > Math.abs(bExtreme.v)) bExtreme = p;
+    }
   }
+  if (peak) flushExtreme();
   if (out[out.length - 1] !== pts[pts.length - 1]) out.push(pts[pts.length - 1]);
   return out;
 }
@@ -449,10 +472,22 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // Left-axis lines first, then right-axis ones on top: a secondary-axis series is
   // usually context for everything else, so it must never end up buried under a wash.
   const byAxis = [...geo.filter((x) => x.s.axis !== 'right'), ...geo.filter((x) => x.s.axis === 'right')];
+  // opts.clipForecastPastLine: also cut the forecast LINE (not just its fill) at "now" for
+  // EVERY planned (non-`actual`) series, both axes — left-axis flows and the right-axis
+  // planned-SOC / per-device-SOC curves alike — so nothing predicted is drawn left of the
+  // divider. The stretch before "now" already happened; its measured overlays cover what
+  // they cover and a planned series with no measured counterpart just starts at "now".
+  // Off by default (every other card keeps the full-width forecast line for plan-vs-actual
+  // comparison); the power chart opts in unless show_forecast_history is set. Require real
+  // measured points, not just the presence of an `actual` series — if the history fetch
+  // failed, keep drawing the forecast across the past rather than leaving it blank.
+  const clipPastLine = opts.clipForecastPastLine && hasActual
+    && series.some((s) => s.actual && s.points && s.points.length);
   for (const { s, d } of byAxis) {
     const w = s.width || (s.actual ? 1.75 : 2.5);
     const op = s.opacity != null ? s.opacity : (s.actual ? 0.9 : 1);
-    paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${w}" opacity="${op}" stroke-linejoin="round" stroke-linecap="round" ${s.dash ? 'stroke-dasharray="5 4"' : ''}/>`;
+    const clip = (clipPastLine && !s.actual) ? ` clip-path="url(#${futureClipId})"` : '';
+    paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${w}" opacity="${op}" stroke-linejoin="round" stroke-linecap="round"${clip} ${s.dash ? 'stroke-dasharray="5 4"' : ''}/>`;
   }
   // preserveAspectRatio="none": a line/area chart has no inherent aspect ratio to
   // protect (x is time, y is an independent unit) — stretching to exactly fill
@@ -609,6 +644,13 @@ export class GridLensChartCardBase extends HTMLElement {
   get wantsSocHistory() { return false; }
   get wantsEnergyHistory() { return false; }
 
+  // When true, the crosshair reads the measured overlay at the exact hovered time for
+  // anything at or before "now" — including the elapsed part of the current 30-min slot —
+  // instead of snapping back to the last trajectory slot boundary. Only sensible for a
+  // card that actually draws a continuous measured series (the power chart); the price /
+  // cash / dispatch charts are genuinely per-slot and keep snapping.
+  get continuousMeasuredPast() { return false; }
+
   // Hook for a wantsEnergyHistory subclass to name its deferrable devices' real power
   // sensors: { [sensor_id]: power_entity }, keyed by the device's configured energy
   // entity_id (matches _deferSensorIds, not _deferNames — see that field's comment).
@@ -713,8 +755,36 @@ export class GridLensChartCardBase extends HTMLElement {
         };
         const fS = toKw(c.solar_power_entity), fL = toKw(c.load_power_entity), fG = toKw(c.grid_power_entity);
         const fB = toKw(c.battery_power_entity);
-        const grid = this._series(byId[c.grid_power_entity]);
-        const loadRaw = this._series(byId[c.load_power_entity]).map(p => ({ t: p.t, v: Math.max(0, p.v * fL) }));
+        // The history rows stop at whatever the sensor last recorded (and this fetch is
+        // throttled to 60s), so on their own the measured lines fall short of the "now"
+        // divider and the forecast line is all that's drawn there. Append the current live
+        // state of each sensor as a point at `end`, exactly as the SOC branch above already
+        // does with curSoc — the measured lines now reach "now". `unavailable`/`unknown` →
+        // NaN → skipped, leaving that series history-only.
+        const liveT = new Date();
+        // Append the sensor's current live state (scaled to kW) as a point at `liveT`, so
+        // the measured line reaches the "now" divider instead of stopping at the last
+        // recorded history row. `unavailable`/`unknown` → NaN → skipped (series stays
+        // history-only). `clamp` matches the per-series map below (solar/load floored at 0,
+        // grid/battery signed).
+        const withLive = (pts, eid, factor, clamp) => {
+          const s = hass.states[eid];
+          const v = s ? parseFloat(s.state) * factor : NaN;
+          if (!isNaN(v)) pts.push({ t: liveT, v: clamp ? Math.max(0, v) : v });
+          return pts;
+        };
+        const solarRaw = withLive(
+          this._series(byId[c.solar_power_entity]).map(p => ({ t: p.t, v: Math.max(0, p.v * fS) })),
+          c.solar_power_entity, fS, true);
+        const loadRaw = withLive(
+          this._series(byId[c.load_power_entity]).map(p => ({ t: p.t, v: Math.max(0, p.v * fL) })),
+          c.load_power_entity, fL, true);
+        const gridRaw = withLive(
+          this._series(byId[c.grid_power_entity]).map(p => ({ t: p.t, v: p.v * fG })),
+          c.grid_power_entity, fG, false);
+        const battRaw = withLive(
+          this._series(byId[c.battery_power_entity]).map(p => ({ t: p.t, v: p.v * fB })),
+          c.battery_power_entity, fB, false);
         // Per-device deferrable actuals, same order as _deferNames/_deferSensorIds (so they
         // share the forecast dashed lines' colours) — joined on the device's sensor_id, not
         // its display name. deferrable_names now goes through the same resolve_device_name
@@ -726,19 +796,25 @@ export class GridLensChartCardBase extends HTMLElement {
           const eid = deferMap[sid];
           if (!eid || !byId[eid]) return [];
           const fD = toKw(eid);
-          return this._series(byId[eid]).map(p => ({ t: p.t, v: Math.max(0, p.v * fD) }));
+          return withLive(
+            this._series(byId[eid]).map(p => ({ t: p.t, v: Math.max(0, p.v * fD) })),
+            eid, fD, true);
         });
+        // peak: true — keep each downsample bucket's largest-magnitude sample too, so a
+        // short real transient (e.g. a 4-minute 12 kW solar burst) survives rather than
+        // collapsing to whatever its bucket ended on. Not applied to the deferrable series
+        // (piecewise on/off already, and each is step-drawn).
         this._actualEnergy = {
-          solar: ds(this._series(byId[c.solar_power_entity]).map(p => ({ t: p.t, v: Math.max(0, p.v * fS) }))),
+          solar: ds(solarRaw, 160, { peak: true }),
           // "Load" here means the same thing the forecast side means by it — whole-home
           // load minus deferrable devices — so the two sides of "now" read consistently.
-          load: ds(subtractStepSeries(loadRaw, deferRaw)),
+          load: ds(subtractStepSeries(loadRaw, deferRaw), 160, { peak: true }),
           // Signed, unsplit: >0 import, <0 export — one line instead of two, matching the
           // forecast side's net grid_kwh and the powerflow card's own sign convention.
-          grid: ds(grid.map(p => ({ t: p.t, v: p.v * fG }))),
+          grid: ds(gridRaw, 160, { peak: true }),
           // Signed: >0 charging (into battery), <0 discharging (out), same convention as
           // the powerflow card's battery_power_entity reading.
-          battery: ds(this._series(byId[c.battery_power_entity]).map(p => ({ t: p.t, v: p.v * fB }))),
+          battery: ds(battRaw, 160, { peak: true }),
           defer: deferRaw.map(pts => ds(pts)),
         };
       }
@@ -869,7 +945,13 @@ export class GridLensChartCardBase extends HTMLElement {
         ((ev.clientX - r.left) / r.width * GW - GML) / (GW - GML - GMR)));
       const ms = t0 + frac * (t1 - t0);
       const trajStart = new Date(this._traj[0].start).getTime();
-      const isHistory = ms < trajStart;
+      // Snap the crosshair to a 30-min trajectory slot only in the genuine future. Left of
+      // "now" the plan has already been overtaken by measured data, so a card that draws
+      // that data (continuousMeasuredPast) reads it at the exact hovered time rather than
+      // quantising to trajStart — otherwise every hover inside the current slot reports the
+      // slot-boundary value and "now" looks frozen until the next boundary.
+      const histBoundary = this.continuousMeasuredPast ? Math.max(trajStart, Date.now()) : trajStart;
+      const isHistory = ms < histBoundary;
 
       let bestMs, best = null;
       if (!isHistory) {
