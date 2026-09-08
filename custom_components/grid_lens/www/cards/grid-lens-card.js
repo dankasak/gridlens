@@ -870,8 +870,6 @@ class GridLensCard extends HTMLElement {
 
     const plansHtml = plansToShow.map(([planName, details]) => {
       const breakdown = details.breakdown || {};
-      const optimization = details.optimization || {};
-      const schedule = optimization.schedule || [];
       const profile = details.hourly_profile || null;
       const isCurrentPlan = planName === currentPlanName;
       const total = breakdown.total || 0;

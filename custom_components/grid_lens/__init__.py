@@ -468,6 +468,30 @@ def _plan_from_history(entries: list, start_date) -> str | None:
     return active
 
 
+# Fields inside a plan's `optimization` dict that are hour-by-hour arrays over the
+# whole comparison period (720+ entries each). grid-lens-card.js never reads them —
+# it renders from the 24-slot `hourly_profile` and the `breakdown` — but left in the
+# SSE payload they dominate its size: ~430 KB per plan × ~120 plans, sent once per
+# `plan` event and again in full inside `complete`, pushing the response past 100 MB
+# and making the browser's EventSource abort ("Calculation stream failed"). The
+# diagnostic-zip endpoint recomputes its own copy, so dropping them here is local to
+# the stream. Scalars (totals, solver, clamp notes) stay.
+_HEAVY_OPT_ARRAYS = ("schedule", "day_profile")
+
+
+def _slim_stream_detail(detail):
+    """Return a copy of a per-plan detail dict with the whole-period hourly arrays
+    stripped from `optimization`. Everything the comparison card actually renders
+    (breakdown, hourly_profile, spikes, plan_info, strategy) is untouched."""
+    if not isinstance(detail, dict):
+        return detail
+    opt = detail.get("optimization")
+    if not isinstance(opt, dict):
+        return detail
+    slim_opt = {k: v for k, v in opt.items() if k not in _HEAVY_OPT_ARRAYS}
+    return {**detail, "optimization": slim_opt}
+
+
 # Files this integration once shipped from www/ and must never serve again. An update
 # — HACS, or sync-to-ha.sh's `cp -r` — copies files in and never deletes, so removing a
 # file from the repo does NOT remove it from an existing install. It sits there being
@@ -539,7 +563,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260908c"
+    _CARD_VERSION = "20260908e"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -1150,7 +1174,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 plans_done += 1
                 await send('plan', {
                     'plan_key':          plan_key,
-                    'detail':            detail,
+                    'detail':            _slim_stream_detail(detail),
                     'plans_done':        plans_done,
                     'plans_total':       plans_total,
                     'current_plan_name': meta.get('current_plan_name'),
@@ -1178,6 +1202,10 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 on_progress=on_fetch_progress,
                 exclude_greedy=exclude_greedy,
             )
+            if isinstance(result, dict) and isinstance(result.get('plan_details'), dict):
+                result['plan_details'] = {
+                    k: _slim_stream_detail(v) for k, v in result['plan_details'].items()
+                }
             await send('complete', result)
             return resp
 
