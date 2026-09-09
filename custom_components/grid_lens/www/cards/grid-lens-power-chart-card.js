@@ -16,7 +16,7 @@
  */
 import {
   GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor, clampPct, fmtPct,
-} from './grid-lens-chart-common.js?v=20260908c';
+} from './grid-lens-chart-common.js?v=20260909a';
 
 // Free-energy shading (see _freeEnergyBands). CSS custom props rather than literals so
 // both bands follow the viewer's light/dark theme like every other colour on this card;
@@ -135,6 +135,20 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     return byId;
   }
 
+  // Each deferrable device's own battery/EV SOC sensor (GridLens integration config:
+  // "battery/EV SOC sensor" on the device_power step), keyed the same way as
+  // _deferPowerEntities() — by the device's configured energy entity_id. Absent (falsy
+  // soc_entity) for a device without one; those simply get no measured SOC line.
+  _deferSocEntities() {
+    const attr = this._deferrableLoadsAttr();
+    if (!Array.isArray(attr)) return {};
+    const byId = {};
+    for (const d of attr) {
+      if (d && d.energy_entity && d.soc_entity) byId[d.energy_entity] = d.soc_entity;
+    }
+    return byId;
+  }
+
   // Each device's GreedyEnergyTracker sensor (cumulative kWh added only while Greedy
   // Consumption was actually driving it — see greedy_energy.py and sensor.py's
   // _build_deferrable_loads), keyed the same way as _deferPowerEntities() above. Absent
@@ -188,7 +202,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       ${deferLegend}
       ${this._legendItem('soc', '<i style="border-top:3px dashed var(--soc)"></i>', 'SOC % (right axis)')}
       ${bandLegend}
-      <span style="color:var(--muted)">— thin = measured${dnames.some((_, i) => (this._traj || []).some((r) => r[`defer_${i}_soc`] != null)) ? ' · dashed device line = its SOC %, faint flat line = SOC ceiling' : ''}</span>
+      <span style="color:var(--muted)">— thin = measured · SOC dashed = planned, solid = measured${dnames.some((_, i) => (this._traj || []).some((r) => r[`defer_${i}_soc`] != null)) ? ' · faint flat line = device SOC ceiling' : ''}</span>
     `;
   }
 
@@ -379,10 +393,18 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     if (!traj.length) return [];
     const out = [];
     (this._deferNames || []).forEach((nm, i) => {
+      const color = this._deferColor(i);
+      // Measured (historical) per-device SOC — solid, left of "now", on the same right
+      // axis as the battery SOC line and drawn the same way (actual: true so it isn't
+      // clipped to the forecast side). Emitted whenever the device has a SOC sensor with
+      // history in view, even if the plan carries no forecast SOC model for it.
+      const meas = (this._actualDeviceSoc || [])[i];
+      if (meas && meas.length > 1) {
+        out.push({ points: meas, group: `defer_${i}`, color, axis: 'right', actual: true, width: 2 });
+      }
       const key = `defer_${i}_soc`;
       const pts = traj.filter((r) => r[key] != null).map((r) => ({ t: new Date(r.start), v: +r[key] }));
       if (pts.length < 2) return;
-      const color = this._deferColor(i);
       out.push({
         points: pts, pointsForecast: true, group: `defer_${i}`,
         color, axis: 'right', dash: true, width: 2,
@@ -443,7 +465,10 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
         // the same shape language the standalone SOC card uses — because adding two new
         // hues to a chart that already carries ten was the opposite of standing out.
         { key: 'soc_percent', group: 'soc', color: 'var(--soc)', axis: 'right', dash: true, width: 3.5 },
-        { points: this._actual, group: 'soc', color: 'var(--soc)', axis: 'right', width: 3 },
+        // actual: true keeps this OFF the clipForecastPastLine path — it is measured
+        // history, all of it left of "now", so clipping it to the forecast side hid it
+        // entirely (the bug this fixes). Same treatment the measured flow series get.
+        { points: this._actual, group: 'soc', color: 'var(--soc)', axis: 'right', actual: true, width: 3 },
         // Per-device predicted SOC (EV etc.) + its ceiling line — same right axis. Drawn
         // after battery SOC so a device curve sits on top of it where they overlap.
         ...this._deviceSocSeries(),
@@ -548,6 +573,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
         `<div>${this._signedRow(actualGrid || 0, 'buy', 'sell', '--gridflow')} · ${this._signedRow(actualBattery || 0, 'charge', 'discharge', '--battery')} kW</div>` +
         deferRows +
         this._socRow(bestMs, null) +
+        this._deferSocNote(null, bestMs) +
         `<div style="font-size:10px;color:var(--muted);margin-top:4px">${
           bestMs < new Date((this._traj[0] || {}).start || 0).getTime()
             ? 'Historical data only (no forecast)' : 'Measured'
@@ -566,23 +592,28 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
         return v > 0.01 ? `<div><span class="k" style="color:${this._deferColor(i)}">${esc(nm)}</span> ${v.toFixed(2)} kW${g}</div>` : '';
       }).join('')
       + this._socRow(bestMs, best)
-      + this._deferSocNote(best)
+      + this._deferSocNote(best, bestMs)
       // Name the shaded band the cursor is sitting in, so the wash isn't just decoration.
       + this._bandNote(best, kwScale);
   }
 
-  // Per-device predicted SOC in the tooltip, with a callout when the SOC ceiling is what
+  // Per-device SOC in the tooltip — planned (from the trajectory) and/or measured (from
+  // the device's own SOC sensor history), with a callout when the SOC ceiling is what
   // holds the charge back for that device (soc_limited) — the number a user needs to
-  // reconcile "avg 15 kWh/day" against "only ~10 kWh scheduled today".
-  _deferSocNote(best) {
-    if (!best) return '';
+  // reconcile "avg 15 kWh/day" against "only ~10 kWh scheduled today". `bestMs` may be
+  // null (no measured lookup), `best` may be null (a purely historical hover).
+  _deferSocNote(best, bestMs) {
     return (this._deferNames || []).map((nm, i) => {
-      const pct = best[`defer_${i}_soc`];
-      if (pct == null) return '';
-      const st = this._evSocFor(i);
+      const plan = best ? best[`defer_${i}_soc`] : null;
+      const meas = bestMs != null ? this._nearest((this._actualDeviceSoc || [])[i], bestMs) : null;
+      if (plan == null && meas == null) return '';
       const color = this._deferColor(i);
-      let s = `<div><span class="k" style="color:${color}">${esc(nm)} SOC</span> ${(+pct).toFixed(0)}%`;
-      if (st && st.soc_limited && Number.isFinite(+st.unmet_kwh)) {
+      const parts = [];
+      if (plan != null) parts.push(`plan ${(+plan).toFixed(0)}%`);
+      if (meas != null) parts.push(`measured ${(+meas).toFixed(0)}%`);
+      let s = `<div><span class="k" style="color:${color}">${esc(nm)} SOC</span> ${parts.join(' · ')}`;
+      const st = this._evSocFor(i);
+      if (plan != null && st && st.soc_limited && Number.isFinite(+st.unmet_kwh)) {
         s += ` <span style="color:var(--muted)">— capped at ${(+st.max_percent).toFixed(0)}%, `
           + `${(+st.unmet_kwh).toFixed(1)} kWh held back by the ceiling</span>`;
       }

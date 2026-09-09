@@ -652,11 +652,20 @@ day-0 slots only) for each SOC-tracked device, integrated from the post-consolid
 per-device energy so it lines up with the deferrable bars a card draws.
 
 Two cards surface it:
-- **`grid-lens-power-chart-card`** — a dashed per-device SOC curve on the existing 0–100%
-  right axis, in the device's colour, grouped with that device so isolating its legend
-  entry keeps the curve. When `soc_limited`, a fainter flat line marks the ceiling the
-  curve is flattening against, and the hover tooltip adds `… SOC 90% — capped at 90%,
-  N kWh held back by the ceiling`.
+- **`grid-lens-power-chart-card`** — a dashed per-device *planned* SOC curve on the existing
+  0–100% right axis, in the device's colour, grouped with that device so isolating its
+  legend entry keeps the curve. When `soc_limited`, a fainter flat line marks the ceiling
+  the curve is flattening against, and the hover tooltip adds `… SOC plan 90% — capped at
+  90%, N kWh held back by the ceiling`.
+  **Measured per-device SOC (added 2026-09-09)** — a *solid* line on that same right axis,
+  left of "now", for any deferrable load whose `soc_entity` (the `..._soc_sensors` config
+  field) resolves, drawn exactly like the measured battery-SOC line. The dashed/solid pair
+  reads the same way the standalone SOC card's does: dashed = planned, solid = measured.
+  History is fetched by the base class (`_deferSocEntities()` hook → `_actualDeviceSoc`,
+  parallel to `_deferSensorIds`); the sensor's live state is appended as a final point so
+  the line reaches the divider. Fixed in the same change: the measured *battery* SOC line
+  was silently missing its `actual: true` flag, so `clipForecastPastLine` clipped it to the
+  forecast side (right of "now", where it has no points) and it never rendered.
 - **`grid-lens-load-control-card`** — a "SOC-limited · `<got>` of ~`<target>` kWh" line on
   the device's row (next to the 14-day sparkline it appears to contradict), shown only
   while `soc_limited`; the tooltip explains the headroom maths and points at Max SOC % in
@@ -675,8 +684,10 @@ reached only when a load is marked as having its own battery — §12b), `plan_c
 per-slot `deferrable_soc_percent`, and the enriched `ev_soc_status` incl. `soc_limited`),
 `advisory/planner.py` (`defer_<i>_soc` trajectory keys) + `advisory/models.py`
 (`ev_soc_status` passthrough), `www/cards/grid-lens-chart-common.js` (`_evSocStatus`,
-`multiLineChart` `pointsForecast` / `s.opacity`), `www/cards/grid-lens-power-chart-card.js`
-(`_deviceSocSeries`/`_deferSocNote`), `www/cards/grid-lens-load-control-card.js`
+`multiLineChart` `pointsForecast` / `s.opacity`; `_deferSocEntities()` hook + `_actualDeviceSoc`
+per-device measured-SOC fetch), `www/cards/grid-lens-power-chart-card.js`
+(`_deviceSocSeries`/`_deferSocNote`; `_deferSocEntities()` reads `soc_entity` off the
+`deferrable_loads` attribute), `www/cards/grid-lens-load-control-card.js`
 (`_socCapFor`/`_socCapHtml`).
 
 ---
@@ -1136,7 +1147,7 @@ convention, never a hardcoded entity id — so they work unmodified on any insta
 |---|---|
 | `grid-lens-card` | Full plan comparison (the Plan Comparison view). |
 | `grid-lens-powerflow-card` | **Gated** — live radial energy flow: solar / grid / battery / home + one node per deferrable load, animated flow balls, live buy/sell price, greedy badges. Requires the Battery Control + Power Flow add-on; see §12. `load_power_entity`/`grid_power_entity`/`battery_power_entity`/`battery_discharge_power_entity` are auto-populated in the seeded dashboard straight from the same `load_power_sensor`/`grid_power_sensor`/`battery_charge_power_sensor`/`battery_discharge_power_sensor` config_flow already collects (Sensors/Battery setup steps) — no separate onboarding needed; `solar_power_entity` auto-discovers from HA's own Energy Dashboard prefs; `ev_power_entity`/`ev_active_entity` remain manual-only (no config_flow counterpart — only needed when the EV isn't already represented as a regular deferrable load). |
-| `grid-lens-power-chart-card` | Measured & forecast power (kW) — solar, load, signed grid, signed battery, per-device deferrable, plus free-energy shading, **plus battery SOC on a right-hand 0–100% axis** (2026-08-28), **plus a per-device predicted SOC curve on that same axis for any deferrable load with an SOC model** (2026-09-07) — dashed, in the device's colour, grouped with the device; when the plan's SOC ceiling is shortening that device's charge (`soc_limited`) a faint flat line marks the ceiling and the tooltip names the kWh held back. Click a legend name to isolate that series (forecast + measured pair, y-axis rescales to it); click it again to restore every series. SOC is exempt from isolation — it sits on its own axis, so keeping it costs the kW rescale nothing and it is context for whatever you isolated. **Left of "now" shows measured data only** (2026-09-08): each measured series carries the sensor's current live state as a final point so the line reaches the "now" divider (previously it stopped at the last recorded history row, up to a minute stale, leaving the forecast line as the only thing drawn there), and **every planned series is clipped at the divider** — the forecast flow lines, their area fills, the planned battery-SOC line and the per-device predicted-SOC curves/ceiling lines all stop at "now" (both axes), so nothing predicted renders in the past; set `show_forecast_history: true` to draw the forecast across the past again for plan-vs-actual comparison. (Still full-width: the free-energy time bands — the teal $0-import window is a known tariff fact, the orange spill band is plan-derived.) Downsampling (`ds()` in `grid-lens-chart-common.js`) also keeps each bucket's largest-magnitude sample for the measured kW series (`{peak:true}`), so a short real transient — a few-minute solar burst — survives instead of collapsing to whatever its bucket ended on. The crosshair (`continuousMeasuredPast` getter) reads the measured overlay at the exact hovered time for anything at or before "now" — including the elapsed part of the current 30-min slot — instead of snapping the read back to the last slot boundary; it only snaps to a slot in the genuine future. The other chart cards (price/cash/dispatch) are per-slot by nature and keep snapping. |
+| `grid-lens-power-chart-card` | Measured & forecast power (kW) — solar, load, signed grid, signed battery, per-device deferrable, plus free-energy shading, **plus battery SOC on a right-hand 0–100% axis** (2026-08-28), **plus a per-device predicted SOC curve on that same axis for any deferrable load with an SOC model** (2026-09-07) — dashed, in the device's colour, grouped with the device; when the plan's SOC ceiling is shortening that device's charge (`soc_limited`) a faint flat line marks the ceiling and the tooltip names the kWh held back. **SOC on the historic (left-of-"now") side (2026-09-09):** the measured battery-SOC line — solid, right axis — now actually renders there (it was silently clipped to the forecast side by a missing `actual: true` flag), and a **measured per-device SOC** line (also solid, right axis, device colour) is drawn for any deferrable load whose `soc_entity` config field resolves; base class fetches it via the `_deferSocEntities()` hook into `_actualDeviceSoc`. Dashed = planned, solid = measured, matching the standalone SOC card. Click a legend name to isolate that series (forecast + measured pair, y-axis rescales to it); click it again to restore every series. SOC is exempt from isolation — it sits on its own axis, so keeping it costs the kW rescale nothing and it is context for whatever you isolated. **Left of "now" shows measured data only** (2026-09-08): each measured series carries the sensor's current live state as a final point so the line reaches the "now" divider (previously it stopped at the last recorded history row, up to a minute stale, leaving the forecast line as the only thing drawn there), and **every planned series is clipped at the divider** — the forecast flow lines, their area fills, the planned battery-SOC line and the per-device predicted-SOC curves/ceiling lines all stop at "now" (both axes), so nothing predicted renders in the past; set `show_forecast_history: true` to draw the forecast across the past again for plan-vs-actual comparison. (Still full-width: the free-energy time bands — the teal $0-import window is a known tariff fact, the orange spill band is plan-derived.) Downsampling (`ds()` in `grid-lens-chart-common.js`) also keeps each bucket's largest-magnitude sample for the measured kW series (`{peak:true}`), so a short real transient — a few-minute solar burst — survives instead of collapsing to whatever its bucket ended on. The crosshair (`continuousMeasuredPast` getter) reads the measured overlay at the exact hovered time for anything at or before "now" — including the elapsed part of the current 30-min slot — instead of snapping the read back to the last slot boundary; it only snaps to a slot in the genuine future. The other chart cards (price/cash/dispatch) are per-slot by nature and keep snapping. |
 | `grid-lens-price-chart-card` | Import/export rate trajectory. |
 
 **Secondary axis (`multiLineChart`, `opts.rightAxis` + `series[].axis: 'right'`).** Added so

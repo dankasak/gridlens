@@ -631,6 +631,7 @@ export class GridLensChartCardBase extends HTMLElement {
     this._traj = null;
     this._summary = {};
     this._actual = [];
+    this._actualDeviceSoc = [];
     this._lastFetch = 0;
     this._sig = '';
     this._actualEnergy = { solar: [], load: [], grid: [], battery: [], defer: [] };
@@ -657,6 +658,12 @@ export class GridLensChartCardBase extends HTMLElement {
   // Default = none (no deferrable devices configured, or this chart doesn't care about
   // them) — _fetchActual() below fetches nothing extra and _actualEnergy.defer stays empty.
   _deferPowerEntities() { return {}; }
+
+  // Hook for a wantsSocHistory subclass to name each deferrable device's own battery/EV
+  // SOC sensor: { [sensor_id]: soc_entity }, keyed by the device's configured energy
+  // entity_id (matches _deferSensorIds, same join key as _deferPowerEntities()). Default
+  // = none — _fetchActual() fetches no per-device SOC history and _actualDeviceSoc stays [].
+  _deferSocEntities() { return {}; }
 
   setConfig(config) {
     if (!config || !config.entity) throw new Error('Define "entity" (the planned_dispatch sensor)');
@@ -731,7 +738,8 @@ export class GridLensChartCardBase extends HTMLElement {
       const end = new Date();
       const c = this._config;
       const eids = [];
-      if (this.wantsSocHistory) eids.push(c.soc_entity);
+      const socDeferMap = this.wantsSocHistory ? (this._deferSocEntities() || {}) : {};
+      if (this.wantsSocHistory) eids.push(c.soc_entity, ...Object.values(socDeferMap));
       const deferMap = this.wantsEnergyHistory ? (this._deferPowerEntities() || {}) : {};
       if (this.wantsEnergyHistory) eids.push(c.solar_power_entity, c.load_power_entity, c.grid_power_entity, c.battery_power_entity, ...Object.values(deferMap));
       const uniq = [...new Set(eids)].filter(Boolean);
@@ -747,6 +755,19 @@ export class GridLensChartCardBase extends HTMLElement {
         const soc = this._series(byId[c.soc_entity]);
         if (!isNaN(curSoc)) soc.push({ t: end, v: curSoc });
         this._actual = ds(soc);
+        // Per-device measured SOC, parallel to _deferSensorIds (same join key the forecast
+        // per-device SOC curves use). A device with no configured SOC sensor contributes an
+        // empty array and is simply not drawn. The sensor's current live state is appended
+        // as the final point so the line reaches "now", exactly as the battery branch above.
+        this._actualDeviceSoc = (this._deferSensorIds || []).map((sid) => {
+          const eid = socDeferMap[sid];
+          if (!eid || !byId[eid]) return [];
+          const pts = this._series(byId[eid]);
+          const liveSt = hass.states[eid];
+          const liveV = liveSt ? parseFloat(liveSt.state) : NaN;
+          if (!isNaN(liveV)) pts.push({ t: end, v: liveV });
+          return ds(pts);
+        });
       }
       if (this.wantsEnergyHistory) {
         const toKw = (eid) => {
