@@ -48,6 +48,10 @@ class AdvisoryDispatchSensor(CoordinatorEntity, SensorEntity):
                 attrs["restored"] = True  # last good plan, shown until a live one lands
             if data.get("pending_reason"):
                 attrs["pending_reason"] = data["pending_reason"]  # why live plan is pending
+            if data.get("past_rates"):
+                # Elapsed-today buy/sell rate slots — the price chart card prepends these to
+                # the forward trajectory so it can draw the part of today already gone.
+                attrs["past_rates"] = data["past_rates"]
             attrs.update(data.get("attributes", {}))  # generated_at, trajectory, soc, cost…
         return attrs
 

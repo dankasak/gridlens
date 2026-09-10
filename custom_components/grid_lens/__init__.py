@@ -282,7 +282,7 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
 
     power_flow_sections = [{"column_span": 3, "cards": [{
         "type": "custom:grid-lens-advisory-card", "entity": dispatch,
-        "compact": True, "title": "Optimiser & Plan",
+        "compact": True, "title": "Optimiser & Plan", "show_current_rates": True,
         **({"control_switch_entity": battery_control} if battery_control else {}),
         **({"layout_toggles": [
             {"entity": t, "label": lbl}
@@ -308,6 +308,12 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
                 "own_line_when_siblings": 2,
             },
         ],
+        "grid_options": {"columns": "full"},
+    }]}, {"column_span": 3, "cards": [{
+        # Full buy/sell rate graph for the current plan — elapsed today + the forecast,
+        # with its own hover crosshair and Today/Full-horizon toggle. Sits under the power
+        # chart; the compact bar at the top only carries the current-rate readout.
+        "type": "custom:grid-lens-price-chart-card", "entity": dispatch,
         "grid_options": {"columns": "full"},
     }]}]
     views.append({
@@ -563,7 +569,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260909a"
+    _CARD_VERSION = "20260910b"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",

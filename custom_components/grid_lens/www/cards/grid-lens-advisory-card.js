@@ -17,6 +17,7 @@
  *   control_switch_entity: switch.roof_grid_lens_nsw_battery_control (optional)
  *   compact: true                                          (optional)
  *   title: "Optimiser & Plan"                               (optional, compact mode only)
+ *   show_current_rates: true                                (optional)
  *   layout_toggles:                                         (optional)
  *     - entity: switch.<...>_show_scene_power_flow
  *       label: Scene
@@ -28,6 +29,12 @@
  * it — a slim status bar for surfacing "when did the optimiser last run" on a page
  * that isn't the full Battery Plan view (e.g. at the top of the Power Flow page).
  *
+ * `show_current_rates: true` adds a one-line buy/sell readout ("Buy 22c/kWh · Sell 3c/kWh")
+ * under the plan-status line — the rate in effect for the slot covering now, read from the
+ * same `trajectory` attribute. Just the numbers; the rate *graph* is the standalone
+ * `grid-lens-price-chart-card` (placed under the power chart on the Power Flow view).
+ * Independent of `compact` — works in the full card too.
+ *
  * `layout_toggles` adds a clickable on/off chip per entry to the header, toggling that
  * entity (any `switch.*` — nothing here is specific to the Power Flow layouts it was
  * built for). The chips are deliberately co-located with the plan status rather than
@@ -36,7 +43,8 @@
  */
 import {
   STYLE, esc, fmtTime, fmtDayHour, modeLabel, MODE_COLORS, execMode, reasonFor, deferColorFor,
-} from './grid-lens-chart-common.js?v=20260909a';
+  fmtC,
+} from './grid-lens-chart-common.js?v=20260910b';
 
 class GridLensAdvisoryCard extends HTMLElement {
   constructor() {
@@ -156,10 +164,35 @@ class GridLensAdvisoryCard extends HTMLElement {
     return new Date(t[1].start).getTime() - new Date(t[0].start).getTime();
   }
 
+  // One-line buy/sell readout for the slot covering now — the rate the plan is pricing
+  // against this instant. Empty string unless show_current_rates is set and a plan is
+  // available, so it drops cleanly out of both the compact and full layouts.
+  _currentRatesHtml() {
+    if (!this._config.show_current_rates) return '';
+    const t = this._traj;
+    if (!t || !t.length || (this._summary && this._summary.status !== 'ok')) return '';
+    const nowMs = Date.now();
+    let cur = null;
+    for (const row of t) {
+      if (new Date(row.start).getTime() <= nowMs) cur = row; else break;
+    }
+    cur = cur || t[0];
+    const buy = cur.import_rate != null ? `${fmtC(cur.import_rate)}/kWh` : '–';
+    const sell = cur.export_rate != null ? `${fmtC(cur.export_rate)}/kWh` : '–';
+    return `<div class="rates-now">` +
+      `<span><span class="rk" style="color:var(--buy)">Buy</span> <b>${buy}</b></span>` +
+      `<span><span class="rk" style="color:var(--sell)">Sell</span> <b>${sell}</b></span>` +
+      `</div>`;
+  }
+
   _renderShell() {
     this.shadowRoot.innerHTML = `
       <style>${STYLE}
         .hd-right { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+        .rates-now { display:flex; gap:14px; margin-top:4px; font-size:12px;
+                     color:var(--ink2); font-variant-numeric:tabular-nums; }
+        .rates-now .rk { font-weight:650; }
+        .rates-now b { color:var(--ink); font-weight:650; }
         .chips { display:flex; gap:6px; flex-wrap:wrap; }
         .chip { display:inline-flex; align-items:center; gap:6px; cursor:pointer;
                 font:inherit; font-size:11px; font-weight:600; line-height:1;
@@ -192,6 +225,7 @@ class GridLensAdvisoryCard extends HTMLElement {
         <div>
           <div class="title">${title}</div>
           <div class="sub">${s.plan_name ? esc(s.plan_name) : 'Grid Lens advisory'}${s.solver ? ' · ' + esc(s.solver) : ''}${s.generated_at ? ' · ' + fmtTime(s.generated_at) : ''}</div>
+          ${this._currentRatesHtml()}
         </div>
         <div class="hd-right">
           ${this._toggleChipsHtml()}

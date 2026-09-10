@@ -810,6 +810,36 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             "next_action": next_action,
             "next_power_w": round(next_power, 1),
             "attributes": result.to_attributes(),
+            "past_rates": self._elapsed_today_rates(bundle.start),
             "sources": bundle.sources,
             "plan_name": f"{self._plan.retailer} - {self._plan.plan_name}",
         }
+
+    def _elapsed_today_rates(self, plan_start: datetime) -> list[dict]:
+        """Buy/sell rate for each slot from local midnight up to ``plan_start`` (exclusive).
+
+        The trajectory only runs forward from the current slot, so the price chart has no
+        way to draw the part of today that already happened. These rows come straight from
+        the plan's own tariff structure (``get_import_rate``/``get_export_rate``) — the same
+        source the forward ``import_rate``/``export_rate`` use — so the two halves join at
+        "now". Rate *structure* only: no wholesale/PEA overlay (that forward curve isn't the
+        realised price, and the overlay is off-by-default/uncalibrated — see rates.py).
+        """
+        out: list[dict] = []
+        try:
+            step = timedelta(minutes=SLOT_MINUTES)
+            start_local = dt_util.as_local(plan_start)
+            cursor = start_local.replace(hour=0, minute=0, second=0, microsecond=0)
+            while cursor < start_local:
+                out.append(
+                    {
+                        "start": cursor.isoformat(),
+                        "import_rate": round(float(self._plan.get_import_rate(cursor)), 4),
+                        "export_rate": round(float(self._plan.get_export_rate(cursor)), 4),
+                    }
+                )
+                cursor += step
+        except Exception:  # noqa: BLE001 — a rate-lookup quirk must not sink the whole plan
+            _LOGGER.debug("elapsed-today rate curve failed", exc_info=True)
+            return []
+        return out
