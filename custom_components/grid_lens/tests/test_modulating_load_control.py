@@ -554,6 +554,77 @@ async def _run_unknown_plug_is_treated_as_plugged():
     assert _values(hass3) == [13.0]
 
 
+# ================================================================= reassert on connect
+# Regression coverage for the incident this feature exists for (GRIDLENS_CHECKLIST.md
+# 2026-09-11): the household's Wattpilot starts charging on its own the instant a car is
+# plugged in, at whatever current it was last left at — GridLens's own target never
+# changed, so write economy (correctly, by its own logic) never re-sent its "off" decision,
+# and the session ran uncontrolled until a human noticed and forced it off by hand 28
+# minutes later. Generic, not Wattpilot-specific: exercised here against both actuation
+# shapes this controller supports (button pair, and a plain switch/setpoint device).
+async def _run_reconnect_reasserts_off_via_stop_button():
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    hass.states.set("sensor.evse_status", "available")               # not connected yet
+    c = _mk(
+        hass, plug_entity_id="sensor.evse_status",
+        start_button_entity_id="button.start", stop_button_entity_id="button.stop",
+    )
+    await c.modulate(0.0, _T0)                                       # first tick: establish off
+    assert len(_presses(hass, "button.stop")) == 1
+    assert c._commanded is False
+
+    # Car plugs in; the plan still wants this device off (nothing about GridLens's own
+    # decision changed). Without the fix this would be silently skipped — same "on/off
+    # unchanged" no-op that let tonight's session run uncontrolled.
+    hass.states.set("sensor.evse_status", "charging")
+    t = _T0 + timedelta(seconds=30)
+    await c.modulate(0.0, t)
+    assert len(_presses(hass, "button.stop")) == 2, "did not reassert off on the connect edge"
+    assert 0.0 not in _values(hass), "wrote 0 to a setpoint that would reject it"
+    assert "reconnected" in c._note
+
+    # And it does NOT re-fire on the next ordinary tick — only the edge itself forces it.
+    await c.modulate(0.0, t + timedelta(seconds=30))
+    assert len(_presses(hass, "button.stop")) == 2
+
+
+async def _run_reconnect_forces_write_past_rate_limit():
+    """Same edge, plain switch/setpoint device: the forced reassert must bypass the
+    deadband/min-write-interval trim exactly like any other on/off crossing — a stale
+    'nothing changed' skip is exactly the bug this exists to close."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    hass.states.set("switch.evse", "off")
+    hass.states.set("sensor.evse_status", "available")
+    c = _mk(hass, plug_entity_id="sensor.evse_status", switch_entity_id="switch.evse")
+    await c.modulate(0.0, _T0)
+    assert _values(hass) == [0.0]
+
+    hass.states.set("sensor.evse_status", "charging")
+    t = _T0 + timedelta(seconds=1)                                   # well inside the rate limit
+    await c.modulate(0.0, t)
+    assert _values(hass) == [0.0, 0.0], "reassert was skipped by the write-economy trim"
+    assert "reconnected" in c._note
+
+
+async def _run_already_plugged_at_startup_is_not_a_reconnect():
+    """A restart with the car already connected must not read as 'just connected' — no
+    prior confirmed-False reading means no edge, same fail-open posture as plugged_in()
+    itself (see _plugged_in_prev's docstring)."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    hass.states.set("sensor.evse_status", "charging")                # already connected
+    c = _mk(
+        hass, plug_entity_id="sensor.evse_status",
+        start_button_entity_id="button.start", stop_button_entity_id="button.stop",
+    )
+    await c.modulate(0.0, _T0)                                       # first tick only
+    assert len(_presses(hass, "button.stop")) == 1
+    await c.modulate(0.0, _T0 + timedelta(seconds=30))
+    assert len(_presses(hass, "button.stop")) == 1, "startup misread as a fresh connect"
+
+
 # ================================================================= manual override
 async def _run_override_force_on_commands_cap():
     hass = FakeHass()
@@ -1489,6 +1560,10 @@ if __name__ == "__main__":
         ("plug_states", test_plug_states),
         ("unplugged_commands_zero", lambda: _run_async(_run_unplugged_commands_zero)),
         ("unknown_plug_is_plugged", lambda: _run_async(_run_unknown_plug_is_treated_as_plugged)),
+        # reassert on connect
+        ("reconnect_reasserts_off_via_stop_button", lambda: _run_async(_run_reconnect_reasserts_off_via_stop_button)),
+        ("reconnect_forces_write_past_rate_limit", lambda: _run_async(_run_reconnect_forces_write_past_rate_limit)),
+        ("already_plugged_at_startup_not_reconnect", lambda: _run_async(_run_already_plugged_at_startup_is_not_a_reconnect)),
         # override
         ("override_force_on_is_cap", lambda: _run_async(_run_override_force_on_commands_cap)),
         ("override_force_off_is_zero", lambda: _run_async(_run_override_force_off_commands_zero)),

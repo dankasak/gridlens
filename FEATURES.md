@@ -938,6 +938,25 @@ still reads the setpoint's raw value, which a button-actuated charger never zero
 so it can read "on" for a while after a real stop-button press. Not on any decision path
 today (only its own tests call it), documented in its docstring rather than silently wrong.
 
+**Reassert on connect (2026-09-11, same day).** The Wattpilot's second surprise: it starts
+charging on its own the instant a car is plugged in (its native `Default` mode has no local
+PV-surplus/tariff signal to hold off with — `Eco` mode needs hardware this household doesn't
+have and a tariff provider that doesn't serve Australia, see `GRIDLENS_CHECKLIST.md`). Write
+economy is keyed off GridLens's *own* last commanded state, which quietly assumes the
+hardware only ever moves because GridLens moved it — so with the plan already saying "off"
+before and after the plug-in, nothing about GridLens's own decision changed, and the stop
+was never re-sent. The device charged at full, un-costed grid rate for 28 minutes until a
+human noticed and forced it off by hand via the override select. Fix, generic and not
+Wattpilot-specific: `modulate()` now tracks `plugged_in()` and treats a confirmed
+not-connected → connected edge as forcing one immediate re-actuation of whatever GridLens
+currently wants, bypassing the deadband/rate-limit trim exactly like any other on/off
+crossing — regardless of whether that decision differs from what was last commanded. Needs
+only `deferrable_load_plug_sensor`, already optional on every modulating device regardless of
+vendor; a device with no plug sensor configured gets no edge to trigger on (same fail-open
+posture as plug detection itself), and a charger that doesn't free-run on its own just gets a
+harmless redundant re-write. See `control/modulating_controller.py` `modulate()`/`_write()`
+and `tests/test_modulating_load_control.py`'s `reconnect_*` checks.
+
 Phase auto-derivation and each vendor's exact step/rounding semantics are still unverified
 beyond the Wattpilot's own 1–32 A single number entity — every other vendor named above is
 still stub-only.

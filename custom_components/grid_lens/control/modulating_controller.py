@@ -61,6 +61,21 @@ Behaviours this file is careful about, in rough order of how expensive getting t
 * **Fail *open* on the plug sensor.** ``plugged_in()`` returns None, not False, whenever it
   can't confirm — an unconfigured or unavailable plug entity must never be the reason a car
   didn't charge overnight.
+* **Reassert on connect.** Write economy above is keyed off *our own* last commanded state,
+  which quietly assumes the hardware only ever changes because we changed it. Found false
+  2026-09-11: the household's Wattpilot starts charging on its own the instant a car is
+  plugged in (its native ``Default`` mode — no local PV-surplus or tariff signal it can use
+  instead, see GRIDLENS_CHECKLIST.md), while GridLens's own target was already "off" and
+  stayed "off" — so nothing about *our* decision changed, and write economy correctly (by its
+  own logic) never re-sent it. The device charged at full, un-costed grid rate until a human
+  noticed and forced it off by hand 28 minutes later. The fix is generic, not
+  Wattpilot-specific: a plug/connect sensor is the one signal every charger shape here already
+  optionally provides (``plug_entity_id``), so a confirmed not-connected → connected edge
+  forces one immediate re-actuation of whatever GridLens currently wants — bypassing the
+  deadband/rate-limit trim exactly like any other on/off crossing — regardless of whether that
+  decision differs from what we last commanded. An install with no plug sensor configured gets
+  no edge to trigger on, same fail-open posture as the bullet above; a charger that doesn't
+  free-run on its own never needed this and it's a no-op re-write for it.
 """
 from __future__ import annotations
 
@@ -190,6 +205,12 @@ class ModulatingLoadController(DeferrableLoadController):
         # commanded figure that the fast loop derived from live surplus rather than the plan.
         self._planned_w = 0.0
         self._want_on = False
+        # Last plug reading modulate() saw, to detect a not-connected → connected edge (see
+        # the module docstring's "Reassert on connect" bullet). None (unknown, or no plug
+        # sensor configured) deliberately never counts as the "before" side of an edge — an
+        # HA restart with the car already plugged in must not read as "just connected" and
+        # spam a start/stop actuation on the first tick.
+        self._plugged_in_prev: Optional[bool] = None
 
     # ------------------------------------------------------------------ units & envelope
     def _native(self, attr: str) -> Optional[float]:
@@ -473,13 +494,22 @@ class ModulatingLoadController(DeferrableLoadController):
         the plan said so" from "charging because the roof is spilling". Optional, so a caller
         that only has a number to hand doesn't have to invent a label.
         """
+        # Tracked even under an override (below) so the edge itself is never missed — only
+        # whether we ACT on it is conditional. A plugged_in() reading of None (no sensor
+        # configured, or momentarily unreadable) is never treated as the "before" side of an
+        # edge; see _plugged_in_prev's docstring.
+        plugged = self.plugged_in()
+        just_connected = plugged is True and self._plugged_in_prev is False
+        self._plugged_in_prev = plugged
+
         if self._override is not None:
             # A human has taken control; the one command that implements the override was
             # already issued by set_override(). Re-asserting it every 30 s would fight
-            # whatever they do at the charger itself.
+            # whatever they do at the charger itself — a fresh connect is no exception, the
+            # override stays hands-off until the human clears it.
             return
 
-        if self.plugged_in() is False:
+        if plugged is False:
             await self._write(0.0, now, source="off", reason="unplugged")
             return
 
@@ -514,7 +544,10 @@ class ModulatingLoadController(DeferrableLoadController):
             resolved = "off"
         else:
             resolved = source or "plan"
-        await self._write(commanded, now, source=resolved)
+        await self._write(
+            commanded, now, source=resolved,
+            force=just_connected, reason="reconnected" if just_connected else "",
+        )
 
     def _quantised_setpoint(self, commanded_w: float) -> float:
         """``commanded_w`` in setpoint units, snapped to the entity's ``step``.
@@ -548,7 +581,8 @@ class ModulatingLoadController(DeferrableLoadController):
         return self.target_w_to_setpoint(self._amps_to_w(self.write_deadband_a))
 
     async def _write(
-        self, commanded_w: float, now: datetime, *, source: str, reason: str = ""
+        self, commanded_w: float, now: datetime, *, source: str, reason: str = "",
+        force: bool = False,
     ) -> None:
         """Apply write economy, then actuate. Never raises.
 
@@ -556,10 +590,16 @@ class ModulatingLoadController(DeferrableLoadController):
         entirely. Crossing the on/off boundary — including the very first command, where
         ``_commanded`` is still None — always writes: those are the transitions that actually
         start or stop energy flowing, and delaying one to satisfy a rate limit is the wrong
-        trade."""
+        trade.
+
+        ``force`` (set only for a just-connected edge — see the module docstring's "Reassert
+        on connect" bullet) makes this tick behave as a crossing even when ``want_on`` matches
+        what we already believe is commanded: the whole point is that the hardware may have
+        moved on its own, so "nothing changed on our side" cannot be trusted to mean "nothing
+        needs writing" here the way it normally does."""
         setpoint = self._quantised_setpoint(commanded_w)
         want_on = setpoint > 0.0
-        crossing = self._commanded is None or want_on != bool(self._commanded)
+        crossing = force or self._commanded is None or want_on != bool(self._commanded)
 
         if not crossing:
             if (
