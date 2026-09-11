@@ -237,6 +237,13 @@ def _turn_offs(hass):
     return [c for c in hass.services.calls if c[1] == "turn_off"]
 
 
+def _presses(hass, entity_id=None):
+    calls = [c for c in hass.services.calls if (c[0], c[1]) == ("button", "press")]
+    if entity_id is not None:
+        calls = [c for c in calls if c[2] == entity_id]
+    return calls
+
+
 def _run_async(coro):
     asyncio.new_event_loop().run_until_complete(coro())
 
@@ -572,6 +579,82 @@ async def _run_override_force_off_commands_zero():
     assert c.override is False
 
 
+async def _run_button_pair_presses_on_crossing_only():
+    """A charger with no stateful switch and a setpoint that refuses 0 outright (the
+    household's own Fronius Wattpilot, ha-wattpilot integration: max_charging_current has
+    native_min_value=6, confirmed 2026-09-11) needs start/stop buttons instead of a switch.
+    The start button fires once on the off->on crossing, never again on a plain ramp — a
+    button has no readable state to gate on, so re-pressing "force start" every 30 s while
+    already charging would be as bad as never pressing it at all."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    c = _mk(hass, start_button_entity_id="button.start", stop_button_entity_id="button.stop")
+    await c.modulate(3000.0, _T0)                                    # off -> on: crossing
+    assert len(_presses(hass, "button.start")) == 1
+    assert _values(hass) == [13.0]
+    t = _T0 + timedelta(seconds=30)
+    await c.modulate(4000.0, t)                                      # still on: no crossing
+    assert len(_presses(hass, "button.start")) == 1, "re-pressed start on a plain ramp"
+    assert _values(hass) == [13.0, 17.0]
+
+
+async def _run_button_pair_stop_skips_the_zero_write():
+    """The whole reason this exists: an entity like ha-wattpilot's max_charging_current
+    rejects a literal 0 (HA's number platform is expected to reject/clamp a set_value
+    below native_min_value, not accept it). Turning off via the stop button must never
+    even attempt that write — before this mechanism existed, the write raised and _write
+    caught it *before* updating self._commanded, so GridLens believed it had turned the
+    charger off while the hardware kept drawing at its last setpoint (GRIDLENS_CHECKLIST.md
+    2026-09-11)."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    c = _mk(hass, start_button_entity_id="button.start", stop_button_entity_id="button.stop")
+    await c.modulate(3000.0, _T0)                                    # on, 13 A
+    await c.modulate(0.0, _T0 + timedelta(seconds=30))               # on -> off: crossing
+    assert len(_presses(hass, "button.stop")) == 1
+    assert 0.0 not in _values(hass), "wrote 0 to a setpoint that would reject it"
+    assert c._commanded is False
+
+
+async def _run_button_pair_repeated_off_does_not_repress_stop():
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    c = _mk(hass, start_button_entity_id="button.start", stop_button_entity_id="button.stop")
+    await c.modulate(3000.0, _T0)
+    await c.modulate(0.0, _T0 + timedelta(seconds=30))
+    await c.modulate(0.0, _T0 + timedelta(seconds=60))               # still off
+    await c.modulate(1000.0, _T0 + timedelta(seconds=90))            # below floor -> stays off
+    assert len(_presses(hass, "button.stop")) == 1
+
+
+async def _run_button_pair_override_uses_buttons():
+    hass = FakeHass()
+    _evse(hass, mx=32, state="16")
+    c = _mk(hass, start_button_entity_id="button.start", stop_button_entity_id="button.stop")
+    await c.set_override(True, _T0)                                  # Force On
+    assert len(_presses(hass, "button.start")) == 1
+    assert _values(hass) == [32.0]
+    await c.set_override(False, _T0 + timedelta(seconds=5))          # Force Off
+    assert len(_presses(hass, "button.stop")) == 1
+    assert 0.0 not in _values(hass)
+
+
+async def _run_button_pair_takes_priority_over_switch():
+    """If a load somehow has both wired (the config flow's both-or-neither validation
+    doesn't stop a switch being set alongside a complete button pair), the button pair
+    wins and the switch is left untouched — see _write_setpoint's elif."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    hass.states.set("switch.evse", "off")
+    c = _mk(
+        hass, switch_entity_id="switch.evse",
+        start_button_entity_id="button.start", stop_button_entity_id="button.stop",
+    )
+    await c.modulate(3000.0, _T0)
+    assert len(_presses(hass, "button.start")) == 1
+    assert not _turn_ons(hass), "switch was actuated even though buttons are configured"
+
+
 async def _run_modulate_inert_under_override():
     hass = FakeHass()
     _evse(hass, mx=32)
@@ -709,6 +792,18 @@ def test_join_key_falls_back_to_setpoint():
     # And the on/off controller's key is unchanged.
     onoff = DeferrableLoadController(hass, name="P", switch_entity_id="switch.pool", max_w=2000.0)
     assert onoff.join_key == "switch.pool"
+    # Regression 2026-09-11: join_key must stay the setpoint entity for a button-actuated,
+    # switchless device — NOT fall through to the start button. Every card that pairs a
+    # master switch/override-select/greedy-toggle to a device computes its own join key as
+    # `d.switch_entity || d.setpoint_entity` from the deferrable_loads sensor attribute,
+    # which never carries the button entities at all. Preferring a button here made the two
+    # disagree, so no auxiliary entity ever matched and the Load Control card showed
+    # permanently greyed-out buttons and "Not controlling" for the household's own Wattpilot.
+    buttons = _mk(
+        hass, start_button_entity_id="button.start", stop_button_entity_id="button.stop"
+    )
+    assert buttons.join_key == "number.evse"
+    assert buttons.status()["switch"] == "number.evse"
     assert onoff.status()["control_type"] == "onoff"
 
 
@@ -807,6 +902,8 @@ def test_manager_reads_modulating_config():
         "deferrable_load_voltage": [240.0],
         "deferrable_load_min_current": [10.0],
         "deferrable_load_plug_sensor": ["sensor.evse_status"],
+        "deferrable_load_start_button": ["button.evse_start"],
+        "deferrable_load_stop_button": ["button.evse_stop"],
     })
     c = m.controllers[0]
     assert c._unit() == "kw"
@@ -814,6 +911,8 @@ def test_manager_reads_modulating_config():
     assert c.voltage == 240.0
     assert c.min_current_a == 10.0
     assert c.plug_entity_id == "sensor.evse_status"
+    assert c.start_button_entity_id == "button.evse_start"
+    assert c.stop_button_entity_id == "button.evse_stop"
 
 
 async def _run_manager_target_plan_only():
@@ -830,17 +929,25 @@ async def _run_manager_target_surplus():
     hass.states.set("sensor.grid", "-2000")          # exporting 2 kW
     hass.states.set("sensor.evse_power", "1000")     # of which this device already eats 1 kW
     target, source = await m._modulation_target_w(0, _T0)
-    assert target == 3000.0 and source == "surplus"  # -grid + device_power
+    # device_w - grid_w - _EXPORT_BIAS_W = 1000 - (-2000) - 150 (deliberate small-export
+    # undershoot, added 2026-09-11 — see module-level _EXPORT_BIAS_W).
+    assert target == 2850.0 and source == "surplus"
 
-    # The device-power term is what stops the loop converging on its own starting point:
-    # importing 500 W while this device draws 1 kW still means 1 kW is claimable.
+    # Regression 2026-09-11: while genuinely importing, surplus must claim less than the
+    # device's current draw, not the full amount. Old formula (`max(0,-grid_w) + device_w`)
+    # zeroed the import term instead of subtracting it, so it claimed the full 1 kW even
+    # though 500 W of it was real, unbuffered grid import — the exact bug (surplus
+    # "not accounting for" a real shortfall) found live against the household's own
+    # Wattpilot. Only 500 W of the device's 1 kW draw is backed by real spare solar here
+    # (device_w - grid_w = 1000 - 500); the rest is import. That 500 W ties the plan's own
+    # 500 W allocation, so surplus doesn't exceed it and the plan term wins the max().
     m2, hass2 = _mod_mgr(grid_power_sensor="sensor.grid")
     m2.set_plan(_plan(export_rate=0.0, dev_w=500.0), updated_at=_T0)
     await m2.set_greedy(0, True)
     hass2.states.set("sensor.grid", "500")
     hass2.states.set("sensor.evse_power", "1000")
     target2, source2 = await m2._modulation_target_w(0, _T0)
-    assert target2 == 1000.0 and source2 == "surplus"
+    assert target2 == 500.0 and source2 == "plan"
 
 
 async def _run_manager_target_surplus_below_floor():
@@ -854,7 +961,9 @@ async def _run_manager_target_surplus_below_floor():
     hass.states.set("sensor.grid", "-2000")          # exporting 2 kW below the 5c floor
     hass.states.set("sensor.evse_power", "1000")
     target, source = await m._modulation_target_w(0, _T0)
-    assert target == 3000.0 and source == "surplus", (target, source)
+    # device_w(1000) - grid_w(-2000) - _EXPORT_BIAS_W(150) = 2850, not a flat 3000 —
+    # the deliberate small-export-over-small-import undershoot (added 2026-09-11).
+    assert target == 2850.0 and source == "surplus", (target, source)
 
     m2, hass2 = _mod_mgr(grid_power_sensor="sensor.grid")   # floor left at 0 (disabled)
     m2.set_plan(_plan(export_rate=0.03, dev_w=1000.0), updated_at=_T0)
@@ -941,6 +1050,163 @@ async def _run_manager_target_free_import_takes_cap():
     assert source == "surplus"
 
 
+# ================================================================= battery discharge masking
+# Found live 2026-09-11 against the household's own Sigenergy + Wattpilot: a battery
+# discharging to hold grid flow near zero (its own self-consumption loop, or GridLens's own
+# SELF_USE battery action) makes "no import" look exactly like free solar surplus. Sigenergy
+# splits charge/discharge across two always-positive sensors rather than one signed one, so
+# reading only the charge sensor (0 W while discharging) made both the live-surplus term and
+# _battery_headroom_w() blind to a real, live discharge.
+async def _run_manager_target_surplus_masked_by_battery_discharge():
+    m, hass = _mod_mgr(
+        grid_power_sensor="sensor.grid",
+        battery_charge_power_sensor="sensor.batt_charge",
+        battery_discharge_power_sensor="sensor.batt_discharge",
+    )
+    m.set_plan(_plan(export_rate=0.0, dev_w=1000.0), updated_at=_T0)
+    await m.set_greedy(0, True)
+    hass.states.set("sensor.grid", "0")               # looks perfectly balanced...
+    hass.states.set("sensor.batt_charge", "0")
+    hass.states.set("sensor.batt_discharge", "1000")  # ...only because the battery covers 1 kW
+    hass.states.set("sensor.evse_power", "5000")
+    target, source = await m._modulation_target_w(0, _T0)
+    # Surplus term alone: device_w(5000) - grid_w(0) - discharge_w(1000) -
+    # _EXPORT_BIAS_W(150) = 3850. Then the battery-priority correction (added
+    # 2026-09-11) relieves the *final* target by the same live discharge again:
+    # 3850 - discharge_w(1000) = 2850 — not double-counted against the same term twice,
+    # just applied once each to whichever of plan_w/surplus_w actually won the max().
+    assert target == 2850.0 and source == "battery_priority", (target, source)
+
+
+async def _run_manager_target_battery_priority_below_plan():
+    """The core case this correction exists for, found live 2026-09-11: plan_w assumed
+    enough solar for both the EV and the battery, real solar fell short, and the battery
+    alone absorbed the whole gap while the device kept its full plan-driven draw with
+    nothing to pull it back. plan_w here is the *dominant* term (no greedy condition
+    fires — export_rate above the waste ceiling), so this is the one case none of the
+    other terms in this function can reach: only the post-max battery-priority
+    correction can relieve the device below what the plan itself allocated."""
+    m, hass = _mod_mgr(
+        grid_power_sensor="sensor.grid",
+        battery_charge_power_sensor="sensor.batt_charge",
+        battery_discharge_power_sensor="sensor.batt_discharge",
+    )
+    m.set_plan(_plan(export_rate=0.20, dev_w=2100.0), updated_at=_T0)  # rate well above 0
+    await m.set_greedy(0, True)
+    hass.states.set("sensor.grid", "0")
+    hass.states.set("sensor.batt_charge", "0")
+    hass.states.set("sensor.batt_discharge", "562")   # the battery is covering the shortfall
+    hass.states.set("sensor.evse_power", "2189")
+    target, source = await m._modulation_target_w(0, _T0)
+    assert target == 1538.0 and source == "battery_priority", (target, source)  # 2100 - 562
+
+
+async def _run_manager_target_battery_priority_ignores_greedy_toggle():
+    """The correction is a priority/safety rule, not an opportunistic add-on — it must
+    still apply even with Greedy Consumption switched off for this device."""
+    m, hass = _mod_mgr(
+        grid_power_sensor="sensor.grid",
+        battery_charge_power_sensor="sensor.batt_charge",
+        battery_discharge_power_sensor="sensor.batt_discharge",
+    )
+    m.set_plan(_plan(export_rate=0.20, dev_w=2100.0), updated_at=_T0)
+    # greedy left at its default-off state — no set_greedy(0, True) call.
+    hass.states.set("sensor.grid", "0")
+    hass.states.set("sensor.batt_charge", "0")
+    hass.states.set("sensor.batt_discharge", "562")
+    hass.states.set("sensor.evse_power", "2189")
+    target, source = await m._modulation_target_w(0, _T0)
+    assert target == 1538.0 and source == "battery_priority", (target, source)
+
+
+async def _run_manager_target_no_discharge_no_correction():
+    """Battery idle or charging must leave plan_w untouched by this correction — it only
+    ever fires on a live discharge, never as a general-purpose plan override."""
+    m, hass = _mod_mgr(
+        grid_power_sensor="sensor.grid",
+        battery_charge_power_sensor="sensor.batt_charge",
+        battery_discharge_power_sensor="sensor.batt_discharge",
+    )
+    m.set_plan(_plan(export_rate=0.20, dev_w=2100.0), updated_at=_T0)
+    await m.set_greedy(0, True)
+    hass.states.set("sensor.grid", "0")
+    hass.states.set("sensor.batt_charge", "500")   # battery charging, not discharging
+    hass.states.set("sensor.batt_discharge", "0")
+    hass.states.set("sensor.evse_power", "2189")
+    target, source = await m._modulation_target_w(0, _T0)
+    assert target == 2100.0 and source == "plan", (target, source)
+
+
+async def _run_manager_target_surplus_battery_charging_not_credited():
+    """Asymmetry, added 2026-09-11 on explicit household instruction: battery *discharge*
+    reduces this device's claim (test above), but battery *charging* must NOT inflate it —
+    the battery gets first claim on genuine surplus, this device only sees what's left
+    over, never a bonus for what the battery is currently absorbing.
+
+    plan_w is set between the two possible answers so the two cases are actually
+    distinguishable through the final max(plan_w, surplus_w): if charging were still
+    (wrongly) credited, surplus would hit 2850 and *win* over the plan, handing the
+    battery's own 2 kW to this device; correctly excluded, surplus is capped at 850 and
+    the plan's own, smaller allocation is what governs instead."""
+    m, hass = _mod_mgr(
+        grid_power_sensor="sensor.grid",
+        battery_charge_power_sensor="sensor.batt_charge",
+        battery_discharge_power_sensor="sensor.batt_discharge",
+    )
+    m.set_plan(_plan(export_rate=0.0, dev_w=1500.0), updated_at=_T0)
+    await m.set_greedy(0, True)
+    hass.states.set("sensor.grid", "0")              # balanced...
+    hass.states.set("sensor.batt_charge", "2000")     # ...because the battery is soaking up 2 kW
+    hass.states.set("sensor.batt_discharge", "0")
+    hass.states.set("sensor.evse_power", "1000")
+    target, source = await m._modulation_target_w(0, _T0)
+    # device_w(1000) - grid_w(0) - discharge_w(0) - _EXPORT_BIAS_W(150) = 850, capped below
+    # plan_w(1500) — so the plan governs, proving surplus never claimed the battery's 2 kW.
+    assert target == 1500.0 and source == "plan", (target, source)
+
+
+async def _run_manager_target_surplus_no_battery_configured_unchanged():
+    """No battery sensors configured must skip only the discharge correction — the
+    export-bias margin still applies, it isn't battery-specific."""
+    m, hass = _mod_mgr(grid_power_sensor="sensor.grid")
+    m.set_plan(_plan(export_rate=0.0, dev_w=1000.0), updated_at=_T0)
+    await m.set_greedy(0, True)
+    hass.states.set("sensor.grid", "0")
+    hass.states.set("sensor.evse_power", "5000")
+    target, source = await m._modulation_target_w(0, _T0)
+    assert target == 4850.0 and source == "surplus"  # 5000 - 0 - _EXPORT_BIAS_W(150)
+
+
+async def _run_battery_headroom_unipolar_discharge_sensor():
+    """_battery_headroom_w() must see a live discharge even when it's split onto a second,
+    always-positive sensor rather than going negative on the charge sensor."""
+    m, hass = _mod_mgr(
+        battery_soc_sensor="sensor.soc",
+        battery_charge_power_sensor="sensor.batt_charge",
+        battery_discharge_power_sensor="sensor.batt_discharge",
+        battery_max_discharge_rate=5.0,
+    )
+    hass.states.set("sensor.soc", "50")
+    hass.states.set("sensor.batt_charge", "0")
+    hass.states.set("sensor.batt_discharge", "1000")
+    # Without the discharge sensor netted in, this would misread as "not discharging at
+    # all" and report the full 5000 W rated rate as headroom.
+    assert m._battery_headroom_w() == 4000.0
+
+
+async def _run_battery_headroom_signed_single_sensor_unchanged():
+    """A battery with one genuinely signed sensor (no discharge sensor configured) —
+    the original, still-common shape — must behave exactly as before this fix."""
+    m, hass = _mod_mgr(
+        battery_soc_sensor="sensor.soc",
+        battery_charge_power_sensor="sensor.batt_charge",
+        battery_max_discharge_rate=5.0,
+    )
+    hass.states.set("sensor.soc", "50")
+    hass.states.set("sensor.batt_charge", "-1000")  # signed: discharging 1 kW
+    assert m._battery_headroom_w() == 4000.0
+
+
 async def _run_manager_target_fails_closed():
     # (a) no grid power sensor configured at all -> surplus never engages.
     m, _hass = _mod_mgr()
@@ -986,7 +1252,8 @@ async def _run_manager_target_respects_schedule_gate():
     assert await m._modulation_target_w(0, at_20) == (500.0, "plan")  # outside the window
     await m.set_greedy_respects_schedule(0, False)
     target, source = await m._modulation_target_w(0, at_20)
-    assert target == 3000.0 and source == "surplus"
+    # device_w(0, no power sensor configured) - grid_w(-3000) - _EXPORT_BIAS_W(150) = 2850.
+    assert target == 2850.0 and source == "surplus"
 
 
 class _FakeScheduleStore:
@@ -1227,6 +1494,12 @@ if __name__ == "__main__":
         ("override_force_off_is_zero", lambda: _run_async(_run_override_force_off_commands_zero)),
         ("modulate_inert_under_override", lambda: _run_async(_run_modulate_inert_under_override)),
         ("override_clear_returns_to_plan", lambda: _run_async(_run_override_clear_returns_to_plan)),
+        # button-pair actuation (no stateful switch, and/or a setpoint that refuses 0)
+        ("button_pair_crossing_only", lambda: _run_async(_run_button_pair_presses_on_crossing_only)),
+        ("button_pair_skips_zero_write", lambda: _run_async(_run_button_pair_stop_skips_the_zero_write)),
+        ("button_pair_no_repress_off", lambda: _run_async(_run_button_pair_repeated_off_does_not_repress_stop)),
+        ("button_pair_override", lambda: _run_async(_run_button_pair_override_uses_buttons)),
+        ("button_pair_beats_switch", lambda: _run_async(_run_button_pair_takes_priority_over_switch)),
         # cap
         ("current_cap_narrows", lambda: _run_async(_run_current_cap_narrows_envelope)),
         ("cap_zero_means_unknown", lambda: _run_async(_run_cap_zero_means_unknown_not_zero_allowed)),
@@ -1246,6 +1519,14 @@ if __name__ == "__main__":
         ("manager_target_surplus", lambda: _run_async(_run_manager_target_surplus)),
         ("manager_target_surplus_below_floor", lambda: _run_async(_run_manager_target_surplus_below_floor)),
         ("manager_target_free_import", lambda: _run_async(_run_manager_target_free_import_takes_cap)),
+        ("surplus_masked_by_battery_discharge", lambda: _run_async(_run_manager_target_surplus_masked_by_battery_discharge)),
+        ("battery_priority_below_plan", lambda: _run_async(_run_manager_target_battery_priority_below_plan)),
+        ("battery_priority_ignores_greedy_toggle", lambda: _run_async(_run_manager_target_battery_priority_ignores_greedy_toggle)),
+        ("no_discharge_no_correction", lambda: _run_async(_run_manager_target_no_discharge_no_correction)),
+        ("surplus_battery_charging_not_credited", lambda: _run_async(_run_manager_target_surplus_battery_charging_not_credited)),
+        ("surplus_no_battery_unchanged", lambda: _run_async(_run_manager_target_surplus_no_battery_configured_unchanged)),
+        ("battery_headroom_unipolar_discharge", lambda: _run_async(_run_battery_headroom_unipolar_discharge_sensor)),
+        ("battery_headroom_signed_unchanged", lambda: _run_async(_run_battery_headroom_signed_single_sensor_unchanged)),
         ("manager_target_forecast_surplus", lambda: _run_async(_run_manager_target_forecast_surplus)),
         ("greedy_reason_on_onoff_controller", test_greedy_reason_exposed_on_onoff_controller),
         ("manager_target_fails_closed", lambda: _run_async(_run_manager_target_fails_closed)),

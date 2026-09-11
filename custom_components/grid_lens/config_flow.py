@@ -1608,8 +1608,25 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         )
 
     async def async_step_load_control(self, user_input=None):
-        """Which entity Grid Lens turns on and off for this load."""
+        """Which entity Grid Lens turns on and off for this load.
+
+        For a **modulating** load (`load_modulating` still queued in `self._load_steps`)
+        the control entity is *optional*: a setpoint-only charger — the common OCPP shape —
+        stops delivering when its current is wound to 0, so it needs no switch at all.
+        `ModulatingLoadController` defaults `switch_entity_id=""` and its `join_key` falls
+        back to the setpoint id, so an empty value here is fully wired downstream. An
+        on/off load has no other actuator, so there the entity stays required. The
+        companion, when set, is always a `switch.*` (a `climate.*` entity can't be
+        current-ramped), so the climate on-mode question is dropped for it too.
+
+        A charger shaped like the household's own Fronius Wattpilot — no stateful switch
+        at all, AND a setpoint entity that refuses a literal 0 write (native_min_value=6,
+        confirmed 2026-09-11) — can't be expressed as a switch here regardless; leave this
+        blank and wire `async_step_load_modulating`'s start_button/stop_button pair
+        instead.
+        """
         load = self._loads[self._editing]
+        modulating = "modulating" in self._load_steps
 
         if user_input is not None:
             load["switch"] = str(user_input.get("switch", "") or "")
@@ -1617,33 +1634,42 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             return await self._next_load_step()
 
         prev = load.get("switch", "")
-        switch_key = (
-            vol.Required("switch", default=prev) if prev else vol.Required("switch")
-        )
+        if modulating:
+            switch_key = (
+                vol.Optional("switch", default=prev) if prev else vol.Optional("switch")
+            )
+        else:
+            switch_key = (
+                vol.Required("switch", default=prev) if prev else vol.Required("switch")
+            )
+        schema: dict = {
+            switch_key: selector.EntitySelector(
+                selector.EntitySelectorConfig(
+                    domain=["switch"] if modulating else ["switch", "climate"]
+                )
+            ),
+        }
+        if not modulating:
+            # Only consulted for a climate.* entity that doesn't support
+            # climate.turn_on/turn_off (most do) — which hvac_mode means "on".
+            schema[vol.Optional(
+                "climate_on_mode", default=load.get("climate_on_mode", ""),
+            )] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        {"value": "", "label": "Auto (turn_on / restore last mode)"},
+                        {"value": "cool", "label": "Cool"},
+                        {"value": "heat", "label": "Heat"},
+                        {"value": "heat_cool", "label": "Heat/Cool (auto)"},
+                        {"value": "dry", "label": "Dry"},
+                        {"value": "fan_only", "label": "Fan only"},
+                    ],
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            )
         return self.async_show_form(
             step_id="load_control",
-            data_schema=vol.Schema({
-                switch_key: selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain=["switch", "climate"])
-                ),
-                # Only consulted for a climate.* entity that doesn't support
-                # climate.turn_on/turn_off (most do) — which hvac_mode means "on".
-                vol.Optional(
-                    "climate_on_mode", default=load.get("climate_on_mode", ""),
-                ): selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=[
-                            {"value": "", "label": "Auto (turn_on / restore last mode)"},
-                            {"value": "cool", "label": "Cool"},
-                            {"value": "heat", "label": "Heat"},
-                            {"value": "heat_cool", "label": "Heat/Cool (auto)"},
-                            {"value": "dry", "label": "Dry"},
-                            {"value": "fan_only", "label": "Fan only"},
-                        ],
-                        mode=selector.SelectSelectorMode.DROPDOWN,
-                    )
-                ),
-            }),
+            data_schema=vol.Schema(schema),
             description_placeholders={"name": self._load_display_name(load)},
         )
 
@@ -1651,15 +1677,27 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         """Setpoint wiring for a modulating ("type 2") load — an EV charger whose
         current or power can be ramped rather than only switched."""
         load = self._loads[self._editing]
+        errors: dict[str, str] = {}
 
         if user_input is not None:
-            load["setpoint"] = str(user_input.get("setpoint", "") or "")
-            load["setpoint_unit"] = str(user_input.get("setpoint_unit", "") or "")
-            load["phases"] = int(user_input.get("phases", 0) or 0)
-            load["voltage"] = float(user_input.get("voltage", 0.0) or 0.0)
-            load["min_current"] = float(user_input.get("min_current", 0.0) or 0.0)
-            load["plug_sensor"] = str(user_input.get("plug_sensor", "") or "")
-            return await self._next_load_step()
+            start_button = str(user_input.get("start_button", "") or "")
+            stop_button = str(user_input.get("stop_button", "") or "")
+            # Both or neither — one wired without the other is a broken config, not a
+            # valid third state (see const.py's CONF_DEFERRABLE_LOAD_START_BUTTON).
+            if bool(start_button) != bool(stop_button):
+                errors["start_button" if not start_button else "stop_button"] = (
+                    "modulating_button_pair_incomplete"
+                )
+            if not errors:
+                load["setpoint"] = str(user_input.get("setpoint", "") or "")
+                load["setpoint_unit"] = str(user_input.get("setpoint_unit", "") or "")
+                load["phases"] = int(user_input.get("phases", 0) or 0)
+                load["voltage"] = float(user_input.get("voltage", 0.0) or 0.0)
+                load["min_current"] = float(user_input.get("min_current", 0.0) or 0.0)
+                load["plug_sensor"] = str(user_input.get("plug_sensor", "") or "")
+                load["start_button"] = start_button
+                load["stop_button"] = stop_button
+                return await self._next_load_step()
 
         prev_setpoint = load.get("setpoint", "")
         setpoint_key = (
@@ -1671,8 +1709,19 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             vol.Optional("plug_sensor", default=prev_plug)
             if prev_plug else vol.Optional("plug_sensor")
         )
+        prev_start = load.get("start_button", "")
+        start_key = (
+            vol.Optional("start_button", default=prev_start)
+            if prev_start else vol.Optional("start_button")
+        )
+        prev_stop = load.get("stop_button", "")
+        stop_key = (
+            vol.Optional("stop_button", default=prev_stop)
+            if prev_stop else vol.Optional("stop_button")
+        )
         return self.async_show_form(
             step_id="load_modulating",
+            errors=errors,
             data_schema=vol.Schema({
                 setpoint_key: selector.EntitySelector(
                     selector.EntitySelectorConfig(domain="number")
@@ -1725,6 +1774,19 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 ),
                 plug_key: selector.EntitySelector(
                     selector.EntitySelectorConfig(domain=["binary_sensor", "sensor"])
+                ),
+                # Both optional, and only meaningful together (see the error above): a
+                # charger whose only start/stop control is a momentary action rather than
+                # a stateful switch — or whose setpoint entity refuses a literal 0 write
+                # (e.g. ha-wattpilot's max_charging_current has a 6 A floor, confirmed
+                # 2026-09-11) — needs these instead of, or alongside, the Control Entity
+                # switch on the previous screen. Leave both blank for a plain OCPP/Easee/
+                # Wallbox-shaped setpoint where writing 0 already means off.
+                start_key: selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="button")
+                ),
+                stop_key: selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="button")
                 ),
             }),
             description_placeholders={"name": self._load_display_name(load)},

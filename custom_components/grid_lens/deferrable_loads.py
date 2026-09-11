@@ -44,6 +44,8 @@ from .const import (
     CONF_DEFERRABLE_LOAD_MIN_CURRENT,
     CONF_DEFERRABLE_LOAD_PHASES,
     CONF_DEFERRABLE_LOAD_PLUG_SENSOR,
+    CONF_DEFERRABLE_LOAD_START_BUTTON,
+    CONF_DEFERRABLE_LOAD_STOP_BUTTON,
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_SETPOINT,
     CONF_DEFERRABLE_LOAD_SETPOINT_UNIT,
@@ -85,6 +87,8 @@ _MONITORED_DEFAULTS: dict[str, Any] = {
     "voltage": 0.0,
     "min_current": 0.0,
     "plug_sensor": "",
+    "start_button": "",
+    "stop_button": "",
 }
 
 _DECLARED_DEFAULTS: dict[str, Any] = {
@@ -118,6 +122,8 @@ _MONITORED_MAP: tuple[tuple[str, str, Any], ...] = (
     ("voltage", CONF_DEFERRABLE_LOAD_VOLTAGE, 0.0),
     ("min_current", CONF_DEFERRABLE_LOAD_MIN_CURRENT, 0.0),
     ("plug_sensor", CONF_DEFERRABLE_LOAD_PLUG_SENSOR, ""),
+    ("start_button", CONF_DEFERRABLE_LOAD_START_BUTTON, ""),
+    ("stop_button", CONF_DEFERRABLE_LOAD_STOP_BUTTON, ""),
 )
 
 _DECLARED_MAP: tuple[tuple[str, str, Any], ...] = (
@@ -271,7 +277,8 @@ def apply_control_style(load: dict[str, Any], style: str) -> None:
     down the modulating path. Mutates `load` in place.
     """
     if style != CONTROL_MODULATING:
-        for field in ("setpoint", "setpoint_unit", "plug_sensor"):
+        for field in ("setpoint", "setpoint_unit", "plug_sensor",
+                      "start_button", "stop_button"):
             load[field] = _MONITORED_DEFAULTS[field]
         for field in ("phases", "voltage", "min_current"):
             load[field] = _MONITORED_DEFAULTS[field]

@@ -244,6 +244,23 @@ CONF_DEFERRABLE_LOAD_MIN_CURRENT = "deferrable_load_min_current"  # list of floa
 # "" = unknown, and unknown means "assume available": GridLens never withholds charging
 # because it couldn't confirm a plug. See MODULATING_PLUGGED_STATES / _UNPLUGGED_STATES.
 CONF_DEFERRABLE_LOAD_PLUG_SENSOR = "deferrable_load_plug_sensor"  # list of entity IDs ("" = none)
+# Optional momentary button.* pair for a charger whose only start/stop control is an
+# action rather than a stateful switch — AND/OR whose setpoint entity refuses a literal
+# 0 write outright (a nonzero native_min_value, not just "0 means off"). Found 2026-09-11
+# on the household's own Fronius Wattpilot (ha-wattpilot integration): its
+# max_charging_current number has native_min_value=6 — HA's number platform rejects a
+# set_value below that rather than clamping — and its only start/stop control is three
+# momentary buttons (the underlying `frc` force-state property has no readable entity at
+# all). Neither of the setpoint-only mechanisms above (write 0, or a switch) can express
+# "off" on hardware shaped like this. When both are set, ModulatingLoadController presses
+# stop_button instead of writing 0 to the setpoint, and start_button before ramping up —
+# see control/modulating_controller.py._write_setpoint. "" = not configured (the default,
+# and the only option for a plain OCPP/Easee/Wallbox-shaped setpoint, where 0 already
+# means off and no button pair exists to press anyway). Requiring both when either is set
+# is enforced by the config flow, not here — a device with only one wired is a broken
+# config, not a valid third state.
+CONF_DEFERRABLE_LOAD_START_BUTTON = "deferrable_load_start_button"  # list of entity IDs ("" = none)
+CONF_DEFERRABLE_LOAD_STOP_BUTTON = "deferrable_load_stop_button"    # list of entity IDs ("" = none)
 
 # Default per-phase supply voltage for amps ↔ watts. 230 V is the IEC/EU/AU nominal
 # (AU is nominally 230 V +10%/−6% since AS 60038, though real suburban supply often sits

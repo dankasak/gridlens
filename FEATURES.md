@@ -784,7 +784,11 @@ charger limit, Wallbox's max charging current, Zaptec, go-e, openEVSE, Tesla's c
 Sigenergy's AC-charger output current. Config is "point GridLens at that number entity", so
 any integration matching the shape works with **no GridLens change**. A `switch.*` may be
 configured alongside it (turned on before ramping up, off after commanding 0); the common
-case is a setpoint alone, since writing 0 A stops delivery.
+case is a setpoint alone, since writing 0 A stops delivery. The wizard's `load_control`
+step reflects this — the control entity is **optional** for a modulating load (and the
+climate-only "on mode" question is dropped), so a setpoint-only charger such as a Fronius
+Wattpilot completes setup without being forced to bind an unrelated switch. It was
+required for every controllable load until 2026-09-10, contradicting this design.
 
 **Entities:** all of §6's, plus `number.*_<device>_max_current` — a user ceiling on the
 current GridLens may command. Defaults to the hardware max (unrestricted out of the box);
@@ -802,12 +806,69 @@ device is actually modulating** — a household with no charger never gains a 30
 to modulate rather than switch.
 
 **Target power** (`LoadControlManager._modulation_target_w`):
-`target = max(plan_w, surplus_w)`, where `surplus_w` is the continuous generalisation of
-Greedy Consumption — `current export + what this device is already drawing`, i.e. how much it
-could pull without creating new import. A free-import window targets the full cap. The
-surplus term is gated on the same greedy toggles and schedule check as §7, and **fails closed**:
-no `grid_power_sensor`, unknown rate, or unavailable entity and the term contributes nothing,
+`target = max(plan_w, surplus_w)`, where
+`surplus_w = device_w - grid_w - max(0, discharge_w) - _EXPORT_BIAS_W` is the continuous
+generalisation of Greedy Consumption — this device's own draw minus the grid flow *a battery
+discharge isn't masking*, minus a small deliberate undershoot, i.e. how much it could pull
+without creating new import. A free-import window targets the full cap. The surplus term is
+gated on the same greedy toggles and schedule check as §7, and **fails closed**: no
+`grid_power_sensor`, unknown rate, or unavailable entity and the term contributes nothing,
 leaving pure plan-following.
+
+**⚠ Net out battery discharge before trusting "grid near zero" (fixed 2026-09-11).** Found
+live against the household's own Sigenergy + Wattpilot: a battery discharging to hold grid
+flow near zero — its own onboard self-consumption loop, or GridLens's own SELF_USE battery
+action — makes "no import" look exactly like free solar surplus. The formula used to be
+`max(0,-grid_w) + device_w`, which (a) never subtracted a real import at all when
+`grid_w > 0` — it just handed back the device's full current draw regardless, silently
+overstating surplus by the *entire* shortfall — and (b) had no battery term, so it couldn't
+tell "grid is 0 because solar exactly matches load" from "grid is 0 because the battery is
+propping it up." `discharge_w` comes from `LoadControlManager._read_battery_net_power_w()`
+(see §7's battery-headroom entry below for the two-sensor shape it also fixes); no battery
+configured skips the correction (`device_w - grid_w - _EXPORT_BIAS_W`) — the export-bias
+undershoot below still applies, that part isn't battery-specific.
+
+**⚠ Battery charging is deliberately NOT symmetric with discharge (household instruction,
+2026-09-11).** Only `max(0, discharge_w)` is added back — a battery actively *charging* from
+spare solar contributes nothing to this device's claim, even though the same net-power
+reading would suggest real headroom exists. The household's stated priority: the battery gets
+first claim on genuine surplus; a modulating load only ever sees what's left over once the
+battery's own charging is satisfied, never a bonus for what the battery is currently
+absorbing. (The LP's own `plan_w` is unaffected by any of this — the live surplus term only
+ever *adds* to what the plan already allocated, so a plan that deliberately schedules this
+device from battery/grid for an unrelated economic reason, e.g. a cheap TOU window, still
+works exactly as planned.)
+
+**⚠ `_EXPORT_BIAS_W` (150 W default) — small deliberate export bias (household instruction,
+2026-09-11).** The household's own reasoning: their currently-configured Minimum Export Price
+floor treats even a positive, real export rate (3c/kWh) as "not worth selling" and routes it
+to self-consumption instead — but import rates run well above that, so a small *mistaken*
+import costs far more than a small *missed* export earns. Rather than aim the live-surplus
+term at exact breakeven (where ordinary sensor noise lands on either side with equal
+probability), it deliberately undershoots by a small fixed margin so noise is far more likely
+to land on the (cheap) export side than the (expensive) import side. Small relative to a
+typical quantisation step (~230 W for a 1 A step) — a nudge, not a meaningful throttle.
+
+**⚠ Battery priority can pull the target below `plan_w` — found live the same day the
+other two fixes shipped (household instruction, 2026-09-11).** Everything above this point
+only ever *adds* to `plan_w`; none of it can express "the plan turned out too optimistic,
+back off." That gap showed up immediately: the LP's plan for the live slot assumed enough
+solar for *both* the EV and the battery (its own trajectory: `action: charge, power_w: 985,
+grid_charge_w: 0` alongside `deferrable_kwh` for the EV in the same slot) — real solar fell
+short, and with nothing able to reduce below `plan_w`, the EV kept its full planned draw
+regardless while the battery alone absorbed the entire shortfall (climbing from 0 W to
+560+ W discharge over several minutes, `modulation_source: "plan"` unmoving the whole time).
+Fix: a live battery discharge is ground truth that *something* isn't matching the plan's
+assumptions right now — a too-optimistic forecast, self-use, or even a deliberate
+plan-driven evening discharge — and in every one of those cases the battery keeps first
+claim. Applied **after** `target_w = max(plan_w, surplus_w)`: `target_w = max(0, target_w -
+discharge_w)`, regardless of the greedy toggle (a priority/safety correction, not an
+opportunistic add-on) and independent of `grid_power_sensor` (only needs the battery
+sensors). `modulation_source` reports `"battery_priority"` when this is what actually
+reduced the figure, surfaced on the Load Control card's "why" line as "Reduced — home
+battery has priority." No discharge (idle or charging) leaves the plan/surplus result
+completely untouched — this never acts as a general-purpose override, only a live-discharge
+response.
 
 **⚠ The 6 A floor is the subtle part.** An EV's feasible set is `{0} ∪ [min, max]`, **not**
 `[0, max]` — IEC 61851 forbids offering below 6 A, and commanding 3 A doesn't charge slowly,
@@ -850,10 +911,36 @@ switchless charger on an install collide. `DeferrableLoadController.join_key` ex
 exactly this: the subclass falls back to the setpoint entity id. Use it, never
 `switch_entity_id`, for anything user-facing.
 
-**⚠ Untested on real hardware.** The dev rig has no modulating charger — only an on/off smart
-plug — so everything above is verified against stubs only (`tests/test_modulating_load_control.py`).
-Phase auto-derivation, companion-switch ordering, and each vendor's step/rounding semantics
-have never met a real charger.
+**⚠ Untested on real hardware** until 2026-09-11, when the household's own Fronius Wattpilot
+arrived — the first modulating charger to actually meet this code, via `ha-wattpilot`
+(`ruaan-deysel/ha-wattpilot`, local WebSocket, HACS). It immediately found a real gap:
+
+**A charger with no stateful switch AND a setpoint that refuses 0 needs a third
+mechanism.** ha-wattpilot's `max_charging_current` number has `native_min_value=6` — HA's
+`number` platform rejects a `set_value` below that rather than clamping — and its only
+start/stop control is two momentary `button.*` actions (the underlying `frc` force-state
+property isn't exposed as a readable entity at all). Neither of the mechanisms above (write
+0, or a switch) can express "off" here: writing 0 raised, and — before this was fixed — the
+exception was caught *inside* `_write` **before** `self._commanded` was updated, so
+GridLens believed it had turned the charger off while the hardware kept drawing at its last
+setpoint. Config: `deferrable_load_start_button` / `..._stop_button` (both-or-neither,
+enforced by the config flow), a `button.*` pair pressed by `ModulatingLoadController`
+instead of a switch — start once on the off→on crossing, stop once on-off, never on a plain
+amps ramp (a button has no readable state to gate on, so `_write()`'s own `crossing` flag is
+what stops a repeat press every 30 s tick). When configured, turning off skips the setpoint
+write entirely rather than attempting a value the entity would refuse. Still not an
+OCPP-or-any-vendor driver — a second, optional actuation shape alongside the switch, for
+exactly this "no switch, and 0 isn't valid either" case. See `control/modulating_controller.py`
+`_write_setpoint` and `GRIDLENS_CHECKLIST.md` 2026-09-11 for the full incident.
+
+**Known gap this introduces:** `_actual_state()` (is the hardware currently delivering?)
+still reads the setpoint's raw value, which a button-actuated charger never zeroes on stop —
+so it can read "on" for a while after a real stop-button press. Not on any decision path
+today (only its own tests call it), documented in its docstring rather than silently wrong.
+
+Phase auto-derivation and each vendor's exact step/rounding semantics are still unverified
+beyond the Wattpilot's own 1–32 A single number entity — every other vendor named above is
+still stub-only.
 
 ---
 
@@ -942,6 +1029,21 @@ never fires**, same discipline as conditions #1 and #2's missing-sensor handling
 `greedy_blocked = "no_battery_headroom"` whenever the spill rate alone would have driven a
 draw (see below) — distinguishing "the spill hasn't cleared the bar yet" from "it cleared,
 but the battery can't safely supply it right now".
+
+**⚠ `battery_charge_power_sensor` isn't signed on every inverter (fixed 2026-09-11).** The
+original assumption — positive = charging, negative = discharging, one sensor — holds for
+Tesla Powerwall and most single-sensor integrations, but Sigenergy (and presumably others)
+splits charge and discharge across two always-*positive* sensors instead: "Battery Charging
+Power" reads a flat 0 during a real discharge, so read alone it's indistinguishable from "not
+touching the battery at all." `_battery_headroom_w()` (and `_modulation_target_w`'s live
+surplus term above) now read `_read_battery_net_power_w()` instead, which optionally nets a
+second `battery_discharge_power_sensor` (`CONF_BATTERY_DISCHARGE_POWER_SENSOR`) off the charge
+reading when configured — the same two-sensor convention `plan_calculator.py`'s historical
+battery-behaviour backtest already used for this exact config key, just not previously wired
+into the live control path. Before this fix, a discharging Sigenergy battery reported the
+*full* rated discharge rate as headroom (blind to the real, live draw), and the live-surplus
+term above had no way to see the discharge was happening at all. No `battery_discharge_power_sensor`
+configured reproduces the original signed-single-sensor behaviour exactly.
 
 **What counts as "energy the plan will waste"** (`LoadControlManager._forecast_surplus_budget`),
 summed only up to the reservation point described above:
@@ -1625,8 +1727,8 @@ A forecast-only pool pump now answers **three** questions.
 | `load_detail_monitored` | Max kW, control style, has-own-battery, [on CL] | Editing a metered load |
 | `load_detail_declared` | Name, daily kWh, max kW, hours, [on CL] | Editing a declared load |
 | `load_detail_estimated` | Name, control entity, est. kW, auto-refine | Editing an estimated load |
-| `load_control` | Control entity + climate on-mode | Control style is on/off or modulating |
-| `load_modulating` | Setpoint, unit, phases, voltage, min current, plug sensor | Control style is modulating |
+| `load_control` | Control entity (+ climate on-mode for on/off) | Control style is on/off or modulating — **required** for on/off, **optional** for modulating (a setpoint-only charger needs no switch) |
+| `load_modulating` | Setpoint, unit, phases, voltage, min current, plug sensor, start/stop button pair | Control style is modulating |
 | `load_soc` | SOC sensor, charge ceiling, capacity | "Has its own battery" ticked |
 | `load_cl` | CL register, already-in-aggregate | "On a Controlled Load circuit" ticked |
 | `load_power` | Whole-house load power sensor | Offered when an estimated load exists |
@@ -1665,6 +1767,13 @@ field, so entries written before the wizard classify correctly with no migration
   rather than defaulting to `False`. The direct path never runs `async_step_controlled_load`,
   and `False` there would have silently hidden every CL question from a household that has a
   CL register.
+- **A modulating load no longer has to be given a control entity** (2026-09-10). The
+  `load_control` step made `switch` `vol.Required` for every controllable load, so a
+  setpoint-only charger (the common OCPP / Fronius Wattpilot shape — writing 0 A stops
+  delivery) could not finish the wizard without binding some unrelated switch, even though
+  `ModulatingLoadController` has always defaulted `switch_entity_id=""` and joined on the
+  setpoint id. It is now `vol.Optional` when `load_modulating` is queued, and the
+  climate-only "on mode" field is dropped for that case.
 
 **Known gaps.** The hub is a select-and-submit list, not one-click-per-load — HA menus
 require a static `async_step_*` per option, and a dynamic load list can't provide that. CL

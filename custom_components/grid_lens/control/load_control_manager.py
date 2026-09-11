@@ -40,6 +40,7 @@ from homeassistant.util import dt as dt_util
 from ..const import (
     CONF_BATTERY_CAPACITY,
     CONF_BATTERY_CHARGE_POWER_SENSOR,
+    CONF_BATTERY_DISCHARGE_POWER_SENSOR,
     CONF_BATTERY_MAX_DISCHARGE_RATE,
     CONF_BATTERY_MIN_SOC,
     CONF_BATTERY_SOC_SENSOR,
@@ -48,6 +49,8 @@ from ..const import (
     CONF_DEFERRABLE_LOAD_MIN_CURRENT,
     CONF_DEFERRABLE_LOAD_PHASES,
     CONF_DEFERRABLE_LOAD_PLUG_SENSOR,
+    CONF_DEFERRABLE_LOAD_START_BUTTON,
+    CONF_DEFERRABLE_LOAD_STOP_BUTTON,
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_SETPOINT,
     CONF_DEFERRABLE_LOAD_SETPOINT_UNIT,
@@ -90,6 +93,17 @@ _RESERVED_DISCHARGE_MIN_W = 300.0
 # shortens the window and must still be actionable.
 _MIN_BUDGET_WINDOW_H = 0.5
 
+# The live export-surplus term (see _modulation_target_w) deliberately undershoots true
+# breakeven by this much, so ordinary noise lands on the export side more often than the
+# import side — added 2026-09-11 on the household's own explicit instruction: a small
+# mistaken *export* at a below-floor rate still earns something, a small mistaken *import*
+# costs the (usually much higher) import rate, so the two aren't symmetric and shouldn't be
+# aimed at with equal weight. Same reasoning as write_deadband_a's "cheaper to undershoot
+# than chatter" — just applied to money instead of write frequency. Small relative to a
+# modulating load's usual step (a 1 A quantisation step is ~230 W), so it nudges rather than
+# meaningfully throttles.
+_EXPORT_BIAS_W = 150.0
+
 
 class LoadControlManager:
     def __init__(
@@ -120,6 +134,11 @@ class LoadControlManager:
         voltages: list = list(d.get(CONF_DEFERRABLE_LOAD_VOLTAGE, []) or [])
         min_currents: list = list(d.get(CONF_DEFERRABLE_LOAD_MIN_CURRENT, []) or [])
         plug_sensors: list = list(d.get(CONF_DEFERRABLE_LOAD_PLUG_SENSOR, []) or [])
+        # Momentary start/stop actuation, an alternative to a switch for a charger with
+        # neither a stateful switch nor a setpoint that accepts 0 (see
+        # ModulatingLoadController's module docstring — found on ha-wattpilot, 2026-09-11).
+        start_buttons: list = list(d.get(CONF_DEFERRABLE_LOAD_START_BUTTON, []) or [])
+        stop_buttons: list = list(d.get(CONF_DEFERRABLE_LOAD_STOP_BUTTON, []) or [])
         # Retained for Greedy Consumption's schedule lookup (_schedule_allows_now):
         # sensor_id is the schedule store's key for a device's stored weekly grid —
         # same source advisory/coordinator.py._deferrable_for_horizon already reads.
@@ -142,6 +161,23 @@ class LoadControlManager:
         # second flag to keep in sync.
         self._battery_soc_sensor: str = d.get(CONF_BATTERY_SOC_SENSOR) or ""
         self._battery_charge_power_sensor: str = d.get(CONF_BATTERY_CHARGE_POWER_SENSOR) or ""
+        # Optional second sensor for a battery whose charge-power reading is unipolar
+        # (0 while discharging, e.g. Sigenergy's own "Battery Charging Power" — the
+        # discharge magnitude lives on a *separate* "Battery Discharging Power" entity
+        # instead of going negative on the same one). "" means the charge sensor above is
+        # already signed (positive=charging, negative=discharging), the original
+        # assumption — see _read_battery_net_power_w(). plan_calculator.py's historical
+        # battery-behaviour backtest already reads the same two-sensor shape from this
+        # same config key; this is that convention finally reaching the live control path
+        # too (found 2026-09-11: with only the charge sensor read, a discharging Sigenergy
+        # battery looked like "0 W, not charging" to both _battery_headroom_w() and the
+        # live export-surplus term below, so a live battery discharge masked by a
+        # near-zero grid reading (itself often the *inverter's own* self-consumption loop
+        # holding grid flow near zero, not real solar surplus) was invisible — the surplus
+        # term just re-authorised whatever the modulating load already drew, and the
+        # forecast-surplus gate thought it had full headroom while the battery was
+        # actually being drained to fund the load).
+        self._battery_discharge_power_sensor: str = d.get(CONF_BATTERY_DISCHARGE_POWER_SENSOR) or ""
         self._battery_min_soc: float = float(d.get(CONF_BATTERY_MIN_SOC, 10.0))
         self._battery_max_discharge_rate_kw: float = float(d.get(CONF_BATTERY_MAX_DISCHARGE_RATE, 5.0))
         # Usable pack size (kWh). Backs the forecast-surplus condition's transient-dip check
@@ -195,6 +231,12 @@ class LoadControlManager:
                     setpoint_unit=setpoint_units[i] if i < len(setpoint_units) else "",
                     plug_entity_id=plug_sensors[i] if i < len(plug_sensors) else "",
                     climate_on_mode=climate_on_modes[i] if i < len(climate_on_modes) else "",
+                    start_button_entity_id=(
+                        start_buttons[i] if i < len(start_buttons) else ""
+                    ),
+                    stop_button_entity_id=(
+                        stop_buttons[i] if i < len(stop_buttons) else ""
+                    ),
                 )
                 self._modulating.add(i)
                 self._device_power_sensors[i] = self._resolve_device_power(
@@ -582,6 +624,22 @@ class LoadControlManager:
           netted off inside the grid reading. Without that second term the loop would
           converge to a fixed point at whatever it happened to start at: raise the setpoint,
           export falls by the same amount, and the surplus figure says there is no more room.
+          The grid reading is corrected for live battery *discharge* first (fixed
+          2026-09-11, see ``_read_battery_net_power_w``): a battery discharging to hold grid
+          flow near zero — its own self-consumption loop, or GridLens's own SELF_USE battery
+          action — makes "no import" look like free solar when it's actually funded by the
+          battery. ``surplus_w = device_w - (grid_w + max(0, discharge_w))``: adding back
+          what the battery is propping up recovers the grid flow *solar and consumption
+          alone* would produce, which is what "surplus" is actually meant to measure.
+          **Deliberately asymmetric** (household instruction, 2026-09-11): the battery
+          *charging* is never netted the same way — a positive ``battery_w`` (absorbing
+          spare solar) is dropped entirely, not added back as extra headroom for this
+          device. The battery gets first claim on genuine surplus; this device only sees
+          what's left after it, on top of a small deliberate ``_EXPORT_BIAS_W`` undershoot
+          so ordinary noise lands on the (cheap) export side rather than the (expensive)
+          import side. No battery configured (or unreadable) skips only the discharge
+          correction (``device_w - grid_w - _EXPORT_BIAS_W``) — the export-bias margin
+          applies to every install, battery or not.
         * **Free import window** (import price ≤ 0) — energy costs nothing, so take the
           device's whole envelope rather than metering it against export.
 
@@ -589,12 +647,32 @@ class LoadControlManager:
         or a device with no discoverable power sensor simply removes the surplus term, and the
         plan still drives. With no ``grid_power_sensor`` configured at all, surplus tracking
         never engages and this degrades to pure plan-following.
+
+        **Battery priority can pull the target below plan_w — the one exception to "plan is
+        a floor"** (household instruction, 2026-09-11). Every term above only ever *adds* to
+        plan_w; none of them can express "the plan turned out too optimistic, back off."
+        Found live: plan_w assumed enough solar for both this device and the battery, real
+        solar fell short, and with nothing able to reduce below plan_w the device kept its
+        full planned draw regardless while the battery alone absorbed the entire shortfall.
+        A live battery discharge (``discharge_w``, from ``_read_battery_net_power_w()``) is
+        ground truth that *something* isn't matching the plan's assumptions right now — a
+        too-optimistic forecast, self-use, or even a deliberate plan-driven evening
+        discharge — and in every one of those cases the battery keeps first claim: this
+        device is pulled back by exactly the discharge amount, even below plan_w. Applied
+        after ``max(plan_w, surplus_w)`` regardless of the greedy toggle (a priority
+        correction, not an opportunistic add-on) and independent of ``grid_power_sensor``
+        (only needs the battery sensors, which already fail closed to 0 on their own).
         """
         controller = self.controllers[index]
         current = self._current_interval(now)
         plan_w = max(0.0, self._device_power_now(index, current))
         import_rate = current.import_rate if current else None
         export_rate = current.export_rate if current else None
+
+        # Live battery discharge (W; 0 while charging/idle/unconfigured/unreadable) — read
+        # once, shared by the live-surplus term below and the battery-priority correction
+        # after the max() so both act on the same live reading within this tick.
+        discharge_w = max(0.0, -(self._read_battery_net_power_w() or 0.0))
 
         surplus_w: Optional[float] = None
         if controller.greedy and not (
@@ -609,8 +687,23 @@ class LoadControlManager:
                     and self._grid_power_sensor):
                 grid_w = self._read_grid_power_w()
                 if grid_w is not None:
-                    device_w = self._read_device_power_w(index)
-                    surplus_w = max(0.0, -grid_w) + max(0.0, device_w or 0.0)
+                    device_w = self._read_device_power_w(index) or 0.0
+                    # Net out battery *discharge* before treating "grid near zero" as real
+                    # solar surplus (fixed 2026-09-11). A battery running its own — or
+                    # GridLens's own SELF_USE — self-consumption loop holds grid flow near
+                    # zero using stored charge, not spare solar; read on its own, that looks
+                    # identical to genuine surplus.
+                    #
+                    # Asymmetric on purpose (household instruction, 2026-09-11): only
+                    # discharge is added back — battery *charging* is dropped, not credited
+                    # to this device, so the battery keeps first claim on genuine surplus
+                    # rather than competing with this device for it. `_EXPORT_BIAS_W` then
+                    # shaves a small, deliberate margin off the result so the loop settles a
+                    # little short of true breakeven — cheap insurance against import on the
+                    # noise, given import runs well above the export rate this household is
+                    # diverting in the first place.
+                    grid_w_ex_battery = grid_w + discharge_w
+                    surplus_w = max(0.0, device_w - grid_w_ex_battery - _EXPORT_BIAS_W)
             if import_rate is not None and import_rate <= 0.0:
                 cap_w = getattr(controller, "cap_w", 0.0)
                 if cap_w > 0.0:
@@ -626,9 +719,19 @@ class LoadControlManager:
             if fc_target_w > 0.0:
                 surplus_w = max(surplus_w or 0.0, fc_target_w)
         target_w = max(plan_w, surplus_w or 0.0)
+        source = "surplus" if (surplus_w or 0.0) > plan_w else "plan"
+
+        # Battery-priority correction — see the docstring above. The only place in this
+        # function the target is allowed to drop below plan_w.
+        if discharge_w > 0.0 and target_w > 0.0:
+            relieved_w = max(0.0, target_w - discharge_w)
+            if relieved_w < target_w:
+                target_w = relieved_w
+                source = "battery_priority"
+
         if target_w <= 0.0:
             return 0.0, "off"
-        return target_w, "surplus" if (surplus_w or 0.0) > plan_w else "plan"
+        return target_w, source
 
     def _forecast_surplus_budget(
         self, index: int, now: datetime
@@ -744,6 +847,36 @@ class LoadControlManager:
         controller treats that as "unknown", never guessing a value."""
         return self._read_power_w(self._grid_power_sensor)
 
+    def _read_battery_net_power_w(self) -> Optional[float]:
+        """Live net battery power (W, +charging/-discharging), or None if unconfigured
+        or unreadable.
+
+        Two sensor shapes, matching plan_calculator.py's historical battery-behaviour
+        backtest (same config keys, same convention — this is that logic finally
+        reaching the live control path, see CONF_BATTERY_DISCHARGE_POWER_SENSOR's
+        comment):
+
+        * No discharge sensor configured — ``_battery_charge_power_sensor`` is assumed
+          already signed (the original, still-common shape: Tesla Powerwall and most
+          single-sensor integrations).
+        * A discharge sensor IS configured — both sensors are unipolar (0 while the
+          battery is doing the other thing), so net power is charge minus discharge.
+          Sigenergy is the concrete case: "Battery Charging Power" reads 0 during a real
+          discharge, so read alone it looks exactly like "not touching the battery at
+          all" rather than "actively discharging".
+        """
+        if not self._battery_charge_power_sensor:
+            return None
+        charge_w = self._read_power_w(self._battery_charge_power_sensor)
+        if charge_w is None:
+            return None
+        if not self._battery_discharge_power_sensor:
+            return charge_w
+        discharge_w = self._read_power_w(self._battery_discharge_power_sensor)
+        if discharge_w is None:
+            return None
+        return charge_w - discharge_w
+
     def _read_percent(self, entity_id: str) -> Optional[float]:
         """A plain 0-100 sensor reading (SOC), or None if unconfigured/unavailable."""
         if not entity_id:
@@ -767,16 +900,20 @@ class LoadControlManager:
         full draw right now — otherwise firing is just real, unbuffered grid import wearing
         a forecast's clothing.
 
-        None (never 0) whenever the SOC sensor or the signed charge-power sensor is missing
+        None (never 0) whenever the SOC sensor or the net battery-power reading is missing
         or unreadable — same fail-closed discipline as every other Greedy Consumption input;
         a household with no battery configured must never have this silently read as
         "unlimited headroom". 0.0 (a real, measured answer) once SOC is at or below the
         configured minimum: there is a battery, it just has nothing spare to give.
 
-        ``_battery_charge_power_sensor`` is signed, positive = charging, negative =
-        discharging (same convention plan_calculator.py's battery backtest already uses) —
+        Net battery power (``_read_battery_net_power_w()``, +charging/-discharging) —
         the discharging magnitude is netted off the rated max discharge rate to get what's
-        actually still free, not just what the battery is rated for.
+        actually still free, not just what the battery is rated for. Fixed 2026-09-11: this
+        used to read ``_battery_charge_power_sensor`` directly, assuming it was always
+        signed — wrong for a battery whose charge sensor reads 0 during a real discharge
+        (Sigenergy: the discharge magnitude lives on a separate sensor). That made this
+        method blind to an actual discharge, reporting the full rated discharge rate as
+        "headroom" while the battery was being drawn down for real.
         """
         if not self._battery_soc_sensor or not self._battery_charge_power_sensor:
             return None
@@ -785,7 +922,7 @@ class LoadControlManager:
             return None
         if soc <= self._battery_min_soc:
             return 0.0
-        charge_w = self._read_power_w(self._battery_charge_power_sensor)
+        charge_w = self._read_battery_net_power_w()
         if charge_w is None:
             return None
         discharging_w = max(0.0, -charge_w)

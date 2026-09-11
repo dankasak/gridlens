@@ -263,8 +263,8 @@
         }
       },
       "load_control": {
-        "title": "{name} — On/Off Control",
-        "description": "The `switch.*` or `climate.*` entity Grid Lens will turn on and off to run **{name}** at the best times.\n\nControl starts disabled: each load gets its own master switch, off by default, that you turn on when you're ready to let Grid Lens actuate it.\n\nThe **\"on\" mode** below is only consulted for a `climate.*` entity that doesn't support turn on/off — most do, so leave it on Auto unless yours misbehaves.",
+        "title": "{name} — Control Entity",
+        "description": "The `switch.*` or `climate.*` entity Grid Lens turns on and off to run **{name}** at the best times.\n\nFor a **modulating charger** (an adjustable current/power setpoint) this is **optional** — leave it blank if the charger stops when its current is set to zero, which almost all do. Set it only if your charger needs a separate switch flipped on before it will draw.\n\nControl starts disabled: each load gets its own master switch, off by default, that you turn on when you're ready to let Grid Lens actuate it.\n\nThe **\"on\" mode** below is only consulted for a `climate.*` entity that doesn't support turn on/off — most do, so leave it on Auto unless yours misbehaves.",
         "data": {
           "switch": "Control entity",
           "climate_on_mode": "Climate \"on\" mode"
@@ -272,14 +272,16 @@
       },
       "load_modulating": {
         "title": "{name} — Modulating Control",
-        "description": "A charging current or power setpoint lets Grid Lens ramp **{name}** continuously instead of just switching it — following your solar surplus as it changes rather than running flat out or not at all.\n\nThe setpoint is a `number.*` entity such as OCPP's `maximum_current`, Easee's `dynamic_charger_limit`, Wallbox's `maximum_charging_current`, or the equivalent on Zaptec, go-e, openEVSE, Tesla or a Sigenergy AC charger.\n\nUnit, phase count and voltage default to auto-detected values that are right for almost every install. Minimum current defaults to the 6 A EV charging floor. A plug/connected sensor lets Grid Lens avoid commanding current into an empty socket.\n\nLive solar-surplus tracking also needs the Grid Power sensor configured on the Energy Sensors step — without it this charger follows the optimizer's plan and never chases a passing cloud.",
+        "description": "A charging current or power setpoint lets Grid Lens ramp **{name}** continuously instead of just switching it — following your solar surplus as it changes rather than running flat out or not at all.\n\nThe setpoint is a `number.*` entity such as OCPP's `maximum_current`, Easee's `dynamic_charger_limit`, Wallbox's `maximum_charging_current`, or the equivalent on Zaptec, go-e, openEVSE, Tesla or a Sigenergy AC charger.\n\nUnit, phase count and voltage default to auto-detected values that are right for almost every install. Minimum current defaults to the 6 A EV charging floor. A plug/connected sensor lets Grid Lens avoid commanding current into an empty socket.\n\n**Start/stop buttons** are for a charger with no stateful switch at all, or whose setpoint entity refuses a literal 0 (some chargers reject a write below their own minimum current rather than clamping it — a plain switch or a 0 write won't stop these). Leave both blank unless the previous screen's Control Entity doesn't fit; when used, both must be set together.\n\nLive solar-surplus tracking also needs the Grid Power sensor configured on the Energy Sensors step — without it this charger follows the optimizer's plan and never chases a passing cloud.",
         "data": {
           "setpoint": "Current/power setpoint entity",
           "setpoint_unit": "Setpoint unit",
           "phases": "Phases",
           "voltage": "Supply voltage",
           "min_current": "Minimum charging current",
-          "plug_sensor": "Plug/connected sensor"
+          "plug_sensor": "Plug/connected sensor",
+          "start_button": "Start button (optional)",
+          "stop_button": "Stop button (optional)"
         }
       },
       "load_soc": {
@@ -344,7 +346,8 @@
       "cannot_connect": "Could not connect to the Grid Lens API. Check your internet connection.",
       "load_name_required": "Give this load a name.",
       "load_duplicate_name": "Another load already uses that name. Names must be unique — two loads sharing one would be merged.",
-      "load_control_required": "Pick the entity Grid Lens should switch on and off. A load with a name but no control entity is silently ignored."
+      "load_control_required": "Pick the entity Grid Lens should switch on and off. A load with a name but no control entity is silently ignored.",
+      "modulating_button_pair_incomplete": "Set both the start and stop button, or neither — one without the other can't actuate the charger."
     }
   }
 }

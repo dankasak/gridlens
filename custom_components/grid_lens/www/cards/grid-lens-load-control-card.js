@@ -496,14 +496,22 @@ class GridLensLoadControlCard extends HTMLElement {
            a bolted-on new style, but their own classes since they're not a boost value. */
         .modcur { font-size: 11px; font-weight: 600; color: var(--ink); white-space: nowrap;
                border: 1px solid var(--border); border-radius: 7px; padding: 3px 8px;
-               flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+               flex: 0 0 auto; font-variant-numeric: tabular-nums;
+               min-width: 100px; box-sizing: border-box; text-align: center; }
         .maxcur { display: flex; align-items: center; gap: 3px; flex: 0 0 auto;
-               border: 1px solid var(--border); border-radius: 7px; padding: 3px 7px; }
+               border: 1px solid var(--border); border-radius: 7px; padding: 3px 7px;
+               min-width: 84px; box-sizing: border-box; }
         .maxcur-label { font-size: 10px; color: var(--ink2); }
         .maxcur-input { width: 32px; border: none; background: transparent; color: var(--ink);
                font-size: 12px; font-family: inherit; text-align: right; }
         .maxcur-input::-webkit-outer-spin-button, .maxcur-input::-webkit-inner-spin-button { margin: 0; }
         .maxcur-unit { font-size: 10px; color: var(--ink2); }
+        /* Reserved-but-empty variant of either box above (added 2026-09-11) — a
+           non-modulating row (or a modulating one whose max-current entity hasn't resolved
+           yet) still occupies the same min-width, so every *other* column on the row (the
+           greedy icons, Today Boost, the control segment) lines up across every row
+           regardless of which ones happen to be modulating. */
+        .modcur.ph, .maxcur.ph { visibility: hidden; border-color: transparent; }
         /* Daily-kWh sparkline: how much this device has actually drawn per day over the
            last two weeks, so a user reaching for Today Boost has a number to react to
            instead of guessing. Deliberately not colour-coded per device (unlike the
@@ -737,6 +745,10 @@ class GridLensLoadControlCard extends HTMLElement {
     const label = {
       plan: 'Following the plan',
       surplus: 'Charging on surplus solar/export',
+      // Battery-priority correction (added 2026-09-11): the plan/surplus figure got
+      // pulled back because the home battery is discharging to cover the gap — see
+      // LoadControlManager._modulation_target_w's docstring.
+      battery_priority: 'Reduced — home battery has priority',
       override: 'Manual override',
       off: 'Not charging',
     }[a.modulation_source];
@@ -750,8 +762,14 @@ class GridLensLoadControlCard extends HTMLElement {
   // on this card already uses, no new discovery). Degrades to an em-dash rather than
   // hiding the chip outright when the setpoint entity is unavailable/unknown, so the row
   // keeps its shape instead of jumping when a charger briefly drops offline.
+  // Both this and _maxCurrentHtml below always render a same-sized box, populated or not
+  // (added 2026-09-11) — the same "reserve the column even when empty" treatment .greedy's
+  // disabled gbtns and .spark's loading placeholder already use elsewhere on this row, so a
+  // modulating device's two extra columns don't shift every *other* field (greedy icons,
+  // boost input, the control segment) sideways relative to a plain on/off row. `.ph`
+  // (`visibility: hidden`) keeps the reserved width/height without drawing anything.
   _currentReadoutHtml(d) {
-    if (d.control_type !== 'modulating') return '';
+    if (d.control_type !== 'modulating') return '<div class="modcur ph"></div>';
     const hass = this._hass;
     const spSt = d.setpoint_entity ? hass.states[d.setpoint_entity] : null;
     const spVal = spSt ? parseFloat(spSt.state) : NaN;
@@ -779,10 +797,11 @@ class GridLensLoadControlCard extends HTMLElement {
   // a modulating device with no max_current number at all reads as "not configured yet",
   // same treatment the rest of this card gives a missing auxiliary entity.
   _maxCurrentHtml(r, d) {
-    if (d.control_type !== 'modulating' || !r.maxCurEid) return '';
+    const ph = '<div class="maxcur ph"></div>';
+    if (d.control_type !== 'modulating' || !r.maxCurEid) return ph;
     const hass = this._hass;
     const st = hass.states[r.maxCurEid];
-    if (!st) return '';
+    if (!st) return ph;
     const ba = st.attributes || {};
     const val = parseFloat(st.state);
     const shown = Number.isFinite(val) ? val : (ba.max ?? 0);
@@ -960,13 +979,13 @@ class GridLensLoadControlCard extends HTMLElement {
       const a = controlSt ? (controlSt.attributes || {}) : {};
       const note = friendlyNote(a.note);
       const isErr = (a.note || '').startsWith('command_error');
-      // A modulating device with no separate on/off switch (the common case) has no
-      // switch_entity to show here — fall back to the setpoint entity so the meta line
-      // still names the entity actually being driven instead of trailing off after "· ".
-      const drivenEntity = d.switch_entity || d.setpoint_entity || '';
-      const meta = d.controllable
-        ? `${on ? 'Controlling' : 'Not controlling'} · ${esc(drivenEntity)}${note ? ' · ' + esc(note) : ''}`
-        : 'Forecast only — no control switch configured';
+      // "Controlling"/"Not controlling" + the driven entity id was dropped 2026-09-11 —
+      // pure boilerplate that repeated on every row (the master switch above already
+      // shows on/off) and widened rows enough to break the card's layout. The note
+      // itself stays: for a modulating device it's usually redundant with modLine's
+      // richer "why" line below, but for an on/off device it's the only diagnostic text
+      // on the row (e.g. a command_error), so it's worth the one line when non-empty.
+      const meta = d.controllable ? note : 'Forecast only — no control switch configured';
       // Second meta line: the live greedy story. Answers "is greedy doing anything right
       // now, and if not, how close is it?" — the boolean toggles above only say it's
       // armed. Rendered off the control switch's own attributes (the controller's
@@ -1096,7 +1115,7 @@ class GridLensLoadControlCard extends HTMLElement {
           <ha-icon class="icon${d.controllable ? '' : ' dim'}" icon="mdi:power-plug"></ha-icon>
           <div class="info">
             <div class="name">${esc(d.name || d.energy_entity)}</div>
-            <div class="meta${isErr ? ' err' : ''}">${meta}</div>
+            ${meta ? `<div class="meta${isErr ? ' err' : ''}">${esc(meta)}</div>` : ''}
             ${greedyLine}
             ${modLine}
             ${socCapLine}

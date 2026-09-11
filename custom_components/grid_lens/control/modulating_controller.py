@@ -10,6 +10,17 @@ controller is deliberately **not** an OCPP driver: it is told which number entit
 what its value means, and what the device's floor is. Any integration matching that shape
 works with no code change here.
 
+Not every integration fits that shape exactly, though. Found 2026-09-11 on the household's
+own Fronius Wattpilot (the ``ha-wattpilot`` HACS integration): its charging-current entity
+has ``native_min_value=6`` — HA's ``number`` platform rejects a ``set_value`` below that
+rather than clamping it, so "write 0 to stop" (the mechanism every OCPP/Easee/Wallbox-shaped
+setpoint relies on) simply isn't available — and its only start/stop control is two
+momentary ``button.*`` actions (the underlying force-state property has no readable entity
+at all, so there's nothing to build a synthetic switch from either). ``start_button_entity_id``/
+``stop_button_entity_id`` (see ``_write_setpoint``) is the accommodation: still not an
+OCPP-or-any-other-vendor driver — just a second, optional actuation shape alongside the
+switch, for the "no switch and 0 isn't valid either" case.
+
 Why a separate controller rather than a mode on the on/off one:
 
 * **The LP already solves for this.** ``def_i`` is a continuous 0..max_kw variable. The
@@ -108,6 +119,8 @@ class ModulatingLoadController(DeferrableLoadController):
         plug_entity_id: str = "",
         write_deadband_a: float = 0.5,
         min_write_interval_s: float = 20.0,
+        start_button_entity_id: str = "",
+        stop_button_entity_id: str = "",
         **kwargs,
     ) -> None:
         # switch_entity_id is optional here (the common case is a setpoint alone — writing 0
@@ -118,10 +131,29 @@ class ModulatingLoadController(DeferrableLoadController):
         )
         self.setpoint_entity_id = setpoint_entity_id
         self.plug_entity_id = plug_entity_id or ""
+        # See _write_setpoint: an alternative to switch_entity_id for a charger whose only
+        # start/stop control is a momentary action, or whose setpoint refuses a literal 0
+        # write outright (const.py's CONF_DEFERRABLE_LOAD_START_BUTTON/_STOP_BUTTON has the
+        # full story — found on the household's own Fronius Wattpilot, 2026-09-11). Config
+        # flow enforces both-or-neither; take that on trust here rather than re-validating.
+        self.start_button_entity_id = start_button_entity_id or ""
+        self.stop_button_entity_id = stop_button_entity_id or ""
 
         # See DeferrableLoadController.join_key: a switchless charger (the common OCPP
         # shape) would otherwise publish an empty pairing key, and every such device on an
-        # install would collide on it.
+        # install would collide on it. Deliberately NOT falling through to
+        # start_button_entity_id here (tried, then reverted 2026-09-11): every card that
+        # pairs a master switch/override-select/greedy-toggle to a device does so by
+        # matching its own `phys = d.switch_entity || d.setpoint_entity` (computed from the
+        # `deferrable_loads` sensor attribute, which doesn't carry the button entities at
+        # all — see grid-lens-load-control-card.js._resolveRows) against this class's
+        # published `join_key`. Preferring a start button here made the two disagree for
+        # any switchless, button-actuated device — join_key became the button's entity id,
+        # phys stayed the setpoint's, no auxiliary entity ever matched, and the Load
+        # Control card fell back to its "control entities are still loading" placeholder
+        # forever (greyed-out buttons, "Not controlling" that never clears). setpoint_id is
+        # `vol.Required` for every modulating load, so it already guarantees a non-empty,
+        # unique key with no button involved.
         self._join_key = switch_entity_id or setpoint_entity_id
         self.min_current_a = max(0.0, float(min_current_a or 0.0)) or DEFAULT_MIN_CHARGE_CURRENT_A
         self.voltage = float(voltage) if float(voltage or 0.0) > 0.0 else DEFAULT_SUPPLY_VOLTAGE
@@ -340,7 +372,17 @@ class ModulatingLoadController(DeferrableLoadController):
         sitting at 0 A is off no matter what its relay says. A companion switch, when
         configured, can only veto (an off switch means off regardless of setpoint); an
         unreadable switch is ignored rather than treated as off, same fail-open discipline as
-        the plug sensor."""
+        the plug sensor.
+
+        **Known gap for a button-actuated charger** (``start_button_entity_id``/
+        ``stop_button_entity_id`` configured): ``_write_setpoint`` deliberately never writes
+        0 to the setpoint when stopping via the stop button (the entity may refuse it), so
+        this can read "on" for a while after a real stop-button press — the setpoint's raw
+        value is simply stale, not wrong on the hardware. There is no fix available from
+        here: the underlying start/stop state (ha-wattpilot's ``frc`` force-state property,
+        for instance) isn't exposed as a readable entity at all by a button-only
+        integration. Not on any decision path today (only this class's own tests call it),
+        but true for any future consumer."""
         st = self.hass.states.get(self.setpoint_entity_id)
         if st is None or str(st.state).lower() in ("unknown", "unavailable", "none", ""):
             return None
@@ -534,7 +576,7 @@ class ModulatingLoadController(DeferrableLoadController):
                 return
 
         try:
-            await self._write_setpoint(setpoint, want_on)
+            await self._write_setpoint(setpoint, want_on, crossing=crossing)
         except Exception as err:  # noqa: BLE001 — a failed write must never kill the loop
             _LOGGER.error(
                 "Modulating load %s: setpoint write (%s = %s) failed: %s",
@@ -562,27 +604,73 @@ class ModulatingLoadController(DeferrableLoadController):
             if want_on else f"setpoint_off{'_' + reason if reason else ''}"
         )
 
-    async def _write_setpoint(self, setpoint: float, want_on: bool) -> None:
+    async def _write_setpoint(
+        self, setpoint: float, want_on: bool, *, crossing: bool = True
+    ) -> None:
         """The raw hardware write. Raises on failure — every caller wraps it.
 
-        Ordering matters when a companion switch is configured: energise before ramping up,
-        de-energise after commanding 0, so the device is never asked to deliver current
-        through a relay that is still open (or left holding a stale non-zero limit after the
-        relay opens)."""
-        if want_on and self.switch_entity_id and self._switch_state() is not True:
-            await self._switch(True)
-        await self.hass.services.async_call(
-            "number", "set_value",
-            {"entity_id": self.setpoint_entity_id, "value": setpoint},
-            blocking=True,
-        )
-        if not want_on and self.switch_entity_id and self._switch_state() is not False:
-            await self._switch(False)
+        Two on/off mechanisms, tried in this order:
+
+        * **Start/stop buttons** (``start_button_entity_id``/``stop_button_entity_id``) —
+          for a charger whose only start/stop control is a momentary action rather than a
+          stateful switch, or whose setpoint entity refuses a literal 0 write outright (a
+          nonzero ``native_min_value`` — confirmed 2026-09-11 on the household's own
+          ha-wattpilot integration, whose ``max_charging_current`` has a 6 A floor and
+          raises rather than clamps). Pressed only on an actual on/off ``crossing``, never
+          on an in-session amps adjustment: a button has no readable on/off state to gate
+          on the way ``_switch_state()`` gates the switch below, so ``crossing`` (computed
+          once in ``_write()``, where "commanded on" is already tracked) is what stops this
+          from re-pressing "start" on every 30 s tick while already charging. Turning off
+          this way skips the setpoint write entirely — the entity may not accept 0 at all,
+          and the stop button is trusted to actually halt delivery on its own, matching how
+          the Fronius app's own controls work. (Before this exodus, an entity that rejects
+          0 raised out of ``number.set_value`` and ``_write`` caught it *before* updating
+          ``self._commanded`` — so GridLens believed it had turned the charger off while the
+          hardware kept drawing at its last setpoint. See GRIDLENS_CHECKLIST.md 2026-09-11.)
+        * **Companion switch** (``switch_entity_id``), the pre-existing mechanism — energise
+          before ramping up, de-energise after commanding 0, so the device is never asked to
+          deliver current through a relay that is still open, or left holding a stale
+          non-zero limit after the relay opens.
+
+        Neither configured (the common OCPP/Easee/Wallbox case) means the setpoint write
+        alone does the job: 0 already means off there.
+        """
+        if want_on:
+            if crossing and self.start_button_entity_id:
+                await self._press(self.start_button_entity_id)
+            elif self.switch_entity_id and self._switch_state() is not True:
+                await self._switch(True)
+            await self.hass.services.async_call(
+                "number", "set_value",
+                {"entity_id": self.setpoint_entity_id, "value": setpoint},
+                blocking=True,
+            )
+        else:
+            if self.stop_button_entity_id:
+                if crossing:
+                    await self._press(self.stop_button_entity_id)
+                # else: this is a re-assert of an already-off state — nothing to press
+                # again, and there is no valid "off" value to write to the setpoint either.
+            else:
+                await self.hass.services.async_call(
+                    "number", "set_value",
+                    {"entity_id": self.setpoint_entity_id, "value": setpoint},
+                    blocking=True,
+                )
+            if self.switch_entity_id and self._switch_state() is not False:
+                await self._switch(False)
 
     async def _switch(self, on: bool) -> None:
         """Drive the optional companion on/off entity, reusing the parent's actuation so a
         ``climate.*`` companion goes through the same turn_on/set_hvac_mode fallback."""
         await super()._actuate(on)
+
+    async def _press(self, button_entity_id: str) -> None:
+        """Press a momentary ``button.*`` entity — the start/stop actuation for a charger
+        with no stateful switch (see ``_write_setpoint``)."""
+        await self.hass.services.async_call(
+            "button", "press", {"entity_id": button_entity_id}, blocking=True,
+        )
 
     # ------------------------------------------------------------------ manual override
     def _force_on_target_w(self) -> float:

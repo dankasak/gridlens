@@ -53,6 +53,8 @@ _ENTRY = {
     const.CONF_DEFERRABLE_LOAD_VOLTAGE: [0.0, 240.0],
     const.CONF_DEFERRABLE_LOAD_MIN_CURRENT: [0.0, 6.0],
     const.CONF_DEFERRABLE_LOAD_PLUG_SENSOR: ["", "binary_sensor.evse_plug"],
+    const.CONF_DEFERRABLE_LOAD_START_BUTTON: ["", ""],
+    const.CONF_DEFERRABLE_LOAD_STOP_BUTTON: ["", ""],
     # One declared load.
     const.CONF_DEFERRABLE_LOAD_DUMMY_NAMES: ["Hot Water"],
     const.CONF_DEFERRABLE_LOAD_DUMMY_KWH: [8.0],
@@ -109,7 +111,7 @@ def test_round_trip_preserves_every_array():
     written = dl.write_loads(dl.read_loads(_ENTRY))
     for key in dl.ALL_KEYS:
         assert written[key] == _ENTRY[key], (key, written[key], _ENTRY[key])
-    print("  ✓ read_loads/write_loads round-trips all 22 parallel arrays unchanged")
+    print("  ✓ read_loads/write_loads round-trips all 24 parallel arrays unchanged")
 
 
 def test_arrays_stay_index_aligned():
@@ -168,8 +170,8 @@ def test_modulating_load_walks_the_setpoint_step():
     assert res["step_id"] == "load_control"
     res = run(f.async_step_load_control({"switch": "switch.evse", "climate_on_mode": ""}))
     assert res["step_id"] == "load_modulating"
-    assert set(_fields(res)) == {"setpoint", "setpoint_unit", "phases",
-                                 "voltage", "min_current", "plug_sensor"}
+    assert set(_fields(res)) == {"setpoint", "setpoint_unit", "phases", "voltage",
+                                 "min_current", "plug_sensor", "start_button", "stop_button"}
     res = run(f.async_step_load_modulating({
         "setpoint": "number.evse_current", "setpoint_unit": "a", "phases": "3",
         "voltage": 240.0, "min_current": 6.0, "plug_sensor": "binary_sensor.evse_plug",
@@ -183,6 +185,140 @@ def test_modulating_load_walks_the_setpoint_step():
     assert load["setpoint"] == "number.evse_current" and load["phases"] == 3
     assert load["soc_capacity_kwh"] == 64.0
     print("  ✓ a modulating load walks detail → control → modulating → soc")
+
+
+def test_modulating_load_needs_no_control_entity():
+    """A setpoint-only charger — the common OCPP shape — stops delivering when its current
+    is wound to 0, so the control-entity step must accept an empty answer.
+    `ModulatingLoadController` defaults `switch_entity_id=""` and joins on the setpoint id,
+    so downstream is fine; only the wizard used to force a switch. (A charger that can't
+    even accept a 0 write — the household's own Fronius Wattpilot — needs the separate
+    start_button/stop_button pair; see test_modulating_load_with_button_pair below.)"""
+    f = _flow()
+    run(f.async_step_loads())
+    run(f.async_step_loads({"action": "edit:1"}))  # EV Charger
+    res = run(f.async_step_load_detail_monitored({
+        "max_kw": 7.4, "control_style": dl.CONTROL_MODULATING,
+        "has_soc": False, "on_controlled_load": False, "remove": False,
+    }))
+    assert res["step_id"] == "load_control"
+    # The modulating variant of the control step drops the climate-only "on mode"
+    # question — a current-ramped charger's companion is always a plain switch.
+    assert set(_fields(res)) == {"switch"}
+    # Submit with no switch at all.
+    res = run(f.async_step_load_control({}))
+    assert res["step_id"] == "load_modulating"
+    res = run(f.async_step_load_modulating({
+        "setpoint": "number.wattpilot_current", "setpoint_unit": "", "phases": "0",
+        "voltage": 0.0, "min_current": 0.0, "plug_sensor": "sensor.wattpilot_car",
+    }))
+    assert res["step_id"] == "loads"
+    load = f._loads[1]
+    assert load["switch"] == "" and load["setpoint"] == "number.wattpilot_current"
+    assert dl.control_style(load) == dl.CONTROL_MODULATING
+    # The written arrays stay index-aligned with an empty switch slot.
+    out = dl.write_loads(f._loads)
+    i = out[const.CONF_DEFERRABLE_LOAD_SETPOINT].index("number.wattpilot_current")
+    assert out[const.CONF_DEFERRABLE_LOAD_SWITCHES][i] == ""
+    print("  ✓ a modulating load completes the wizard with no control entity")
+
+
+def test_onoff_control_step_still_asks_for_climate_on_mode():
+    """The non-modulating path is unchanged: it keeps the required control entity and
+    the climate "on" mode dropdown."""
+    f = _flow()
+    run(f.async_step_loads())
+    run(f.async_step_loads({"action": "edit:1"}))
+    res = run(f.async_step_load_detail_monitored({
+        "max_kw": 7.4, "control_style": dl.CONTROL_ONOFF,
+        "has_soc": False, "on_controlled_load": False, "remove": False,
+    }))
+    assert res["step_id"] == "load_control"
+    assert set(_fields(res)) == {"switch", "climate_on_mode"}
+    print("  ✓ the on/off control step is unchanged")
+
+
+def test_modulating_load_with_button_pair():
+    """A charger like the household's own Fronius Wattpilot (ha-wattpilot integration,
+    confirmed 2026-09-11): no stateful switch at all, and its setpoint's own
+    native_min_value=6 means writing 0 to signal off is rejected outright, not just
+    unnecessary. start_button/stop_button is the accommodation — walk the wizard with no
+    switch and a button pair instead, and check it saves and round-trips."""
+    f = _flow()
+    run(f.async_step_loads())
+    run(f.async_step_loads({"action": "edit:1"}))  # EV Charger
+    res = run(f.async_step_load_detail_monitored({
+        "max_kw": 7.4, "control_style": dl.CONTROL_MODULATING,
+        "has_soc": False, "on_controlled_load": False, "remove": False,
+    }))
+    assert res["step_id"] == "load_control"
+    res = run(f.async_step_load_control({}))  # no switch — the buttons replace it
+    assert res["step_id"] == "load_modulating"
+    res = run(f.async_step_load_modulating({
+        "setpoint": "number.wattpilot_max_charging_current", "setpoint_unit": "",
+        "phases": "0", "voltage": 0.0, "min_current": 6.0,
+        "plug_sensor": "sensor.wattpilot_car_connected",
+        "start_button": "button.wattpilot_start_charging_force",
+        "stop_button": "button.wattpilot_stop_charging",
+    }))
+    assert res["step_id"] == "loads"
+    load = f._loads[1]
+    assert load["switch"] == ""
+    assert load["start_button"] == "button.wattpilot_start_charging_force"
+    assert load["stop_button"] == "button.wattpilot_stop_charging"
+    out = dl.write_loads(f._loads)
+    i = out[const.CONF_DEFERRABLE_LOAD_SETPOINT].index("number.wattpilot_max_charging_current")
+    assert out[const.CONF_DEFERRABLE_LOAD_START_BUTTON][i] == "button.wattpilot_start_charging_force"
+    assert out[const.CONF_DEFERRABLE_LOAD_STOP_BUTTON][i] == "button.wattpilot_stop_charging"
+    print("  ✓ a modulating load can be wired with a start/stop button pair instead of a switch")
+
+
+def test_modulating_button_pair_must_be_complete():
+    """One button without the other is a broken config, not a valid third state — the
+    step must reject it and let the user fix it, not silently save half a pair."""
+    f = _flow()
+    run(f.async_step_loads())
+    run(f.async_step_loads({"action": "edit:1"}))
+    run(f.async_step_load_detail_monitored({
+        "max_kw": 7.4, "control_style": dl.CONTROL_MODULATING,
+        "has_soc": False, "on_controlled_load": False, "remove": False,
+    }))
+    run(f.async_step_load_control({}))
+    res = run(f.async_step_load_modulating({
+        "setpoint": "number.wattpilot_max_charging_current",
+        "start_button": "button.wattpilot_start_charging_force",
+        # stop_button left blank
+    }))
+    assert res["step_id"] == "load_modulating"
+    assert res["errors"] == {"stop_button": "modulating_button_pair_incomplete"}
+    # The load itself is untouched — a rejected submission must not half-save.
+    assert f._loads[1]["start_button"] == ""
+    print("  ✓ a lone start_button with no stop_button is rejected, not half-saved")
+
+
+def test_downgrading_from_modulating_clears_the_button_pair():
+    """Leaving a button pair behind would keep LoadControlManager treating this as a
+    button-actuated modulating load even after the user switched it back to on/off."""
+    f = _flow()
+    run(f.async_step_loads())
+    run(f.async_step_loads({"action": "edit:1"}))
+    run(f.async_step_load_detail_monitored({
+        "max_kw": 7.4, "control_style": dl.CONTROL_MODULATING,
+        "has_soc": False, "on_controlled_load": False, "remove": False,
+    }))
+    run(f.async_step_load_control({}))
+    run(f.async_step_load_modulating({
+        "setpoint": "number.wattpilot_max_charging_current",
+        "start_button": "button.wattpilot_start_charging_force",
+        "stop_button": "button.wattpilot_stop_charging",
+    }))
+    run(f.async_step_load_detail_monitored({
+        "max_kw": 7.4, "control_style": dl.CONTROL_ONOFF,
+        "has_soc": False, "on_controlled_load": False, "remove": False,
+    }))
+    load = f._loads[1]
+    assert load["start_button"] == "" and load["stop_button"] == ""
+    print("  ✓ switching a load off modulating clears its button pair too")
 
 
 def test_downgrading_from_modulating_clears_the_setpoint():
