@@ -41,8 +41,11 @@ is SOC-guardrail- and inverter-HAL-specific):
   top of the LP's plan: turn the device on any time energy is genuinely free right now,
   regardless of what the plan scheduled for this slot. Two conditions (either is enough):
   the current import price is free (a plan's $0 window), or the household is currently
-  exporting at least as much power as this device draws while the export price is $0 (so
-  running it can't create new grid import — it only claims otherwise-worthless export).
+  exporting at least as much power as this device draws while the export price is at or
+  below the user's **Minimum Export Price** (``min_export_price``, a c/kWh preference;
+  0 disables the floor, so the bar is then just "export price ≤ $0"). Running the device
+  can't create new grid import — the house is already exporting more than its draw — it
+  only redirects export the user has said isn't worth selling into self-consumption.
   Folds into the same ``want_on`` computed each tick, so it's subject to the same
   debounce/transition-economy machinery as a plan-driven flip — no separate code path,
   no separate chatter risk. Optionally gated to the device's own configured availability
@@ -51,30 +54,36 @@ is SOC-guardrail- and inverter-HAL-specific):
   else here, greedy is completely suppressed while a manual override is active — a human
   at the physical switch always wins.
 * **Forecast surplus** (``greedy_forecast_surplus``, a third opt-in on top of greedy, off
-  by default) — a *forward-looking* third greedy condition. The two conditions above are
-  strictly instantaneous: they only fire once free energy is already flowing. On a
+  by default) — a *forward-looking*, *proportional* third greedy condition. The two above
+  are strictly instantaneous: they only fire once wasted energy is already flowing. On a
   solar+battery house that systematically fires late — mid-morning the battery soaks up
   every spare watt, so live export is ~0 and neither condition is true, yet the plan
-  already knows that this afternoon far more energy will spill to a $0 export than this
-  device could ever eat. By the time export actually shows up, hours of run-time have
-  been wasted. So: if the plan forecasts that, over the look-ahead window, *more* free
-  energy will be thrown away than this device could consume running flat out for that
-  whole window, run it now.
+  already knows this afternoon will spill far more than the retailer's feed-in is worth.
+  By the time export actually shows up, hours of run-time have been wasted.
 
-  This one is opt-in on top of the master switch because it fires ahead of any live
-  signal, purely off the plan's forecast — the other two only ever confirm energy that is
-  already flowing. To keep it from ever creating real grid import, it is additionally
-  gated on live battery headroom (``battery_headroom_w``, computed by
-  ``LoadControlManager._battery_headroom_w`` from the configured battery SOC and charge
-  power sensors): it may only fire when the battery's current SOC is above its configured
-  minimum with enough free discharge rate to supply this device's full draw right now.
-  That's what makes the bet safe — running now draws the battery down rather than the
-  grid, and that hole is refilled by the forecast spill this condition is betting on. No
-  battery configured, or an unreadable SOC/charge sensor, means there is no buffer to draw
-  on, so the condition fails closed and simply never fires — same discipline as every
-  other Greedy Consumption input. The "could run flat out for the whole window and still
-  spill" threshold on the forecast side is unchanged and still has to clear first: a
-  marginal, uncertain surplus never trips this even when the battery has headroom to spare.
+  So: ``LoadControlManager._forecast_surplus_budget`` sums how much energy the plan will
+  waste (export at or below the Minimum Export Price, plus unused free-import headroom)
+  over a look-ahead window, and the device is run *now* at that average rate —
+  ``spill_kwh / covered_h`` — clamped to the device's own envelope. Not all-or-nothing
+  against a "could it run flat out the whole window" bar: greedy activates exactly to the
+  extent the plan would otherwise waste energy.
+
+  Opt-in on top of the master switch because it fires ahead of any live signal, purely off
+  the plan's forecast. Two things keep the bet safe, so running now draws the *battery*
+  down rather than the grid and the hole is refilled by the forecast spill:
+
+  1. **Reservation clip.** The budget window ends at the first slot where the plan itself
+     starts materially discharging the battery — past there the plan is spending the
+     battery on something it values (evening peak export, a high import rate), and greedy
+     must not borrow charge across it. A ``DispatchInterval`` carries no per-slot SOC, so
+     "stop at the first planned drawdown" is the proxy for "don't discharge below the
+     plan's own SOC trajectory".
+  2. **Battery headroom, rate and energy.** ``battery_headroom_w`` (free discharge rate
+     right now) caps the draw; ``battery_headroom_kwh`` (energy to the configured minimum
+     SOC) must cover the *whole* budget, since a back-loaded spill means the battery can be
+     down by the full budget before the refill lands. Both come from
+     ``LoadControlManager``; either missing (no battery, no capacity, unreadable sensor)
+     fails the condition closed — same discipline as every other Greedy Consumption input.
 """
 from __future__ import annotations
 
@@ -156,6 +165,12 @@ class DeferrableLoadController:
         self._greedy_free_kwh: Optional[float] = None
         self._greedy_needed_kwh: Optional[float] = None
         self._greedy_battery_headroom_w: Optional[float] = None
+        self._greedy_battery_headroom_kwh: Optional[float] = None
+        # Power (W) the proportional forecast-surplus condition wants this device to draw
+        # right now (0.0 when it isn't firing). Read by
+        # LoadControlManager._modulation_target_w for a modulating device and published by
+        # status(); for an on/off device it's simply max_w when firing, else 0.
+        self._greedy_forecast_target_w: float = 0.0
 
     # ------------------------------------------------------------------ identity
     @property
@@ -201,11 +216,23 @@ class DeferrableLoadController:
         export_rate: Optional[float],
         grid_power_w: Optional[float],
         schedule_allows: Optional[bool],
-        forecast_free_kwh: Optional[float] = None,
+        forecast_spill_kwh: Optional[float] = None,
         forecast_hours: Optional[float] = None,
         battery_headroom_w: Optional[float] = None,
+        battery_headroom_kwh: Optional[float] = None,
+        min_export_price: float = 0.0,
     ) -> bool:
         """True if Greedy Consumption says "on" right now, independent of the plan.
+
+        ``min_export_price`` ($/kWh) is the user's Minimum Export Price preference: the
+        export-surplus condition treats any export priced at or below it as not worth
+        selling, so greedy soaks it locally instead. 0.0 disables the floor and restores
+        the original "export price ≤ $0" bar exactly.
+
+        ``forecast_spill_kwh`` / ``forecast_hours`` / ``battery_headroom_w`` /
+        ``battery_headroom_kwh`` drive the proportional forecast-surplus condition (see
+        ``_forecast_surplus_target_w``). It also sets ``self._greedy_forecast_target_w`` —
+        the power that condition wants — which the manager reads for a modulating device.
 
         Uses ``self.max_w`` (the device's real full configured draw) — NOT
         ``on_threshold_w()``'s 50%-of-max fractional floor, which is a different concept
@@ -219,11 +246,13 @@ class DeferrableLoadController:
         greedy "on" is otherwise indistinguishable from a plan-driven one in the UI —
         "why is my pool pump running?" is the whole observability question here.
         """
-        self._greedy_free_kwh = forecast_free_kwh
+        self._greedy_free_kwh = forecast_spill_kwh
         self._greedy_needed_kwh = (
             self.forecast_surplus_needed_kwh(forecast_hours) if forecast_hours else None
         )
         self._greedy_battery_headroom_w = battery_headroom_w
+        self._greedy_battery_headroom_kwh = battery_headroom_kwh
+        self._greedy_forecast_target_w = 0.0
         self._greedy_reason = None
         self._greedy_blocked = None
         if not self._greedy_enabled:
@@ -234,7 +263,12 @@ class DeferrableLoadController:
         if import_rate is not None and import_rate <= 0.0:
             self._greedy_reason = "import_free"
             return True
-        if export_rate is not None and export_rate <= 0.0:
+        # "Export is being wasted" — historically export_rate <= $0, now also any rate at
+        # or below the user's Minimum Export Price (a rate they've said isn't worth
+        # selling). max(0.0, ...) keeps a negative/zero preference from ever RAISING the
+        # bar below $0, and a 0.0 preference reproduces the old test byte-for-byte.
+        export_waste_ceiling = max(0.0, min_export_price)
+        if export_rate is not None and export_rate <= export_waste_ceiling:
             if grid_power_w is None:
                 # The export price is $0 — the one situation this condition exists for —
                 # but there is no live grid reading to measure the spill against, so it
@@ -255,7 +289,11 @@ class DeferrableLoadController:
                     self._greedy_reason = "export_surplus"
                     self._greedy_blocked = None
                     return True
-        if self._forecast_surplus_wants_on(forecast_free_kwh, forecast_hours, battery_headroom_w):
+        target_w = self._forecast_surplus_target_w(
+            forecast_spill_kwh, forecast_hours, battery_headroom_w, battery_headroom_kwh
+        )
+        if target_w > 0.0:
+            self._greedy_forecast_target_w = target_w
             self._greedy_reason = "forecast_surplus"
             # A later condition firing supersedes the block recorded above — greedy is on,
             # so publishing a "blocked" reason alongside it would just be noise.
@@ -274,55 +312,74 @@ class DeferrableLoadController:
         return self.max_w
 
     def forecast_surplus_needed_kwh(self, hours: float) -> float:
-        """Free energy (kWh) that must be forecast wasted over ``hours`` before the
-        forecast-surplus condition fires: exactly what this device would consume running
-        flat out for that whole window.
-
-        Deliberately the *full* window rather than some fraction of it. The condition is
-        allowed to spend real money right now, so the bar is "even with this device
-        running continuously from now to the end of the window, the plan still throws
-        free energy away" — not "there's a bit of spare solar around".
-        """
+        """Reference figure for the observability progress bar: what this device would
+        consume running flat out for ``hours``. NOT the fire threshold any more (the
+        forecast-surplus condition is proportional since 2026-09-11) — it's the
+        denominator the card divides ``forecast_free_kwh`` by to show "how close is the
+        forecast spill to keeping this device fully fed"."""
         return max(0.0, self.max_w) / 1000.0 * max(0.0, hours)
 
-    def _forecast_surplus_wants_on(
+    def _forecast_surplus_snap_w(self, target_w: float) -> float:
+        """Clamp the proportional forecast-surplus rate to what this device can physically
+        do. The caller has already checked ``target_w`` clears
+        ``_export_surplus_threshold_w()`` (``max_w`` for an on/off load), so an on/off load
+        just runs fully on. ``ModulatingLoadController`` overrides this to clamp into its
+        own ``[min_w, cap_w]`` envelope instead."""
+        return self.max_w
+
+    def _forecast_surplus_target_w(
         self,
-        forecast_free_kwh: Optional[float],
+        forecast_spill_kwh: Optional[float],
         forecast_hours: Optional[float],
         battery_headroom_w: Optional[float] = None,
-    ) -> bool:
-        """Third greedy condition: the plan forecasts more free energy going to waste
-        over the look-ahead than this device could possibly absorb (see module docstring).
+        battery_headroom_kwh: Optional[float] = None,
+    ) -> float:
+        """Power (W) the *proportional* forecast-surplus condition wants this device to
+        draw right now — 0.0 when it isn't firing (see module docstring).
 
-        ``forecast_free_kwh`` is computed by ``LoadControlManager`` from the live plan
-        (free energy the plan itself does NOT already allocate to this device);
-        ``forecast_hours`` is the span it actually covered, which can be shorter than the
-        nominal look-ahead near the end of the plan horizon — so the bar scales down with
-        it rather than becoming unreachable. Fails closed on missing inputs, like the
-        other two conditions.
+        ``forecast_spill_kwh`` / ``forecast_hours`` come from
+        ``LoadControlManager._forecast_surplus_budget``: how much energy the plan will
+        waste over the reservation-clipped look-ahead, and that window's span. The device
+        runs at the average waste rate ``forecast_spill_kwh / forecast_hours``, clamped to
+        what it can physically do (``_forecast_surplus_snap_w``).
 
-        ``battery_headroom_w`` is the live battery discharge headroom (W)
-        ``LoadControlManager._battery_headroom_w`` computes from the configured battery
-        SOC and charge-power sensors — None when no battery is configured, or a reading
-        is unavailable. The forecast clearing its bar is necessary but not sufficient:
-        this condition may only actually fire when the battery can cover this device's
-        full draw right now, so it draws the battery down instead of the grid (see the
-        module docstring's "Forecast surplus" section). Records ``"no_battery_headroom"``
-        in ``_greedy_blocked`` when the forecast alone would have fired — otherwise a
-        battery that's flat or unconfigured makes this condition look silently inert
-        rather than "armed but can't safely act right now".
+        ``_export_surplus_threshold_w()`` is the smallest draw worth a write — ``max_w``
+        for an on/off load (all-or-nothing), ``min_w`` for a modulating one. If the spill
+        rate doesn't even reach that, the condition simply doesn't fire and records
+        nothing (there's just no surplus to chase).
+
+        Once the spill *is* big enough, two battery gates apply — both fail-closed on a
+        missing/None input (no battery, no capacity, unreadable sensor) and both recording
+        ``"no_battery_headroom"`` in ``_greedy_blocked`` so the "armed but can't act" state
+        is visible rather than silently inert:
+
+        * ``battery_headroom_w`` — free discharge rate right now — caps the draw; if that
+          cap drops it back below the minimum-worthwhile draw, the condition is blocked.
+        * ``battery_headroom_kwh`` — energy to the configured minimum SOC — must cover the
+          *whole* budget, because a back-loaded spill means the battery can be down by the
+          full budget before the refill lands.
         """
         if not self._greedy_forecast_surplus:
-            return False
-        if forecast_free_kwh is None or not forecast_hours or forecast_hours <= 0.0:
-            return False
-        needed = self.forecast_surplus_needed_kwh(forecast_hours)
-        if not (needed > 0.0 and forecast_free_kwh >= needed):
-            return False
-        if battery_headroom_w is None or battery_headroom_w < self.max_w:
+            return 0.0
+        if forecast_spill_kwh is None or not forecast_hours or forecast_hours <= 0.0:
+            return 0.0
+        if forecast_spill_kwh <= 0.0:
+            return 0.0
+        rate_w = forecast_spill_kwh * 1000.0 / forecast_hours
+        min_draw = self._export_surplus_threshold_w()
+        if rate_w + 1e-6 < min_draw:
+            return 0.0  # the spill itself isn't enough to justify even a minimal run
+        if battery_headroom_w is None or battery_headroom_kwh is None:
             self._greedy_blocked = "no_battery_headroom"
-            return False
-        return True
+            return 0.0
+        if battery_headroom_w <= 0.0 or battery_headroom_kwh + 1e-6 < forecast_spill_kwh:
+            self._greedy_blocked = "no_battery_headroom"
+            return 0.0
+        target_w = min(rate_w, battery_headroom_w)
+        if target_w + 1e-6 < min_draw:
+            self._greedy_blocked = "no_battery_headroom"
+            return 0.0
+        return self._forecast_surplus_snap_w(target_w)
 
     def _actual_state(self) -> Optional[bool]:
         st = self.hass.states.get(self.switch_entity_id)
@@ -352,9 +409,11 @@ class DeferrableLoadController:
         export_rate: Optional[float] = None,
         grid_power_w: Optional[float] = None,
         schedule_allows: Optional[bool] = None,
-        forecast_free_kwh: Optional[float] = None,
+        forecast_spill_kwh: Optional[float] = None,
         forecast_hours: Optional[float] = None,
         battery_headroom_w: Optional[float] = None,
+        battery_headroom_kwh: Optional[float] = None,
+        min_export_price: float = 0.0,
     ) -> None:
         """Reconcile the switch toward the plan (plus Greedy Consumption, if enabled)
         for this tick.
@@ -375,11 +434,14 @@ class DeferrableLoadController:
             self._greedy_free_kwh = None
             self._greedy_needed_kwh = None
             self._greedy_battery_headroom_w = None
+            self._greedy_battery_headroom_kwh = None
+            self._greedy_forecast_target_w = 0.0
             return
 
         greedy_on = self._greedy_wants_on(
             import_rate, export_rate, grid_power_w, schedule_allows,
-            forecast_free_kwh, forecast_hours, battery_headroom_w,
+            forecast_spill_kwh, forecast_hours, battery_headroom_w,
+            battery_headroom_kwh, min_export_price,
         )
         plan_on = self.desired_on(planned_w)
         if plan_on and self._greedy_reason is not None:
@@ -571,20 +633,29 @@ class DeferrableLoadController:
             # so firing would be real, unbuffered grid import). None = greedy was free to
             # fire and simply didn't match.
             "greedy_blocked": self._greedy_blocked,
-            # Forecast-surplus progress: free energy the plan expects to waste over the
-            # look-ahead vs the bar it has to clear. Both None unless the forecast-surplus
-            # toggle is on (the manager only computes it then).
+            # Forecast-surplus figures: energy the plan expects to waste over the
+            # reservation-clipped look-ahead (`forecast_free_kwh`), the flat-out reference
+            # the card's progress bar divides it by (`forecast_needed_kwh`), and the
+            # proportional power the condition is actually asking for right now
+            # (`forecast_target_w`, 0 when it isn't firing). All None/0 unless the
+            # forecast-surplus toggle is on — the manager only computes the inputs then.
             "forecast_free_kwh": (
                 round(self._greedy_free_kwh, 2) if self._greedy_free_kwh is not None else None
             ),
             "forecast_needed_kwh": (
                 round(self._greedy_needed_kwh, 2) if self._greedy_needed_kwh is not None else None
             ),
-            # Live battery discharge headroom (W) backing the forecast-surplus gate above.
-            # None = no battery configured, or the SOC/charge sensor couldn't be read.
+            "forecast_target_w": round(self._greedy_forecast_target_w, 1),
+            # Battery headroom backing the forecast-surplus gate: free discharge rate now
+            # (W) and energy to the configured minimum SOC (kWh). None = no battery / no
+            # capacity configured, or a sensor couldn't be read.
             "forecast_battery_headroom_w": (
                 round(self._greedy_battery_headroom_w, 1)
                 if self._greedy_battery_headroom_w is not None else None
+            ),
+            "forecast_battery_headroom_kwh": (
+                round(self._greedy_battery_headroom_kwh, 2)
+                if self._greedy_battery_headroom_kwh is not None else None
             ),
             "note": self._note,
         }

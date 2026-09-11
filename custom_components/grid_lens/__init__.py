@@ -331,7 +331,10 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
     # (not under Tuning) — user request 2026-07-30: it's the knob most often touched
     # alongside that switch, so they sit together at the top of Settings.
     control_tiles = []
-    if entry.data.get("has_battery"):
+    # Mirror number.py::async_setup_entry's gate: the Min export price entity now exists
+    # for a battery-less install with deferrable loads too (it feeds Greedy Consumption's
+    # "export is being wasted" bar, not just the battery LP), so surface its tile there.
+    if entry.data.get("has_battery") or entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS):
         min_export = eid(f"{entry.entry_id}_min_export_price")
         if min_export:
             control_tiles.append({
@@ -569,7 +572,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260910b"
+    _CARD_VERSION = "20260911c"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",

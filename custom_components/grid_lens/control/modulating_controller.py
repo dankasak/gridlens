@@ -364,6 +364,13 @@ class ModulatingLoadController(DeferrableLoadController):
         inherited unchanged."""
         return self.min_w
 
+    def _forecast_surplus_snap_w(self, target_w: float) -> float:
+        """A modulating load takes exactly the proportional forecast-surplus rate, capped
+        at its own ``cap_w``. The caller has already checked it clears ``min_w`` (this
+        class's ``_export_surplus_threshold_w``). The on/off parent instead runs fully
+        on."""
+        return min(target_w, self.cap_w) if self.cap_w > 0.0 else target_w
+
     # ------------------------------------------------------------------ 5-minute tick
     async def apply(
         self,
@@ -374,9 +381,11 @@ class ModulatingLoadController(DeferrableLoadController):
         export_rate: Optional[float] = None,
         grid_power_w: Optional[float] = None,
         schedule_allows: Optional[bool] = None,
-        forecast_free_kwh: Optional[float] = None,
+        forecast_spill_kwh: Optional[float] = None,
         forecast_hours: Optional[float] = None,
         battery_headroom_w: Optional[float] = None,
+        battery_headroom_kwh: Optional[float] = None,
+        min_export_price: float = 0.0,
     ) -> None:
         """Evaluate the plan and the greedy conditions for this slot — and write nothing.
 
@@ -395,11 +404,14 @@ class ModulatingLoadController(DeferrableLoadController):
             self._greedy_free_kwh = None
             self._greedy_needed_kwh = None
             self._greedy_battery_headroom_w = None
+            self._greedy_battery_headroom_kwh = None
+            self._greedy_forecast_target_w = 0.0
             return
 
         greedy_on = self._greedy_wants_on(
             import_rate, export_rate, grid_power_w, schedule_allows,
-            forecast_free_kwh, forecast_hours, battery_headroom_w,
+            forecast_spill_kwh, forecast_hours, battery_headroom_w,
+            battery_headroom_kwh, min_export_price,
         )
         self._planned_w = max(0.0, float(planned_w))
         self._want_on = greedy_on or self._planned_w > 0.0

@@ -85,6 +85,12 @@ def _bootstrap():
     el_stub.resolve_device_name = lambda hass, *anchors: next((a for a in anchors if a), None)
     el_stub.resolve_power_sensor = lambda hass, *anchors: None
     sys.modules["gl.entity_lookup"] = el_stub
+    # Stub runtime_settings (pulls in homeassistant.helpers.entity_registry, unstubbed).
+    # LoadControlManager._min_export_price() imports get_live_number from it lazily;
+    # returning the passed default reproduces "no number entity registered yet".
+    rs_stub = types.ModuleType("gl.runtime_settings")
+    rs_stub.get_live_number = lambda hass, entry_id, suffix, default: default
+    sys.modules["gl.runtime_settings"] = rs_stub
     lc = _load(os.path.join(_COMPONENT, "control", "load_controller.py"),
                "gl.control.load_controller", package="gl.control")
     lcm = _load(os.path.join(_COMPONENT, "control", "load_control_manager.py"),

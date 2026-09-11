@@ -126,6 +126,12 @@ def _bootstrap():
         lambda hass, *anchors: _POWER_SENSORS.get(anchors[0] if anchors else "")
     )
     sys.modules["gl.entity_lookup"] = el_stub
+    # Stub runtime_settings (pulls in homeassistant.helpers.entity_registry, unstubbed).
+    # LoadControlManager._min_export_price() imports get_live_number from it lazily;
+    # returning the passed default reproduces "no number entity registered yet".
+    rs_stub = types.ModuleType("gl.runtime_settings")
+    rs_stub.get_live_number = lambda hass, entry_id, suffix, default: default
+    sys.modules["gl.runtime_settings"] = rs_stub
     lc = _load(os.path.join(_COMPONENT, "control", "load_controller.py"),
                "gl.control.load_controller", package="gl.control")
     # Preloaded so load_control_manager's function-local
@@ -837,30 +843,65 @@ async def _run_manager_target_surplus():
     assert target2 == 1000.0 and source2 == "surplus"
 
 
+async def _run_manager_target_surplus_below_floor():
+    """Greedy condition #2's price bar is the user's Minimum Export Price, not a hard $0
+    (added 2026-09-11). A 3c export with the floor set to 5c counts as "being wasted", so
+    a modulating load ramps to soak it; with the floor at its 0 default nothing changes;
+    an export above the floor is worth selling and is left alone."""
+    m, hass = _mod_mgr(grid_power_sensor="sensor.grid", min_export_price=5.0)  # c/kWh
+    m.set_plan(_plan(export_rate=0.03, dev_w=1000.0), updated_at=_T0)
+    await m.set_greedy(0, True)
+    hass.states.set("sensor.grid", "-2000")          # exporting 2 kW below the 5c floor
+    hass.states.set("sensor.evse_power", "1000")
+    target, source = await m._modulation_target_w(0, _T0)
+    assert target == 3000.0 and source == "surplus", (target, source)
+
+    m2, hass2 = _mod_mgr(grid_power_sensor="sensor.grid")   # floor left at 0 (disabled)
+    m2.set_plan(_plan(export_rate=0.03, dev_w=1000.0), updated_at=_T0)
+    await m2.set_greedy(0, True)
+    hass2.states.set("sensor.grid", "-2000")
+    hass2.states.set("sensor.evse_power", "1000")
+    assert await m2._modulation_target_w(0, _T0) == (1000.0, "plan")
+
+    m3, hass3 = _mod_mgr(grid_power_sensor="sensor.grid", min_export_price=5.0)
+    m3.set_plan(_plan(export_rate=0.08, dev_w=1000.0), updated_at=_T0)  # 8c > 5c floor
+    await m3.set_greedy(0, True)
+    hass3.states.set("sensor.grid", "-2000")
+    hass3.states.set("sensor.evse_power", "1000")
+    assert await m3._modulation_target_w(0, _T0) == (1000.0, "plan")
+
+
 async def _run_manager_target_forecast_surplus():
     """Greedy condition #3 must actually reach the setpoint on a modulating device.
 
     It is the one greedy condition with no live figure to meter against — it is
-    forward-looking and evaluated once per 5-minute tick by apply(), which records it in
-    greedy_reason. Before 2026-08-03 _modulation_target_w implemented only conditions #1 and
-    #2, so #3 was silently inert here: the card's progress bar would fill and fire and the
-    switch would report greedy_reason=forecast_surplus while the charger stayed at plan_w.
-    Its bar is "even flat out for the whole window the plan still spills", so the correct
-    response is the device's full envelope."""
+    forward-looking, evaluated once per 5-minute tick by apply(), which stashes the
+    proportional power it wants in ``_greedy_forecast_target_w`` (already clamped into
+    this device's envelope by ``_forecast_surplus_snap_w``). Before 2026-08-03
+    ``_modulation_target_w`` implemented only conditions #1 and #2, so #3 was silently
+    inert here: the card's badge would light up while the charger stayed at plan_w."""
     m, _hass = _mod_mgr()
     m.set_plan(_plan(dev_w=0.0), updated_at=_T0)     # plan wants nothing this slot
     await m.set_greedy(0, True)
     await m.set_greedy_forecast_surplus(0, True)
     c = m.controllers[0]
     c._greedy_reason = "forecast_surplus"            # as apply() would have set it
+    c._greedy_forecast_target_w = c.cap_w            # ...alongside the target power
     target, source = await m._modulation_target_w(0, _T0)
     assert target == c.cap_w and source == "surplus", (target, source, c.cap_w)
 
-    # Opt-in: the master greedy switch still gates it.
+    # A target below cap_w (a smaller forecast rate) reaches the setpoint proportionally,
+    # not rounded up to the full envelope.
+    c._greedy_forecast_target_w = c.cap_w / 2.0
+    target2, source2 = await m._modulation_target_w(0, _T0)
+    assert target2 == c.cap_w / 2.0 and source2 == "surplus"
+
+    # Opt-in: the master greedy switch still gates it, even with a target stashed.
     m2, _h2 = _mod_mgr()
     m2.set_plan(_plan(dev_w=0.0), updated_at=_T0)
     await m2.set_greedy(0, False)
     m2.controllers[0]._greedy_reason = "forecast_surplus"
+    m2.controllers[0]._greedy_forecast_target_w = m2.controllers[0].cap_w
     assert await m2._modulation_target_w(0, _T0) == (0.0, "off")
 
     # And Greedy Respects Schedule still confines it to the device's allowed window.
@@ -869,6 +910,7 @@ async def _run_manager_target_forecast_surplus():
     await m3.set_greedy(0, True)
     await m3.set_greedy_respects_schedule(0, True)
     m3.controllers[0]._greedy_reason = "forecast_surplus"
+    m3.controllers[0]._greedy_forecast_target_w = m3.controllers[0].cap_w
     m3._schedule_allows_now = _never_allowed
     assert await m3._modulation_target_w(0, _T0) == (0.0, "off")
 
@@ -1202,6 +1244,7 @@ if __name__ == "__main__":
         ("manager_reads_modulating_config", test_manager_reads_modulating_config),
         ("manager_target_plan_only", lambda: _run_async(_run_manager_target_plan_only)),
         ("manager_target_surplus", lambda: _run_async(_run_manager_target_surplus)),
+        ("manager_target_surplus_below_floor", lambda: _run_async(_run_manager_target_surplus_below_floor)),
         ("manager_target_free_import", lambda: _run_async(_run_manager_target_free_import_takes_cap)),
         ("manager_target_forecast_surplus", lambda: _run_async(_run_manager_target_forecast_surplus)),
         ("greedy_reason_on_onoff_controller", test_greedy_reason_exposed_on_onoff_controller),

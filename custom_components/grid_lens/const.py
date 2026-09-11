@@ -161,8 +161,13 @@ CONF_BATTERY_MAX_SOC = "battery_max_soc"
 # Minimum export price floor, in cents/kWh (0 = disabled, unchanged behaviour).
 # Below this price the optimizer stops treating grid export as valuable — it still
 # exports if nothing else can absorb the surplus, but prefers routing it into a
-# deferrable load or holding battery charge instead of selling cheap. Converted to
-# $/kWh (÷100) before reaching BatteryOptimizer, to match import/export rate units.
+# deferrable load or holding battery charge instead of selling cheap. Also widens
+# Greedy Consumption's "export is being wasted" trigger (load_controller.py) from
+# "export price ≤ $0" to "export price ≤ this floor", so a Greedy-enabled load soaks
+# below-floor export instead of it being sold. Converted to $/kWh (÷100) before
+# reaching BatteryOptimizer / the load controller, to match import/export rate units.
+# Live-tunable via number.py's GridLensMinExportPriceNumber (the config-flow no longer
+# writes this key; entry.data only holds the pre-entity fallback, in practice 0.0).
 CONF_MIN_EXPORT_PRICE = "min_export_price"
 
 # Which inverter driver ControlManager dispatches battery commands to (inverters/__init__.py).

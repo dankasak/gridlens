@@ -93,9 +93,12 @@ async def async_setup_entry(
 ) -> None:
     entities: list[NumberEntity] = []
 
-    # min_export_price only affects the battery LP's export pricing — without a
-    # battery, optimize_hourly_schedule never runs, so the entity would do nothing.
-    if entry.data.get(CONF_HAS_BATTERY, False):
+    # min_export_price feeds two things: the battery LP's export pricing (needs a
+    # battery — without one optimize_hourly_schedule never runs) and Greedy Consumption's
+    # "export is being wasted" bar (needs a deferrable load). Offer the entity if either
+    # applies, so a battery-less install with a pool pump can still say "don't run it to
+    # dump solar I'd rather have sold above 5c".
+    if entry.data.get(CONF_HAS_BATTERY, False) or entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS):
         entities.append(GridLensMinExportPriceNumber(entry))
 
     # One "today boost" override per configured deferrable device (Feature 2) —
@@ -148,14 +151,19 @@ async def async_setup_entry(
 
 class GridLensMinExportPriceNumber(RestoreEntity, NumberEntity):
     """Below this feed-in price, surplus solar/battery power is routed to a
-    deferrable load or held in the battery instead of exported cheaply (see
-    battery_optimizer.py's min_export_price). 0 = disabled — always export at
-    whatever the plan pays.
+    deferrable load or held in the battery instead of exported cheaply. Two
+    consumers: the battery LP's export pricing (battery_optimizer.py's
+    min_export_price) and Greedy Consumption's "export is being wasted" bar
+    (load_control_manager.py's _min_export_price / load_controller.py's
+    _greedy_wants_on) — a load with Greedy enabled will run to soak export
+    priced at or below this instead of selling it. 0 = disabled — always export
+    at whatever the plan pays, and Greedy's export bar stays at "≤ $0".
 
     Restores its last value across restarts (RestoreEntity); this entity's
     state IS the live setting — battery_optimizer picks up a change on the
-    optimizer's next run (advisory re-plans every 2 minutes), no restart or
-    reconfigure needed. See runtime_settings.get_live_number.
+    optimizer's next run (advisory re-plans every 2 minutes) and load control
+    on its next 5-minute tick, no restart or reconfigure needed. See
+    runtime_settings.get_live_number.
     """
 
     _attr_has_entity_name = True

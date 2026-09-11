@@ -643,21 +643,27 @@ class GridLensLoadControlCard extends HTMLElement {
   // and still tracking, or already fired). Same X/Y the numbers next to it show — this
   // just spells out what "trigger progress" means, since the bar alone doesn't.
   _forecastSurplusTip(have, need) {
-    return `Trigger progress: forecast free energy the plan would otherwise waste over the `
-      + `look-ahead window (spilled $0 export, or an unused $0-import window) versus what `
-      + `this device would use running flat out for that whole window. Fills to 100% when `
-      + `the free energy forecast catches up to that — the instant Greedy switches the `
-      + `device on early. Currently ${have.toFixed(1)} of ${need.toFixed(1)} kWh.`;
+    return `Forecast surplus: energy the plan expects to waste over the look-ahead `
+      + `(export at or below your Minimum Export Price, or an unused free-import window), `
+      + `up to the point the plan itself starts drawing the battery down. Greedy runs this `
+      + `device at that average rate now, off the battery, and the spill refills it. The `
+      + `bar is that surplus versus what the device would use running flat out for the `
+      + `same window — at 100% a plain on/off load runs fully; a modulating load ramps in `
+      + `proportionally below that. Currently ${have.toFixed(1)} of ${need.toFixed(1)} kWh.`;
   }
 
   _greedyLine(a) {
     if (!a || !a.greedy) return '';
     const reason = a.greedy_reason;
     if (reason) {
+      let fcRate = '';
+      if (reason === 'forecast_surplus' && a.forecast_target_w) {
+        fcRate = ` at ~${Math.round(+a.forecast_target_w)} W`;
+      }
       const label = {
         import_free: 'On — import is free right now',
         export_surplus: 'On — running on surplus export',
-        forecast_surplus: 'On — forecast surplus',
+        forecast_surplus: `On — soaking forecast surplus${fcRate}`,
       }[reason] || `On — ${esc(reason)}`;
       let nums = '';
       let bar = '';
@@ -689,13 +695,14 @@ class GridLensLoadControlCard extends HTMLElement {
     }
     if (a.greedy_blocked === 'no_grid_power') {
       // Distinct from the two "armed, but not right now" cases below it: this one is not a
-      // condition that will clear on its own. Export is free RIGHT NOW and greedy still
-      // can't act, because no live grid power sensor is readable. Say so, or the card reads
-      // "waiting for free energy" while free energy is actively being spilled.
+      // condition that will clear on its own. Export is being wasted RIGHT NOW (feed-in at
+      // or below the Minimum Export Price) and greedy still can't act, because no live grid
+      // power sensor is readable. Say so, or the card reads "waiting for free energy" while
+      // that energy is actively being spilled.
       return `<div class="greedy-line" data-tip="${esc('Greedy\'s export-surplus condition needs a live '
         + 'grid power sensor (positive = importing, negative = exporting). Set the optional Grid Power '
         + 'sensor in Grid Lens > Reconfigure > Energy sensors.')}" tabindex="0">`
-        + `Greedy: export is free, but no grid power sensor is set</div>`;
+        + `Greedy: export is being wasted, but no grid power sensor is set</div>`;
     }
     if (a.greedy_blocked) {
       const why = a.greedy_blocked === 'override'
