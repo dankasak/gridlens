@@ -24,6 +24,14 @@ Confidence varies per vendor and is tracked in `confirmed`:
     OCPP" entry) — a plausible-looking claim about a piece of hardware is not the same
     as one anyone here has actually verified.
 
+Where a pattern came from a source outside this repo, that vendor also carries a `source`
+URL — the page actually consulted, not a guess at where one might look. Zaptec, go-eCharger
+and OpenEVSE were looked up this way on 2026-09-11 (web search); OCPP/Easee/Wallbox instead
+reuse this project's own pre-existing docs.html/strings.json claims (also unverified, but
+predating this module, so no new source to cite); Wattpilot and Sigenergy have no `source`
+because they're not literature claims at all — live entity IDs and this repo's own other
+integration's code, respectively.
+
 Deliberately free of Home Assistant imports at module scope (only `detect()` touches
 `hass.states`, defensively) so the vendor table itself can be exercised offline.
 """
@@ -103,6 +111,7 @@ EV_CHARGER_VENDORS: list[dict[str, Any]] = [
             "Pattern from ha-zaptec-community/ha-zaptec's published docs (2026-09-11 web "
             "search); unverified against real hardware."
         ),
+        "source": "https://github.com/ha-zaptec-community/ha-zaptec",
         "patterns": {"setpoint": r"^number\..*available_current$"},
         "defaults": {"min_current": 6.0},
     },
@@ -115,6 +124,7 @@ EV_CHARGER_VENDORS: list[dict[str, Any]] = [
             "component) with likely-differing entity IDs; this pattern is a best-effort "
             "common suffix from 2026-09-11 web search, unverified against real hardware."
         ),
+        "source": "https://github.com/cathiele/homeassistant-goecharger",
         "patterns": {"setpoint": r"^number\..*max_current$"},
         "defaults": {"min_current": 6.0},
     },
@@ -126,6 +136,7 @@ EV_CHARGER_VENDORS: list[dict[str, Any]] = [
             "Pattern from the core openevse integration's published \"Charge rate\" "
             "number entity (2026-09-11 web search); unverified against real hardware."
         ),
+        "source": "https://www.home-assistant.io/integrations/openevse/",
         "patterns": {"setpoint": r"^number\..*charge_rate$"},
         "defaults": {"min_current": 6.0},
     },

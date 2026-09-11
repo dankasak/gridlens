@@ -976,9 +976,11 @@ taken from this repo's own `custom_components/sigen` source (`ac_charger_output_
 plant, so this was actually the first time this codebase's own claimed vendor shape was
 checked against its own other integration's source rather than assumed. OCPP, Easee and
 Wallbox reuse this doc's/`strings.json`'s pre-existing (also unverified) claims; Zaptec, go-e
-and OpenEVSE are new patterns from a 2026-09-11 web search, also unverified against real
-hardware — each is labelled "(unverified pattern)" in the dropdown so a wrong guess is never
-mistaken for a confirmed one. Getting one wrong is harmless by design: a false or missing
+and OpenEVSE are new patterns from a 2026-09-11 web search — cited per-vendor as `source` in
+`ev_charger_vendors.py` (Zaptec: github.com/ha-zaptec-community/ha-zaptec; go-eCharger:
+github.com/cathiele/homeassistant-goecharger; OpenEVSE: home-assistant.io/integrations/openevse)
+— also unverified against real hardware — each is labelled "(unverified pattern)" in the
+dropdown so a wrong guess is never mistaken for a confirmed one. Getting one wrong is harmless by design: a false or missing
 match just leaves that screen's field at its old blank/manual default. Tesla was deliberately
 left out of the pattern table — no stable, install-independent entity-naming convention was
 found, only per-install custom names — rather than guess one with nothing behind it.
