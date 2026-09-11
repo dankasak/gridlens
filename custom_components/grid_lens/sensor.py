@@ -8,6 +8,7 @@ from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, Sen
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
@@ -343,6 +344,12 @@ class CurrentPlanCostSensor(GridLensSensorBase):
         # availability window is set (see const.py's note on the retired static
         # deferrable_load_hours config field).
         default_week = week_from_hours(None)
+        # Each device's "Show In Power Flow" switch (switch.py's GridLensDeferrableVisibleSwitch)
+        # is created for every configured device, keyed by the same {entry_id}_deferrable_
+        # visible_{index} unique_id scheme as every other per-index entity here — resolved via
+        # the entity registry rather than a config-flow field, since there's nothing for the
+        # user to pick: the switch IS the thing being referenced, not an anchor pointing at one.
+        ent_reg = async_get_entity_registry(self.hass)
         out: list[dict[str, Any]] = []
         for i, sensor_id in enumerate(sensors):
             sw = switches[i] if i < len(switches) else ""
@@ -421,6 +428,14 @@ class CurrentPlanCostSensor(GridLensSensorBase):
                     greedy_trackers[i].sensor_entity_id
                     if i in greedy_trackers and greedy_trackers[i].sensor_entity_id
                     else None
+                ),
+                # "Show In Power Flow" switch for this device — ON (default/missing) means
+                # the Power Flow card draws its node; the user's own disable button on that
+                # node (or the entity directly) turns it off. None only for a config entry
+                # whose switch platform hasn't finished setting up yet (registry not
+                # populated) — the card treats a missing entity as visible.
+                "visible_entity": ent_reg.async_get_entity_id(
+                    "switch", DOMAIN, f"{self._entry.entry_id}_deferrable_visible_{i}"
                 ),
             })
         return out

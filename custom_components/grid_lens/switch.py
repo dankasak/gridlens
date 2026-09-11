@@ -12,7 +12,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
-from .const import DOMAIN
+from .const import CONF_DEFERRABLE_LOAD_SENSORS, CONF_DEFERRABLE_LOAD_SWITCHES, DOMAIN
+from .entity_lookup import async_get_energy_dashboard_names, resolve_device_name
 
 # Power Flow diagram layouts the user can independently show/hide on the Power Flow
 # dashboard view: (layout key, display name, icon, default on). Both can be on at once —
@@ -63,6 +64,32 @@ async def async_setup_entry(
         entities.append(
             GridLensPowerflowLayoutSwitch(entry, layout, name, icon, default_on)
         )
+
+    # One "Show In Power Flow" visibility switch per configured deferrable device — ALL of
+    # them (enumerate(sensors), not load_mgr.controllers), since a forecast-only/declared
+    # load with no control switch still draws its own node on the diagram and needs the same
+    # disable-button affordance as a controllable one. Pure display preference like the
+    # layout toggles above, not device control, so it exists regardless of entitlement too.
+    sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or []
+    if sensors:
+        switches_cfg = entry.data.get(CONF_DEFERRABLE_LOAD_SWITCHES, []) or []
+        # Fetched directly rather than read off the coordinator's own
+        # energy_dashboard_names cache: this platform is forwarded (async_forward_
+        # entry_setups) BEFORE __init__.py's first coordinator.async_refresh() ever
+        # runs, so that cache is still its unpopulated {} default here — reading it
+        # would silently skip the Energy Dashboard label and name this switch after
+        # whatever the entity registry has (e.g. "EV Charger"), while sensor.py's
+        # _build_deferrable_loads() (evaluated later, on-demand) resolves the same
+        # device's card-node name with the label already populated ("EV Mobile
+        # Charger") — exactly the kind of name-mismatch-between-places drift this
+        # file's own resolve_device_name() exists to prevent everywhere else.
+        dashboard_names = await async_get_energy_dashboard_names(hass)
+        for i, sensor_id in enumerate(sensors):
+            sw = switches_cfg[i] if i < len(switches_cfg) else ""
+            name = resolve_device_name(
+                hass, sw or None, sensor_id, dashboard_names=dashboard_names
+            ) or sensor_id
+            entities.append(GridLensDeferrableVisibleSwitch(entry, i, name))
 
     if entities:
         async_add_entities(entities)
@@ -351,6 +378,56 @@ class GridLensDeferrableGreedySurplusSwitch(RestoreEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         await self._manager.set_greedy_forecast_surplus(self._index, False)
+        self._attr_is_on = False
+        self.async_write_ha_state()
+
+
+class GridLensDeferrableVisibleSwitch(RestoreEntity, SwitchEntity):
+    """ON (default) = this deferrable load draws its own node on the Power Flow diagram.
+
+    A pure dashboard display preference, not device control — same reasoning as
+    GridLensPowerflowLayoutSwitch below: plain RestoreEntity persistence is fine, no deadman
+    needed, since nothing here actuates hardware. Created for EVERY configured deferrable
+    device, including a forecast-only/declared load with no switch_entity at all — the Power
+    Flow card draws a node for any of them regardless of controllability, so the "disable"
+    button on that node needs something to turn off either way.
+
+    Unlike switch_entity/soc_entity (a user-configured anchor the card resolves a sibling
+    sensor from), there's no separate real-world entity to join against here — this switch
+    IS the thing being referenced. So sensor.py's _build_deferrable_loads() resolves it by
+    unique_id through the entity registry (same {entry_id}_deferrable_visible_{index}
+    scheme this class sets) into a `visible_entity` field, rather than a config-flow field
+    or an attribute-based join key. Turning it off only changes what the Power Flow card
+    draws — the Load Control card, schedule card, greedy logic and LP optimizer all keep
+    running exactly as before; they don't consult this at all.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:eye-outline"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, entry: ConfigEntry, index: int, device_name: str) -> None:
+        self._attr_name = f"{device_name} Show In Power Flow"
+        self._attr_unique_id = f"{entry.entry_id}_deferrable_visible_{index}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_is_on = True
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last is not None and last.state in ("on", "off"):
+            self._attr_is_on = last.state == "on"
+        self.async_write_ha_state()
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self._attr_is_on = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
         self._attr_is_on = False
         self.async_write_ha_state()
 
