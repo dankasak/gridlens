@@ -262,6 +262,13 @@
           "remove": "Remove this load"
         }
       },
+      "load_ev_brand": {
+        "title": "{name} — Charger Brand (optional)",
+        "description": "If **{name}** is one of these charger brands, picking it here scans this Home Assistant instance for its entities and pre-fills the setpoint, plug sensor and start/stop button fields on the next two screens — still fully editable, nothing is saved yet. Not listed, or you'd rather pick the entities yourself? Leave this on \"Other\" and answer the next two screens as normal; nothing here is required.\n\n**\"Unverified pattern\"** means this brand's entity-naming pattern hasn't been confirmed against real hardware yet — worth trying, but check the pre-filled fields carefully before saving.",
+        "data": {
+          "vendor": "Charger brand"
+        }
+      },
       "load_control": {
         "title": "{name} — Control Entity",
         "description": "The `switch.*` or `climate.*` entity Grid Lens turns on and off to run **{name}** at the best times.\n\nFor a **modulating charger** (an adjustable current/power setpoint) this is **optional** — leave it blank if the charger stops when its current is set to zero, which almost all do. Set it only if your charger needs a separate switch flipped on before it will draw.\n\nControl starts disabled: each load gets its own master switch, off by default, that you turn on when you're ready to let Grid Lens actuate it.\n\nThe **\"on\" mode** below is only consulted for a `climate.*` entity that doesn't support turn on/off — most do, so leave it on Auto unless yours misbehaves.",

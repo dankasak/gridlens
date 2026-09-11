@@ -167,6 +167,8 @@ def test_modulating_load_walks_the_setpoint_step():
         "max_kw": 7.4, "control_style": dl.CONTROL_MODULATING,
         "has_soc": True, "on_controlled_load": False, "remove": False,
     }))
+    assert res["step_id"] == "load_ev_brand"
+    res = run(f.async_step_load_ev_brand({"vendor": "other"}))
     assert res["step_id"] == "load_control"
     res = run(f.async_step_load_control({"switch": "switch.evse", "climate_on_mode": ""}))
     assert res["step_id"] == "load_modulating"
@@ -184,7 +186,7 @@ def test_modulating_load_walks_the_setpoint_step():
     load = f._loads[1]
     assert load["setpoint"] == "number.evse_current" and load["phases"] == 3
     assert load["soc_capacity_kwh"] == 64.0
-    print("  ✓ a modulating load walks detail → control → modulating → soc")
+    print("  ✓ a modulating load walks detail → ev_brand → control → modulating → soc")
 
 
 def test_modulating_load_needs_no_control_entity():
@@ -201,6 +203,8 @@ def test_modulating_load_needs_no_control_entity():
         "max_kw": 7.4, "control_style": dl.CONTROL_MODULATING,
         "has_soc": False, "on_controlled_load": False, "remove": False,
     }))
+    assert res["step_id"] == "load_ev_brand"
+    res = run(f.async_step_load_ev_brand({"vendor": "other"}))
     assert res["step_id"] == "load_control"
     # The modulating variant of the control step drops the climate-only "on mode"
     # question — a current-ramped charger's companion is always a plain switch.
@@ -251,6 +255,8 @@ def test_modulating_load_with_button_pair():
         "max_kw": 7.4, "control_style": dl.CONTROL_MODULATING,
         "has_soc": False, "on_controlled_load": False, "remove": False,
     }))
+    assert res["step_id"] == "load_ev_brand"
+    res = run(f.async_step_load_ev_brand({"vendor": "other"}))
     assert res["step_id"] == "load_control"
     res = run(f.async_step_load_control({}))  # no switch — the buttons replace it
     assert res["step_id"] == "load_modulating"
@@ -273,6 +279,67 @@ def test_modulating_load_with_button_pair():
     print("  ✓ a modulating load can be wired with a start/stop button pair instead of a switch")
 
 
+def test_ev_brand_detection_prefills_wattpilot_fields():
+    """The new brand-pick step (`ev_charger_vendors.detect()`) scans hass.states for a
+    recognised vendor's entities and pre-fills the setpoint/plug/button fields the next
+    two screens ask for — the exact Wattpilot entity shapes confirmed 2026-09-11. Only
+    blank fields get filled, and the momentary "force start" button (a third, similarly
+    named entity) must not be picked up by the plain start_charging match."""
+    f = _flow()
+    f.hass.states = base.FakeStates({
+        "number.wattpilot_91087557_max_charging_current": {},
+        "sensor.wattpilot_91087557_car_connected": {},
+        "button.wattpilot_91087557_start_charging": {},
+        "button.wattpilot_91087557_start_charging_force": {},
+        "button.wattpilot_91087557_stop_charging": {},
+    })
+    run(f.async_step_loads())
+    run(f.async_step_loads({"action": "edit:0"}))  # Pool Pump — starts blank, unlike the
+    # fixture's EV Charger slot, so a fill here is unambiguously the brand step's doing.
+    res = run(f.async_step_load_detail_monitored({
+        "max_kw": 7.4, "control_style": dl.CONTROL_MODULATING,
+        "has_soc": False, "on_controlled_load": False, "remove": False,
+    }))
+    assert res["step_id"] == "load_ev_brand"
+    res = run(f.async_step_load_ev_brand({"vendor": "wattpilot"}))
+    assert res["step_id"] == "load_control"
+    load = f._loads[0]
+    assert load["setpoint"] == "number.wattpilot_91087557_max_charging_current"
+    assert load["plug_sensor"] == "sensor.wattpilot_91087557_car_connected"
+    assert load["start_button"] == "button.wattpilot_91087557_start_charging"
+    assert load["stop_button"] == "button.wattpilot_91087557_stop_charging"
+    assert load["min_current"] == 6.0
+    # The very next screen — Control Entity — is still shown (the switch field stays
+    # optional/blank for a switchless charger like this one); the one after that,
+    # Modulating Control, must already default to the detected setpoint.
+    res = run(f.async_step_load_control({}))
+    assert res["step_id"] == "load_modulating"
+    assert res["data_schema"].marker("setpoint").default == "number.wattpilot_91087557_max_charging_current"
+    assert res["data_schema"].marker("plug_sensor").default == "sensor.wattpilot_91087557_car_connected"
+    assert res["data_schema"].marker("start_button").default == "button.wattpilot_91087557_start_charging"
+    assert res["data_schema"].marker("stop_button").default == "button.wattpilot_91087557_stop_charging"
+    print("  ✓ picking a recognised charger brand pre-fills its detected entities")
+
+
+def test_ev_brand_skip_leaves_every_field_for_manual_entry():
+    """"Other" (the default) must change nothing — the whole point is that skipping this
+    screen behaves exactly like the wizard did before it existed."""
+    f = _flow()
+    f.hass.states = base.FakeStates({
+        "number.wattpilot_91087557_max_charging_current": {},
+    })
+    run(f.async_step_loads())
+    run(f.async_step_loads({"action": "edit:0"}))
+    run(f.async_step_load_detail_monitored({
+        "max_kw": 7.4, "control_style": dl.CONTROL_MODULATING,
+        "has_soc": False, "on_controlled_load": False, "remove": False,
+    }))
+    run(f.async_step_load_ev_brand({"vendor": "other"}))
+    load = f._loads[0]
+    assert load["setpoint"] == "" and load["plug_sensor"] == "" and load["min_current"] == 0.0
+    print("  ✓ leaving the brand step on \"Other\" prefills nothing")
+
+
 def test_modulating_button_pair_must_be_complete():
     """One button without the other is a broken config, not a valid third state — the
     step must reject it and let the user fix it, not silently save half a pair."""
@@ -283,6 +350,7 @@ def test_modulating_button_pair_must_be_complete():
         "max_kw": 7.4, "control_style": dl.CONTROL_MODULATING,
         "has_soc": False, "on_controlled_load": False, "remove": False,
     }))
+    run(f.async_step_load_ev_brand({"vendor": "other"}))
     run(f.async_step_load_control({}))
     res = run(f.async_step_load_modulating({
         "setpoint": "number.wattpilot_max_charging_current",
@@ -306,6 +374,7 @@ def test_downgrading_from_modulating_clears_the_button_pair():
         "max_kw": 7.4, "control_style": dl.CONTROL_MODULATING,
         "has_soc": False, "on_controlled_load": False, "remove": False,
     }))
+    run(f.async_step_load_ev_brand({"vendor": "other"}))
     run(f.async_step_load_control({}))
     run(f.async_step_load_modulating({
         "setpoint": "number.wattpilot_max_charging_current",

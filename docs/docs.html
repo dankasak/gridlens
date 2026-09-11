@@ -163,7 +163,8 @@
 
         <h3 id="ev-chargers">EV chargers — variable charging current</h3>
         <p>An EV charger is not really an on/off appliance. Most can be told <em>how many amps</em> to deliver, and Grid Lens will use that: instead of slamming the charger fully on or fully off, it dials the charging current up and down to match what the plan wants and what your solar is actually producing right now.</p>
-        <p>This works with any charger integration that exposes a charging-current limit as a Home Assistant <code>number</code> entity — which is essentially all of them. Known-good shapes include <strong>OCPP</strong> (<code>number.…_maximum_current</code>), <strong>Easee</strong>, <strong>Wallbox</strong>, <strong>Zaptec</strong>, <strong>go-e</strong>, <strong>openEVSE</strong>, <strong>Tesla</strong> and <strong>Sigenergy</strong>. Point Grid Lens at that entity under <strong>Grid Lens → Configure</strong> and it takes over from there; there's no per-brand setup.</p>
+        <p>This works with any charger integration that exposes a charging-current limit as a Home Assistant <code>number</code> entity — which is essentially all of them. Known-good shapes include <strong>OCPP</strong> (<code>number.…_maximum_current</code>), <strong>Easee</strong>, <strong>Wallbox</strong>, <strong>Zaptec</strong>, <strong>go-e</strong>, <strong>openEVSE</strong>, <strong>Tesla</strong> and <strong>Sigenergy</strong>. Point Grid Lens at that entity under <strong>Grid Lens → Configure</strong> and it takes over from there; there's no per-brand setup required.</p>
+        <p><strong>Setting up a charger from a list, when yours is on it.</strong> The Deferrable Loads wizard's first modulating-load screen offers an optional <strong>Charger Brand</strong> dropdown. Pick your charger's brand and Grid Lens scans this Home Assistant instance for that brand's entities and pre-fills the fields below — still fully editable, nothing is saved until you finish the wizard as normal. Leave it on "Other" (the default) to fill everything in by hand, exactly as before this existed. A brand marked "(unverified pattern)" in the list hasn't been confirmed against real hardware yet — worth trying, but check what it fills in before saving; not listed at all just means pick the entities yourself below, same as always.</p>
         <table class="compare-table">
           <thead><tr><th>Setting</th><th>Default</th><th>What it does</th></tr></thead>
           <tbody>
@@ -171,12 +172,16 @@
             <tr><td>Units / phases / voltage</td><td>Auto</td><td>Detected from the entity itself. Only set these if auto-detection gets it wrong.</td></tr>
             <tr><td>Minimum current</td><td>6 A</td><td>The lowest current your car will accept. Rarely needs changing.</td></tr>
             <tr><td>Plugged-in sensor</td><td>—</td><td>Optional. Lets Grid Lens stop commanding a charger with no car attached.</td></tr>
+            <tr><td>Start / Stop buttons</td><td>—</td><td>Optional pair, for a charger with no stateful on/off switch at all, or whose current entity refuses to be set to exactly 0. Leave both blank if your Control Entity switch (or writing 0 A) already stops delivery — that's the common case. If used, both must be set together.</td></tr>
             <tr><td>Max Current</td><td>Charger maximum</td><td>Your own ceiling — "never charge above 10 A", whatever the plan wants.</td></tr>
           </tbody>
         </table>
         <p>With <strong>Greedy Consumption</strong> switched on, a modulating charger does something an on/off one can't: it tracks your surplus continuously, every 30 seconds, ramping the current to absorb exactly what you're exporting. An on/off appliance has to wait until the whole of its draw is covered before it can switch on at all. For live surplus tracking you'll also need a <strong>grid power sensor</strong> configured — without one, the charger simply follows the optimiser's plan instead.</p>
         <div class="note">
           <strong>Why 6 amps matters.</strong> An electric car can't charge below about 6 A — offer it less and it won't charge slowly, it will refuse outright. So Grid Lens never commands an in-between current: it either charges at 6 A or more, or not at all. It also holds on a little past the point where it would otherwise stop, because a car that gets cut off can take half a minute to start again — better to ride out a passing cloud than restart the session.
+        </div>
+        <div class="note">
+          <strong>Turn off the charger's own scheduling first.</strong> Many chargers ship with their own solar-following or scheduled-charging mode (PV surplus, Eco mode, a preferred-departure timer). Leave one of those switched on alongside Grid Lens and the two will fight over the same current setpoint — whichever wrote last wins, unpredictably. Before wiring a charger into Grid Lens, switch its own app or Home Assistant entities back to a plain "always available" / manual mode and let Grid Lens be the only thing driving the current.
         </div>
 
         <h3 id="estimated-loads">Estimated loads</h3>

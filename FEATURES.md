@@ -957,6 +957,32 @@ posture as plug detection itself), and a charger that doesn't free-run on its ow
 harmless redundant re-write. See `control/modulating_controller.py` `modulate()`/`_write()`
 and `tests/test_modulating_load_control.py`'s `reconnect_*` checks.
 
+**Brand-assisted setup (2026-09-11).** The Wattpilot's own setup needed a session's worth of
+source-diving to find the right entities by hand (see the "First real modulating charger on
+the rig" `GRIDLENS_CHECKLIST.md` entry that day) — nothing about the wizard surfaced any of
+it. A new, purely optional `load_ev_brand` wizard step (`config_flow.py`, patterns in
+`ev_charger_vendors.py`) now runs first for a modulating load: pick a recognised brand from a
+dropdown and, if a matching entity is actually present on this Home Assistant instance, its
+setpoint / plug-sensor / start-stop-button / switch fields (plus `min_current`) are pre-filled
+as the very next two screens' defaults — still fully editable, nothing saved until the wizard
+is walked through as normal. Leaving it on "Other" (the default) changes nothing, identical to
+before this step existed. Only fills a currently-blank field, so re-running it on an
+already-configured load never clobbers a deliberate manual override.
+
+Per-vendor confidence is tracked explicitly (`confirmed` in `EV_CHARGER_VENDORS`), not
+uniform: **Wattpilot** is live-confirmed (the entities above). **Sigenergy** AC-charger is
+taken from this repo's own `custom_components/sigen` source (`ac_charger_output_current` /
+`ac_charger_start_stop`) but not live-confirmed — no AC charger is wired to this dev rig's
+plant, so this was actually the first time this codebase's own claimed vendor shape was
+checked against its own other integration's source rather than assumed. OCPP, Easee and
+Wallbox reuse this doc's/`strings.json`'s pre-existing (also unverified) claims; Zaptec, go-e
+and OpenEVSE are new patterns from a 2026-09-11 web search, also unverified against real
+hardware — each is labelled "(unverified pattern)" in the dropdown so a wrong guess is never
+mistaken for a confirmed one. Getting one wrong is harmless by design: a false or missing
+match just leaves that screen's field at its old blank/manual default. Tesla was deliberately
+left out of the pattern table — no stable, install-independent entity-naming convention was
+found, only per-install custom names — rather than guess one with nothing behind it.
+
 Phase auto-derivation and each vendor's exact step/rounding semantics are still unverified
 beyond the Wattpilot's own 1–32 A single number entity — every other vendor named above is
 still stub-only.
@@ -1747,6 +1773,7 @@ A forecast-only pool pump now answers **three** questions.
 | `load_detail_monitored` | Max kW, control style, has-own-battery, [on CL] | Editing a metered load |
 | `load_detail_declared` | Name, daily kWh, max kW, hours, [on CL] | Editing a declared load |
 | `load_detail_estimated` | Name, control entity, est. kW, auto-refine | Editing an estimated load |
+| `load_ev_brand` | Charger brand (optional) — detects & pre-fills the next two screens' fields when a match is found on this HA instance | Control style is modulating |
 | `load_control` | Control entity (+ climate on-mode for on/off) | Control style is on/off or modulating — **required** for on/off, **optional** for modulating (a setpoint-only charger needs no switch) |
 | `load_modulating` | Setpoint, unit, phases, voltage, min current, plug sensor, start/stop button pair | Control style is modulating |
 | `load_soc` | SOC sensor, charge ceiling, capacity | "Has its own battery" ticked |
@@ -1829,6 +1856,8 @@ custom_components/grid_lens/
 ├── config_flow.py           setup flow — §12a; options flow + per-load wizard — §12b
 ├── deferrable_loads.py      one-dict-per-load view over the parallel arrays the rest of
 │                            the code reads; the seam the wizard edits through — §12b
+├── ev_charger_vendors.py    per-brand EV-charger entity patterns for the optional
+│                            load_ev_brand wizard step — §6a
 ├── plan_calculator.py       plan cost engine
 ├── retailer_plans.py        plan fetch/cache from the API
 ├── battery_optimizer.py     the LP/MILP

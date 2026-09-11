@@ -175,6 +175,11 @@ def _bootstrap():
     # Real module, not a stub — it is the seam config_flow reads/writes loads through,
     # and stubbing it would test nothing. Pure Python, no HA imports, loads fine here.
     _load(os.path.join(_COMPONENT, "deferrable_loads.py"), "gl.deferrable_loads", package="gl")
+    # Also real, not stubbed — the vendor pattern table is pure Python and its own
+    # detect()/vendor_options() are exactly what the ev_brand wizard step exercises.
+    _load(
+        os.path.join(_COMPONENT, "ev_charger_vendors.py"), "gl.ev_charger_vendors", package="gl"
+    )
     inv = types.ModuleType("gl.inverters")
     inv.__path__ = []
     inv.INVERTER_BRANDS = {"sigenergy": {"mqtt": "Sigenergy (MQTT)"}}
@@ -217,6 +222,9 @@ class FakeStates:
 
     def get(self, eid):
         return self._d.get(eid)
+
+    def async_entity_ids(self):
+        return list(self._d.keys())
 
 
 class FakeResponse:

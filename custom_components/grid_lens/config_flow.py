@@ -31,6 +31,7 @@ from .deferrable_loads import (
     read_loads,
     write_loads,
 )
+from .ev_charger_vendors import detect as detect_ev_charger, vendor_by_id, vendor_options
 from .const import (
     DOMAIN,
     CONF_ENERGY_SENSOR,
@@ -1451,6 +1452,11 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 style = str(user_input.get("control_style", CONTROL_NONE))
                 apply_control_style(load, style)
                 self._load_steps = []
+                if style == CONTROL_MODULATING:
+                    # Runs before "control"/"modulating" so a detected brand's entities
+                    # are already sitting in `load` as those steps' defaults — see
+                    # async_step_load_ev_brand.
+                    self._load_steps.append("ev_brand")
                 if style != CONTROL_NONE:
                     self._load_steps.append("control")
                 if style == CONTROL_MODULATING:
@@ -1605,6 +1611,47 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             and load.get("kind") in (DECLARED, ESTIMATED)
             and str(load.get("name", "")).strip().lower() == lowered
             for i, load in enumerate(self._loads)
+        )
+
+    async def async_step_load_ev_brand(self, user_input=None):
+        """Optional brand pick for a modulating load — pure convenience, skippable.
+
+        Picking a recognised charger brand scans this Home Assistant instance for that
+        vendor's known entity pattern and, on a match, pre-fills `load["setpoint"]` /
+        `["plug_sensor"]` / `["start_button"]` / `["stop_button"]` / `["switch"]` plus a
+        sensible `min_current` default — nothing else changes, and nothing here is
+        persisted: `async_step_load_control` / `async_step_load_modulating` render these
+        same fields right after, already defaulted, still fully editable. See
+        `ev_charger_vendors.py` for what's live-confirmed versus best-effort per vendor.
+        Only ever fills a field that's currently blank, so re-running this on an already
+        configured load never clobbers a deliberate manual override.
+        """
+        load = self._loads[self._editing]
+
+        if user_input is not None:
+            vendor_id = str(user_input.get("vendor", "other") or "other")
+            vendor = vendor_by_id(vendor_id)
+            if vendor:
+                found = detect_ev_charger(self.hass, vendor_id)
+                for field in ("setpoint", "plug_sensor", "start_button", "stop_button", "switch"):
+                    if found.get(field) and not load.get(field):
+                        load[field] = found[field]
+                for field, value in vendor.get("defaults", {}).items():
+                    if not load.get(field):
+                        load[field] = value
+            return await self._next_load_step()
+
+        return self.async_show_form(
+            step_id="load_ev_brand",
+            data_schema=vol.Schema({
+                vol.Optional("vendor", default="other"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=vendor_options(self.hass),
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+            }),
+            description_placeholders={"name": self._load_display_name(load)},
         )
 
     async def async_step_load_control(self, user_input=None):
