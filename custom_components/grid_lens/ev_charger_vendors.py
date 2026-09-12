@@ -147,7 +147,16 @@ EV_CHARGER_VENDORS: list[dict[str, Any]] = [
 # documented "known-good shape" in docs.html but isn't offered here, rather than
 # guessing a pattern with nothing behind it. Add it once a real pattern is confirmed.
 
-_OTHER = {"id": "other", "label": "Other / not listed — I'll pick the entities myself"}
+# Must use "value"/"label" — the same shape `vendor_options()` appends for every real
+# vendor below. This one was written as {"id": ...} until 2026-09-12: the offline wizard
+# tests call `async_step_load_ev_brand` directly and never validate the option dicts
+# through a real SelectSelector, so the mismatch was invisible there. On a live HA
+# instance it broke the picker for every *modulating* load (the only load kind that
+# reaches this step) — reproduced via the config_entries HTTP flow API editing the
+# household's own Wattpilot load: submitting `load_detail_monitored` crashed with a
+# HA-core `TypeError: cannot use 'list' as a dict key`, surfaced to the user as
+# `async_step_load_ev_brand`'s "unknown error" in the Reconfigure dialog.
+_OTHER = {"value": "other", "label": "Other / not listed — I'll pick the entities myself"}
 
 
 def _entity_ids(hass) -> list[str]:
