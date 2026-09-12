@@ -53,7 +53,8 @@
           "battery_max_soc": "Maximum state of charge (%)",
           "battery_soc_sensor": "State of charge sensor (optional)",
           "battery_charge_power_sensor": "Charge power sensor (optional)",
-          "battery_discharge_power_sensor": "Discharge power sensor (optional)"
+          "battery_discharge_power_sensor": "Discharge power sensor (optional)",
+          "max_ac_output_kw": "Inverter max AC output (kW, optional)"
         },
         "data_description": {
           "battery_capacity": "Total usable capacity in kWh (e.g. Sigenergy 10 kWh)",
@@ -64,7 +65,8 @@
           "battery_max_soc": "Maximum charge level for battery health (%)",
           "battery_soc_sensor": "Sensor reporting current battery charge as a percentage (0–100).",
           "battery_charge_power_sensor": "Sensor for battery charging power. Use a signed sensor (positive = charging, negative = discharging) and leave Discharge blank — or supply two separate unipolar sensors (one for each direction).",
-          "battery_discharge_power_sensor": "Discharge power sensor if separate from the charge sensor. Leave blank if your charge sensor is signed (negative when discharging)."
+          "battery_discharge_power_sensor": "Discharge power sensor if separate from the charge sensor. Leave blank if your charge sensor is signed (negative when discharging).",
+          "max_ac_output_kw": "Some all-in-one battery/PV inverters cap total AC output well below what PV + battery could otherwise supply together (check your inverter's datasheet). Leave at 0 if you don't know, or if your inverter has no such ceiling — this only matters if PV and battery output can together exceed it."
         }
       },
       "devices": {
@@ -195,7 +197,11 @@
           "battery_max_soc": "Maximum state of charge (%)",
           "battery_soc_sensor": "State of charge sensor (optional)",
           "battery_charge_power_sensor": "Charge power sensor (optional)",
-          "battery_discharge_power_sensor": "Discharge power sensor (optional)"
+          "battery_discharge_power_sensor": "Discharge power sensor (optional)",
+          "max_ac_output_kw": "Inverter max AC output (kW, optional)"
+        },
+        "data_description": {
+          "max_ac_output_kw": "Some all-in-one battery/PV inverters cap total AC output well below what PV + battery could otherwise supply together (check your inverter's datasheet). Leave at 0 if you don't know, or if your inverter has no such ceiling — this only matters if PV and battery output can together exceed it."
         }
       },
       "inverter": {

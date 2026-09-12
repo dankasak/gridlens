@@ -57,6 +57,8 @@ from ..const import (
     CONF_DEFERRABLE_LOAD_SWITCHES,
     CONF_DEFERRABLE_LOAD_VOLTAGE,
     CONF_GRID_POWER_SENSOR,
+    CONF_LOAD_POWER_SENSOR,
+    CONF_MAX_AC_OUTPUT_KW,
     CONF_MIN_EXPORT_PRICE,
     DEFAULT_MIN_CHARGE_CURRENT_A,
     DOMAIN,
@@ -186,6 +188,18 @@ class LoadControlManager:
         # the check can't be done, so the proportional forecast-surplus draw is disabled
         # (same fail-closed discipline as a missing SOC sensor).
         self._battery_capacity_kwh: float = float(d.get(CONF_BATTERY_CAPACITY, 0.0) or 0.0)
+
+        # Inverter/plant AC output ceiling (see const.py's CONF_MAX_AC_OUTPUT_KW) — None
+        # when unset (the common case, unchanged behaviour). Paired with the whole-house
+        # load sensor already used for load estimation (CONF_LOAD_POWER_SENSOR): together
+        # with the grid power sensor above, `load_w - grid_w` gives live combined AC output
+        # without needing a vendor-specific "plant output" sensor.
+        self._max_ac_output_w: Optional[float] = (
+            float(d[CONF_MAX_AC_OUTPUT_KW]) * 1000.0
+            if d.get(CONF_MAX_AC_OUTPUT_KW)
+            else None
+        )
+        self._load_power_sensor: str = d.get(CONF_LOAD_POWER_SENSOR) or ""
 
         # One controller per device that has a control entity configured. Keyed by the
         # device's index in the deferrable lists, so DispatchInterval.deferrable_w[i] lines
@@ -501,10 +515,12 @@ class LoadControlManager:
         spill_kwh, spill_hours = (None, 0.0)
         battery_headroom_w: Optional[float] = None
         battery_headroom_kwh: Optional[float] = None
+        ac_output_headroom_w: Optional[float] = None
         if controller.greedy and controller.greedy_forecast_surplus:
             spill_kwh, spill_hours = self._forecast_surplus_budget(index, now)
             battery_headroom_w = self._battery_headroom_w()
             battery_headroom_kwh = self._battery_headroom_kwh()
+            ac_output_headroom_w = self._ac_output_headroom_w()
         if controller.greedy and not self._grid_power_sensor and not self._warned_no_grid_power:
             # Greedy's export-surplus condition is the one that catches a house spilling
             # kilowatts at a $0 export price, and it is silently unavailable without this
@@ -532,6 +548,7 @@ class LoadControlManager:
                 forecast_hours=spill_hours,
                 battery_headroom_w=battery_headroom_w,
                 battery_headroom_kwh=battery_headroom_kwh,
+                ac_output_headroom_w=ac_output_headroom_w,
                 min_export_price=self._min_export_price(),
             )
         except Exception as err:  # noqa: BLE001 — a bad device tick must not kill the timer
@@ -648,6 +665,12 @@ class LoadControlManager:
         plan still drives. With no ``grid_power_sensor`` configured at all, surplus tracking
         never engages and this degrades to pure plan-following.
 
+        **Inverter AC output ceiling, applied last, regardless of source** (found
+        2026-09-12 — see ``_ac_output_headroom_w``). ``plan_w`` and ``fc_target_w`` both
+        reason about PV/battery *capability*; neither knows the plant's own AC-side output
+        can be capped well below that. Only relevant when ``CONF_MAX_AC_OUTPUT_KW`` is
+        configured — unset (the default) leaves this a no-op.
+
         **Battery priority can pull the target below plan_w — the one exception to "plan is
         a floor"** (household instruction, 2026-09-11). Every term above only ever *adds* to
         plan_w; none of them can express "the plan turned out too optimistic, back off."
@@ -728,6 +751,25 @@ class LoadControlManager:
             if relieved_w < target_w:
                 target_w = relieved_w
                 source = "battery_priority"
+
+        # Inverter/plant AC output ceiling — a live, continuously-reevaluated hard cap,
+        # applied regardless of which term above produced target_w. Every term so far
+        # (plan_w, the live export-surplus term, and fc_target_w) reasons about PV and
+        # battery *capability*, never about whether the plant can actually deliver that
+        # much AC power at once; fc_target_w in particular is only refreshed on the
+        # 5-minute apply() tick, so a stale forecast figure can keep winning this loop's
+        # max() for minutes after live conditions no longer support it. Found 2026-09-12:
+        # PV alone was already at the plant's ~10kW ceiling, so the battery's real ~20kW
+        # of discharge headroom was moot, and the forecast-surplus condition — unaware of
+        # any of this — sized the Wattpilot's target off PV+battery capability that could
+        # never reach the car. See LoadControlManager._ac_output_headroom_w.
+        ac_headroom_w = self._ac_output_headroom_w()
+        if ac_headroom_w is not None:
+            device_w = self._read_device_power_w(index) or 0.0
+            allowed_w = max(0.0, device_w + ac_headroom_w)
+            if target_w > allowed_w:
+                target_w = allowed_w
+                source = "ac_output_cap"
 
         if target_w <= 0.0:
             return 0.0, "off"
@@ -949,6 +991,47 @@ class LoadControlManager:
         if soc is None:
             return None
         return max(0.0, (soc - self._battery_min_soc) / 100.0 * self._battery_capacity_kwh)
+
+    def _ac_output_headroom_w(self) -> Optional[float]:
+        """Headroom (W) below the configured inverter/plant AC output ceiling, or None if
+        no ceiling is configured.
+
+        Many all-in-one battery/PV inverters cap total AC output well below what PV and
+        battery could otherwise deliver together — confirmed on this household's own
+        Sigenergy plant, where 7 days of ``sensor.sigen_0_plant_active_power`` never
+        exceeded ~10kW regardless of available PV or battery SOC (GRIDLENS_CHECKLIST.md,
+        2026-09-12). Neither ``_battery_headroom_w`` above nor the LP's own forecast knows
+        about this: both reason about PV/battery *capability*, not the inverter's AC-side
+        rating, so on a day PV alone is already near the cap, "the battery has 20kWh free"
+        is true and irrelevant — none of it can physically reach the loads. This is what
+        sized the Wattpilot's charging current off headroom that didn't really exist
+        (GRIDLENS_CHECKLIST.md, 2026-09-12).
+
+        ``plant_output_w = load_w - grid_w`` — whole-house consumption minus whatever the
+        grid is currently contributing (or absorbing, if negative) — is the live combined
+        AC power the plant is delivering right now. Deliberately built from the two
+        general-purpose sensors every install already has a config slot for
+        (``CONF_LOAD_POWER_SENSOR``, ``CONF_GRID_POWER_SENSOR``) rather than a
+        vendor-specific "total AC output" sensor, so this works on any inverter brand.
+
+        None whenever no ceiling is configured (the overwhelmingly common case — most
+        installs' PV + battery can't reach the inverter's rating anyway, so this feature
+        is opt-in). Once a ceiling IS configured, 0.0 (not None) whenever the sensors it
+        needs aren't configured or aren't currently readable — fails closed the same way
+        ``_battery_headroom_w`` does: a household that has told GridLens about a real
+        hardware limit gets that limit enforced, not silently ignored the moment a live
+        reading blips.
+        """
+        if self._max_ac_output_w is None:
+            return None
+        if not self._load_power_sensor or not self._grid_power_sensor:
+            return 0.0
+        load_w = self._read_power_w(self._load_power_sensor)
+        grid_w = self._read_grid_power_w()
+        if load_w is None or grid_w is None:
+            return 0.0
+        plant_output_w = load_w - grid_w
+        return max(0.0, self._max_ac_output_w - plant_output_w)
 
     def _read_device_power_w(self, index: int) -> Optional[float]:
         """Live power (W) device ``index`` is drawing right now, for the surplus term's

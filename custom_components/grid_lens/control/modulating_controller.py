@@ -199,7 +199,7 @@ class ModulatingLoadController(DeferrableLoadController):
         self._last_write_at: Optional[datetime] = None
         self._commanded_w = 0.0
         # Observability only (published by status()): which term produced the last commanded
-        # figure. "plan" | "surplus" | "override" | "off".
+        # figure. "plan" | "surplus" | "battery_priority" | "ac_output_cap" | "override" | "off".
         self._modulation_source = "off"
         # Last plan/greedy decision from the 5-minute apply(), kept so status() can explain a
         # commanded figure that the fast loop derived from live surplus rather than the plan.

@@ -395,6 +395,58 @@ async def _run_surplus_needs_battery_headroom():
     assert c.status()["greedy_blocked"] == "no_battery_headroom"
 
 
+async def _run_surplus_ac_output_headroom_clamps_and_blocks():
+    """CONF_MAX_AC_OUTPUT_KW's live headroom (LoadControlManager._ac_output_headroom_w)
+    is a third, OPTIONAL gate alongside the two battery ones — None (no ceiling
+    configured, the default) is a pure no-op, unlike a missing battery headroom which
+    always blocks. A fresh FakeHass per case: _turn_ons() counts cumulative calls, and
+    each case's outcome must be judged in isolation."""
+    # ac_output_headroom_w=None (unconfigured) behaves exactly like before this feature
+    # existed — battery headroom alone decides.
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
+    c.set_greedy(True)
+    c.set_greedy_forecast_surplus(True)
+    await c.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
+                  forecast_spill_kwh=10.0, forecast_hours=4.0,
+                  battery_headroom_w=2000.0, battery_headroom_kwh=12.0,
+                  ac_output_headroom_w=None)
+    assert len(_turn_ons(hass)) == 1
+    assert c.status()["forecast_target_w"] == 2000.0
+
+    # Battery headroom would allow the full 2 kW, but the plant's own AC output ceiling
+    # (found 2026-09-12: PV alone was already at the inverter's rating) leaves nothing ->
+    # blocked, distinctly from a battery-headroom block.
+    hass2 = FakeHass()
+    hass2.states.set("switch.x", "off")
+    c2 = DeferrableLoadController(hass2, name="X2", switch_entity_id="switch.x", max_w=2000.0)
+    c2.set_greedy(True)
+    c2.set_greedy_forecast_surplus(True)
+    await c2.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
+                   forecast_spill_kwh=10.0, forecast_hours=4.0,
+                   battery_headroom_w=2000.0, battery_headroom_kwh=12.0,
+                   ac_output_headroom_w=0.0)
+    assert len(_turn_ons(hass2)) == 0
+    assert c2.status()["greedy_blocked"] == "no_ac_output_headroom"
+
+    # AC headroom exactly clearing this on/off device's all-or-nothing bar -> still fires
+    # (an on/off load has no partial state to clamp INTO — see
+    # ModulatingLoadController's own forecast-surplus test for the proportional case).
+    hass3 = FakeHass()
+    hass3.states.set("switch.x", "off")
+    c3 = DeferrableLoadController(hass3, name="X3", switch_entity_id="switch.x", max_w=2000.0)
+    c3.set_greedy(True)
+    c3.set_greedy_forecast_surplus(True)
+    await c3.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
+                   forecast_spill_kwh=10.0, forecast_hours=4.0,
+                   battery_headroom_w=2000.0, battery_headroom_kwh=12.0,
+                   ac_output_headroom_w=2000.0)
+    assert len(_turn_ons(hass3)) == 1
+    assert c3.status()["greedy_blocked"] is None
+    assert c3.status()["forecast_ac_output_headroom_w"] == 2000.0
+
+
 async def _run_surplus_insufficient_no_effect():
     hass = FakeHass()
     hass.states.set("switch.x", "off")
@@ -702,6 +754,54 @@ def test_manager_battery_headroom_reads_soc_and_charge_sensors():
     hass.states.set("sensor.battery_soc", "60")
     hass.states.set("sensor.battery_power", "unavailable")
     assert m._battery_headroom_w() is None
+
+
+def test_manager_ac_output_headroom_unconfigured():
+    # No max_ac_output_kw at all (the common case) -> None, a pure no-op — never mistaken
+    # for "0 W of headroom", which would incorrectly block every forecast-surplus device.
+    m, _hass = _mgr()
+    assert m._ac_output_headroom_w() is None
+    # Explicit 0 (the config-flow default) means the same thing: unset.
+    m2, _hass2 = _mgr(extra_data={"max_ac_output_kw": 0.0})
+    assert m2._ac_output_headroom_w() is None
+
+
+def test_manager_ac_output_headroom_reads_load_and_grid_sensors():
+    # A configured ceiling (10 kW, matching the household's own Sigenergy plant) needs
+    # both load and grid power to compute live plant output.
+    m, hass = _mgr(extra_data={
+        "max_ac_output_kw": 10.0,
+        "load_power_sensor": "sensor.load_power",
+        "grid_power_sensor": "sensor.grid_power",
+    })
+    # Configured but nothing readable yet -> fails CLOSED (0.0, not None): a real ceiling
+    # the household told GridLens about must not be silently ignored on a sensor blip.
+    assert m._ac_output_headroom_w() == 0.0
+    # Plant output (load - grid) already at exactly the ~10 kW cap found on this
+    # household's own Sigenergy install (GRIDLENS_CHECKLIST.md, 2026-09-12) -> zero
+    # headroom left, regardless of any battery capacity behind it.
+    hass.states.set("sensor.load_power", "13500")
+    hass.states.set("sensor.grid_power", "3500")  # importing
+    assert m._ac_output_headroom_w() == 0.0  # 10000 - (13500 - 3500) = 0
+    # Plant comfortably under the cap -> full remaining headroom.
+    hass.states.set("sensor.load_power", "4000")
+    hass.states.set("sensor.grid_power", "0")
+    assert m._ac_output_headroom_w() == 6000.0
+    # Plant already over the cap (shouldn't happen, but never a negative headroom).
+    hass.states.set("sensor.load_power", "15000")
+    hass.states.set("sensor.grid_power", "0")
+    assert m._ac_output_headroom_w() == 0.0
+    # A sensor going unavailable again -> back to failing closed at 0.0.
+    hass.states.set("sensor.grid_power", "unavailable")
+    assert m._ac_output_headroom_w() == 0.0
+
+
+def test_manager_ac_output_headroom_no_sensors_configured():
+    # Ceiling configured, but neither load nor grid power sensor set (an install that
+    # knows its inverter's rating but hasn't wired the general sensors) -> fails closed,
+    # same discipline as an unreadable sensor.
+    m, _hass = _mgr(extra_data={"max_ac_output_kw": 10.0})
+    assert m._ac_output_headroom_w() == 0.0
 
 
 def test_manager_schedule_default_unrestricted():
@@ -1044,6 +1144,7 @@ if __name__ == "__main__":
         ("status_reports_greedy_state", test_status_reports_greedy_state),
         ("surplus_turns_on_when_rate_covers_draw", lambda: _run_async(_run_surplus_turns_on_when_rate_covers_draw)),
         ("surplus_needs_battery_headroom", lambda: _run_async(_run_surplus_needs_battery_headroom)),
+        ("surplus_ac_output_headroom_clamps_and_blocks", lambda: _run_async(_run_surplus_ac_output_headroom_clamps_and_blocks)),
         ("surplus_insufficient_no_effect", lambda: _run_async(_run_surplus_insufficient_no_effect)),
         ("surplus_needs_its_own_toggle", lambda: _run_async(_run_surplus_needs_its_own_toggle)),
         ("surplus_needs_master_greedy", lambda: _run_async(_run_surplus_needs_master_greedy)),
@@ -1061,6 +1162,9 @@ if __name__ == "__main__":
         ("manager_min_export_price", test_manager_min_export_price),
         ("manager_battery_headroom_no_battery_configured", test_manager_battery_headroom_no_battery_configured),
         ("manager_battery_headroom_reads_soc_and_charge_sensors", test_manager_battery_headroom_reads_soc_and_charge_sensors),
+        ("manager_ac_output_headroom_unconfigured", test_manager_ac_output_headroom_unconfigured),
+        ("manager_ac_output_headroom_reads_load_and_grid_sensors", test_manager_ac_output_headroom_reads_load_and_grid_sensors),
+        ("manager_ac_output_headroom_no_sensors_configured", test_manager_ac_output_headroom_no_sensors_configured),
         ("manager_schedule_default_unrestricted", test_manager_schedule_default_unrestricted),
         ("manager_schedule_store_restricts_hours", test_manager_schedule_store_restricts_hours),
         ("manager_forecast_surplus_budget_counts_spilled_export", test_manager_forecast_surplus_budget_counts_spilled_export),

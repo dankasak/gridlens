@@ -166,6 +166,7 @@ class DeferrableLoadController:
         self._greedy_needed_kwh: Optional[float] = None
         self._greedy_battery_headroom_w: Optional[float] = None
         self._greedy_battery_headroom_kwh: Optional[float] = None
+        self._greedy_ac_output_headroom_w: Optional[float] = None
         # Power (W) the proportional forecast-surplus condition wants this device to draw
         # right now (0.0 when it isn't firing). Read by
         # LoadControlManager._modulation_target_w for a modulating device and published by
@@ -220,6 +221,7 @@ class DeferrableLoadController:
         forecast_hours: Optional[float] = None,
         battery_headroom_w: Optional[float] = None,
         battery_headroom_kwh: Optional[float] = None,
+        ac_output_headroom_w: Optional[float] = None,
         min_export_price: float = 0.0,
     ) -> bool:
         """True if Greedy Consumption says "on" right now, independent of the plan.
@@ -230,9 +232,10 @@ class DeferrableLoadController:
         the original "export price ≤ $0" bar exactly.
 
         ``forecast_spill_kwh`` / ``forecast_hours`` / ``battery_headroom_w`` /
-        ``battery_headroom_kwh`` drive the proportional forecast-surplus condition (see
-        ``_forecast_surplus_target_w``). It also sets ``self._greedy_forecast_target_w`` —
-        the power that condition wants — which the manager reads for a modulating device.
+        ``battery_headroom_kwh`` / ``ac_output_headroom_w`` drive the proportional
+        forecast-surplus condition (see ``_forecast_surplus_target_w``). It also sets
+        ``self._greedy_forecast_target_w`` — the power that condition wants — which the
+        manager reads for a modulating device.
 
         Uses ``self.max_w`` (the device's real full configured draw) — NOT
         ``on_threshold_w()``'s 50%-of-max fractional floor, which is a different concept
@@ -252,6 +255,7 @@ class DeferrableLoadController:
         )
         self._greedy_battery_headroom_w = battery_headroom_w
         self._greedy_battery_headroom_kwh = battery_headroom_kwh
+        self._greedy_ac_output_headroom_w = ac_output_headroom_w
         self._greedy_forecast_target_w = 0.0
         self._greedy_reason = None
         self._greedy_blocked = None
@@ -290,7 +294,8 @@ class DeferrableLoadController:
                     self._greedy_blocked = None
                     return True
         target_w = self._forecast_surplus_target_w(
-            forecast_spill_kwh, forecast_hours, battery_headroom_w, battery_headroom_kwh
+            forecast_spill_kwh, forecast_hours, battery_headroom_w, battery_headroom_kwh,
+            ac_output_headroom_w,
         )
         if target_w > 0.0:
             self._greedy_forecast_target_w = target_w
@@ -333,6 +338,7 @@ class DeferrableLoadController:
         forecast_hours: Optional[float],
         battery_headroom_w: Optional[float] = None,
         battery_headroom_kwh: Optional[float] = None,
+        ac_output_headroom_w: Optional[float] = None,
     ) -> float:
         """Power (W) the *proportional* forecast-surplus condition wants this device to
         draw right now — 0.0 when it isn't firing (see module docstring).
@@ -358,6 +364,17 @@ class DeferrableLoadController:
         * ``battery_headroom_kwh`` — energy to the configured minimum SOC — must cover the
           *whole* budget, because a back-loaded spill means the battery can be down by the
           full budget before the refill lands.
+
+        A third, optional gate — ``ac_output_headroom_w``
+        (``LoadControlManager._ac_output_headroom_w``) — clamps the draw again when the
+        household has configured an inverter AC output ceiling (``CONF_MAX_AC_OUTPUT_KW``):
+        the plan's own forecast reasons about PV/battery *capability*, never about whether
+        the plant can physically deliver that much combined AC power, so a day PV alone is
+        already near the ceiling would otherwise size this device's target off battery
+        headroom that can't actually reach it (found 2026-09-12 — GRIDLENS_CHECKLIST.md).
+        None (the default, when no ceiling is configured) leaves this a no-op — unlike the
+        battery gates, its absence is NOT itself a block, since the feature is opt-in and
+        most installs have no such ceiling to model.
         """
         if not self._greedy_forecast_surplus:
             return 0.0
@@ -376,6 +393,11 @@ class DeferrableLoadController:
             self._greedy_blocked = "no_battery_headroom"
             return 0.0
         target_w = min(rate_w, battery_headroom_w)
+        if ac_output_headroom_w is not None:
+            target_w = min(target_w, ac_output_headroom_w)
+            if target_w + 1e-6 < min_draw:
+                self._greedy_blocked = "no_ac_output_headroom"
+                return 0.0
         if target_w + 1e-6 < min_draw:
             self._greedy_blocked = "no_battery_headroom"
             return 0.0
@@ -413,6 +435,7 @@ class DeferrableLoadController:
         forecast_hours: Optional[float] = None,
         battery_headroom_w: Optional[float] = None,
         battery_headroom_kwh: Optional[float] = None,
+        ac_output_headroom_w: Optional[float] = None,
         min_export_price: float = 0.0,
     ) -> None:
         """Reconcile the switch toward the plan (plus Greedy Consumption, if enabled)
@@ -435,13 +458,14 @@ class DeferrableLoadController:
             self._greedy_needed_kwh = None
             self._greedy_battery_headroom_w = None
             self._greedy_battery_headroom_kwh = None
+            self._greedy_ac_output_headroom_w = None
             self._greedy_forecast_target_w = 0.0
             return
 
         greedy_on = self._greedy_wants_on(
             import_rate, export_rate, grid_power_w, schedule_allows,
             forecast_spill_kwh, forecast_hours, battery_headroom_w,
-            battery_headroom_kwh, min_export_price,
+            battery_headroom_kwh, ac_output_headroom_w, min_export_price,
         )
         plan_on = self.desired_on(planned_w)
         if plan_on and self._greedy_reason is not None:
@@ -628,9 +652,11 @@ class DeferrableLoadController:
             # availability window with Respects Schedule on), "override" (a human has
             # Force On/Off set), "no_grid_power" (the export price is $0 but there is no
             # readable grid power sensor, so the export-surplus condition can't be judged),
-            # or "no_battery_headroom" (the forecast-surplus bar cleared, but the battery
+            # "no_battery_headroom" (the forecast-surplus bar cleared, but the battery
             # has no configured/readable SOC-and-charge-sensor headroom to safely draw on,
-            # so firing would be real, unbuffered grid import). None = greedy was free to
+            # so firing would be real, unbuffered grid import), or "no_ac_output_headroom"
+            # (a configured inverter AC output ceiling — CONF_MAX_AC_OUTPUT_KW — leaves no
+            # room once current plant output is accounted for). None = greedy was free to
             # fire and simply didn't match.
             "greedy_blocked": self._greedy_blocked,
             # Forecast-surplus figures: energy the plan expects to waste over the
@@ -656,6 +682,13 @@ class DeferrableLoadController:
             "forecast_battery_headroom_kwh": (
                 round(self._greedy_battery_headroom_kwh, 2)
                 if self._greedy_battery_headroom_kwh is not None else None
+            ),
+            # Inverter AC output headroom (W) backing the forecast-surplus gate, when
+            # CONF_MAX_AC_OUTPUT_KW is configured. None = no ceiling configured (the
+            # common case — this is a no-op then, not a block).
+            "forecast_ac_output_headroom_w": (
+                round(self._greedy_ac_output_headroom_w, 1)
+                if self._greedy_ac_output_headroom_w is not None else None
             ),
             "note": self._note,
         }

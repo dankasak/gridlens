@@ -55,6 +55,7 @@ from .const import (
     CONF_BATTERY_DISCHARGE_POWER_SENSOR,
     CONF_BATTERY_MIN_SOC,
     CONF_BATTERY_MAX_SOC,
+    CONF_MAX_AC_OUTPUT_KW,
     CONF_INVERTER_BRAND,
     CONF_INVERTER_TRANSPORT,
     CONF_DEFERRABLE_LOAD_SENSORS,
@@ -116,6 +117,7 @@ _BATTERY_ADVANCED_DEFAULTS = {
     CONF_BATTERY_EFFICIENCY: 95.0,
     CONF_BATTERY_MIN_SOC: 10.0,
     CONF_BATTERY_MAX_SOC: 90.0,
+    CONF_MAX_AC_OUTPUT_KW: 0.0,
 }
 
 # Sensors that must be cumulative energy counters, not instantaneous power. All three
@@ -965,6 +967,12 @@ def _battery_schema(defaults: dict, basic: bool = False) -> vol.Schema:
         )
         schema_dict[opt(CONF_BATTERY_MAX_SOC, 90.0)] = selector.NumberSelector(
             selector.NumberSelectorConfig(min=0.0, max=100.0, step=1.0, unit_of_measurement="%", mode=selector.NumberSelectorMode.BOX)
+        )
+        # Opt-in inverter AC-output ceiling (see const.py's CONF_MAX_AC_OUTPUT_KW). Advanced
+        # / edge-case, same reasoning as the three fields above: most installs don't need it,
+        # so it's dropped from the basic setup-flow form and only offered here. 0 = unset.
+        schema_dict[opt(CONF_MAX_AC_OUTPUT_KW, 0.0)] = selector.NumberSelector(
+            selector.NumberSelectorConfig(min=0.0, max=1000.0, step=0.1, unit_of_measurement="kW", mode=selector.NumberSelectorMode.BOX)
         )
     if defaults.get(CONF_BATTERY_SOC_SENSOR):
         schema_dict[vol.Optional(CONF_BATTERY_SOC_SENSOR, default=defaults[CONF_BATTERY_SOC_SENSOR])] = entity_sel()

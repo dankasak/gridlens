@@ -1095,6 +1095,49 @@ async def _run_manager_target_forecast_surplus():
     assert await m3._modulation_target_w(0, _T0) == (0.0, "off")
 
 
+async def _run_manager_target_ac_output_cap():
+    """Live inverter AC output ceiling clamp (found 2026-09-12 against the household's
+    own Sigenergy + Wattpilot — GRIDLENS_CHECKLIST.md): applied LAST, after plan/surplus/
+    battery-priority, regardless of which term produced the pre-clamp target — and
+    re-evaluated every 30s here, unlike ``fc_target_w`` which is only refreshed on the
+    5-minute ``apply()`` tick. Numbers mirror the actual incident: PV alone had the
+    ~10kW plant at its ceiling, the Wattpilot was already drawing 6.6kW, and the
+    forecast-surplus condition (unaware of any of this) wanted the full envelope."""
+    m, hass = _mod_mgr(
+        grid_power_sensor="sensor.grid",
+        load_power_sensor="sensor.load",
+        max_ac_output_kw=10.0,
+    )
+    m.set_plan(_plan(dev_w=1000.0), updated_at=_T0)
+    await m.set_greedy(0, True)
+    await m.set_greedy_forecast_surplus(0, True)
+    c = m.controllers[0]
+    c._greedy_reason = "forecast_surplus"
+    c._greedy_forecast_target_w = c.cap_w          # forecast wants the full envelope
+    hass.states.set("sensor.load", "13500")        # whole-house consumption
+    hass.states.set("sensor.grid", "3500")         # importing 3.5 kW
+    hass.states.set("sensor.evse_power", "6600")   # this device's OWN current draw
+    target, source = await m._modulation_target_w(0, _T0)
+    # Plant output (load - grid) = 10000 W, exactly at the configured 10 kW ceiling ->
+    # zero AC headroom, so the target is capped to the device's own current draw, not
+    # the forecast's full-envelope figure.
+    assert target == 6600.0 and source == "ac_output_cap", (target, source)
+
+    # No ceiling configured (the default) -> a pure no-op, unaffected by any of this.
+    m2, hass2 = _mod_mgr(grid_power_sensor="sensor.grid", load_power_sensor="sensor.load")
+    m2.set_plan(_plan(dev_w=1000.0), updated_at=_T0)
+    await m2.set_greedy(0, True)
+    await m2.set_greedy_forecast_surplus(0, True)
+    c2 = m2.controllers[0]
+    c2._greedy_reason = "forecast_surplus"
+    c2._greedy_forecast_target_w = c2.cap_w
+    hass2.states.set("sensor.load", "13500")
+    hass2.states.set("sensor.grid", "3500")
+    hass2.states.set("sensor.evse_power", "6600")
+    target2, source2 = await m2._modulation_target_w(0, _T0)
+    assert target2 == c2.cap_w and source2 == "surplus"
+
+
 def test_greedy_reason_exposed_on_onoff_controller():
     """greedy_reason is public because _modulation_target_w reads it — but it must read
     identically on a plain on/off load, whose behaviour this feature did not change."""
@@ -1603,6 +1646,7 @@ if __name__ == "__main__":
         ("battery_headroom_unipolar_discharge", lambda: _run_async(_run_battery_headroom_unipolar_discharge_sensor)),
         ("battery_headroom_signed_unchanged", lambda: _run_async(_run_battery_headroom_signed_single_sensor_unchanged)),
         ("manager_target_forecast_surplus", lambda: _run_async(_run_manager_target_forecast_surplus)),
+        ("manager_target_ac_output_cap", lambda: _run_async(_run_manager_target_ac_output_cap)),
         ("greedy_reason_on_onoff_controller", test_greedy_reason_exposed_on_onoff_controller),
         ("manager_target_fails_closed", lambda: _run_async(_run_manager_target_fails_closed)),
         ("manager_target_schedule_gate", lambda: _run_async(_run_manager_target_respects_schedule_gate)),

@@ -1092,6 +1092,39 @@ into the live control path. Before this fix, a discharging Sigenergy battery rep
 term above had no way to see the discharge was happening at all. No `battery_discharge_power_sensor`
 configured reproduces the original signed-single-sensor behaviour exactly.
 
+**⚠ A third, optional gate: the inverter's own AC output ceiling (found 2026-09-12).**
+Both battery gates above reason about PV/battery *capability* — how much energy is there to
+give — never about whether the plant can physically deliver it. Many all-in-one battery/PV
+inverters cap total combined AC output well below what PV + battery could otherwise supply
+together: confirmed on the household's own Sigenergy plant, where 7 days of
+`sensor.sigen_0_plant_active_power` never exceeded ~10kW regardless of available PV or
+battery SOC. On a day PV alone is already near that ceiling, "the battery has 20kWh free" is
+true and irrelevant — none of it can reach the loads. This is what actually happened: Greedy
+Consumption sized the household's Wattpilot's charging current off PV+battery headroom that
+existed on paper but couldn't physically get through the inverter, and the car imported the
+difference from the grid.
+
+**`max_ac_output_kw` (Battery Configuration, options flow only — advanced/opt-in, 0 = unset,
+the default)** backs `LoadControlManager._ac_output_headroom_w`: `plant_output_w = load_w −
+grid_w` (whole-house consumption minus what the grid is contributing/absorbing) gives live
+combined AC output from the two general-purpose sensors every install already has a config
+slot for (`load_power_sensor`, `grid_power_sensor`) — no vendor-specific "total AC output"
+sensor needed. Headroom = `max_ac_output_kw × 1000 − plant_output_w`, clamped to 0. None
+(not configured) is a pure no-op — unlike the battery gates, its absence never blocks
+anything, since most installs' PV + battery genuinely can't reach their inverter's rating.
+Once configured, an unreadable sensor fails closed to 0.0 headroom (`greedy_blocked =
+"no_ac_output_headroom"` when that's what stopped condition #3 firing), same discipline as
+the battery gates.
+
+Applied in two places: as a third clamp on condition #3's own target (`_forecast_surplus_target_w`,
+alongside the two battery gates), and — because `fc_target_w` only refreshes on the 5-minute
+`apply()` tick while the modulating fast loop runs every 30s — as a final live clamp in
+`_modulation_target_w` (`source = "ac_output_cap"`), applied *after* plan/surplus/battery-priority
+regardless of which term produced the pre-clamp target. The second one is the one that actually
+matters day to day: it re-evaluates live every 30s, so it catches an uncontrolled coincidental
+load (the household's own "Smart Load 01") or a stale forecast figure within one fast-tick,
+not just at the next 5-minute plan tick.
+
 **What counts as "energy the plan will waste"** (`LoadControlManager._forecast_surplus_budget`),
 summed only up to the reservation point described above:
 - **Spilled export** — a slot with `export_rate ≤ min_export_price` (i.e. `≤ 0` when the

@@ -158,6 +158,21 @@ CONF_BATTERY_DISCHARGE_POWER_SENSOR = "battery_discharge_power_sensor"
 CONF_BATTERY_MIN_SOC = "battery_min_soc"
 CONF_BATTERY_MAX_SOC = "battery_max_soc"
 
+# Maximum combined AC power (kW) the site's inverter/PCS can actually deliver to loads
+# and export, regardless of how much PV and/or battery could otherwise supply. This is a
+# real hardware ceiling on many all-in-one battery/PV inverters (confirmed on this
+# household's own Sigenergy plant: 7 days of sensor.sigen_0_plant_active_power never
+# exceeding ~10kW no matter the PV or battery SOC — see GRIDLENS_CHECKLIST.md,
+# 2026-09-12) and is independent of the DC-side PV rating or the battery's own max
+# charge/discharge rate above. 0.0 / unset (the default — most installs' combined PV +
+# battery can't reach the inverter's rating anyway, so this is opt-in) means no cap is
+# modeled, unchanged behaviour. When set, backs both Greedy Consumption's
+# forecast-surplus target sizing and a live safety clamp in the modulating-load fast
+# loop (control/load_control_manager.py's _ac_output_headroom_w) — neither the LP's own
+# forecast nor the live export-surplus term otherwise has any way to know the plant
+# can't pass through everything PV + battery could deliver.
+CONF_MAX_AC_OUTPUT_KW = "max_ac_output_kw"
+
 # Minimum export price floor, in cents/kWh (0 = disabled, unchanged behaviour).
 # Below this price the optimizer stops treating grid export as valuable — it still
 # exports if nothing else can absorb the surplus, but prefers routing it into a
