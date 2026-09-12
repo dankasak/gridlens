@@ -862,13 +862,27 @@ Fix: a live battery discharge is ground truth that *something* isn't matching th
 assumptions right now — a too-optimistic forecast, self-use, or even a deliberate
 plan-driven evening discharge — and in every one of those cases the battery keeps first
 claim. Applied **after** `target_w = max(plan_w, surplus_w)`: `target_w = max(0, target_w -
-discharge_w)`, regardless of the greedy toggle (a priority/safety correction, not an
-opportunistic add-on) and independent of `grid_power_sensor` (only needs the battery
-sensors). `modulation_source` reports `"battery_priority"` when this is what actually
-reduced the figure, surfaced on the Load Control card's "why" line as "Reduced — home
-battery has priority." No discharge (idle or charging) leaves the plan/surplus result
+discharge_w - _BATTERY_PRIORITY_BIAS_W)`, regardless of the greedy toggle (a priority/safety
+correction, not an opportunistic add-on) and independent of `grid_power_sensor` (only needs
+the battery sensors). `modulation_source` reports `"battery_priority"` when this is what
+actually reduced the figure, surfaced on the Load Control card's "why" line as "Reduced —
+home battery has priority." No discharge (idle or charging) leaves the plan/surplus result
 completely untouched — this never acts as a general-purpose override, only a live-discharge
 response.
+
+**⚠ `_BATTERY_PRIORITY_BIAS_W` (150 W default) — deliberate over-correction, added
+2026-09-12 (household instruction, same reasoning as `_EXPORT_BIAS_W` above).** Cancelling
+the live discharge *exactly* only drives it to zero in the limit: every real tick lags the
+reading it's correcting against (30 s modulation ticks, amp-step quantisation, the write
+deadband/rate limit), so in practice the plain `target_w - discharge_w` version just stops
+discharge from getting *worse* rather than bringing it back to zero — confirmed live: a full
+hour of declining afternoon PV showed the Wattpilot tracking the plan down while the battery
+still funded a residual ~0.25–0.5 kW the whole time (SOC 100% → 98.5%). The household's
+stance mirrors the export-bias one exactly: a little mistaken export is cheap, unnecessary
+battery cycling (wear) is the thing being avoided, so the correction should overshoot toward
+the safe side — pull back by the discharge amount *plus* a fixed margin — rather than track
+the live reading exactly. Same 150 W default as `_EXPORT_BIAS_W`, same module
+(`load_control_manager.py`), not user-configurable (a code constant, like its counterpart).
 
 **⚠ The 6 A floor is the subtle part.** An EV's feasible set is `{0} ∪ [min, max]`, **not**
 `[0, max]` — IEC 61851 forbids offering below 6 A, and commanding 3 A doesn't charge slowly,

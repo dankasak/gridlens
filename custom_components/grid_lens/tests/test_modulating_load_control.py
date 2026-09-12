@@ -1216,10 +1216,11 @@ async def _run_manager_target_surplus_masked_by_battery_discharge():
     target, source = await m._modulation_target_w(0, _T0)
     # Surplus term alone: device_w(5000) - grid_w(0) - discharge_w(1000) -
     # _EXPORT_BIAS_W(150) = 3850. Then the battery-priority correction (added
-    # 2026-09-11) relieves the *final* target by the same live discharge again:
-    # 3850 - discharge_w(1000) = 2850 — not double-counted against the same term twice,
-    # just applied once each to whichever of plan_w/surplus_w actually won the max().
-    assert target == 2850.0 and source == "battery_priority", (target, source)
+    # 2026-09-11, given its own bias 2026-09-12) relieves the *final* target by the same
+    # live discharge again, plus _BATTERY_PRIORITY_BIAS_W(150): 3850 - 1000 - 150 = 2700 —
+    # not double-counted against the same term twice, just applied once each to whichever
+    # of plan_w/surplus_w actually won the max().
+    assert target == 2700.0 and source == "battery_priority", (target, source)
 
 
 async def _run_manager_target_battery_priority_below_plan():
@@ -1242,7 +1243,7 @@ async def _run_manager_target_battery_priority_below_plan():
     hass.states.set("sensor.batt_discharge", "562")   # the battery is covering the shortfall
     hass.states.set("sensor.evse_power", "2189")
     target, source = await m._modulation_target_w(0, _T0)
-    assert target == 1538.0 and source == "battery_priority", (target, source)  # 2100 - 562
+    assert target == 1388.0 and source == "battery_priority", (target, source)  # 2100-562-150
 
 
 async def _run_manager_target_battery_priority_ignores_greedy_toggle():
@@ -1260,7 +1261,46 @@ async def _run_manager_target_battery_priority_ignores_greedy_toggle():
     hass.states.set("sensor.batt_discharge", "562")
     hass.states.set("sensor.evse_power", "2189")
     target, source = await m._modulation_target_w(0, _T0)
-    assert target == 1538.0 and source == "battery_priority", (target, source)
+    assert target == 1388.0 and source == "battery_priority", (target, source)  # 2100-562-150
+
+
+async def _run_manager_target_battery_priority_bias_applied_even_for_small_discharge():
+    """Found live 2026-09-12: exact cancellation (pre-fix `target_w - discharge_w`) only
+    drives discharge to zero in the limit, since every real tick lags the reading it's
+    correcting against — a full hour of live household stats showed the battery still
+    funding a residual ~0.25-0.5 kW the whole time. _BATTERY_PRIORITY_BIAS_W makes the
+    correction over-shoot on purpose, even for a small discharge reading, so it settles
+    toward a little export instead of chasing an exact zero it never quite reaches."""
+    m, hass = _mod_mgr(
+        grid_power_sensor="sensor.grid",
+        battery_charge_power_sensor="sensor.batt_charge",
+        battery_discharge_power_sensor="sensor.batt_discharge",
+    )
+    m.set_plan(_plan(export_rate=0.20, dev_w=2100.0), updated_at=_T0)
+    hass.states.set("sensor.grid", "0")
+    hass.states.set("sensor.batt_charge", "0")
+    hass.states.set("sensor.batt_discharge", "50")    # a small, live discharge
+    hass.states.set("sensor.evse_power", "2189")
+    target, source = await m._modulation_target_w(0, _T0)
+    assert target == 1900.0 and source == "battery_priority", (target, source)  # 2100-50-150
+
+
+async def _run_manager_target_battery_priority_bias_floors_at_zero():
+    """The bias must never push the correction negative -- max(0.0, ...) still floors the
+    result at 0 (falls through to the function's own `target_w <= 0.0 -> (0.0, "off")`)
+    even when discharge_w + the bias together exceed target_w."""
+    m, hass = _mod_mgr(
+        grid_power_sensor="sensor.grid",
+        battery_charge_power_sensor="sensor.batt_charge",
+        battery_discharge_power_sensor="sensor.batt_discharge",
+    )
+    m.set_plan(_plan(export_rate=0.20, dev_w=200.0), updated_at=_T0)
+    hass.states.set("sensor.grid", "0")
+    hass.states.set("sensor.batt_charge", "0")
+    hass.states.set("sensor.batt_discharge", "100")   # 200 - 100 - 150(bias) would go negative
+    hass.states.set("sensor.evse_power", "0")
+    target, source = await m._modulation_target_w(0, _T0)
+    assert target == 0.0 and source == "off", (target, source)
 
 
 async def _run_manager_target_no_discharge_no_correction():
@@ -1670,6 +1710,8 @@ if __name__ == "__main__":
         ("surplus_masked_by_battery_discharge", lambda: _run_async(_run_manager_target_surplus_masked_by_battery_discharge)),
         ("battery_priority_below_plan", lambda: _run_async(_run_manager_target_battery_priority_below_plan)),
         ("battery_priority_ignores_greedy_toggle", lambda: _run_async(_run_manager_target_battery_priority_ignores_greedy_toggle)),
+        ("battery_priority_bias_small_discharge", lambda: _run_async(_run_manager_target_battery_priority_bias_applied_even_for_small_discharge)),
+        ("battery_priority_bias_floors_at_zero", lambda: _run_async(_run_manager_target_battery_priority_bias_floors_at_zero)),
         ("no_discharge_no_correction", lambda: _run_async(_run_manager_target_no_discharge_no_correction)),
         ("surplus_battery_charging_not_credited", lambda: _run_async(_run_manager_target_surplus_battery_charging_not_credited)),
         ("surplus_no_battery_unchanged", lambda: _run_async(_run_manager_target_surplus_no_battery_configured_unchanged)),

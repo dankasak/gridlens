@@ -106,6 +106,20 @@ _MIN_BUDGET_WINDOW_H = 0.5
 # meaningfully throttles.
 _EXPORT_BIAS_W = 150.0
 
+# The battery-priority correction (see _modulation_target_w) deliberately over-corrects by
+# this much, for the same asymmetry reason as _EXPORT_BIAS_W above — added 2026-09-12 on the
+# household's own explicit instruction after a fresh incident: a full hour of live stats
+# (declining afternoon PV, the Wattpilot tracking it down but the battery still funding a
+# residual ~0.25-0.5 kW of the gap the whole time, SOC 100% -> 98.5%) showed the *exact*
+# cancellation below (`target_w - discharge_w`) converges to zero discharge only in the
+# limit — every real tick lags the live reading it corrects against (30 s modulation
+# ticks, amp-step quantisation, the write deadband/rate limit), so in practice it just
+# stops the discharge from being made *worse* rather than driving it back to zero. Same
+# household stance as the export-bias comment: a little mistaken *export* is cheap, a
+# little battery cycling is the thing being avoided here (wear, per the household), so the
+# correction should overshoot toward the safe side rather than track the discharge exactly.
+_BATTERY_PRIORITY_BIAS_W = 150.0
+
 
 class LoadControlManager:
     def __init__(
@@ -681,10 +695,13 @@ class LoadControlManager:
         ground truth that *something* isn't matching the plan's assumptions right now — a
         too-optimistic forecast, self-use, or even a deliberate plan-driven evening
         discharge — and in every one of those cases the battery keeps first claim: this
-        device is pulled back by exactly the discharge amount, even below plan_w. Applied
-        after ``max(plan_w, surplus_w)`` regardless of the greedy toggle (a priority
-        correction, not an opportunistic add-on) and independent of ``grid_power_sensor``
-        (only needs the battery sensors, which already fail closed to 0 on their own).
+        device is pulled back by the discharge amount plus a fixed ``_BATTERY_PRIORITY_BIAS_W``
+        margin (found 2026-09-12: pulling back by *exactly* the live discharge reading only
+        cancels it in the limit, since every real tick lags what it's correcting against —
+        see that constant's comment), even below plan_w. Applied after
+        ``max(plan_w, surplus_w)`` regardless of the greedy toggle (a priority correction,
+        not an opportunistic add-on) and independent of ``grid_power_sensor`` (only needs
+        the battery sensors, which already fail closed to 0 on their own).
         """
         controller = self.controllers[index]
         current = self._current_interval(now)
@@ -747,7 +764,7 @@ class LoadControlManager:
         # Battery-priority correction — see the docstring above. The only place in this
         # function the target is allowed to drop below plan_w.
         if discharge_w > 0.0 and target_w > 0.0:
-            relieved_w = max(0.0, target_w - discharge_w)
+            relieved_w = max(0.0, target_w - discharge_w - _BATTERY_PRIORITY_BIAS_W)
             if relieved_w < target_w:
                 target_w = relieved_w
                 source = "battery_priority"
