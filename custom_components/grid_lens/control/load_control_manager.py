@@ -1014,6 +1014,22 @@ class LoadControlManager:
         (``CONF_LOAD_POWER_SENSOR``, ``CONF_GRID_POWER_SENSOR``) rather than a
         vendor-specific "total AC output" sensor, so this works on any inverter brand.
 
+        **Currently-exported power is added back in, not treated as already spoken for**
+        (fixed 2026-09-12, hours after the fix above shipped — found live: the household
+        was exporting 3kW and this clamp throttled the Wattpilot DOWN anyway). Hitting the
+        ceiling is not itself a problem — the plant is allowed to produce flat-out at
+        ``max_ac_output_kw`` all day. What matters is whether MORE production would be
+        needed, and redirecting power that's already being produced and already flowing
+        out as export costs nothing: it doesn't add one extra watt to what the plant has to
+        generate, it just changes where the existing output goes. Only genuinely NEW
+        demand — beyond both the plant's spare production capacity and whatever's already
+        being exported for free — can actually push total output past the ceiling. So
+        headroom = ``(cap - plant_output)`` (spare production capacity, the original term)
+        ``+ export_w`` (current export magnitude, 0 while importing) — the plain
+        ``cap - plant_output`` alone conflates "the plant happens to be producing a lot
+        right now" with "there's no room for more load", which is exactly backwards when
+        most of that production is being wasted as export in the first place.
+
         None whenever no ceiling is configured (the overwhelmingly common case — most
         installs' PV + battery can't reach the inverter's rating anyway, so this feature
         is opt-in). Once a ceiling IS configured, 0.0 (not None) whenever the sensors it
@@ -1031,7 +1047,8 @@ class LoadControlManager:
         if load_w is None or grid_w is None:
             return 0.0
         plant_output_w = load_w - grid_w
-        return max(0.0, self._max_ac_output_w - plant_output_w)
+        export_w = max(0.0, -grid_w)
+        return max(0.0, self._max_ac_output_w - plant_output_w) + export_w
 
     def _read_device_power_w(self, index: int) -> Optional[float]:
         """Live power (W) device ``index`` is drawing right now, for the surplus term's

@@ -1109,12 +1109,24 @@ the default)** backs `LoadControlManager._ac_output_headroom_w`: `plant_output_w
 grid_w` (whole-house consumption minus what the grid is contributing/absorbing) gives live
 combined AC output from the two general-purpose sensors every install already has a config
 slot for (`load_power_sensor`, `grid_power_sensor`) — no vendor-specific "total AC output"
-sensor needed. Headroom = `max_ac_output_kw × 1000 − plant_output_w`, clamped to 0. None
-(not configured) is a pure no-op — unlike the battery gates, its absence never blocks
-anything, since most installs' PV + battery genuinely can't reach their inverter's rating.
-Once configured, an unreadable sensor fails closed to 0.0 headroom (`greedy_blocked =
-"no_ac_output_headroom"` when that's what stopped condition #3 firing), same discipline as
-the battery gates.
+sensor needed. None (not configured) is a pure no-op — unlike the battery gates, its absence
+never blocks anything, since most installs' PV + battery genuinely can't reach their
+inverter's rating. Once configured, an unreadable sensor fails closed to 0.0 headroom
+(`greedy_blocked = "no_ac_output_headroom"` when that's what stopped condition #3 firing),
+same discipline as the battery gates.
+
+**Headroom credits back whatever's currently being exported (fixed same day, hours after
+the gate above first shipped).** Naively, headroom = `max_ac_output_kw × 1000 − plant_output_w`
+— but that alone conflates "the plant happens to be producing near its ceiling right now"
+with "there's no room for more load", which is backwards whenever most of that production is
+being wasted as export. Found live: household exporting ~3.4kW with PV near the plant's own
+cap, and the gate throttled a legitimately surplus-soaking Wattpilot **down** anyway.
+Redirecting power already flowing out as export to a load costs the plant nothing extra to
+produce — only genuinely NEW demand, beyond both spare production capacity and current
+export, can actually push total output past the ceiling. So the real headroom is
+`max(0, max_ac_output_kw × 1000 − plant_output_w) + export_w` (`export_w = max(0, −grid_w)`,
+0 while importing) — the export term is what makes hitting the ceiling harmless on a
+sunny, mostly-exporting day, and only bites when the shortfall genuinely can't be produced.
 
 Applied in two places: as a third clamp on condition #3's own target (`_forecast_surplus_target_w`,
 alongside the two battery gates), and — because `fc_target_w` only refreshes on the 5-minute

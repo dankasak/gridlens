@@ -1138,6 +1138,36 @@ async def _run_manager_target_ac_output_cap():
     assert target2 == c2.cap_w and source2 == "surplus"
 
 
+async def _run_manager_target_ac_output_cap_credits_current_export():
+    """Regression for a bug in the fix above, found live the same day it shipped: the
+    household was exporting ~3.4kW (PV essentially at the plant's ~10kW cap) and the
+    clamp throttled the Wattpilot DOWN anyway, because ``plant_output`` alone looked
+    maxed. Redirecting power already being exported to a load doesn't need the plant to
+    produce one extra watt — it must never be treated as unavailable. Numbers are the
+    real incident's: 6.54kW house load, 3.385kW export, this device already drawing
+    ~5.93kW, 10kW cap."""
+    m, hass = _mod_mgr(
+        grid_power_sensor="sensor.grid",
+        load_power_sensor="sensor.load",
+        max_ac_output_kw=10.0,
+    )
+    m.set_plan(_plan(dev_w=1000.0), updated_at=_T0)
+    await m.set_greedy(0, True)
+    await m.set_greedy_forecast_surplus(0, True)
+    c = m.controllers[0]
+    c._greedy_reason = "forecast_surplus"
+    c._greedy_forecast_target_w = c.cap_w          # forecast wants the full envelope
+    hass.states.set("sensor.load", "6540")         # whole-house consumption
+    hass.states.set("sensor.grid", "-3385")        # EXPORTING 3.385 kW
+    hass.states.set("sensor.evse_power", "5932")   # this device's own current draw
+    target, source = await m._modulation_target_w(0, _T0)
+    # Plant is producing 9925W (load - grid = 6540 - -3385), just 75W under the 10kW
+    # ceiling — but 3385W of that is being wasted as export, all of it redirectable.
+    # allowed = device_w + (cap - plant_output) + export = 5932 + 75 + 3385 = 9392,
+    # comfortably above the forecast's full-envelope ask — so no clamping at all.
+    assert target == c.cap_w and source == "surplus", (target, source, c.cap_w)
+
+
 def test_greedy_reason_exposed_on_onoff_controller():
     """greedy_reason is public because _modulation_target_w reads it — but it must read
     identically on a plain on/off load, whose behaviour this feature did not change."""
@@ -1647,6 +1677,7 @@ if __name__ == "__main__":
         ("battery_headroom_signed_unchanged", lambda: _run_async(_run_battery_headroom_signed_single_sensor_unchanged)),
         ("manager_target_forecast_surplus", lambda: _run_async(_run_manager_target_forecast_surplus)),
         ("manager_target_ac_output_cap", lambda: _run_async(_run_manager_target_ac_output_cap)),
+        ("manager_target_ac_output_cap_credits_current_export", lambda: _run_async(_run_manager_target_ac_output_cap_credits_current_export)),
         ("greedy_reason_on_onoff_controller", test_greedy_reason_exposed_on_onoff_controller),
         ("manager_target_fails_closed", lambda: _run_async(_run_manager_target_fails_closed)),
         ("manager_target_schedule_gate", lambda: _run_async(_run_manager_target_respects_schedule_gate)),

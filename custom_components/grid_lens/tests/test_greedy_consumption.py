@@ -794,6 +794,22 @@ def test_manager_ac_output_headroom_reads_load_and_grid_sensors():
     # A sensor going unavailable again -> back to failing closed at 0.0.
     hass.states.set("sensor.grid_power", "unavailable")
     assert m._ac_output_headroom_w() == 0.0
+    # EXPORTING right at the plant's own production limit (found live 2026-09-12, hours
+    # after the ceiling fix above shipped: household exporting ~3.4kW, PV essentially at
+    # the plant's cap, and this clamp throttled a legitimately-surplus-soaking Wattpilot
+    # DOWN because "plant output" alone looked maxed). Redirecting the exported power to
+    # a load costs the plant nothing extra to produce -> it must be credited back, not
+    # treated as already spoken for.
+    hass.states.set("sensor.load_power", "6540")
+    hass.states.set("sensor.grid_power", "-3385")  # exporting
+    # (cap - plant_output) + export = (10000 - (6540 - -3385)) + 3385 = 75 + 3385 = 3460
+    assert abs(m._ac_output_headroom_w() - 3460.0) < 1e-6
+    # Comfortably exporting well below the cap -> the full export is redirectable, on top
+    # of genuine spare capacity.
+    hass.states.set("sensor.load_power", "2000")
+    hass.states.set("sensor.grid_power", "-5000")  # exporting 5kW
+    # (10000 - (2000 - -5000)) + 5000 = 3000 + 5000 = 8000
+    assert m._ac_output_headroom_w() == 8000.0
 
 
 def test_manager_ac_output_headroom_no_sensors_configured():
