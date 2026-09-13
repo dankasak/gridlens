@@ -1118,10 +1118,12 @@ async def _run_manager_target_ac_output_cap():
     hass.states.set("sensor.grid", "3500")         # importing 3.5 kW
     hass.states.set("sensor.evse_power", "6600")   # this device's OWN current draw
     target, source = await m._modulation_target_w(0, _T0)
-    # Plant output (load - grid) = 10000 W, exactly at the configured 10 kW ceiling ->
-    # zero AC headroom, so the target is capped to the device's own current draw, not
-    # the forecast's full-envelope figure.
-    assert target == 6600.0 and source == "ac_output_cap", (target, source)
+    # Load (13500) is already 3.5kW over the configured 10kW ceiling, backfilled by
+    # import -> headroom is -3500 (fixed 2026-09-13, see _ac_output_headroom_w), so the
+    # target is capped BELOW the device's own current draw (6600 - 3500 = 3100), not
+    # merely held at it — the whole point of the fix being able to correct an existing
+    # overshoot rather than just freeze it.
+    assert target == 3100.0 and source == "ac_output_cap", (target, source)
 
     # No ceiling configured (the default) -> a pure no-op, unaffected by any of this.
     m2, hass2 = _mod_mgr(grid_power_sensor="sensor.grid", load_power_sensor="sensor.load")

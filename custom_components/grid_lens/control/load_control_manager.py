@@ -1054,6 +1054,30 @@ class LoadControlManager:
         ``_battery_headroom_w`` does: a household that has told GridLens about a real
         hardware limit gets that limit enforced, not silently ignored the moment a live
         reading blips.
+
+        **Importing must be able to show up as *negative* headroom, not floor at zero**
+        (found 2026-09-13 — GRIDLENS_CHECKLIST.md). The version of this method above
+        computed ``plant_output_w = load_w - grid_w`` unconditionally, then floored
+        ``cap - plant_output_w`` at 0.0 before adding ``export_w`` back. That floor is
+        correct on the export side (see above) but wrong on the import side: subtracting
+        a live import out of ``load_w`` credits the plant with output it isn't actually
+        producing, so an import that exists *because* load already exceeds the cap gets
+        netted straight back out and reported as ~0 headroom instead of the negative
+        figure that would tell the caller to shed load. Downstream, ``allowed_w =
+        device_w + ac_headroom_w`` can then never fall below the device's own current
+        draw — the clamp becomes a one-way "don't increase further" ceiling that can hold
+        an existing overshoot but never correct one, because the device's own (already
+        excessive) draw is baked into ``load_w`` and handed straight back as the new
+        floor. Live symptom: the Wattpilot's setpoint froze at 22 A with a steady
+        ~350-450 W import for several minutes with zero further writes (``note`` stuck on
+        ``hold_setpoint_deadband``) — not a slow control loop, a formula that structurally
+        could not output a corrective figure while importing.
+
+        Fix: while importing (``grid_w > 0``), compare the cap against ``load_w``
+        directly — never net the live import back out of it first — so a load already
+        over the cap shows up as negative headroom and pulls ``allowed_w`` back below the
+        device's current draw. The exporting branch is untouched (it was already correct
+        and stays covered by its own tests above).
         """
         if self._max_ac_output_w is None:
             return None
@@ -1063,8 +1087,15 @@ class LoadControlManager:
         grid_w = self._read_grid_power_w()
         if load_w is None or grid_w is None:
             return 0.0
-        plant_output_w = load_w - grid_w
-        export_w = max(0.0, -grid_w)
+        if grid_w > 0.0:
+            # Importing: crediting the plant with output it isn't producing (by netting
+            # the import out of load_w first, as the export branch below does) is exactly
+            # what hid the overshoot this method exists to correct. Compare the cap
+            # against total demand instead, so exceeding it while backfilled by grid
+            # import registers as negative headroom rather than a false-safe zero.
+            return self._max_ac_output_w - load_w
+        export_w = -grid_w
+        plant_output_w = load_w + export_w
         return max(0.0, self._max_ac_output_w - plant_output_w) + export_w
 
     def _read_device_power_w(self, index: int) -> Optional[float]:

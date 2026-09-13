@@ -777,17 +777,21 @@ def test_manager_ac_output_headroom_reads_load_and_grid_sensors():
     # Configured but nothing readable yet -> fails CLOSED (0.0, not None): a real ceiling
     # the household told GridLens about must not be silently ignored on a sensor blip.
     assert m._ac_output_headroom_w() == 0.0
-    # Plant output (load - grid) already at exactly the ~10 kW cap found on this
-    # household's own Sigenergy install (GRIDLENS_CHECKLIST.md, 2026-09-12) -> zero
-    # headroom left, regardless of any battery capacity behind it.
+    # Load already 3.5kW over the ~10 kW cap found on this household's own Sigenergy
+    # install (GRIDLENS_CHECKLIST.md, 2026-09-12), backfilled by grid import -> NEGATIVE
+    # headroom (fixed 2026-09-13: netting the live import out of load_w before comparing
+    # to the cap hid this overshoot as a false-safe 0.0, which is exactly what let a
+    # device's setpoint freeze mid-overshoot instead of being pulled back down).
     hass.states.set("sensor.load_power", "13500")
     hass.states.set("sensor.grid_power", "3500")  # importing
-    assert m._ac_output_headroom_w() == 0.0  # 10000 - (13500 - 3500) = 0
+    assert m._ac_output_headroom_w() == -3500.0  # 10000 - 13500 = -3500
     # Plant comfortably under the cap -> full remaining headroom.
     hass.states.set("sensor.load_power", "4000")
     hass.states.set("sensor.grid_power", "0")
     assert m._ac_output_headroom_w() == 6000.0
-    # Plant already over the cap (shouldn't happen, but never a negative headroom).
+    # Load over the cap with grid_w exactly 0 (not importing) is physically
+    # inconsistent, but exercises the non-importing branch's own floor at zero — the
+    # negative-headroom fix above only applies once grid_w > 0.
     hass.states.set("sensor.load_power", "15000")
     hass.states.set("sensor.grid_power", "0")
     assert m._ac_output_headroom_w() == 0.0
