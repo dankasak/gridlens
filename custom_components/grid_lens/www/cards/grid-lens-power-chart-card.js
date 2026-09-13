@@ -164,6 +164,34 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     return byId;
   }
 
+  // Each device's "Show In Power Flow" switch (switch.py's GridLensDeferrableVisibleSwitch),
+  // keyed the same way as _deferPowerEntities() above — by the device's configured energy
+  // entity_id. Same switch the Power Flow card's own hide button turns off; this card just
+  // reads its state too so a hidden load also disappears from this chart.
+  _deferVisibleEntities() {
+    const attr = this._deferrableLoadsAttr();
+    if (!Array.isArray(attr)) return {};
+    const byId = {};
+    for (const d of attr) {
+      if (d && d.energy_entity) byId[d.energy_entity] = d.visible_entity || null;
+    }
+    return byId;
+  }
+
+  // Whether deferrable device index i (this._deferNames[i]/defer_i) should be drawn at all.
+  // Joined via _deferSensorIds[i] (the device's configured energy entity_id) rather than
+  // position, because dnames/defer_i indices come from the advisory trajectory — which can
+  // drop a zero-daily_kwh device — while _deferrableLoadsAttr()'s raw list never does (see
+  // advisory/coordinator.py's _device_override comment on the same index-drift risk).
+  // Fails open (visible) on a missing switch entity, same semantics as the Power Flow
+  // card's own _isLoadVisible() — an old/mid-setup config entry must not blank every line.
+  _isDeferVisible(i) {
+    const sid = (this._deferSensorIds || [])[i];
+    const ventity = sid ? this._deferVisibleEntities()[sid] : null;
+    const st = ventity && this._hass && this._hass.states[ventity];
+    return !st || st.state !== 'off';
+  }
+
   // A clickable legend entry for one logical series (forecast + measured pair share a
   // `group` — see _energySeries()). Click isolates the chart to just that group; clicking
   // the already-isolated one again clears isolation and restores every series — wired in
@@ -177,9 +205,9 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
 
   _legendHtml() {
     const dnames = this._deferNames || [];
-    const deferLegend = dnames.map((nm, i) => this._legendItem(
+    const deferLegend = dnames.map((nm, i) => this._isDeferVisible(i) ? this._legendItem(
       `defer_${i}`, `<i style="border-top:2px solid ${this._deferColor(i)}"></i>`, nm,
-    )).join('');
+    ) : '').join('');
     // Only advertise the free-energy shading when there actually is some in view — on a
     // plan with no $0 window and no spill the legend would otherwise carry two
     // permanently-unused entries. Filtered to the selected view range for the same
@@ -253,6 +281,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     const byDevice = this._greedyBandsByDevice || [];
     const out = [];
     dnames.forEach((nm, i) => {
+      if (!this._isDeferVisible(i)) return;
       for (const b of (byDevice[i] || [])) {
         out.push({
           t0: b.t0, t1: b.t1, kind: 'greedy', group: `defer_${i}`,
@@ -393,6 +422,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     if (!traj.length) return [];
     const out = [];
     (this._deferNames || []).forEach((nm, i) => {
+      if (!this._isDeferVisible(i)) return;
       const color = this._deferColor(i);
       // Measured (historical) per-device SOC — solid, left of "now", on the same right
       // axis as the battery SOC line and drawn the same way (actual: true so it isn't
@@ -447,7 +477,9 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
         // at ~max_kw for a slot), not a smooth ramp. Without it smoothPath's cubic spline
         // curves gradually up from 0 toward the turn-on slot instead of holding flat at 0
         // until the device actually switches on. See stepPath()'s own comment.
-        ...dnames.map((nm, i) => ({ key: `defer_${i}`, group: `defer_${i}`, color: this._deferColor(i), area: true, scale: kwScale, step: true })),
+        ...dnames.map((nm, i) => this._isDeferVisible(i)
+          ? { key: `defer_${i}`, group: `defer_${i}`, color: this._deferColor(i), area: true, scale: kwScale, step: true }
+          : null).filter(Boolean),
         { points: this._actualEnergy.solar, group: 'solar', color: 'var(--solar)', actual: true, area: true },
         { points: this._actualEnergy.load, group: 'load', color: 'var(--load)', actual: true, area: true },
         { points: this._actualEnergy.grid, group: 'grid', color: 'var(--gridflow)', actual: true, area: true },
@@ -457,7 +489,9 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
         // on significant_changes_only, so two sparse readings (last "off", first "on") would
         // otherwise get smoothPath'd into the exact same diagonal-ramp artifact as the
         // forecast series above, just drawn from real sensor data instead of planned data.
-        ...dnames.map((nm, i) => ({ points: actualDefer[i], group: `defer_${i}`, color: this._deferColor(i), actual: true, area: true, step: true })),
+        ...dnames.map((nm, i) => this._isDeferVisible(i)
+          ? { points: actualDefer[i], group: `defer_${i}`, color: this._deferColor(i), actual: true, area: true, step: true }
+          : null).filter(Boolean),
         // SOC on its own 0-100% right axis. Deliberately unlike every other series here:
         // no area fill (its baseline would be the LEFT axis' zero, which means nothing on
         // a percentage scale), heavier stroke, and drawn last so it sits above every
@@ -564,6 +598,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
         return `<b>${fmtHour(bestMs)}</b><div style="font-size:11px;color:var(--muted)">No data available</div>`;
       }
       const deferRows = (this._deferNames || []).map((nm, i) => {
+        if (!this._isDeferVisible(i)) return '';
         const v = actualDefer[i];
         const g = this._isGreedyAt(i, bestMs) ? ' <span style="color:var(--muted)">(greedy)</span>' : '';
         return v != null && v > 0.01 ? `<div><span class="k" style="color:${this._deferColor(i)}">${esc(nm)}</span> ${v.toFixed(2)} kW${g}</div>` : '';
@@ -587,6 +622,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       `<div><span class="k" style="color:var(--solar)">sun</span> ${((actualSolar != null ? actualSolar : (+best.solar_kwh || 0) * kwScale)).toFixed(2)} · <span class="k" style="color:var(--load)">load</span> ${((actualLoad != null ? actualLoad : (+best.load_kwh || 0) * kwScale)).toFixed(2)} kW</div>` +
       `<div>${this._signedRow(gridKw, 'buy', 'sell', '--gridflow')} · ${this._signedRow(battKw, 'charge', 'discharge', '--battery')} kW</div>` +
       (this._deferNames || []).map((nm, i) => {
+        if (!this._isDeferVisible(i)) return '';
         const v = actualDefer[i] != null ? actualDefer[i] : (+best['defer_' + i] || 0) * kwScale;
         const g = this._isGreedyAt(i, bestMs) ? ' <span style="color:var(--muted)">(greedy)</span>' : '';
         return v > 0.01 ? `<div><span class="k" style="color:${this._deferColor(i)}">${esc(nm)}</span> ${v.toFixed(2)} kW${g}</div>` : '';
@@ -604,6 +640,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
   // null (no measured lookup), `best` may be null (a purely historical hover).
   _deferSocNote(best, bestMs) {
     return (this._deferNames || []).map((nm, i) => {
+      if (!this._isDeferVisible(i)) return '';
       const plan = best ? best[`defer_${i}_soc`] : null;
       const meas = bestMs != null ? this._nearest((this._actualDeviceSoc || [])[i], bestMs) : null;
       if (plan == null && meas == null) return '';

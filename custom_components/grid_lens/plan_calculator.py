@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import statistics_during_period
+from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
 
 from .battery_optimizer import BatteryOptimizer
 from .retailer_plans import (
@@ -305,6 +306,31 @@ class PlanCalculator:
             })
         return loads
 
+    def _deferrable_visibility(self) -> list[bool]:
+        """Per-device "Show In Power Flow" switch state (switch.py's
+        GridLensDeferrableVisibleSwitch), indexed exactly like self.deferrable_load_sensors —
+        same {entry_id}_deferrable_visible_{i} unique_id scheme sensor.py's
+        _build_deferrable_loads() resolves, same fail-open semantics as that method's
+        visible_entity field and grid-lens-powerflow-card.js's _isLoadVisible() (a missing
+        entity, e.g. mid-setup, reads as visible rather than hiding everything).
+
+        True = show this device in the Power chart / Plan Comparison breakdown, False = the
+        user's hide button is off. Purely a display filter — see calculate_plan_costs' use
+        of it: daily_kwh still feeds the LP for every alternative plan unchanged, exactly
+        like the Power Flow node-hide button never touches Load Control/schedule/greedy
+        logic/the LP optimizer. A hidden load still needs to run; only its own line/bar
+        disappears from the charts.
+        """
+        ent_reg = async_get_entity_registry(self.hass)
+        out = []
+        for i in range(len(self.deferrable_load_sensors)):
+            visible_entity = ent_reg.async_get_entity_id(
+                "switch", DOMAIN, f"{self.entry.entry_id}_deferrable_visible_{i}"
+            )
+            st = self.hass.states.get(visible_entity) if visible_entity else None
+            out.append(not (st and st.state == "off"))
+        return out
+
     def _build_cl_devices(self, deferrable_loads: list[dict]) -> list[dict]:
         """Combine sensor-backed and declared devices that are wired to a Controlled
         Load register into one list, each with the total daily kWh _compute_bill_items
@@ -570,6 +596,20 @@ class PlanCalculator:
                         load['daily_kwh'] / load['max_kw'] if load['max_kw'] > 0 else 0,
                     )
 
+        # Devices the user has hidden via each one's "Show In Power Flow" switch — see
+        # _deferrable_visibility(). Purely a display filter applied below to the
+        # deferrable_devices/deferrable_per_device fields the frontend charts read;
+        # deferrable_loads/deferrable_per_sensor_hod themselves are left untouched so the
+        # LP, CL pricing, and every dollar figure keep accounting for a hidden device's
+        # real energy exactly as before.
+        visible_flags = (
+            self._deferrable_visibility() if self.deferrable_load_sensors else []
+        )
+        visible_sensor_ids = {
+            sid for sid, vis in zip(self.deferrable_load_sensors, visible_flags) if vis
+        }
+        visible_hod_positions = [i for i, vis in enumerate(visible_flags) if vis]
+
         # Controlled-Load-wired devices (sensor-backed or declared) — priced separately
         # in _compute_bill_items, not part of the LP's normal deferrable dispatch (the
         # LP's own timing choice doesn't affect a CL rate's dollar value, since it has
@@ -819,10 +859,22 @@ class PlanCalculator:
             # ── Hourly profile ───────────────────────────────────────────────────────
             lp_day_profile = opt_result.get('day_profile') if opt_result else None
             if lp_day_profile and not is_current:
+                # deferrable_per_device here is positioned exactly like the deferrable_loads
+                # list passed into _calculate_plan_cost_with_battery_optimization above (its
+                # N == len(deferrable_loads)) — so the same visible/hidden positions apply.
+                hidden_positions = {
+                    i for i, d in enumerate(deferrable_loads)
+                    if d['sensor_id'] not in visible_sensor_ids
+                }
                 for slot in lp_day_profile:
                     h = slot['hour']
                     slot['home_load_kwh'] = round(home_load_hod_avg.get(h, 0.0), 4)
                     slot['solar_kwh']     = round(solar_hod_avg.get(h, 0.0), 4)
+                    if hidden_positions and slot.get('deferrable_per_device'):
+                        slot['deferrable_per_device'] = [
+                            v for i, v in enumerate(slot['deferrable_per_device'])
+                            if i not in hidden_positions
+                        ]
                 plan_optimization_results[plan_key]['hourly_profile'] = lp_day_profile
                 plan_optimization_results[plan_key]['spikes'] = opt_result.get('spikes') or []
             else:
@@ -837,9 +889,15 @@ class PlanCalculator:
                     slot['home_load_kwh']  = round(home_load_hod_avg.get(h, 0.0), 4)
                     slot['solar_kwh']      = round(solar_hod_avg.get(h, 0.0), 4)
                     slot['deferrable_kwh'] = round(deferrable_hod_avg.get(h, 0.0), 4)
+                    # visible_hod_positions drops any device the user has hidden (see
+                    # _deferrable_visibility()) — deferrable_hod_avg above is the summed
+                    # total across ALL devices and is deliberately left untouched (that's
+                    # real physical energy, still owed for), only the per-device breakdown
+                    # a hidden device would otherwise draw its own bar/line in disappears.
                     slot['deferrable_per_device'] = [
                         round(deferrable_per_sensor_hod[ii].get(h, 0.0), 4)
-                        for ii in range(len(deferrable_per_sensor_hod))
+                        for ii in visible_hod_positions
+                        if ii < len(deferrable_per_sensor_hod)
                     ]
                     slot['soc_percent'] = round(soc_hod_avg.get(h, 0.0), 1)
                 plan_optimization_results[plan_key]['hourly_profile'] = profile
@@ -936,6 +994,7 @@ class PlanCalculator:
                     'deferrable_devices': [
                         {"name": d["name"], "sensor_id": d["sensor_id"]}
                         for d in deferrable_loads
+                        if d["sensor_id"] in visible_sensor_ids
                     ],
                 })
 
@@ -972,6 +1031,7 @@ class PlanCalculator:
             "deferrable_devices": [
                 {"name": d["name"], "sensor_id": d["sensor_id"]}
                 for d in deferrable_loads
+                if d["sensor_id"] in visible_sensor_ids
             ],
             "usage_days": actual_days,
             "start_date": start_date.isoformat(),
@@ -2223,7 +2283,28 @@ class PlanCalculator:
                         sensor_id, greedy_kwh, sensor_total,
                     )
 
-            daily_kwh = max(0.0, sensor_total - greedy_kwh) / days
+            # Divide by how much of the window this sensor actually has statistics for,
+            # not the nominal window size. A sensor that's just been added (or whose
+            # integration reset its lifetime counter) may only have a few real days of
+            # "hour" records inside a nominal 14-day (or longer) request — dividing its
+            # real total by the full nominal `days` dilutes it with phantom zero-days the
+            # sensor was never reporting for, silently understating daily_kwh by up to
+            # (nominal days / real days)x. Found 2026-09-12: a Wattpilot re-paired 2 days
+            # earlier had exactly 2 days of statistics inside a 14-day advisory window,
+            # producing 2.38 kWh/day (33.3 kWh / 14) instead of the ~16.7 kWh/day its
+            # actual 2 days of data implied — the LP then correctly-but-uselessly
+            # scheduled ~18 minutes of charging for a device that needed hours. Floored at
+            # 1.0 day (not the request's `days`) so a sensor with only a few hours of data
+            # doesn't get wildly extrapolated into an even less trustworthy daily figure.
+            first_ts = min(d['timestamp'] for d in raw)
+            covered_days = max(1.0, min(float(days), (end_time - first_ts).total_seconds() / 86400.0))
+            if covered_days < days - 1e-6:
+                _LOGGER.warning(
+                    "Deferrable sensor %s only has %.1f day(s) of statistics inside the "
+                    "%d-day window — averaging its %.2f kWh over %.1f day(s), not %d",
+                    sensor_id, covered_days, days, sensor_total, covered_days, days,
+                )
+            daily_kwh = max(0.0, sensor_total - greedy_kwh) / covered_days
             if week is not None:
                 from .schedule_grid import max_daily_hours
                 window_capacity = max_daily_hours(week) * max_kw

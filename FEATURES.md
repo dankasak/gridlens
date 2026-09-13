@@ -1335,6 +1335,39 @@ diagram itself** — a hidden load stays hidden until the switch is turned back 
 own entity page (Settings → Devices → Grid Lens, entity category Config), the same
 re-enable path the "Show Classic/Scene Power Flow" layout toggles already use.
 
+**Same switch also hides the device from the Power chart and Plan Comparison (added
+2026-09-13).** Still purely a display filter — daily_kwh keeps feeding the LP for every
+alternative plan, and Load Control/schedule/greedy logic are still untouched; only where
+a hidden device's own line/bar would otherwise be drawn disappears.
+- **Power — measured & forecast chart** (`grid-lens-power-chart-card.js`): client-side,
+  since this card already reads `hass.states` directly. `_isDeferVisible(i)` joins
+  `_deferSensorIds[i]` (the trajectory's `deferrable_sensor_ids`, which can drop a
+  zero-`daily_kwh` device and so isn't positionally aligned with the raw
+  `deferrable_loads` attribute — see `advisory/coordinator.py`'s `_device_override`
+  comment) against the `deferrable_loads` attribute's `visible_entity` field, same
+  fail-open semantics as the Power Flow card. Gates the legend entry, the forecast +
+  measured series, the greedy hatch band, the per-device SOC curve/ceiling line, and
+  both tooltip rows (hourly-hover and pure-history) — a hidden device produces literally
+  no visual output on this chart, not just a dimmed one.
+- **Plan Comparison** (`grid-lens-card.js`): this card deliberately never stores the
+  `hass` object (GC pressure — see its `set hass()` comment), so it cannot read switch
+  state client-side. Filtering happens server-side instead, in
+  `plan_calculator.py::calculate_plan_costs`, via the new `_deferrable_visibility()`
+  helper — the same entity-registry lookup as `sensor.py::_build_deferrable_loads`,
+  independently resolved (this class has no reference to that method's `ent_reg` call).
+  A hidden device's entry is dropped from the `deferrable_devices` list sent to the
+  frontend (both the streaming `plan` event and the final payload) and its slice of
+  every hourly slot's `deferrable_per_device` array is dropped at the same position, for
+  both the LP-schedule-based profile (alternative plans, `day_profile`) and the
+  hour-of-day-average profile (current plan / non-battery-optimized plans, keyed off
+  `deferrable_per_sensor_hod`) — two different index spaces (`deferrable_loads`'
+  filtered-by-having-stats order vs `self.deferrable_load_sensors`' raw config order),
+  each filtered independently by sensor_id/position rather than assumed to match.
+  `deferrable_hod_avg`/`deferrable_kwh` (the combined-across-devices total) are
+  deliberately left untouched, same rationale as "Exclude Greedy Consumption": that's
+  real physical energy the household total must keep reflecting, only the per-device
+  breakdown line disappears.
+
 ⚠ **Band width is capped at `MAX_GREEDY_STEP_MS` (5 min) — fixed 2026-09-02, was painting
 whole plan-driven sessions as greedy.** The tracker sensor is edge-triggered: it only writes
 a new recorded sample when its counter actually ticks up, never a periodic "still greedy"
