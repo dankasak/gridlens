@@ -641,6 +641,31 @@ SOC data before it's ever acted on. Day 0's target is still a floor (charge at l
 usual daily amount) clamped by real headroom under the ceiling, not just a hard cap — so a
 device far from its ceiling keeps its normal behaviour.
 
+**Bug fixed 2026-09-13: a device already over its ceiling made the WHOLE LP infeasible,
+not just that device.** The day-0 floor row already clamped its own target to 0 via
+`headroom = max(0, max_kwh - initial_kwh)` when the live reading sits above
+`soc_max_percent` — but the SOC state variable's own upper bound (`ub[idx:idx+T]`) stayed
+at `max_kwh`, unraised. The equality row that seeds day 0 (`ev_soc[i,0] = initial_kwh`,
+unconditional) then pinned that variable ABOVE its own declared bound — not suboptimal,
+a direct infeasible. And not a rare edge case: a device sitting a hair over its configured
+ceiling (sensor lag, control-loop overshoot — precisely what the live SOC-cutoff interlock
+above exists to catch) is the *normal* end state once it finishes charging, so this fired on
+every single advisory tick once it started, taking `scipy` → `PuLP` → **every plan's entire
+optimizer** down with it: the greedy fallback models no deferrable loads at all, so the Power
+chart's "measured & forecast" forecast side (`defer_i`) went flat 0 for every device,
+including ones with nothing wrong — misread live as the Power Flow hide-button work (added
+the same day) over-hiding, since that was the most recent related change, when the two were
+unconnected. Fix: `ub[idx:idx+T] = max(max_kwh, initial_kwh)` — the ceiling still stops the
+LP charging any *further*, it just can't be lower than where the device already sits.
+`battery_optimizer.py` also gained `_diagnose_infeasible()`: on any future infeasible solve,
+it re-solves the horizon a handful of times with one feature group (deferrable loads as a
+whole, then demand charge / caps / credits / hard terminal floor, then each individual
+device) relaxed in turn and logs the first relaxation that restores feasibility — so
+"LP optimisation failed... using greedy fallback" now names a likely cause instead of just
+the bare scipy/HiGHS status code. See `GRIDLENS_CHECKLIST.md` 2026-09-13 for the full hunt,
+including an inverted boolean in the diagnostic's first draft that initially blamed the six
+innocent devices instead of the one real culprit.
+
 **Observability (added 2026-09-07).** `ev_soc_status` on the LP result / `AdvisoryResult`
 / the `planned_dispatch` sensor — one dict per SOC-tracked device: `name`, `sensor_id`,
 `capacity_kwh`, `initial_percent`, `max_percent`, `day0_final_percent`, `day0_charge_kwh`,

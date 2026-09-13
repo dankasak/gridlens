@@ -466,9 +466,84 @@ class BatteryOptimizer:
             return self._greedy_optimize(solar, load, r_imp, r_exp, E0, T,
                                          timestep_hours=timestep_hours)
         except Exception as exc:
-            _LOGGER.warning("LP optimisation failed (%s) — using greedy fallback.", exc)
+            culprit = self._diagnose_infeasible(
+                solar, load, r_imp, r_exp, E0, T, deferrable_loads,
+                demand_rate=demand_rate, demand_window_mask=dmask,
+                demand_peak_kw_month_to_date=demand_peak_kw_month_to_date,
+                demand_days_remaining=demand_days_remaining,
+                timestep_hours=timestep_hours,
+                soc_reward=soc_reward, export_penalty=export_penalty,
+                no_grid_charge=no_grid_charge,
+                terminal_soc_value=terminal_soc_value,
+                import_caps=import_caps, export_caps=export_caps,
+                conditional_credits=conditional_credits,
+                min_export_price=min_export_price,
+            )
+            _LOGGER.warning(
+                "LP optimisation failed (%s) — using greedy fallback. Likely cause: %s.",
+                exc, culprit,
+            )
             return self._greedy_optimize(solar, load, r_imp, r_exp, E0, T,
                                          timestep_hours=timestep_hours)
+
+    def _diagnose_infeasible(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads,
+                              **kwargs) -> str:
+        """Best-effort bisection to NAME the feature/device making this horizon
+        infeasible, for the log line only — never affects what gets solved or
+        returned to the caller (that's still the greedy fallback either way).
+
+        Re-solves the same horizon a handful of times with one feature group
+        relaxed at a time via ``_lp_optimize`` (the same scipy→PuLP chain the
+        real solve used), stopping at the first relaxation that turns
+        INfeasible back into feasible. Each trial is a full LP solve, but this
+        only ever runs on the rare already-failed path — never in the normal
+        per-tick solve — so a handful of extra milliseconds here is cheap
+        compared to shipping another silent "infeasible, no idea why" log line
+        (see GRIDLENS_CHECKLIST.md 2026-08-21 for how long the M-bound version
+        of this exact failure mode went undiagnosed).
+
+        Tries, in order: dropping every deferrable load (isolates "some device"
+        from everything else); if that's not it, demand-charge shaving, import
+        caps, export caps, conditional credits, and the hard terminal-SOC floor
+        each in turn. If deferrable loads WERE the problem, follows up by
+        dropping each device one at a time to name the specific one(s).
+        """
+        def solves(devs, **overrides) -> bool:
+            trial = dict(kwargs)
+            trial.update(overrides)
+            try:
+                self._lp_optimize(solar, load, r_imp, r_exp, E0, T, devs, **trial)
+                return True
+            except Exception:  # noqa: BLE001 — this IS the failure-probing loop
+                return False
+
+        if not solves([]):
+            if kwargs.get("demand_rate") and solves(deferrable_loads, demand_rate=0.0):
+                return "demand-charge peak-shaving (demand_rate/demand_window_mask)"
+            if kwargs.get("import_caps") and solves(deferrable_loads, import_caps=None):
+                return "an import rate-cap window"
+            if kwargs.get("export_caps") and solves(deferrable_loads, export_caps=None):
+                return "an export rate-cap window"
+            if kwargs.get("conditional_credits") and solves(deferrable_loads, conditional_credits=None):
+                return "a conditional day-credit"
+            if kwargs.get("terminal_soc_value") is None and solves(deferrable_loads, terminal_soc_value=0.0):
+                return "the hard terminal-SOC floor (soc[T-1] >= E0) — battery can't refill to its starting charge by horizon end"
+            return ("unknown — still infeasible with every optional feature relaxed; "
+                    "likely the base battery/import-bound model itself")
+
+        # Deferrable loads (collectively) ARE the problem — name which one(s) individually:
+        # a device whose OWN removal alone turns the horizon feasible again is implicated.
+        # (Not `not solves(trimmed)` — that names devices whose absence *doesn't* help,
+        # i.e. everyone except the actual culprit. Caught live 2026-09-13: this exact
+        # off-by-negation reported the six innocent devices instead of the one real cause.)
+        culprits = []
+        for i, dev in enumerate(deferrable_loads):
+            trimmed = deferrable_loads[:i] + deferrable_loads[i + 1:]
+            if solves(trimmed):
+                culprits.append(dev.get("name") or dev.get("sensor_id") or f"device[{i}]")
+        if culprits:
+            return f"removing any of these alone restores feasibility: {', '.join(culprits)}"
+        return "a combination of deferrable devices together (no single device's removal restores feasibility)"
 
     def calculate_no_battery_cost(
         self,
@@ -828,7 +903,23 @@ class BatteryOptimizer:
             # floor below 0 is not meaningful. Bounded uniformly across the whole T-length
             # block for simplicity; only day0_slots entries are ever tied to anything by an
             # equality row below, so the rest just float within these bounds, unused.
-            ub[idx:idx+T] = ev_soc_specs[i]['max_kwh']
+            #
+            # max(..., initial_kwh): the ceiling constrains how much MORE the LP may charge —
+            # it must never be allowed to fall below the device's live reading, or the t=0
+            # equality row below (ev_soc[i,0] = initial_kwh, unconditional) pins the variable
+            # ABOVE its own declared upper bound, which is not "suboptimal", it is a direct,
+            # deterministic INFEASIBLE — and not a rare edge case: a device that has crept a
+            # touch over its configured ceiling (sensor lag, control-loop overshoot — exactly
+            # what CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT's live cutoff exists to catch, see
+            # __init__ notes) is the normal end state once it finishes charging, not a
+            # malformed config. The day-0 floor row already clamps its own target to 0 via
+            # `headroom = max(0, max_kwh - initial_kwh)` for exactly this case — this just
+            # makes the variable's own bound consistent with that, instead of leaving an
+            # equality/bound contradiction that fails the ENTIRE horizon (every device,
+            # every day) over on solver every tick. Found live 2026-09-13: Wattpilot/XPENG at
+            # 86% against an 85% ceiling took the whole LP infeasible, silently dropping every
+            # deferrable device's forecast to the greedy fallback's flat zero.
+            ub[idx:idx+T] = max(ev_soc_specs[i]['max_kwh'], ev_soc_specs[i]['initial_kwh'])
         for cb2 in credit_blocks:
             ub[cb2["y_idx"]] = 1.0
 
