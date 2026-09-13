@@ -677,10 +677,37 @@ A clamp caused by the ceiling (as opposed to the availability window) is also ta
 message so it doesn't read as "widen your weekly schedule" (the availability-window clamp's
 advice, which wouldn't fix an SOC-ceiling clamp).
 
+**Live-actuation enforcement (added 2026-09-13).** Everything above only ever shaped the
+*plan's* `daily_kwh` allocation for day 0 — it had no way to stop Greedy Consumption's live
+export-surplus / forecast-surplus terms (§6a) from adding real-time power on top of that
+plan regardless of the device's remaining SOC headroom, because those terms are computed
+from live grid/battery readings and know nothing about this config. Found live: a Wattpilot
+install had `deferrable_load_soc_max_percent` configured at 85%, and the vehicle kept
+charging straight through it to 86%+ because Greedy's export-surplus condition doesn't
+consult this cap at all (GRIDLENS_CHECKLIST.md, 2026-09-13). Fixed by making the same two
+fields (`..._soc_sensors` + `..._soc_max_percent`) a **hard interlock in the live tick**,
+independent of the LP-side use above: `LoadControlManager._soc_cutoff_active(index)` reads
+the live sensor every tick and, when it's at/above the configured ceiling, passes
+`soc_cutoff=True` into `DeferrableLoadController.apply()` — which force-stops the device
+immediately (no debounce, same urgency as a manual override) regardless of what the plan or
+either greedy condition wants. `ModulatingLoadController` stashes the same decision from its
+`apply()` override and enforces it a moment later in `modulate()` (the actual setpoint
+writer, on the faster 30 s loop) — so a modulating device's cutoff holds even between
+5-minute ticks. `soc_capacity_kwh` is NOT needed for this half (a plain percent compare is
+enough to decide stop/no-stop); it stays purely an LP-planning input. A manual Force On
+override still wins over the cutoff, same as it wins over the plan and both greedy
+conditions — checked first in `apply()`, so the cutoff is never even evaluated once a human
+has taken the device. Published on the Load Control card via `status()`'s new `soc_cutoff`
+boolean and the existing `greedy_blocked: "soc_cutoff"` value. Covered end-to-end (including
+a regression reproducing the exact incident — full export surplus, greedy + forecast-surplus
+both on, SOC already past the ceiling) by `tests/test_modulating_load_control.py`'s
+`soc_cutoff_*` / `manager_soc_cutoff_overrides_greedy_surplus` and
+`tests/test_deferrable_load_control.py`'s `soc_cutoff_*`.
+
 **Files:** `const.py` (`CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT` /
 `CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH`), `config_flow.py` (the wizard's `load_soc` step,
 reached only when a load is marked as having its own battery — §12b), `plan_calculator.py` (`_get_deferrable_data` — static config passthrough only),
-`advisory/coordinator.py` (`_deferrable_for_horizon` — the live reading),
+`advisory/coordinator.py` (`_deferrable_for_horizon` — the live reading for the LP),
 `battery_optimizer.py` (`ev_soc_idx`/`ev_soc_specs` in `_lp_scipy`; `ev_day0_requested`,
 per-slot `deferrable_soc_percent`, and the enriched `ev_soc_status` incl. `soc_limited`),
 `advisory/planner.py` (`defer_<i>_soc` trajectory keys) + `advisory/models.py`
@@ -689,7 +716,10 @@ per-slot `deferrable_soc_percent`, and the enriched `ev_soc_status` incl. `soc_l
 per-device measured-SOC fetch), `www/cards/grid-lens-power-chart-card.js`
 (`_deviceSocSeries`/`_deferSocNote`; `_deferSocEntities()` reads `soc_entity` off the
 `deferrable_loads` attribute), `www/cards/grid-lens-load-control-card.js`
-(`_socCapFor`/`_socCapHtml`).
+(`_socCapFor`/`_socCapHtml`) — and, for the live-enforcement half,
+`control/load_control_manager.py` (`_soc_cutoff_active`), `control/load_controller.py`
+(`DeferrableLoadController.apply`'s `soc_cutoff` param + `status()`'s `soc_cutoff` field),
+`control/modulating_controller.py` (`ModulatingLoadController.apply`/`modulate`).
 
 ---
 

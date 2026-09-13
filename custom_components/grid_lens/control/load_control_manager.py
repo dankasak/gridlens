@@ -54,6 +54,8 @@ from ..const import (
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_SETPOINT,
     CONF_DEFERRABLE_LOAD_SETPOINT_UNIT,
+    CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT,
+    CONF_DEFERRABLE_LOAD_SOC_SENSORS,
     CONF_DEFERRABLE_LOAD_SWITCHES,
     CONF_DEFERRABLE_LOAD_VOLTAGE,
     CONF_GRID_POWER_SENSOR,
@@ -120,6 +122,21 @@ _EXPORT_BIAS_W = 150.0
 # correction should overshoot toward the safe side rather than track the discharge exactly.
 _BATTERY_PRIORITY_BIAS_W = 150.0
 
+# Stuck-setpoint-while-importing watchdog (see _check_stuck_import) — added 2026-09-13
+# after the ac_output_cap headroom bug (GRIDLENS_CHECKLIST.md, same date) let a modulating
+# device's setpoint freeze mid-overshoot with a live, unchanging import for 5+ minutes and
+# nothing wrote it to the log; only a human noticing the household bill and asking "why is
+# this happening" surfaced it. This check is deliberately bug-agnostic — it doesn't know or
+# care WHICH clamp is stuck, only that one is, so it also catches whatever the *next* such
+# bug turns out to be. Below this import figure is ordinary CT/meter noise, not a real
+# overshoot worth a log line.
+_STUCK_IMPORT_THRESHOLD_W = 100.0
+# How long the setpoint must sit unchanged while importing above the threshold before this
+# warns — long enough that a normal deadband hold (one or two 30s ticks) or the plan's own
+# 5-minute-interval boundary never trips it, short enough that a genuinely stuck clamp is
+# caught well inside the same charging session rather than discovered after the fact.
+_STUCK_IMPORT_MIN_MINUTES = 3.0
+
 
 class LoadControlManager:
     def __init__(
@@ -155,6 +172,13 @@ class LoadControlManager:
         # ModulatingLoadController's module docstring — found on ha-wattpilot, 2026-09-11).
         start_buttons: list = list(d.get(CONF_DEFERRABLE_LOAD_START_BUTTON, []) or [])
         stop_buttons: list = list(d.get(CONF_DEFERRABLE_LOAD_STOP_BUTTON, []) or [])
+        # Per-device hard SOC ceiling (see const.py's CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT
+        # and _soc_cutoff_active below) — live-actuation enforcement, independent of and in
+        # addition to the LP's own planning-side use of these same two lists
+        # (advisory/coordinator.py._deferrable_for_horizon). "" sensor or a 100/unset
+        # max_percent means disabled for that device, matching the LP side's convention.
+        self._soc_sensors: list = list(d.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, []) or [])
+        self._soc_max_percent: list = list(d.get(CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT, []) or [])
         # Retained for Greedy Consumption's schedule lookup (_schedule_allows_now):
         # sensor_id is the schedule store's key for a device's stored weekly grid —
         # same source advisory/coordinator.py._deferrable_for_horizon already reads.
@@ -230,6 +254,11 @@ class LoadControlManager:
         # change without a config reload anyway. "" / missing = no sensor found, which makes
         # the surplus term fall back to "this device contributes nothing to the grid figure".
         self._device_power_sensors: dict[int, str] = {}
+        # Per-device state for _check_stuck_import: when the current "importing with an
+        # unchanging setpoint" streak began, the commanded_w it began at, and whether this
+        # streak has already been warned about (so it logs once per incident, not once per
+        # 30s tick for as long as the incident lasts).
+        self._import_stuck: dict[int, dict] = {}
         for i, sensor_id in enumerate(sensors):
             sw = switches[i] if i < len(switches) else ""
             setpoint = setpoints[i] if i < len(setpoints) else ""
@@ -564,6 +593,7 @@ class LoadControlManager:
                 battery_headroom_kwh=battery_headroom_kwh,
                 ac_output_headroom_w=ac_output_headroom_w,
                 min_export_price=self._min_export_price(),
+                soc_cutoff=self._soc_cutoff_active(index),
             )
         except Exception as err:  # noqa: BLE001 — a bad device tick must not kill the timer
             _LOGGER.error("Load control tick failed for %s: %s", self.controllers[index].name, err)
@@ -640,7 +670,62 @@ class LoadControlManager:
             await controller.modulate(target_w, now, source=source)
         except Exception as err:  # noqa: BLE001 — one bad device must not kill the timer
             _LOGGER.error("Modulation tick failed for %s: %s", controller.name, err)
+        else:
+            self._check_stuck_import(index, controller, now)
         self._notify(index)  # keep the card's live amps/kW and modulation_source current
+
+    def _check_stuck_import(
+        self, index: int, controller: "ModulatingLoadController", now: datetime
+    ) -> None:
+        """Warn once when this device's commanded setpoint sits unchanged for
+        ``_STUCK_IMPORT_MIN_MINUTES`` while the household keeps importing more than
+        ``_STUCK_IMPORT_THRESHOLD_W`` from the grid.
+
+        This is the generic shape of the 2026-09-13 ac_output_cap bug
+        (GRIDLENS_CHECKLIST.md): a control path that can hold an existing overshoot but
+        never correct it produces exactly this pattern — a live import that persists tick
+        after tick with zero further setpoint writes. Deliberately bug-agnostic: it reads
+        only the setpoint and the grid reading, not any clamp's internal reasoning, so it
+        also catches whatever the *next* stuck-clamp bug turns out to be, not just this
+        one. A real, working correction (the setpoint actually moving) resets the streak
+        every time, so an actively-converging control loop never trips this even while it
+        temporarily imports.
+
+        No grid power sensor configured, or momentarily unreadable, is silently skipped
+        (not warned about) — that gap is already covered by ``_warned_no_grid_power`` and
+        piling a second warning on top of it here would just be noise.
+        """
+        grid_w = self._read_grid_power_w()
+        commanded_w = controller.status().get("commanded_w") or 0.0
+        st = self._import_stuck.setdefault(
+            index, {"since": None, "setpoint_w": None, "warned": False}
+        )
+        importing = grid_w is not None and grid_w > _STUCK_IMPORT_THRESHOLD_W
+        setpoint_moved = (
+            st["setpoint_w"] is None or abs(commanded_w - st["setpoint_w"]) > 1e-6
+        )
+        if not importing or commanded_w <= 0.0 or setpoint_moved:
+            # Import cleared, device is off, or the setpoint just genuinely changed
+            # (including the very first observation) — (re)start the streak clean rather
+            # than warn on a control loop that IS moving.
+            st["since"] = now if importing and commanded_w > 0.0 else None
+            st["setpoint_w"] = commanded_w if importing and commanded_w > 0.0 else None
+            st["warned"] = False
+            return
+        elapsed_min = (now - st["since"]).total_seconds() / 60.0
+        if elapsed_min >= _STUCK_IMPORT_MIN_MINUTES and not st["warned"]:
+            status = controller.status()
+            _LOGGER.warning(
+                "Load control: %s has held %.0fW for %.1f min while the household "
+                "imports %.0fW from the grid — setpoint isn't correcting "
+                "(modulation_source=%s, note=%s, greedy_blocked=%s). Investigate the "
+                "active clamp; see GRIDLENS_CHECKLIST.md 2026-09-13 for the first known "
+                "cause of this pattern.",
+                controller.name, commanded_w, elapsed_min, grid_w,
+                status.get("modulation_source"), status.get("note"),
+                status.get("greedy_blocked"),
+            )
+            st["warned"] = True
 
     async def _modulation_target_w(self, index: int, now: datetime) -> tuple[float, str]:
         """Power (W) device ``index`` should be given right now, and which term set it.
@@ -947,6 +1032,39 @@ class LoadControlManager:
             return float(st.state)
         except (TypeError, ValueError):
             return None
+
+    def _soc_cutoff_active(self, index: int) -> bool:
+        """True when device ``index`` has a configured SOC sensor + ceiling
+        (CONF_DEFERRABLE_LOAD_SOC_SENSORS / CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT) and the
+        live reading is at/above that ceiling right now.
+
+        This is the live-actuation half of that config pair — see const.py's comment on
+        those two constants for the full incident this closes (2026-09-13): the LP's own
+        planning use of the same fields (advisory/coordinator.py._deferrable_for_horizon)
+        only ever shaped the *plan's* daily_kwh allocation, so Greedy Consumption's live
+        export-surplus/forecast-surplus terms — which know nothing about a device's
+        remaining SOC headroom — could and did keep commanding real current past the
+        configured ceiling.
+
+        Unlike that planning use, this does NOT need ``soc_capacity_kwh`` — a plain
+        percent compare is all a live stop/no-stop decision needs. No sensor configured,
+        no (or a 100%) ceiling configured, or an unreadable sensor all return False — same
+        fail-open discipline as every other optional input in this manager: a missing or
+        broken SOC sensor must never itself force a device off; it just means this
+        particular safety net is unavailable, and plan/greedy continue to decide normally.
+        """
+        if index >= len(self._soc_sensors):
+            return False
+        sensor_id = self._soc_sensors[index]
+        if not sensor_id:
+            return False
+        max_pct = self._soc_max_percent[index] if index < len(self._soc_max_percent) else 100.0
+        if not max_pct or max_pct >= 100.0:
+            return False
+        soc = self._read_percent(sensor_id)
+        if soc is None:
+            return False
+        return soc >= max_pct
 
     def _battery_headroom_w(self) -> Optional[float]:
         """Battery discharge headroom (W) available right now without dropping SOC below

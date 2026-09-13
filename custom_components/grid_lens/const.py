@@ -305,18 +305,29 @@ MODULATING_UNPLUGGED_STATES = frozenset(
 # not configured; the Power Flow card only shows a SOC figure + history link for devices
 # that have one set, same as it already does for the home battery's soc_entity.
 CONF_DEFERRABLE_LOAD_SOC_SENSORS = "deferrable_load_soc_sensors"  # list of sensor IDs ("" = none)
-# Optional per-device SOC ceiling + capacity, parallel to sensors — lets the LIVE
-# advisory/control optimizer stop scheduling further charge once a device's own SOC
-# sensor (above) nears a configured maximum, freeing that energy for other deferrable
-# loads or export rather than pushing the device past a limit its owner set on purpose
-# (e.g. an EV charged to 90% for battery longevity — not GridLens's call to override).
-# capacity_kwh converts the percentage ceiling into the kWh the LP reasons in; 0.0 (not
-# provided) leaves the device on the plain daily_kwh mechanism, unchanged. Only
-# advisory/coordinator.py's _deferrable_for_horizon wires in a live SOC reading and
-# activates this — plan_calculator.py's plan-comparison backtest never does (there is
-# no "current battery state" for a hypothetical past period), so it always falls
-# through to today's behaviour regardless of these being set. See
-# battery_optimizer.py's module docstring for the LP mechanics.
+# Optional per-device SOC ceiling + capacity, parallel to sensors — stops a device being
+# driven past a maximum its owner set on purpose (e.g. an EV charged to 85% for battery
+# longevity — not GridLens's call to override), freeing that energy for other deferrable
+# loads or export instead. capacity_kwh converts the percentage ceiling into the kWh the
+# LP reasons in for PLANNING; 0.0 (not provided) leaves the device on the plain daily_kwh
+# mechanism there, unchanged. advisory/coordinator.py's _deferrable_for_horizon wires in a
+# live SOC reading and activates this for the LP's forecast (plan_calculator.py's
+# plan-comparison backtest never does — there is no "current battery state" for a
+# hypothetical past period, so it always falls through to today's behaviour there).
+#
+# soc_max_percent is ALSO enforced directly in the live actuation path (added 2026-09-13,
+# see LoadControlManager._soc_cutoff_active) — capacity_kwh is NOT needed for that half,
+# only sensor + max_percent. This is the fix for a real incident: the LP-side cap above
+# only ever shaped the *plan's* daily_kwh allocation, so a device with Greedy Consumption
+# enabled kept getting real-time power from the live export-surplus/forecast-surplus
+# terms (control/load_control_manager.py._modulation_target_w) regardless of the plan —
+# those terms know nothing about a device's remaining SOC headroom. Concretely: a
+# Wattpilot/XPENG install had soc_max_percent=85 configured, the LP's own plan presumably
+# throttled toward it, but Greedy's live surplus kept commanding charge current from solar
+# surplus straight through 85% to 86%+ regardless, because nothing at that layer ever
+# consulted this cap. See GRIDLENS_CHECKLIST.md 2026-09-13. The live check is a hard,
+# override-all-terms interlock applied every tick — it does not touch or reduce the LP's
+# planning-side use of these same two fields above.
 CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT = "deferrable_load_soc_max_percent"    # list of float (100 = no cap)
 CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH = "deferrable_load_soc_capacity_kwh"  # list of float (0 = not provided)
 # Optional per-device Controlled Load register wiring, parallel to sensors. "" = not

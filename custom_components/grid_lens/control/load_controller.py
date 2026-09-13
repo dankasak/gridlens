@@ -154,6 +154,16 @@ class DeferrableLoadController:
         # parallel feature, so the master greedy switch still turns everything off.
         self._greedy_forecast_surplus = False
 
+        # Hard SOC interlock (see const.py's CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT and
+        # LoadControlManager._soc_cutoff_active): True while this device's own configured
+        # SOC sensor reads at/above its configured ceiling. Set by apply() every tick,
+        # read by ModulatingLoadController.modulate() on the faster 30s loop (the on/off
+        # controller has no second loop — apply() already actuates directly). Overrides
+        # every other term (plan, both greedy conditions, battery priority, AC output cap)
+        # — the one thing that can't ever raise it back is a manual override, which is
+        # checked first and stands down all of this, same as every other decision here.
+        self._soc_cutoff = False
+
         # Observability only — never read by any decision, only published by status()
         # (and from there onto the control switch's attributes, the Load Control card and
         # the Power Flow card). Which greedy condition fired on the last evaluated tick,
@@ -437,6 +447,7 @@ class DeferrableLoadController:
         battery_headroom_kwh: Optional[float] = None,
         ac_output_headroom_w: Optional[float] = None,
         min_export_price: float = 0.0,
+        soc_cutoff: bool = False,
     ) -> None:
         """Reconcile the switch toward the plan (plus Greedy Consumption, if enabled)
         for this tick.
@@ -446,6 +457,14 @@ class DeferrableLoadController:
         greedy "on" is exactly as chatter-protected as a plan-driven one. A drift
         re-assert (want == commanded but the hardware has moved) is NOT debounced — it
         restores the state we already intend, so there's no chatter risk.
+
+        ``soc_cutoff`` (``LoadControlManager._soc_cutoff_active``) is a hard interlock:
+        this device's own configured SOC sensor is at/above its configured ceiling.
+        Checked after the manual override (a human's explicit Force On still wins — see
+        the module docstring's override discipline) but before the plan/greedy decision,
+        and forces an immediate, debounce-free off — same urgency as an override, because
+        the whole point is to stop drawing current *now*, not after up to ``min_off``
+        seconds of hold.
         """
         if self._override is not None:
             self._note = f"override_{'on' if self._override else 'off'}"
@@ -460,6 +479,27 @@ class DeferrableLoadController:
             self._greedy_battery_headroom_kwh = None
             self._greedy_ac_output_headroom_w = None
             self._greedy_forecast_target_w = 0.0
+            return
+
+        if soc_cutoff != self._soc_cutoff:
+            self._soc_cutoff = soc_cutoff
+            if soc_cutoff:
+                _LOGGER.warning(
+                    "Load control: %s reached its configured SOC cutoff — stopping "
+                    "(see CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT)", self.name,
+                )
+        if soc_cutoff:
+            self._note = "soc_cutoff"
+            self._greedy_reason = None
+            self._greedy_blocked = "soc_cutoff"
+            self._greedy_free_kwh = None
+            self._greedy_needed_kwh = None
+            self._greedy_battery_headroom_w = None
+            self._greedy_battery_headroom_kwh = None
+            self._greedy_ac_output_headroom_w = None
+            self._greedy_forecast_target_w = 0.0
+            if self._commanded is not False:
+                await self._command(False, now)
             return
 
         greedy_on = self._greedy_wants_on(
@@ -644,6 +684,10 @@ class DeferrableLoadController:
             "greedy": self._greedy_enabled,
             "greedy_respects_schedule": self._greedy_respects_schedule,
             "greedy_forecast_surplus": self._greedy_forecast_surplus,
+            # Hard SOC interlock (see CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT). True means
+            # this device is being force-stopped regardless of plan/greedy, because its
+            # own configured SOC sensor is at/above its configured ceiling right now.
+            "soc_cutoff": self._soc_cutoff,
             # --- greedy observability (see the attributes' comment in __init__) ---
             # Which condition is holding the device on right now (None = greedy isn't the
             # reason it's on; the plan is, or it's off).

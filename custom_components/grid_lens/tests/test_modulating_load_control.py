@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import logging
 import os
 import sys
 import traceback
@@ -724,6 +725,107 @@ async def _run_button_pair_takes_priority_over_switch():
     await c.modulate(3000.0, _T0)
     assert len(_presses(hass, "button.start")) == 1
     assert not _turn_ons(hass), "switch was actuated even though buttons are configured"
+
+
+# ================================================================= SOC cutoff
+# See const.py's CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT and
+# LoadControlManager._soc_cutoff_active — added 2026-09-13 after a live incident: a
+# Wattpilot/XPENG install had this ceiling configured, but nothing in the live actuation
+# path ever consulted it, so Greedy Consumption's export-surplus term kept charging the
+# car straight through it. GRIDLENS_CHECKLIST.md, same date, has the full timeline.
+
+async def _run_soc_cutoff_forces_off_via_button():
+    """Already charging via the button pair; a soc_cutoff=True apply() call (which is all
+    the manager ever does — see LoadControlManager._tick_device) must stop it via the stop
+    button on the very next modulate(), regardless of what target_w is asked for."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    c = _mk(hass, start_button_entity_id="button.start", stop_button_entity_id="button.stop")
+    await c.modulate(3000.0, _T0)                      # on, 13 A
+    assert len(_presses(hass, "button.start")) == 1
+    await c.apply(5000.0, _T0 + timedelta(seconds=30), soc_cutoff=True)
+    assert c.status()["soc_cutoff"] is True
+    assert c.status()["greedy_blocked"] == "soc_cutoff"
+    await c.modulate(7000.0, _T0 + timedelta(seconds=30))   # a huge ask — must still stop
+    assert len(_presses(hass, "button.stop")) == 1
+    assert c._commanded is False
+    # Holding at cutoff must not re-press stop every tick (same write-economy discipline
+    # as any other steady "off").
+    await c.modulate(7000.0, _T0 + timedelta(seconds=60))
+    assert len(_presses(hass, "button.stop")) == 1
+
+
+async def _run_soc_cutoff_forces_off_via_plain_setpoint():
+    """The common OCPP/Easee/Wallbox shape (no button pair, 0 is a valid setpoint write) —
+    soc_cutoff must resolve to the same off-regardless-of-target outcome via a plain
+    number.set_value(0), not just the button-actuated path."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    c = _mk(hass)
+    await c.modulate(3000.0, _T0)
+    await c.apply(5000.0, _T0 + timedelta(seconds=30), soc_cutoff=True)
+    await c.modulate(6000.0, _T0 + timedelta(seconds=30))
+    assert _values(hass)[-1] == 0.0, _values(hass)
+
+
+async def _run_soc_cutoff_clears_when_soc_drops_back():
+    """Not a one-shot latch — the next apply() with soc_cutoff=False (SOC has since
+    dropped, or a new session started at a lower charge) must resume normal plan/greedy
+    control with no manual reset needed."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    c = _mk(hass)
+    await c.apply(5000.0, _T0, soc_cutoff=True)
+    await c.modulate(5000.0, _T0)
+    assert c._commanded is False
+    await c.apply(5000.0, _T0 + timedelta(seconds=30), soc_cutoff=False)
+    await c.modulate(5000.0, _T0 + timedelta(seconds=30))
+    assert c._commanded is True
+    assert c.status()["soc_cutoff"] is False
+
+
+async def _run_soc_cutoff_yields_to_manual_override():
+    """A human's explicit Force On is a deliberate command and still wins over the cutoff —
+    same discipline as every other decision in this file (plan, both greedy conditions,
+    battery priority, the AC output cap)."""
+    hass = FakeHass()
+    _evse(hass, mx=32, state="16")
+    c = _mk(hass)
+    await c.set_override(True, _T0)                     # Force On
+    await c.apply(0.0, _T0 + timedelta(seconds=30), soc_cutoff=True)
+    await c.modulate(1000.0, _T0 + timedelta(seconds=30))
+    assert c._commanded is True, "SOC cutoff overrode a manual Force On"
+
+
+async def _run_manager_soc_cutoff_overrides_greedy_surplus():
+    """End-to-end reproduction of the 2026-09-13 incident: a device with a configured SOC
+    ceiling, Greedy Consumption + forecast-surplus both on, and the house spilling far more
+    export than the device could ever use — the exact conditions that let a live SOC
+    reading sail past its configured cap. The cutoff must win regardless."""
+    m, hass = _mod_mgr(
+        grid_power_sensor="sensor.grid",
+        deferrable_load_soc_sensors=["sensor.car_soc"],
+        deferrable_load_soc_max_percent=[85.0],
+    )
+    _NOW[0] = _T0
+    m.set_plan(_plan(export_rate=0.0, dev_w=5000.0), updated_at=_T0)
+    await m.set_greedy(0, True)
+    hass.states.set("sensor.grid", "-8000")             # spilling 8 kW of solar
+    hass.states.set("sensor.evse_power", "0")
+    hass.states.set("sensor.car_soc", "86")              # already past the 85% ceiling
+    await m.set_entitled(True)
+    await m.enable(0)                                    # ticks + fast-ticks immediately
+    assert _values(hass) == [0.0], _values(hass)
+    assert m.controllers[0].status()["soc_cutoff"] is True
+
+    # Sanity: confirm the surplus term really would have driven this flat-out without the
+    # cutoff, by dropping SOC back below the ceiling and re-ticking both loops.
+    hass.states.set("sensor.car_soc", "70")
+    _NOW[0] = _T0 + timedelta(minutes=5)
+    m.set_plan(_plan(export_rate=0.0, dev_w=5000.0), updated_at=_NOW[0])
+    await m._tick(_NOW[0])
+    await m._fast_tick(_NOW[0])
+    assert _values(hass)[-1] > 0.0, "cutoff never lifted once SOC dropped back below it"
 
 
 async def _run_modulate_inert_under_override():
@@ -1517,6 +1619,76 @@ async def _run_manager_fast_tick_drives_setpoint():
     assert _values(hass) == [22.0, 10.0], _values(hass)
 
 
+class _ListLogHandler(logging.Handler):
+    """Captures formatted log messages for assertion — this suite has no pytest caplog."""
+
+    def __init__(self):
+        super().__init__()
+        self.records: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record.getMessage())
+
+
+async def _run_check_stuck_import_warns_after_threshold():
+    """The generic stuck-setpoint-while-importing watchdog (2026-09-13 — see
+    GRIDLENS_CHECKLIST.md's ac_output_cap entry, the bug this exists to catch the *next*
+    instance of). A plan that hands this device the exact same target every tick, with the
+    grid importing above the noise floor the whole time, is indistinguishable from a
+    control path that's frozen mid-overshoot — it must warn once the streak passes
+    ``_STUCK_IMPORT_MIN_MINUTES``, and not before, and only once per incident."""
+    m, hass = _mod_mgr(grid_power_sensor="sensor.grid")
+    handler = _ListLogHandler()
+    logger = logging.getLogger("gl.control.load_control_manager")
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    try:
+        _NOW[0] = _T0
+        hass.states.set("sensor.grid", "500")  # importing 500W, above the 100W floor
+        m.set_plan(_plan(dev_w=5000.0), updated_at=_T0)
+        await m.set_entitled(True)
+        await m.enable(0)
+        # Same plan -> same commanded_w -> a genuinely stuck setpoint every tick.
+        # _STUCK_IMPORT_MIN_MINUTES is 3.0 (180s) — stay silent strictly before that.
+        for i in range(1, 9):                  # up to 240s = 4 min of ticks
+            _NOW[0] = _T0 + timedelta(seconds=30 * i)
+            await m._fast_tick(_NOW[0])
+            if 30 * i < 180:
+                assert not any("isn't correcting" in r for r in handler.records), (
+                    i, handler.records
+                )
+        warnings = [r for r in handler.records if "isn't correcting" in r]
+        assert len(warnings) == 1, warnings    # exactly once, not re-logged every tick
+    finally:
+        logger.removeHandler(handler)
+
+
+async def _run_check_stuck_import_silent_while_converging():
+    """A control path that IS working — the target genuinely changes tick to tick — must
+    never trip the watchdog, even while it temporarily imports on the way to zero (exactly
+    what a healthy correction looks like immediately after an overshoot)."""
+    m, hass = _mod_mgr(grid_power_sensor="sensor.grid")
+    handler = _ListLogHandler()
+    logger = logging.getLogger("gl.control.load_control_manager")
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    try:
+        _NOW[0] = _T0
+        hass.states.set("sensor.grid", "500")  # importing the whole time
+        m.set_plan(_plan(dev_w=7000.0), updated_at=_T0)
+        await m.set_entitled(True)
+        await m.enable(0)
+        # A genuinely different target every tick -> the setpoint keeps moving, same shape
+        # as the real fix's step-down chase, so the streak resets each time.
+        for i in range(1, 9):
+            _NOW[0] = _T0 + timedelta(seconds=30 * i)
+            m.set_plan(_plan(dev_w=7000.0 - 500.0 * i), updated_at=_T0)
+            await m._fast_tick(_NOW[0])
+        assert not any("isn't correcting" in r for r in handler.records), handler.records
+    finally:
+        logger.removeHandler(handler)
+
+
 async def _run_manager_user_cap_reaches_controller():
     m, hass = _mod_mgr()
     _NOW[0] = _T0
@@ -1690,6 +1862,12 @@ if __name__ == "__main__":
         ("button_pair_no_repress_off", lambda: _run_async(_run_button_pair_repeated_off_does_not_repress_stop)),
         ("button_pair_override", lambda: _run_async(_run_button_pair_override_uses_buttons)),
         ("button_pair_beats_switch", lambda: _run_async(_run_button_pair_takes_priority_over_switch)),
+        # SOC cutoff (const.py's CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT, live enforcement)
+        ("soc_cutoff_forces_off_via_button", lambda: _run_async(_run_soc_cutoff_forces_off_via_button)),
+        ("soc_cutoff_forces_off_via_plain_setpoint", lambda: _run_async(_run_soc_cutoff_forces_off_via_plain_setpoint)),
+        ("soc_cutoff_clears_when_soc_drops_back", lambda: _run_async(_run_soc_cutoff_clears_when_soc_drops_back)),
+        ("soc_cutoff_yields_to_manual_override", lambda: _run_async(_run_soc_cutoff_yields_to_manual_override)),
+        ("manager_soc_cutoff_overrides_greedy_surplus", lambda: _run_async(_run_manager_soc_cutoff_overrides_greedy_surplus)),
         # cap
         ("current_cap_narrows", lambda: _run_async(_run_current_cap_narrows_envelope)),
         ("cap_zero_means_unknown", lambda: _run_async(_run_cap_zero_means_unknown_not_zero_allowed)),
@@ -1728,6 +1906,8 @@ if __name__ == "__main__":
         ("manager_fast_timer_lifecycle", lambda: _run_async(_run_manager_fast_timer_lifecycle)),
         ("pre_feature_entry_no_fast_timer", lambda: _run_async(_run_pre_feature_entry_has_no_fast_timer)),
         ("manager_fast_tick_drives_setpoint", lambda: _run_async(_run_manager_fast_tick_drives_setpoint)),
+        ("check_stuck_import_warns_after_threshold", lambda: _run_async(_run_check_stuck_import_warns_after_threshold)),
+        ("check_stuck_import_silent_while_converging", lambda: _run_async(_run_check_stuck_import_silent_while_converging)),
         ("manager_user_cap_reaches_controller", lambda: _run_async(_run_manager_user_cap_reaches_controller)),
         ("manager_fast_tick_skips_override", lambda: _run_async(_run_manager_fast_tick_skips_override)),
         ("manager_stale_plan_no_writes", lambda: _run_async(_run_manager_fast_tick_stale_plan_no_writes)),

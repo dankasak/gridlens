@@ -450,6 +450,7 @@ class ModulatingLoadController(DeferrableLoadController):
         battery_headroom_kwh: Optional[float] = None,
         ac_output_headroom_w: Optional[float] = None,
         min_export_price: float = 0.0,
+        soc_cutoff: bool = False,
     ) -> None:
         """Evaluate the plan and the greedy conditions for this slot — and write nothing.
 
@@ -458,7 +459,13 @@ class ModulatingLoadController(DeferrableLoadController):
         this plan figure with live surplus. Splitting it this way keeps a single writer (so
         the deadband and min-write-interval are never bypassed) while leaving every greedy
         evaluation, and all of its observability, on the same clock and in the same code as
-        the on/off controller's."""
+        the on/off controller's.
+
+        ``soc_cutoff`` is only *recorded* here (into ``self._soc_cutoff``) — this method
+        never writes the setpoint. ``modulate()`` is the actual actuator for this class and
+        reads the stashed flag directly, same pattern as ``_greedy_forecast_target_w``
+        (computed here by ``_greedy_wants_on``, consumed a moment later by the manager's
+        ``_modulation_target_w``)."""
         if self._override is not None:
             self._note = f"override_{'on' if self._override else 'off'}"
             # Mirror the parent exactly: greedy is not evaluated under an override, so its
@@ -471,6 +478,27 @@ class ModulatingLoadController(DeferrableLoadController):
             self._greedy_battery_headroom_kwh = None
             self._greedy_ac_output_headroom_w = None
             self._greedy_forecast_target_w = 0.0
+            return
+
+        if soc_cutoff != self._soc_cutoff:
+            self._soc_cutoff = soc_cutoff
+            if soc_cutoff:
+                _LOGGER.warning(
+                    "Load control: %s reached its configured SOC cutoff — stopping "
+                    "(see CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT)", self.name,
+                )
+        if soc_cutoff:
+            self._greedy_reason = None
+            self._greedy_blocked = "soc_cutoff"
+            self._greedy_free_kwh = None
+            self._greedy_needed_kwh = None
+            self._greedy_battery_headroom_w = None
+            self._greedy_battery_headroom_kwh = None
+            self._greedy_ac_output_headroom_w = None
+            self._greedy_forecast_target_w = 0.0
+            self._planned_w = 0.0
+            self._want_on = False
+            self._note = "soc_cutoff"
             return
 
         greedy_on = self._greedy_wants_on(
@@ -509,6 +537,17 @@ class ModulatingLoadController(DeferrableLoadController):
             # already issued by set_override(). Re-asserting it every 30 s would fight
             # whatever they do at the charger itself — a fresh connect is no exception, the
             # override stays hands-off until the human clears it.
+            return
+
+        if self._soc_cutoff:
+            # Hard interlock (see apply()'s docstring and const.py's
+            # CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT) — overrides plan, both greedy
+            # conditions, battery priority and the AC output cap alike. Deliberately
+            # ahead of the plug check: a cutoff device should read as "stopped by SOC",
+            # not "stopped because unplugged", if a caller ever inspects why. _write's own
+            # crossing logic means this only actually presses the stop button once (the
+            # genuine on->off transition), not on every 30s tick that follows.
+            await self._write(0.0, now, source="off", reason="soc_cutoff")
             return
 
         if plugged is False:

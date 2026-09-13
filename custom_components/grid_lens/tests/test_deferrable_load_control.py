@@ -229,6 +229,36 @@ async def _run_drift_reassert():
     assert len(_turn_ons(hass)) == 2                 # re-asserted despite same intent
 
 
+async def _run_soc_cutoff_bypasses_min_on_debounce():
+    """See const.py's CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT / LoadControlManager's
+    _soc_cutoff_active — apply(soc_cutoff=True) must stop the load immediately, not wait
+    out the ordinary min_on hold a ``want_on`` flip would otherwise be subject to. Without
+    this a device could keep drawing power for up to min_on_seconds after crossing its
+    configured SOC ceiling — the opposite of what the ceiling is for."""
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0,
+                                min_on_seconds=900, min_off_seconds=900)
+    await c.apply(1500.0, _T0)                       # on at t0
+    hass.states.set("switch.x", "on")
+    # Only 60s later — deep inside the 900s min_on hold a plain want_on=False would honour.
+    await c.apply(1500.0, _T0 + timedelta(seconds=60), soc_cutoff=True)
+    assert len(_turn_offs(hass)) == 1, "SOC cutoff was held by the min_on debounce"
+    assert c.status()["soc_cutoff"] is True
+    assert c.status()["greedy_blocked"] == "soc_cutoff"
+
+
+async def _run_soc_cutoff_yields_to_override():
+    """A human's explicit Force On still wins — same discipline as every other decision
+    here (checked first in apply(); soc_cutoff is never even evaluated under an override)."""
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
+    await c.set_override(True, _T0)
+    await c.apply(0.0, _T0 + timedelta(seconds=30), soc_cutoff=True)
+    assert len(_turn_offs(hass)) == 0, "SOC cutoff overrode a manual Force On"
+
+
 async def _run_command_error_is_safe():
     hass = FakeHass()
     hass.services.fail = True
@@ -393,6 +423,8 @@ if __name__ == "__main__":
         ("debounce_min_on", lambda: _run_async(_run_debounce_min_on)),
         ("debounce_min_off", lambda: _run_async(_run_debounce_min_off)),
         ("drift_reassert", lambda: _run_async(_run_drift_reassert)),
+        ("soc_cutoff_bypasses_min_on_debounce", lambda: _run_async(_run_soc_cutoff_bypasses_min_on_debounce)),
+        ("soc_cutoff_yields_to_override", lambda: _run_async(_run_soc_cutoff_yields_to_override)),
         ("command_error_is_safe", lambda: _run_async(_run_command_error_is_safe)),
         ("climate_actual_state", lambda: _run_async(_run_climate_actual_state)),
         ("climate_turn_on_off", lambda: _run_async(_run_climate_turn_on_off)),

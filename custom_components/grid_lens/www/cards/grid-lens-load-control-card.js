@@ -311,8 +311,16 @@ class GridLensLoadControlCard extends HTMLElement {
         types: ['change'],
       });
       const rows = (res && res[eid]) || [];
+      // `change` comes back in the sensor's own recorded unit — a Wh energy sensor (e.g.
+      // the Wattpilot's cumulative counter) reports change in Wh, not kWh, and the
+      // recorder API doesn't convert it. plan_calculator.py's _get_usage_data divides by
+      // 1000 for a "Wh" unit before ever calling it kWh; this sparkline skipped that
+      // conversion entirely, so an Wh-unit device's tooltip showed its raw Wh change
+      // labeled "kWh" — a 1000x-inflated number (e.g. "25545 kWh" for a 25.5 kWh charge).
+      const st = this._hass.states && this._hass.states[eid];
+      const divisor = (st && st.attributes && st.attributes.unit_of_measurement) === 'Wh' ? 1000.0 : 1.0;
       return rows
-        .map((r) => ({ start: new Date(r.start), kwh: r.change == null ? null : Math.max(0, +r.change) }))
+        .map((r) => ({ start: new Date(r.start), kwh: r.change == null ? null : Math.max(0, +r.change) / divisor }))
         .filter((d) => d.kwh != null && !isNaN(d.start.getTime()));
     } catch (e) {
       return null;
@@ -661,7 +669,22 @@ class GridLensLoadControlCard extends HTMLElement {
   }
 
   _greedyLine(a) {
-    if (!a || !a.greedy) return '';
+    if (!a) return '';
+    // Hard SOC interlock (const.py's CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT, enforced live
+    // since 2026-09-13) — checked ahead of the `!a.greedy` bail below because this can fire
+    // regardless of whether Greedy Consumption is even enabled for the device: it overrides
+    // the plan too, not just greedy. Without this branch a cutoff device with greedy off
+    // would show nothing at all here (silently stopped, no explanation on the row), and one
+    // with greedy on would fall through to the generic `greedy_blocked` branch further down
+    // and misreport "outside this load's availability window" — a schedule explanation for
+    // what is actually an SOC ceiling.
+    if (a.soc_cutoff) {
+      return `<div class="greedy-line" data-tip="${esc('This device reached its configured '
+        + 'SOC cutoff and is being stopped, regardless of the plan or Greedy Consumption. '
+        + 'Adjust Max SOC % in Grid Lens > Reconfigure if this is lower than intended.')}" tabindex="0">`
+        + `Stopped: SOC cutoff reached</div>`;
+    }
+    if (!a.greedy) return '';
     const reason = a.greedy_reason;
     if (reason) {
       let fcRate = '';
