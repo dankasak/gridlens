@@ -29,6 +29,7 @@
           <li><a href="#deferrable">Deferrable loads</a></li>
           <li><a href="#schedules">Allowed run times</a></li>
           <li><a href="#boost">Today Boost</a></li>
+          <li><a href="#charge-target">Charge target</a></li>
           <li><a href="#api-key">API key</a></li>
         </ul>
         <div class="section-title">Automation</div>
@@ -131,6 +132,18 @@
         <p>A small bar chart next to the input shows each device's actual daily use over the last two weeks, with the average of those days beside it — so you can see what "typical" is before deciding how far above it to go.</p>
         <p>If you ask for more than the load's allowed window can physically deliver, the card shows you that ceiling rather than silently ignoring the excess.</p>
         <p>If a load has its own battery with a charge ceiling set (an EV charged only to, say, 90%), and today it starts already close to that ceiling, Grid Lens can only schedule the charge that fits underneath it — which may be well below the 14-day average. When that happens the row shows a <strong>&ldquo;SOC-limited&rdquo;</strong> line with what it scheduled versus the usual amount; raise the load's <strong>Max SOC %</strong> under Configure to allow more.</p>
+
+        <h2 id="charge-target">Charge target</h2>
+        <p>Today Boost tells Grid Lens how much energy a load needs today — but not <em>by when</em>. If you're heading off on a long drive and want the car at 100% by a specific time, set a <strong>charge target</strong> instead: a percentage and a deadline, on any load with an SOC sensor and capacity configured (the same setup Today Boost's SOC-limited ceiling uses).</p>
+        <p>Grid Lens still picks the cheapest, most solar-heavy slots between now and your deadline — it only forces full-power charging in the run-up if that's what it takes to make the target in time. It's not the same as forcing the load <strong>On</strong>, which charges flat-out immediately regardless of price.</p>
+        <p>Find it on the Grid Lens dashboard under <strong>Settings → Charge Targets</strong> — one row per eligible load, with a percentage field and a date/time field. Set both to activate; leaving the percentage at 0 cancels it. It's also available as two Home Assistant services, <code>grid_lens.set_charge_target</code> and <code>grid_lens.clear_charge_target</code>, for scripts and automations.</p>
+        <p>The target clears itself automatically once the load reaches it, or once the deadline passes — nothing to remember to turn back off.</p>
+        <div class="note">
+          <strong>Above your everyday charge ceiling?</strong> A target percentage higher than the load's configured Max SOC % (see <a href="#boost">Today Boost</a>) is allowed — Grid Lens raises the ceiling for that one occasion, then returns to your everyday limit once it's done.
+        </div>
+        <div class="note">
+          <strong>Only within the planning horizon.</strong> Grid Lens plans roughly 24&ndash;48 hours ahead. A deadline further out than that isn't ignored, just not yet accounted for — it's picked up and treated normally once it comes within range on a later replan.
+        </div>
 
         <h2 id="battery-control">Battery control</h2>
         <p>Comparison and planning are read-only. Battery control is the optional step where Grid Lens actually operates your inverter to follow the plan it found.</p>
