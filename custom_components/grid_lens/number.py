@@ -22,6 +22,8 @@ from .const import (
     CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_SETPOINT,
     CONF_DEFERRABLE_LOAD_MIN_CURRENT,
+    CONF_DEFERRABLE_LOAD_SOC_SENSORS,
+    CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH,
     DEFAULT_SUPPLY_VOLTAGE,
     DEFAULT_MIN_CHARGE_CURRENT_A,
 )
@@ -112,6 +114,27 @@ async def async_setup_entry(
             max_kw = max_kws[i] if i < len(max_kws) else 3.5
             entities.append(
                 GridLensDeferrableOverrideNumber(entry, store, sensor_id, name, max_kw)
+            )
+
+    # One ad-hoc charge-target percent per SOC-tracked deferrable device (paired with a
+    # matching datetime.*_charge_target_time entity in datetime.py) — "100% by 7am
+    # Saturday" before a trip. Gated on soc_sensor + soc_capacity_kwh being configured,
+    # not on CONF_DEFERRABLE_LOAD_SENSORS alone: the target math needs a live SOC
+    # reading and a capacity to compute how many kWh are actually needed, the same
+    # requirement the day-0 SOC ceiling mechanism already has.
+    soc_sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, [])
+    soc_capacities = entry.data.get(CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH, [])
+    if soc_sensors:
+        target_store = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_charge_targets")
+        for i, soc_sensor_id in enumerate(soc_sensors):
+            capacity = soc_capacities[i] if i < len(soc_capacities) else 0.0
+            if not soc_sensor_id or not capacity:
+                continue
+            if i >= len(sensors) or not sensors[i]:
+                continue
+            name = _device_display_name(hass, sensors[i])
+            entities.append(
+                GridLensChargeTargetPercentNumber(entry, target_store, sensors[i], name)
             )
 
     # One "max current" ceiling per modulating ("type 2") deferrable device — a user cap
@@ -249,6 +272,90 @@ class GridLensDeferrableOverrideNumber(NumberEntity):
     async def async_set_native_value(self, value: float) -> None:
         if self._store is not None:
             await self._store.async_set(self._sensor_id, value)
+        self._attr_native_value = value if value > 0 else 0.0
+        self.async_write_ha_state()
+
+
+class GridLensChargeTargetPercentNumber(NumberEntity):
+    """The percent half of an ad-hoc, one-off charge target — e.g. "100%" of "100% by
+    7am Saturday" before a trip — paired with datetime.py's
+    GridLensChargeTargetTimeDateTime for the deadline half. 0 = no target (the
+    companion datetime entity's value is then ignored — see charge_target.read_target,
+    both halves are required for a target to be considered set).
+
+    Unlike GridLensDeferrableOverrideNumber's "Today Boost" (no natural end condition,
+    so it persists until manually cleared), this target auto-clears itself once the
+    live SOC reaches it or its own deadline passes (ChargeTargetStore.async_get_active)
+    — so this entity's displayed value can go back to 0 on its own between visits,
+    same as an alarm clock resetting once it's gone off, not a bug.
+
+    Reads/writes through the shared ChargeTargetStore, merging with whatever the
+    companion datetime entity already wrote — writing only this half must not blank
+    out an already-set deadline (or vice versa in the datetime entity).
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:battery-clock"
+    _attr_native_min_value = 0.0
+    _attr_native_max_value = 100.0
+    _attr_native_step = 1.0
+    _attr_native_unit_of_measurement = "%"
+    _attr_mode = NumberMode.BOX
+
+    def __init__(self, entry: ConfigEntry, store, sensor_id: str, name: str) -> None:
+        self._store = store
+        self._entry_id = entry.entry_id
+        self._sensor_id = sensor_id
+        self._attr_name = f"{name} Charge Target Percent"
+        self._attr_unique_id = f"{entry.entry_id}_charge_target_percent_{sensor_id}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_native_value = 0.0
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        await self._refresh_from_store()
+        if self._store is not None:
+            from .charge_target_store import update_signal
+            from homeassistant.helpers.dispatcher import async_dispatcher_connect
+
+            async def _on_update(sensor_id: str) -> None:
+                if sensor_id == self._sensor_id:
+                    await self._refresh_from_store()
+                    self.async_write_ha_state()
+
+            self.async_on_remove(
+                async_dispatcher_connect(
+                    self.hass, update_signal(self._entry_id), _on_update,
+                )
+            )
+
+    async def _refresh_from_store(self) -> None:
+        # Re-reads whatever is currently stored — used both on startup and whenever the
+        # OTHER write path (the grid_lens.set_charge_target/clear_charge_target services,
+        # or the store's own auto-clear-on-reach-or-expiry) changes the target out from
+        # under this entity, so it doesn't keep showing a stale value it didn't itself
+        # write (see charge_target_store.update_signal).
+        if self._store is None:
+            return
+        raw = await self._store.async_get_raw(self._sensor_id)
+        self._attr_native_value = raw["percent"] if raw else 0.0
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        # charge_target_role distinguishes this from a plain Today Boost number (which
+        # carries deferrable_sensor_id too, but not this) — grid-lens-charge-target-card.js
+        # pairs this with the matching datetime entity by deferrable_sensor_id.
+        return {"deferrable_sensor_id": self._sensor_id, "charge_target_role": "percent"}
+
+    async def async_set_native_value(self, value: float) -> None:
+        if self._store is not None:
+            existing = await self._store.async_get_raw(self._sensor_id)
+            target_iso = existing["target_iso"] if existing else ""
+            await self._store.async_set(self._sensor_id, value, target_iso)
         self._attr_native_value = value if value > 0 else 0.0
         self.async_write_ha_state()
 

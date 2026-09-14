@@ -112,6 +112,15 @@ def _install_stubs() -> None:
     sys.modules["gl.advisory.demand"] = dm
     dm_spec.loader.exec_module(dm)
 
+    # charge_target.py (ad-hoc dated charge target maths) is import-free too — load the
+    # real module rather than stub it, same reasoning as schedule_grid/demand above.
+    ct_spec = importlib.util.spec_from_file_location(
+        "gl.charge_target", os.path.join(_COMPONENT, "charge_target.py")
+    )
+    ct_mod = importlib.util.module_from_spec(ct_spec)
+    sys.modules["gl.charge_target"] = ct_mod
+    ct_spec.loader.exec_module(ct_mod)
+
 
 def _load_coordinator():
     _install_stubs()

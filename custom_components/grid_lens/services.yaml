@@ -35,6 +35,55 @@ clear_deferrable_schedule:
       selector:
         text:
 
+set_charge_target:
+  name: Set Ad-Hoc Charge Target
+  description: >
+    Set a one-off "charge to X% by a datetime" target on an SOC-tracked deferrable
+    load (e.g. an EV) — "100% by 7am Saturday" before a trip. The optimizer still
+    chooses the cheapest slots between now and the deadline, only forcing full-power
+    charging if it must to guarantee the target is met in time. Auto-clears itself
+    once the live SOC reaches the target or the deadline passes — no need to clear it
+    manually after use. Equivalent to setting the device's charge-target percent and
+    datetime entities by hand; only works on a device with an SOC sensor + capacity
+    configured (integration reconfigure options).
+  fields:
+    sensor_id:
+      name: Device energy sensor
+      description: The deferrable device's configured energy sensor entity id (its canonical key).
+      required: true
+      example: "sensor.ev_charger_energy"
+      selector:
+        text:
+    target_percent:
+      name: Target percent
+      description: The SOC percent to reach by target_datetime (0-100).
+      required: true
+      example: 100
+      selector:
+        number:
+          min: 1
+          max: 100
+          unit_of_measurement: "%"
+    target_datetime:
+      name: Target datetime
+      description: When the device must have reached target_percent.
+      required: true
+      example: "2026-09-20 07:00:00"
+      selector:
+        datetime:
+
+clear_charge_target:
+  name: Clear Ad-Hoc Charge Target
+  description: Cancel a deferrable load's ad-hoc charge target, if one is set.
+  fields:
+    sensor_id:
+      name: Device energy sensor
+      description: The deferrable device's configured energy sensor entity id.
+      required: true
+      example: "sensor.ev_charger_energy"
+      selector:
+        text:
+
 calculate_period:
   name: Calculate Plan Data for Period
   description: Calculate and populate all plan sensors for a specified date range. This will run optimization for each plan and create hourly data you can graph.

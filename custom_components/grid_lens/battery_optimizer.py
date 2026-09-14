@@ -29,10 +29,17 @@ LP formulation (per hour t):
                      the device still gets its usual energy UNLESS it's already close
                      enough to the ceiling that the full amount would overshoot it — in
                      which case the shortfall is freed for other deferrable loads or
-                     export. Scoped to day 0 only (see ev_soc_idx in _lp_scipy for why:
-                     this model has no driving/discharge forecast, so a multi-day
-                     ceiling constraint would go infeasible once a day starts already
-                     full); day 1+ stays on the flat mechanism above, unchanged.
+                     export. Scoped to day 0 only by default (see ev_soc_idx in
+                     _lp_scipy for why: this model has no driving/discharge forecast,
+                     so a RECURRING multi-day ceiling constraint would go infeasible
+                     once a day starts already full); day 1+ stays on the flat
+                     mechanism above, unchanged — UNLESS an ad-hoc, one-off dated
+                     charge target is active for the device (grid_lens.set_charge_target,
+                     e.g. "100% by 7am Saturday" before a trip), which extends both the
+                     tracking window and the floor's own deadline out to the target's
+                     slot, even into day 1+. A one-off dated floor carries none of the
+                     recurring case's infeasibility risk — it is a single bounded
+                     constraint that stops applying once its slot passes.
     Capped rates   : for hours inside a capped-rate window w (e.g. GloBird ZEROHERO's
                      50 kWh/day free import window), P_imp[t] splits into a free
                      tranche and an over-cap tranche: P_imp[t] = free_w[t] + over_w[t],
@@ -713,6 +720,25 @@ class BatteryOptimizer:
         day0_slots = min(slots_per_day, T)
         ev_soc_idx: dict[int, int] = {}      # device index -> its SOC variable block start
         ev_soc_specs: dict[int, dict] = {}    # device index -> {capacity_kwh, max_kwh, initial_kwh, eta}
+        # Per-device SOC-tracking/floor windows for an ad-hoc dated charge target
+        # (grid_lens.set_charge_target — "100% by 7am Saturday"). Two separate slot
+        # counts per device:
+        #   track_slots — how far the state-variable/ceiling machinery below extends.
+        #                 Always at least day0_slots (today's existing ceiling
+        #                 enforcement, unchanged when no target is active) and further
+        #                 out to the target slot when one is set, even into day 1+.
+        #   floor_slot  — where the "must have charged X by now" floor actually binds.
+        #                 day0_slots (midnight) with no target; the target's own slot
+        #                 otherwise — which may be EARLIER than day0_slots (a same-day
+        #                 afternoon deadline) or later (overnight/next-day).
+        # Extending past day 0 is safe here in a way a recurring constraint would not be:
+        # the day-0-only restriction below exists because a RECURRING "hit the ceiling
+        # every day" floor goes infeasible the moment a later day starts already full (no
+        # driving/departure model). A one-off dated floor has no recurrence — it is a
+        # single bounded constraint that simply stops applying once its slot passes, so
+        # it carries none of that risk.
+        track_slots: dict[int, int] = {}
+        floor_slot: dict[int, int] = {}
         for i, dev in enumerate(deferrable_loads):
             capacity = float(dev.get('soc_capacity_kwh') or 0.0)
             initial_percent = dev.get('soc_initial_percent')
@@ -720,6 +746,15 @@ class BatteryOptimizer:
                 continue
             max_percent = float(dev.get('soc_max_percent', 100.0) or 100.0)
             eta_ev = float(dev.get('soc_charge_efficiency_percent', 90.0) or 90.0) / 100.0
+            target_percent = dev.get('charge_target_percent')
+            target_slot = dev.get('charge_target_slot')
+            has_target = bool(target_percent) and target_slot is not None and int(target_slot) > 0
+            # A one-off target asking for MORE than the standing longevity ceiling (e.g.
+            # 100% for a trip against an everyday 80% cap) must be able to raise it for
+            # this occasion — otherwise the very ceiling this mechanism enforces would
+            # silently block the request the user explicitly asked for.
+            if has_target:
+                max_percent = max(max_percent, float(target_percent))
             ev_soc_idx[i] = n
             n += T
             ev_soc_specs[i] = {
@@ -730,6 +765,8 @@ class BatteryOptimizer:
                 'max_percent': max_percent,
                 'eta': eta_ev,
             }
+            floor_slot[i] = min(T, int(target_slot)) if has_target else day0_slots
+            track_slots[i] = max(day0_slots, floor_slot[i])
 
         # Capped-rate windows (e.g. GloBird ZEROHERO's 50 kWh/day free import window):
         # for each hour inside a window, imp[t] (or exp[t]) is decomposed into a free
@@ -901,8 +938,10 @@ class BatteryOptimizer:
         for i, idx in ev_soc_idx.items():
             # lb stays 0 (np.zeros default) — this model never discharges the device, so a
             # floor below 0 is not meaningful. Bounded uniformly across the whole T-length
-            # block for simplicity; only day0_slots entries are ever tied to anything by an
-            # equality row below, so the rest just float within these bounds, unused.
+            # block for simplicity; only the device's own track_slots[i] entries (day 0,
+            # or further out under an active ad-hoc charge target) are ever tied to
+            # anything by an equality row below, so the rest just float within these
+            # bounds, unused.
             #
             # max(..., initial_kwh): the ceiling constrains how much MORE the LP may charge —
             # it must never be allowed to fall below the device's live reading, or the t=0
@@ -929,17 +968,23 @@ class BatteryOptimizer:
         # (imp[t] or exp[t] = free tranche + over-cap tranche for that hour).
         n_full_days = n_days - len(truncated_days)
         cap_link_rows = sum(len(cb["hours"]) for cb in cap_blocks)
-        # Devices with SOC tracking (ev_soc_idx) get day 0 pulled OUT of the ordinary
-        # per-day equality below (replaced by their own SOC state-update rows further
-        # down) — but only if day 0 would otherwise have contributed one, i.e. it isn't
-        # itself a truncated chunk (a horizon shorter than one day, where day 0 is
-        # already a ≤-cap row in A_ub, not an equality here).
-        day0_truncated = 0 in truncated_days
+        # Devices with SOC tracking (ev_soc_idx) get their tracked window pulled OUT of
+        # the ordinary per-day equality below (replaced by their own SOC state-update
+        # rows further down) — one flat-equality row is displaced for every
+        # non-truncated day-chunk the window touches (normally just day 0; further out
+        # when an ad-hoc charge target extends track_slots past midnight, see
+        # track_slots above). A truncated chunk never contributed an equality row to
+        # begin with (it's already a ≤-cap row in A_ub), so it displaces nothing.
         n_ev_soc = len(ev_soc_idx)
+        n_track_days = {i: math.ceil(track_slots[i] / slots_per_day) for i in ev_soc_idx}
+        displaced_full_day_rows = sum(
+            sum(1 for d in range(n_track_days[i]) if d not in truncated_days)
+            for i in ev_soc_idx
+        )
         n_eq = (
             2*T + N * n_full_days
-            - (n_ev_soc if not day0_truncated else 0)
-            + n_ev_soc * day0_slots
+            - displaced_full_day_rows
+            + sum(track_slots.values())
             + cap_link_rows
         )
         A_eq = lil_matrix((n_eq, n))
@@ -996,14 +1041,21 @@ class BatteryOptimizer:
         # notice per device, from the first full day-chunk that binds.
         clamped: dict[int, dict] = {}
         first_target: dict[int, float] = {}
-        ev_day0_target: dict[int, float] = {}  # device idx -> floor kWh for day 0 (SOC path)
-        ev_day0_requested: dict[int, float] = {}  # device idx -> UN-clamped day-0 target (SOC path)
+        ev_day0_target: dict[int, float] = {}  # device idx -> floor kWh (SOC path; see floor_slot)
+        ev_day0_requested: dict[int, float] = {}  # device idx -> UN-clamped floor target (SOC path)
         eq_row = 2 * T
         for i, dev in enumerate(deferrable_loads):
             mask = dev.get('hour_mask')
             for d in range(n_days):
                 t0 = d * slots_per_day
                 t1 = min(t0 + slots_per_day, T)
+                # SOC-tracked devices (ev_soc_idx) have every day-chunk their tracked
+                # window touches handled entirely below by their own state variable +
+                # floor row — never by this flat equality/cap, or the two would fight
+                # (this one has no notion of the device's live headroom under its
+                # configured ceiling, and could force it past that ceiling).
+                if i in ev_soc_idx and t0 < track_slots[i]:
+                    continue
                 # Fraction-aware: a 0.5-masked slot contributes half a slot of
                 # deliverable capacity (see the ub scaling above).
                 avail_slots = (
@@ -1012,32 +1064,6 @@ class BatteryOptimizer:
                 requested = dev['daily_kwh'] * (t1 - t0) / slots_per_day
                 deliverable = avail_slots * dev['max_kw'] * dt
                 target = min(requested, deliverable)
-                # Day 0 of an SOC-tracked device (ev_soc_idx) is handled entirely below by
-                # its own state variable + floor row — never by this flat equality/cap, or
-                # the two would fight (this one has no notion of the device's live headroom
-                # under its configured ceiling, and could force it past that ceiling).
-                if d == 0 and i in ev_soc_idx:
-                    headroom = (
-                        max(0.0, ev_soc_specs[i]['max_kwh'] - ev_soc_specs[i]['initial_kwh'])
-                        / ev_soc_specs[i]['eta']
-                    )
-                    ev_target = min(requested, deliverable, headroom)
-                    ev_day0_target[i] = ev_target
-                    ev_day0_requested[i] = requested
-                    first_target.setdefault(i, ev_target)
-                    if requested - ev_target > 1e-6:
-                        clamped[i] = {
-                            'name': dev.get('name') or f"device {i}",
-                            'sensor_id': dev.get('sensor_id'),
-                            'requested_kwh': requested,
-                            'deliverable_kwh': min(deliverable, headroom),
-                            'available_hours': avail_slots * dt,
-                            'max_kw': dev['max_kw'],
-                            'reason': (
-                                'soc_ceiling' if headroom < deliverable else 'availability_window'
-                            ),
-                        }
-                    continue
                 # Truncated chunks are a ≤ cap, not an equality (see above), so falling
                 # short there is by design and not worth reporting as a lost target.
                 if d not in truncated_days:
@@ -1060,15 +1086,61 @@ class BatteryOptimizer:
                     b_eq[eq_row] = target
                     eq_row += 1
 
-        # SOC state-update equality rows for day 0 of each SOC-tracked device:
+        # SOC-tracked devices' floor: how much each must have charged by its own
+        # floor_slot (day0_slots/midnight with no active target; the target's own slot
+        # otherwise — see track_slots/floor_slot above). One pass per device rather than
+        # per day-chunk, since the window can now span more than one day-chunk.
+        for i in ev_soc_idx:
+            dev = deferrable_loads[i]
+            spec = ev_soc_specs[i]
+            fslot = floor_slot[i]
+            mask = dev.get('hour_mask')
+            avail = sum(float(mask[t]) for t in range(fslot)) if mask else float(fslot)
+            deliverable = avail * dev['max_kw'] * dt
+            target_percent = dev.get('charge_target_percent')
+            target_slot = dev.get('charge_target_slot')
+            has_target = bool(target_percent) and target_slot is not None and int(target_slot) > 0
+            if has_target:
+                gap_kwh = max(
+                    0.0,
+                    (float(target_percent) - spec['initial_percent']) / 100.0 * spec['capacity_kwh'],
+                )
+                requested = gap_kwh / spec['eta']
+            else:
+                requested = dev['daily_kwh'] * fslot / slots_per_day
+            headroom = max(0.0, spec['max_kwh'] - spec['initial_kwh']) / spec['eta']
+            ev_target = min(requested, deliverable, headroom)
+            ev_day0_target[i] = ev_target
+            ev_day0_requested[i] = requested
+            first_target.setdefault(i, ev_target)
+            if requested - ev_target > 1e-6:
+                if headroom < min(requested, deliverable):
+                    reason = 'soc_ceiling'
+                elif has_target:
+                    reason = 'deadline_infeasible'
+                else:
+                    reason = 'availability_window'
+                clamped[i] = {
+                    'name': dev.get('name') or f"device {i}",
+                    'sensor_id': dev.get('sensor_id'),
+                    'requested_kwh': requested,
+                    'deliverable_kwh': min(deliverable, headroom),
+                    'available_hours': avail * dt,
+                    'max_kw': dev['max_kw'],
+                    'reason': reason,
+                }
+
+        # SOC state-update equality rows for each SOC-tracked device, across its own
+        # track_slots window (day 0 only with no active target; further out — even into
+        # day 1+ — when an ad-hoc charge target's deadline extends past midnight):
         #   ev_soc[i,0] = initial_kwh_i                          (t = 0)
-        #   ev_soc[i,t] = ev_soc[i,t-1] + eta_i · def_i[t]        (t = 1 .. day0_slots-1)
+        #   ev_soc[i,t] = ev_soc[i,t-1] + eta_i · def_i[t]        (t = 1 .. track_slots[i]-1)
         # Structurally caps charge at the configured ceiling via the ub bound set above —
         # the floor row below (A_ub) is the only thing that can still force charging.
         for i, idx in ev_soc_idx.items():
             spec = ev_soc_specs[i]
             def_col0 = (5 + i) * T
-            for t in range(day0_slots):
+            for t in range(track_slots[i]):
                 A_eq[eq_row, idx + t] = 1.0
                 if t == 0:
                     b_eq[eq_row] = spec['initial_kwh']
@@ -1162,13 +1234,14 @@ class BatteryOptimizer:
                 A_ub[r, col] = 1.0
             b_ub[r] = b_val
             r += 1
-        # SOC-tracked devices' day-0 floor: Σ def_i[t] (t in day 0) >= ev_day0_target[i] —
-        # "charge at least what a typical day needs, clamped to what real headroom under the
-        # ceiling allows" (see the ev_day0_target computation above). Encoded as
-        # -Σ def_i[t] <= -target for linprog's A_ub·x <= b_ub form.
+        # SOC-tracked devices' floor: Σ def_i[t] (t in [0, floor_slot[i])) >= ev_day0_target[i]
+        # — "charge at least what's needed by the device's own floor slot, clamped to what
+        # real headroom under its (possibly target-raised) ceiling allows" (see the
+        # per-device floor computation above). Encoded as -Σ def_i[t] <= -target for
+        # linprog's A_ub·x <= b_ub form.
         for i in ev_soc_idx:
             def_col0 = (5 + i) * T
-            for t in range(day0_slots):
+            for t in range(floor_slot[i]):
                 A_ub[r, def_col0 + t] = -1.0
             b_ub[r] = -ev_day0_target.get(i, 0.0)
             r += 1
@@ -1314,12 +1387,15 @@ class BatteryOptimizer:
         # Per-slot predicted SOC for each SOC-tracked device, integrated from the FINAL
         # (post-consolidation) per-device energy so the curve a card plots lines up with the
         # deferrable bars drawn beside it — reading x[ev_soc_idx+t] straight would give the
-        # pre-consolidation trajectory instead. Day 0 only: past day0_slots the device is
-        # back on the flat daily_kwh mechanism, which has no notion of the ceiling and would
-        # walk SOC past 100%. Keyed by device index (sparse — only SOC-tracked devices).
+        # pre-consolidation trajectory instead. Bounded by the device's own track_slots
+        # window (day 0 only with no active target, further out for an ad-hoc charge
+        # target): past that point the device is back on the flat daily_kwh mechanism,
+        # which has no notion of the ceiling and would walk SOC past 100%. Keyed by device
+        # index (sparse — only SOC-tracked devices).
         for i, spec in ev_soc_specs.items():
             soc_kwh = spec['initial_kwh']
-            for t in range(min(day0_slots, len(schedule))):
+            tslots = track_slots.get(i, day0_slots)
+            for t in range(min(tslots, len(schedule))):
                 row = schedule[t]
                 per_dev = row.get('deferrable_per_device') or []
                 e = per_dev[i] if i < len(per_dev) else 0.0
@@ -1350,6 +1426,17 @@ class BatteryOptimizer:
                     "overcharge it. The freed %.1f kWh is available for other deferrable "
                     "loads or export instead.",
                     c['name'], c['requested_kwh'], c['deliverable_kwh'],
+                    c['requested_kwh'] - c['deliverable_kwh'],
+                )
+            elif c.get('reason') == 'deadline_infeasible':
+                _LOGGER.warning(
+                    "Deferrable '%s': ad-hoc charge target needs %.1f kWh but only %.1f kWh "
+                    "is reachable before its deadline (%.1f allowed hours @ %.1f kW) — it "
+                    "will fall %.1f kWh short. Set an earlier target percent or a later "
+                    "deadline, or widen the device's weekly schedule, for the full target "
+                    "to be met in time.",
+                    c['name'], c['requested_kwh'], c['deliverable_kwh'],
+                    c['available_hours'], c['max_kw'],
                     c['requested_kwh'] - c['deliverable_kwh'],
                 )
             else:
@@ -1403,20 +1490,24 @@ class BatteryOptimizer:
                     cb["rate_after_cap"], free_total, over_total,
                     cb.get("cap_application", "strict"), len(rows), budget,
                 )
-        # Per SOC-tracked device: how day 0 actually played out, for the dashboard/advisory
-        # card to show alongside the plain deferrable-device figures (see ev_soc_idx above).
+        # Per SOC-tracked device: how its tracked window actually played out, for the
+        # dashboard/advisory card to show alongside the plain deferrable-device figures
+        # (see ev_soc_idx above). Window is day 0 only unless an ad-hoc charge target
+        # extended it (track_slots/floor_slot above).
         ev_soc_status = []
         for i, idx in ev_soc_idx.items():
             spec = ev_soc_specs[i]
             dev = deferrable_loads[i]
-            final_kwh = max(0.0, x[idx + day0_slots - 1])
-            day0_charge = sum(max(0.0, x[(5 + i) * T + t]) for t in range(day0_slots))
-            # The un-clamped day-0 target (a typical day's charge, from the 14-day average
-            # or a Today Boost) vs what actually fit under the ceiling. soc_limited is the
-            # flag both cards key off: the device reached its configured ceiling AND we
-            # wanted to put more in. unmet_kwh is that shortfall (plug-side kWh);
-            # target_percent is where SOC would have landed without the ceiling, which the
-            # power chart shades the gap up to.
+            tslots = track_slots.get(i, day0_slots)
+            final_kwh = max(0.0, x[idx + tslots - 1])
+            day0_charge = sum(max(0.0, x[(5 + i) * T + t]) for t in range(tslots))
+            # The un-clamped floor target (a typical day's charge, from the 14-day average
+            # or a Today Boost — or the ad-hoc target's SOC gap, if one is active) vs what
+            # actually fit under the ceiling. soc_limited is the flag both cards key off:
+            # the device reached its configured ceiling AND we wanted to put more in.
+            # unmet_kwh is that shortfall (plug-side kWh); target_percent is where SOC
+            # would have landed without the ceiling, which the power chart shades the gap
+            # up to.
             requested_kwh = ev_day0_requested.get(i, day0_charge)
             unmet_kwh = max(0.0, requested_kwh - day0_charge)
             ceiling_hit = final_kwh >= spec['max_kwh'] - 1e-6
@@ -1426,6 +1517,7 @@ class BatteryOptimizer:
                 spec['initial_percent']
                 + requested_kwh * spec['eta'] / spec['capacity_kwh'] * 100.0,
             )
+            has_target = bool(dev.get('charge_target_percent')) and dev.get('charge_target_slot')
             ev_soc_status.append({
                 'name': dev.get('name') or f"device {i}",
                 'sensor_id': dev.get('sensor_id'),
@@ -1438,6 +1530,9 @@ class BatteryOptimizer:
                 'target_percent': target_percent,
                 'unmet_kwh': unmet_kwh,
                 'soc_limited': soc_limited,
+                # True when this status reflects an ad-hoc grid_lens.set_charge_target
+                # deadline rather than the plain day-0 ceiling/Today-Boost mechanism.
+                'charge_target_active': bool(has_target),
             })
 
         return {

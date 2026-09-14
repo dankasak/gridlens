@@ -18,6 +18,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
+from .. import charge_target as ct
 from ..battery_optimizer import BatteryOptimizer
 from ..const import CONF_HAS_DEMAND_TARIFF, DEFAULT_DEMAND_WINDOW_HOURS, DOMAIN
 from ..schedule_grid import rolling_window_hours
@@ -364,6 +365,23 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             return None
         return load_mgr.get_override(index)
 
+    async def _charge_target(self, sensor_id: str, live_soc_percent: float | None) -> dict | None:
+        """The active ad-hoc charge target for sensor_id — {"percent", "target_dt"} — or
+        None if unset, already reached, or its deadline has already passed (the store
+        auto-clears in those last two cases, see ChargeTargetStore.async_get_active)."""
+        if not sensor_id:
+            return None
+        store = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_charge_targets")
+        if store is None:
+            return None
+        raw = await store.async_get_active(sensor_id, live_soc_percent)
+        if raw is None:
+            return None
+        target_dt = dt_util.parse_datetime(raw["target_iso"])
+        if target_dt is None:
+            return None
+        return {"percent": raw["percent"], "target_dt": dt_util.as_utc(target_dt)}
+
     async def _deferrable_for_horizon(self, bundle) -> list:
         """Build the optimizer's per-device deferrable dicts for THIS horizon: device
         daily_kwh/max_kw + a per-slot availability mask.
@@ -402,17 +420,39 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             soc_kwargs = {}
             soc_sensor_id = dev.get("soc_sensor_id")
             capacity = float(dev.get("soc_capacity_kwh") or 0.0)
+            live_soc_percent = None
             if soc_sensor_id and capacity > 0:
                 st = self.hass.states.get(soc_sensor_id)
                 if st is not None and st.state not in ("unknown", "unavailable", None):
                     try:
+                        live_soc_percent = float(st.state)
                         soc_kwargs = {
                             "soc_capacity_kwh": capacity,
-                            "soc_initial_percent": float(st.state),
+                            "soc_initial_percent": live_soc_percent,
                             "soc_max_percent": float(dev.get("soc_max_percent", 100.0) or 100.0),
                         }
                     except (TypeError, ValueError):
-                        pass
+                        live_soc_percent = None
+            # Ad-hoc dated charge target (grid_lens's charge-target number/datetime
+            # entity pair — "100% by 7am Saturday"). Only meaningful for a device that
+            # already has live SOC tracking above (soc_kwargs populated) — a target
+            # needs to know current SOC and capacity to compute what's still needed, the
+            # same requirement the day-0 ceiling mechanism already has. The target auto-
+            # clears itself (via the store) once reached or once its deadline passes, so
+            # nothing here needs to track that — just read whatever is still active.
+            if soc_kwargs:
+                target = await self._charge_target(dev.get("sensor_id", ""), live_soc_percent)
+                if target is not None:
+                    target_slot = ct.slot_for_datetime(
+                        target["target_dt"], bundle.start, bundle.slot_minutes, bundle.slots
+                    )
+                    if target_slot is not None:
+                        soc_kwargs["charge_target_percent"] = target["percent"]
+                        soc_kwargs["charge_target_slot"] = target_slot
+                    # else: deadline already past this solve's horizon start, or not yet
+                    # in view — leave the device on the plain day-0/Today-Boost floor for
+                    # this tick; a later rolling replan picks it up once it's in range
+                    # (or the store's own reach/expiry check clears it, see _charge_target).
             week = None
             if store is not None:
                 try:

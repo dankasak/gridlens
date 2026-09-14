@@ -746,6 +746,12 @@ per-device measured-SOC fetch), `www/cards/grid-lens-power-chart-card.js`
 (`DeferrableLoadController.apply`'s `soc_cutoff` param + `status()`'s `soc_cutoff` field),
 `control/modulating_controller.py` (`ModulatingLoadController.apply`/`modulate`).
 
+**Ad-hoc dated extension (§9a).** The day-0-only scoping above is the *default* — a
+one-off `grid_lens.set_charge_target` ("100% by 7am Saturday") extends a specific
+device's own tracking/floor window out to its deadline slot, even past midnight,
+without the multi-day infeasibility risk a *recurring* day-1+ ceiling would carry.
+See §9a for the full feature.
+
 ---
 
 ## 6. Deferrable load control (layer 3)
@@ -1527,6 +1533,71 @@ sparkline rather than an error.
 
 ---
 
+## 9a. Ad-hoc charge target
+
+**What it does.** A one-off "charge to X% by a datetime" target on an SOC-tracked
+deferrable load — e.g. "100% by 7am Saturday" before a trip. Unlike Today Boost (a
+kWh number with no deadline), this is a percent + a deadline: the optimizer still
+picks the cheapest/solar-heavy slots between now and the deadline, only forcing
+full-power charging in the run-up if it must, to guarantee the target is met in
+time. Set via two paired entities per SOC-tracked device — `number.*_charge_target_percent`
+and `datetime.*_charge_target_time`, shown together on `grid-lens-charge-target-card` (in
+Settings → Charge Targets, seeded automatically for any install with at least one
+SOC-tracked device) — or equivalently the `grid_lens.set_charge_target` /
+`grid_lens.clear_charge_target` services (handy from an automation/script; the card stays
+in sync with a service-set target live, via a dispatcher signal — no restart needed). Only
+available on a device with an SOC sensor + capacity configured (the same
+CONF_DEFERRABLE_LOAD_SOC_SENSORS/_CAPACITY_KWH fields the day-0 SOC ceiling uses —
+see §5) — the target math needs a live SOC reading and a capacity to know how many
+kWh are actually needed.
+
+**Auto-clears itself** once the live SOC reaches the target percent, or once the
+deadline itself passes — no manual clearing needed after use (unlike Today Boost,
+which persists until zeroed; a dated target has a natural end condition Today Boost
+doesn't). Setting the percent entity to 0 (or calling `clear_charge_target`) cancels
+it early.
+
+**A target above the standing SOC ceiling (`soc_max_percent`) temporarily raises it**
+for the occasion — a everyday 80% longevity cap doesn't block an explicit "100% for
+this trip" request.
+
+**Files:** `number.py` (percent entity), `datetime.py` (deadline entity),
+`www/cards/grid-lens-charge-target-card.js` (dashboard card, auto-discovers the entity
+pairs via `charge_target_role`/`deferrable_sensor_id` state attributes),
+`charge_target.py` (pure maths — slot rounding, reach/expiry, store read/write;
+`tests/test_charge_target.py`), `charge_target_store.py` (shared Store; `update_signal` —
+the dispatcher signal both entities and the card's underlying tiles refresh from when the
+OTHER write path, e.g. the service, changes a target),
+`services.py`/`services.yaml` (`set_charge_target`/`clear_charge_target`),
+`advisory/coordinator.py` (`_charge_target`, wired into `_deferrable_for_horizon`),
+`battery_optimizer.py` (`track_slots`/`floor_slot` — generalizes the day-0-only SOC
+floor to bind at an arbitrary slot, even past midnight; see the `_lp_scipy` module
+docstring for why a one-off dated floor is safe where a recurring one would not be).
+
+**Horizon limit.** The deadline only binds once it falls within the current rolling
+horizon (~24-48h) — set further out, it's simply not yet in view and the device
+stays on its usual Today-Boost/historical-average floor until a later replan brings
+the deadline into range. This is the existing rolling-horizon behaviour, not a bug
+specific to this feature.
+
+**Verified live (2026-09-14)** against the dev rig: a real target set on Wattpilot/XPENG
+(95% by +3h, against its 85% standing ceiling) solved clean, raised the effective ceiling,
+and matched hand-derived kWh figures exactly; a no-target tick reproduced the original
+day-0-only behaviour unchanged. `battery_optimizer._lp_scipy` still can't be exercised in
+this dev container itself (no scipy — confirmed again, see `tests/test_demand_charge.py`'s
+header), so this was checked on the live instance, not here. See
+`docs/GRIDLENS_CHECKLIST.md` 2026-09-14 for the full run (including a dispatcher/thread bug
+in the `number`/`datetime` entities' live-sync found and fixed during this check).
+
+**`grid-lens-charge-target-card` is unclicked** — added 2026-09-15, `node --check`'d clean
+and the entities/attributes it auto-discovers off (`charge_target_role`,
+`deferrable_sensor_id`) were confirmed live via the API, but this dev container has no
+browser/display to actually render a Lovelace card in, so the card itself needs the owner
+to look at it before this is "done" the way a curl-tested API change is done — same caveat
+as `gridlens-editor` (docs/CLAUDE.md).
+
+---
+
 ## 10. Cards & the default dashboard
 
 All cards **auto-discover** their entities by attribute fingerprint — never a naming
@@ -1562,6 +1633,7 @@ Callers passing no `rightAxis` are byte-for-byte unchanged (verified against the
 | `grid-lens-dispatch-chart-card` | Planned EMS mode timeline. |
 | `grid-lens-advisory-card` | Plan status header (plan name/solver/last-run time, status badge), control-mode timeline, deferrable-load recommendations. `compact: true` config renders just the header — used as a slim "optimiser & plan" status bar at the top of the Power Flow view; `title` config overrides the header text in that mode. `show_current_rates: true` adds a one-line buy/sell readout ("Buy 22c/kWh · Sell 3c/kWh") under the plan-status line — the rate for the slot covering now, from the same `trajectory` attribute. Just the numbers; the rate *graph* is `grid-lens-price-chart-card`. Off by default and **not** used by the seed anymore — the Power Flow view shows the current rate on the `grid-lens-powerflow-card` Grid node instead (2026-09-11). Still available for a dashboard that has no Power Flow card. Works in the full card too. |
 | `grid-lens-load-control-card` | One row per deferrable load: Today Boost, greedy toggles, Off now / On now / Auto, and live greedy status. |
+| `grid-lens-charge-target-card` | One row per SOC-tracked deferrable load: ad-hoc "charge to X% by a datetime" target (§9a) — a percent tile + a datetime tile, auto-paired via the `charge_target_role`/`deferrable_sensor_id` state attributes, plus a plain-text "Target: 95% by Sat, 2:22 am" / "No target set" status line. Empty state when no device has SOC tracking configured. |
 | `grid-lens-defer-schedule-card` | The 7 × 48 allowed-run-times editor. |
 | `grid-lens-flex-row-card` | Layout helper — per-child `flex` control, stacks below a breakpoint, and collapses children that hide themselves (native `conditional` cards) out of the row. |
 
@@ -2032,11 +2104,14 @@ custom_components/grid_lens/
 ├── plan_sensors.py          per-plan metric sensors
 ├── switch.py                battery control + per-device control & greedy switches
 ├── select.py                Force On/Off/Auto override
-├── number.py                Today Boost, Minimum Export Price
-├── services.py/.yaml        set/clear schedule, calculate_period
+├── number.py                Today Boost, Minimum Export Price, charge-target percent — §9a
+├── datetime.py              charge-target deadline entity — §9a
+├── services.py/.yaml        set/clear schedule, calculate_period, set/clear charge_target
 ├── schedule_grid.py         7x48 grid helpers (slot_allowed, week_from_hours)
 ├── deferrable_schedules.py  schedule Store
 ├── deferrable_overrides.py  boost Store
+├── charge_target.py         ad-hoc charge-target pure maths (slot rounding, reach/expiry) — §9a
+├── charge_target_store.py   ad-hoc charge-target Store — §9a
 ├── load_estimation.py       LoadEstimator + EstimateStore — synthetic energy sensor for an
 │                            unmonitored controllable load (aircon w/ no feedback), §5
 ├── load_estimate_math.py    pure sample-accept/EMA/integration logic behind LoadEstimator

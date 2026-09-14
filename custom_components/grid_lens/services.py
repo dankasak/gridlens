@@ -34,6 +34,8 @@ _LOGGER = logging.getLogger(__name__)
 SERVICE_CALCULATE_PERIOD = "calculate_period"
 SERVICE_SET_DEFERRABLE_SCHEDULE = "set_deferrable_schedule"
 SERVICE_CLEAR_DEFERRABLE_SCHEDULE = "clear_deferrable_schedule"
+SERVICE_SET_CHARGE_TARGET = "set_charge_target"
+SERVICE_CLEAR_CHARGE_TARGET = "clear_charge_target"
 
 
 async def async_setup_services(hass: HomeAssistant, entry) -> None:
@@ -130,6 +132,66 @@ async def async_setup_services(hass: HomeAssistant, entry) -> None:
         availability-hours spec from the integration config."""
         await _write_schedule(call.data.get("sensor_id"), None)
 
+    async def _write_charge_target(sensor_id: str | None, percent: float, target_iso: str) -> None:
+        """Shared validate-and-persist for the two charge-target services. `sensor_id`
+        is the device's configured energy sensor (same canonical key as the schedule/
+        boost stores); mirrors number.py/datetime.py's own writes through the same
+        store — this is just an automation-friendly alternative to setting those two
+        entities by hand. `percent<=0` or a blank `target_iso` clears the target
+        (see charge_target.write_target)."""
+        store = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_charge_targets")
+        if store is None:
+            raise HomeAssistantError("Grid Lens charge-target store is not available")
+        if not sensor_id:
+            raise HomeAssistantError("sensor_id is required")
+        configured = entry.data.get("deferrable_load_sensors", []) or []
+        if sensor_id not in configured:
+            raise HomeAssistantError(
+                f"{sensor_id} is not a configured deferrable load "
+                f"(configured: {', '.join(configured) or 'none'})"
+            )
+        soc_sensors = entry.data.get("deferrable_load_soc_sensors", []) or []
+        soc_capacities = entry.data.get("deferrable_load_soc_capacity_kwh", []) or []
+        idx = configured.index(sensor_id)
+        has_soc = (
+            idx < len(soc_sensors) and soc_sensors[idx]
+            and idx < len(soc_capacities) and soc_capacities[idx]
+        )
+        if percent > 0 and not has_soc:
+            raise HomeAssistantError(
+                f"{sensor_id} has no SOC sensor/capacity configured — a charge target "
+                "needs live SOC tracking to know how much energy is actually needed "
+                "(see the device's reconfigure options)"
+            )
+        await store.async_set(sensor_id, percent, target_iso)
+        _LOGGER.warning(
+            "Charge target %s for %s%s",
+            "saved" if percent > 0 and target_iso else "cleared", sensor_id,
+            f": {percent:g}% by {target_iso}" if percent > 0 and target_iso else "",
+        )
+
+    async def handle_set_charge_target(call: ServiceCall) -> None:
+        """Set an ad-hoc one-off charge target — e.g. 100% by 7am Saturday before a
+        trip. The equivalent of setting the device's charge-target percent + datetime
+        entities by hand; auto-clears once reached or once the deadline passes."""
+        target_dt = call.data.get("target_datetime")
+        try:
+            parsed = dt_util.parse_datetime(target_dt) if target_dt else None
+        except Exception as e:
+            raise HomeAssistantError(f"Invalid target_datetime: {e}")
+        if parsed is None:
+            raise HomeAssistantError("target_datetime is required and must be a valid datetime")
+        if parsed.tzinfo is None:
+            parsed = dt_util.as_local(parsed)
+        percent = call.data.get("target_percent")
+        if percent is None:
+            raise HomeAssistantError("target_percent is required")
+        await _write_charge_target(call.data.get("sensor_id"), float(percent), dt_util.as_utc(parsed).isoformat())
+
+    async def handle_clear_charge_target(call: ServiceCall) -> None:
+        """Cancel a device's ad-hoc charge target, if one is set."""
+        await _write_charge_target(call.data.get("sensor_id"), 0.0, "")
+
     # Register services
     hass.services.async_register(
         DOMAIN,
@@ -141,6 +203,12 @@ async def async_setup_services(hass: HomeAssistant, entry) -> None:
     )
     hass.services.async_register(
         DOMAIN, SERVICE_CLEAR_DEFERRABLE_SCHEDULE, handle_clear_deferrable_schedule
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_CHARGE_TARGET, handle_set_charge_target
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_CLEAR_CHARGE_TARGET, handle_clear_charge_target
     )
 
     _LOGGER.info(f"Registered service: {DOMAIN}.{SERVICE_CALCULATE_PERIOD}")

@@ -22,7 +22,9 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.SWITCH, Platform.NUMBER, Platform.SELECT]
+PLATFORMS: list[Platform] = [
+    Platform.SENSOR, Platform.SWITCH, Platform.NUMBER, Platform.SELECT, Platform.DATETIME,
+]
 
 _HISTORY_STORAGE_KEY = "grid_lens_plan_history"
 _HISTORY_STORAGE_VERSION = 1
@@ -417,6 +419,18 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
             "type": "custom:grid-lens-load-control-card", "title": "Deferrable Loads",
             "grid_options": {"columns": "full"},
         })
+        # Ad-hoc "charge to X% by a datetime" target — FEATURES.md §9a. Only meaningful
+        # for a device with SOC tracking configured (same condition as show_ev above —
+        # the card itself auto-discovers per device, but the heading/card are only worth
+        # seeding at all when at least one device could ever populate a row).
+        if any(
+            (s or "").strip()
+            for s in (entry.data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, []) or [])
+        ):
+            settings_cards.append({
+                "type": "custom:grid-lens-charge-target-card", "title": "Charge Targets",
+                "grid_options": {"columns": "full"},
+            })
         # Weekly gantt-style editor of when each deferrable load may run (per-weekday
         # allowed hours, painted on a 7x24 grid; saved via grid_lens.set_deferrable_schedule).
         settings_cards.append({
@@ -573,7 +587,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260913b"
+    _CARD_VERSION = "20260915a"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -589,6 +603,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         f"/grid_lens/cards/grid-lens-flex-row-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-load-control-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-boost-tuning-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-charge-target-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-defer-schedule-card.js?v={_CARD_VERSION}",
     ]
     stale_urls = {
@@ -1844,6 +1859,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, entry.entry_id
     )
 
+    # Ad-hoc dated charge targets ("100% by 7am Saturday") — shared between the
+    # number.py/datetime.py entity pair (writers) and AdvisoryCoordinator (reader).
+    # Same "created before platforms are forwarded" reasoning as the store above.
+    from .charge_target_store import ChargeTargetStore
+    hass.data[DOMAIN][f"{entry.entry_id}_charge_targets"] = ChargeTargetStore(
+        hass, entry.entry_id
+    )
+
     # Weekly per-weekday availability schedules for deferrable loads (edited on the
     # dashboard schedule card; replaces the static hours config when set for a device).
     # Preloaded here so sensor.py's sync attribute builder can read the cache.
@@ -2018,6 +2041,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(f"{entry.entry_id}_control", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_load_control", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_overrides", None)
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_charge_targets", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_schedules", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_load_estimators", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_power_estimators", None)
