@@ -1,6 +1,7 @@
 """Grid Lens Integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -28,6 +29,28 @@ PLATFORMS: list[Platform] = [
 
 _HISTORY_STORAGE_KEY = "grid_lens_plan_history"
 _HISTORY_STORAGE_VERSION = 1
+
+
+def _calc_lock(hass: HomeAssistant, entry_id: str) -> asyncio.Lock:
+    """One calculate_plan_costs() at a time per config entry.
+
+    Found live 2026-09-15: the background coordinator refresh and an
+    interactive PlanDataView/PlanStreamView request running at the same
+    moment compete for the same executor thread pool (every LP solve is a
+    blocking scipy call handed to SyncWorker threads) — a live test hung
+    12+ minutes with zero progress before this was traced down, versus 55s
+    once the two stopped overlapping. Serialising every calculate_plan_costs()
+    call through this lock (created lazily, not at setup time, so it works
+    regardless of call order) trades "a second caller waits" for "neither
+    caller starves" — see GRIDLENS_CHECKLIST.md, 2026-09-15.
+    """
+    key = f"{entry_id}_calc_lock"
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    lock = domain_data.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        domain_data[key] = lock
+    return lock
 
 # GridLensCoordinator refresh cadence (set dynamically per run — see
 # _adjust_refresh_cadence). The heartbeat is only a backstop: it re-runs the full
@@ -482,16 +505,6 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
     return views
 
 
-def _plan_from_history(entries: list, start_date) -> str | None:
-    """Return the plan name active at start_date (latest entry whose date <= start_date)."""
-    query = start_date.date().isoformat() if hasattr(start_date, 'date') else str(start_date)[:10]
-    active = None
-    for entry in sorted(entries, key=lambda e: e['date']):
-        if entry['date'] <= query:
-            active = entry['plan_name']
-    return active
-
-
 # Fields inside a plan's `optimization` dict that are hour-by-hour arrays over the
 # whole comparison period (720+ entries each). grid-lens-card.js never reads them —
 # it renders from the 24-slot `hourly_profile` and the `breakdown` — but left in the
@@ -587,7 +600,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260915a"
+    _CARD_VERSION = "20260915d"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -836,19 +849,28 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 calculator.plan_data = _fetch.plans
                 calculator.network_operators = _fetch.network_operators
 
-                # Derive which plan the user was actually on at start_date from change history.
-                if start_date:
-                    _hist_store = Store(self.hass, _HISTORY_STORAGE_VERSION, _HISTORY_STORAGE_KEY)
-                    _hist_data = await _hist_store.async_load() or {"entries": []}
-                    _hist_plan = _plan_from_history(_hist_data["entries"], start_date)
-                    if _hist_plan:
-                        calculator.current_plan_override = _hist_plan
-                        _LOGGER.info("History: current plan at %s is %s", start_date.date(), _hist_plan)
+                # Hand the full plan-switch history to the calculator — it splits the
+                # window per-day at any switch that falls inside it (see
+                # PlanCalculator._plan_history_segments) rather than picking one plan
+                # for the whole range from a single start_date lookup. Loaded
+                # unconditionally: calculate_plan_costs resolves its own default
+                # start_date/end_date (last 30 days) when the caller didn't specify
+                # one, and that resolved window can still span a switch — gating this
+                # on `start_date` being explicitly set (as this used to) meant a plan
+                # switch was only ever detected when the user had manually picked a
+                # date range, never on a plain/default-window request.
+                _hist_store = Store(self.hass, _HISTORY_STORAGE_VERSION, _HISTORY_STORAGE_KEY)
+                _hist_data = await _hist_store.async_load() or {"entries": []}
+                calculator.plan_history_entries = _hist_data["entries"]
 
                 _exclude_greedy = request.query.get('exclude_greedy') == 'true'
-                response_data = await calculator.calculate_plan_costs(
-                    start_date, end_date, exclude_greedy=_exclude_greedy
-                )
+                # See _calc_lock's docstring — never run this concurrently with
+                # another calculate_plan_costs() (background refresh or another
+                # request) on the same entry.
+                async with _calc_lock(self.hass, entry_obj.entry_id):
+                    response_data = await calculator.calculate_plan_costs(
+                        start_date, end_date, exclude_greedy=_exclude_greedy
+                    )
                 _LOGGER.info(f"Custom date range calculation complete: {response_data.get('usage_days')} days")
                 return web.Response(
                     text=json.dumps(response_data),
@@ -866,6 +888,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             plan_details = coordinator.data.get('plan_details', {})
             response_data = {
                 'plan_details': plan_details,
+                'periods': coordinator.data.get('periods', []),
                 'energy_flows': coordinator.data.get('energy_flows', {}),
                 'current_plan_total': coordinator.data.get('current_plan_total', 0),
                 'current_plan_name': coordinator.data.get('current_plan_name'),
@@ -1180,19 +1203,24 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 'plans_total': plans_total,
             })
 
-            # Apply plan-history override if available
+            # Apply plan-history — the calculator splits the window per-day at any
+            # switch inside it (see _plan_history_segments) rather than picking one
+            # plan for the whole range from a single lookup. Loaded unconditionally
+            # (not gated on start_date being set): calculate_plan_costs resolves its
+            # own default window when the caller didn't specify one, and that
+            # resolved window can still span a switch — this view has no "use
+            # coordinator cache" fallback for a plain request the way PlanDataView
+            # does, so every call here actually runs calculate_plan_costs and needs
+            # this to detect a switch regardless of whether dates were picked.
             from .plan_calculator import PlanCalculator
             calculator = PlanCalculator(self.hass, entry_obj)
             calculator.plan_data = plan_data
             calculator.network_operators = network_operators
 
-            if start_date:
-                from homeassistant.helpers.storage import Store
-                hist_store = Store(self.hass, _HISTORY_STORAGE_VERSION, _HISTORY_STORAGE_KEY)
-                hist_data  = await hist_store.async_load() or {"entries": []}
-                hist_plan  = _plan_from_history(hist_data["entries"], start_date)
-                if hist_plan:
-                    calculator.current_plan_override = hist_plan
+            from homeassistant.helpers.storage import Store
+            hist_store = Store(self.hass, _HISTORY_STORAGE_VERSION, _HISTORY_STORAGE_KEY)
+            hist_data  = await hist_store.async_load() or {"entries": []}
+            calculator.plan_history_entries = hist_data["entries"]
 
             async def on_plan_ready(plan_key, detail, meta):
                 nonlocal plans_done
@@ -1221,12 +1249,44 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     'plans_total': plans_total,
                 })
 
-            result = await calculator.calculate_plan_costs(
-                start_date, end_date,
-                on_plan_ready=on_plan_ready,
-                on_progress=on_fetch_progress,
-                exclude_greedy=exclude_greedy,
-            )
+            # Ranking every candidate plan against each period's own usage slice
+            # (calculate_plan_costs' `periods` construction) is another full LP
+            # pass per period, on top of the whole-window loop above — a genuinely
+            # long stretch with zero 'plan' events to send, which is exactly what
+            # trips the card's `src.onerror` "stream failed" handler: nothing
+            # written to the response for long enough that the connection looks
+            # dead. Reusing the 'optimising' phase (already what the per-plan loop
+            # above reports) keeps the stream writing throughout instead of only
+            # during the whole-window loop before it.
+            async def on_period_progress(message, step, total):
+                await send('status', {
+                    'phase':       'optimising',
+                    'message':     message,
+                    'fetch_step':  step,
+                    'fetch_total': total,
+                    'plans_total': plans_total,
+                })
+
+            # See _calc_lock's docstring — never overlap with the background
+            # refresh or another request on the same entry. If something else is
+            # already running, say so on the stream immediately: waiting for the
+            # lock is itself a silent stretch otherwise, which is exactly what
+            # trips the card's "stream failed" handler.
+            _lock = _calc_lock(self.hass, entry_obj.entry_id)
+            if _lock.locked():
+                await send('status', {
+                    'phase': 'fetching',
+                    'message': 'Waiting for another calculation on this install to finish…',
+                    'plans_total': plans_total,
+                })
+            async with _lock:
+                result = await calculator.calculate_plan_costs(
+                    start_date, end_date,
+                    on_plan_ready=on_plan_ready,
+                    on_progress=on_fetch_progress,
+                    on_period_progress=on_period_progress,
+                    exclude_greedy=exclude_greedy,
+                )
             if isinstance(result, dict) and isinstance(result.get('plan_details'), dict):
                 result['plan_details'] = {
                     k: _slim_stream_detail(v) for k, v in result['plan_details'].items()
@@ -2046,6 +2106,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(f"{entry.entry_id}_load_estimators", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_power_estimators", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_greedy_trackers", None)
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_calc_lock", None)
 
     return unload_ok
 
@@ -2088,7 +2149,24 @@ class GridLensCoordinator(DataUpdateCoordinator):
         self.calculator = PlanCalculator(self.hass, self.entry)
         self.calculator.plan_data = plan_data
         self.calculator.network_operators = network_operators
-        result = await self.calculator.calculate_plan_costs()
+
+        # Same plan-history hand-off as PlanDataView/PlanStreamView (see there) — the
+        # background/default calculation is what PlanDataView falls back to serving
+        # for a plain request with no explicit date range, so it needs the same
+        # switch-detection or that path never sees the `periods` split either.
+        from homeassistant.helpers.storage import Store
+        hist_store = Store(self.hass, _HISTORY_STORAGE_VERSION, _HISTORY_STORAGE_KEY)
+        hist_data = await hist_store.async_load() or {"entries": []}
+        self.calculator.plan_history_entries = hist_data["entries"]
+
+        # skip_period_alternatives=True: this background refresh repeats on its own
+        # schedule forever with nobody watching it — the full per-period LP ranking
+        # (an extra solve per candidate plan per period, on top of the whole-window
+        # loop) is only worth its cost for someone actually looking at the Plan
+        # Comparison card. PlanDataView/PlanStreamView compute it in full on demand.
+        # _calc_lock: never overlap with an interactive request (see its docstring).
+        async with _calc_lock(self.hass, self.entry.entry_id):
+            result = await self.calculator.calculate_plan_costs(skip_period_alternatives=True)
         _LOGGER.info(
             "Plan calculation complete: %s days (plans: %d, source: %s)",
             result.get("usage_days", 0), len(plan_data), fetch.source,

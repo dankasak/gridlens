@@ -173,6 +173,78 @@ actual data, just sourced from a live feed rather than a static tariff. That sen
 path doesn't yet itemise per-tier (no per-interval FiT/energy_lines split for it) — a known
 gap, not a silent wrong number: it reports one clearly-labelled total instead of guessing.
 
+**A plan switch that falls inside the comparison window is split per-day, not
+all-or-nothing** (`_plan_history_segments`/`_compute_multi_segment_bill_items` in
+`plan_calculator.py`, 2026-09-15). "Current plan" for a custom date-range calculation
+(Plan Comparison's date picker, via `PlanDataView`/`PlanStreamView`) used to be resolved
+once from the plan-switch history log by comparing each entry's date against the window's
+*start* — `entry.date <= window_start`. That's a single binary pick for the whole window:
+if a switch date lands *after* the window start (even by one day — an off-by-one in the
+logged switch date is enough), the newly-switched-to plan drops out of consideration
+entirely and the *previous* plan silently prices the whole range, including days the
+household was genuinely already on the new plan. Now each plan-history entry that falls
+strictly inside `[start_date, end_date)` splits the window into segments, and each segment
+is priced — actual usage, actual tariff — against whichever plan the log says was actually
+held that day; the segment totals sum to the current-plan total. `current_plan_name` (the
+label shown to the user) still reflects whichever plan is held as of the window's end (i.e.
+today), not a segment's plan. The itemised `bill_items` for a multi-segment result carries
+`is_multi_segment: true` and a `segments` array (each with its own full `bill_items`) rather
+than merging two plans' rate lines into one table — a "Peak" line from two different
+retailers would match neither plan's real bill. A PEA-eligible segment (Flow Power;
+`aemo_price_sensor`) gets its own PEA credit sliced from the same whole-window AEMO price
+series the main loop already fetches (`_segment_pea_result`) — confirmed live: a window
+spanning a real Flow Power→GloBird switch now splits into two periods instead of falling
+back, with the Flow Power segment showing its own correctly-computed PEA credit for just
+that slice. **Known gap:** a segment whose plan is `is_market_linked` (sensor-priced
+import/export, e.g. Amber SmartShift — a different mechanism PEA-slicing doesn't help with)
+still isn't split-priced — the whole window falls back to the old single-plan pricing for
+that case. See `docs/GRIDLENS_CHECKLIST.md`, 2026-09-15.
+
+**The Plan Comparison card is organised around these bill-boundary periods, not around a
+flat list of every plan** (`periods` field on `calculate_plan_costs`'s result, and
+`_rank_plans_for_period`/`_price_plan_for_period` in `plan_calculator.py`, 2026-09-15). One
+vertical section per period — however many that is; a window with no plan-history switch in
+it is still exactly one period spanning the whole range, a window spanning three switches
+renders four. Each section shows one cost-sorted grid: the plan actually held that period
+(priced from that period's own real usage — the segment pricing above, always amber-banded
+regardless of where it lands in the sort) sitting inline among that period's own ranked list
+of every OTHER candidate plan, not pulled into its own row above them — 2026-09-15, per
+owner feedback that a separate row made it harder to compare at a glance. Every OTHER
+candidate plan is **re-priced against that same period's own usage slice**, not carried over
+from a whole-window ranking: a short or unusual period can
+genuinely favour a different plan than the window-wide comparison would suggest (a 1-day
+period dominated by one unusually strong solar-export evening ranks very differently to a
+5-day period dominated by weekday peak-import patterns). This is a real per-plan LP solve for
+every candidate plan, once per period — accuracy over cheaper shortlisting, deliberately, at
+the cost of `periods × plans` LP solves for a multi-period window (~240 extra solves for a
+2-period, 124-plan comparison; full default-window request measured end-to-end at 55s —
+fetch + whole-window loop + both periods — 2026-09-15) instead of `plans` for the common
+single-period case, which is unaffected (reuses the whole-window loop's own results, zero
+extra solves). Alternatives don't get an hourly chart — `_price_plan_for_period` deliberately
+skips the hour-of-day-average machinery a period-sliced result has no meaningful version of;
+they show the same itemised `_renderBillRows` breakdown as any other plan instead.
+
+Two things make that cost bearable rather than a "stream failed" timeout (both 2026-09-15,
+found live — see `docs/GRIDLENS_CHECKLIST.md`): the period-ranking loop reports progress
+after every plan priced, via the same `'status'` SSE event the fetch phase already used, so
+the stream keeps writing throughout instead of going silent for the whole periods phase; and
+`GridLensCoordinator`'s unattended background refresh — which repeats on its own schedule
+forever with nobody watching it, and was found competing with interactive requests for the
+same executor thread pool — passes `skip_period_alternatives=True` so it only pays for the
+cheap part (each period's actual-usage bill, no LP) and never the per-plan ranking. A third
+form of the same contention (two interactive requests overlapping, e.g. a page reload
+landing while the previous request is still running server-side) is closed by `_calc_lock()`
+in `__init__.py` — one `asyncio.Lock` per config entry shared by every
+`calculate_plan_costs()` call site, so a second caller waits (with its own "waiting" status
+on the stream) rather than running concurrently and starving both.
+
+**"Show best N" declutter filter** (`_topN`, default 5, `grid-lens-card.js`, 2026-09-15). A
+`<select id="epc-topn">` next to the date controls, persisted like the date range. Purely a
+client-side display filter over data the backend already fully ranked — changing it re-renders
+instantly, no refetch. The plan actually held is always shown regardless of its rank (there
+must always be a baseline to compare against); this only limits how many *alternatives* render,
+per period in the multi-period view, or across the whole flat list in the single-period view.
+
 **Spot pricing for market-linked *alternatives*** (`spot_pricing` block, 2026-09-04 —
 `gridlens-api/docs/SPOT_PRICING_DESIGN.md`). A market-linked plan being *ranked* (not held)
 used to be scored from its static `"(estimate)"` rate bands and a flat default FiT — which

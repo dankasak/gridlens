@@ -12,6 +12,7 @@ class GridLensCard extends HTMLElement {
     this._showHistory = false;
     this._retailerFilter = '';   // live retailer search box, applied as the user types
     this._excludeGreedy = false; // "exclude greedy consumption" checkbox — see setConfig
+    this._topN = 5;              // "Show best N" declutter filter — see setConfig
 
     this._history = null;
     this._editingId = null;
@@ -36,6 +37,8 @@ class GridLensCard extends HTMLElement {
       if (!this._startDate) this._startDate = localStorage.getItem('epc-date-start') || '';
       if (!this._endDate)   this._endDate   = localStorage.getItem('epc-date-end')   || '';
       if (!this._excludeGreedy) this._excludeGreedy = localStorage.getItem('epc-exclude-greedy') === 'true';
+      const storedTopN = localStorage.getItem('epc-top-n');
+      if (storedTopN != null) this._topN = storedTopN === 'all' ? Infinity : parseInt(storedTopN, 10) || 5;
     } catch (_) {}
     this.render();
   }
@@ -458,6 +461,286 @@ class GridLensCard extends HTMLElement {
     return timeRange ? ` <span style="font-weight:400;opacity:0.65">(${this._esc(timeRange)})</span>` : '';
   }
 
+  // Plan keys are "Retailer - Plan Name"; the retailer is everything before the
+  // FIRST " - ", because plan names contain the separator too ("Standing Offer -
+  // Time of Use", "Origin Go Variable Ongoing - New & Move Customers only").
+  _retailerOf(key) {
+    return String(key).split(' - ')[0].trim();
+  }
+
+  // "9 Sep" or "9 – 14 Sep" for a bill_items segment's date range. seg_end from
+  // the backend is exclusive (half-open, see _plan_history_segments) — the last
+  // real day covered is one day earlier, so that's what gets shown as the end.
+  _fmtBillDateRange(startIso, endIso) {
+    const opts = { day: 'numeric', month: 'short' };
+    const start = new Date(startIso);
+    const inclusiveEnd = new Date(new Date(endIso).getTime() - 1);
+    const startStr = start.toLocaleDateString([], opts);
+    const endStr = inclusiveEnd.toLocaleDateString([], opts);
+    return startStr === endStr ? startStr : `${startStr} – ${endStr}`;
+  }
+
+  // Itemised bill rows for one bill_items object (from a plan priced whole,
+  // or from one segment of a multi-segment split — same shape either way, see
+  // _compute_bill_items/_compute_multi_segment_bill_items in plan_calculator.py).
+  // Section order deliberately mirrors a real retailer bill (fixed charges
+  // first, then usage, then export credits, then bonus credits, then total) so
+  // a customer can tick this off against their actual bill line by line — see
+  // the GloBird ZEROHERO reconciliation this was modelled on. Don't reorder
+  // without re-checking against a real bill sample.
+  _renderBillRows(bi) {
+    let rows = '';
+
+    // Supply charge
+    const s = bi.supply;
+    rows += '<div class="bill-section-head">Daily supply charge</div>';
+    rows += `<div class="breakdown-row">
+      <div class="breakdown-label">Supply charge<br>
+        <span style="font-size:11px;opacity:0.7">${(s.rate_per_day * 100).toFixed(2)}&thinsp;c/day &times; ${s.days}&thinsp;days</span>
+      </div>
+      <div class="breakdown-value">$${s.amount.toFixed(2)}</div>
+    </div>`;
+
+    // Subscription fee (e.g. Amber $25/month)
+    if (bi.subscription) {
+      const sub = bi.subscription;
+      rows += '<div class="bill-section-head">Subscription fee</div>';
+      rows += `<div class="breakdown-row">
+        <div class="breakdown-label">Membership subscription<br>
+          <span style="font-size:11px;opacity:0.7">$${sub.rate_per_month.toFixed(2)}/month &times; ${sub.months.toFixed(1)}&thinsp;months</span>
+        </div>
+        <div class="breakdown-value">$${sub.amount.toFixed(2)}</div>
+      </div>`;
+    }
+
+    // Demand charge (peak-kW), only present when on a demand tariff.
+    // `dm.lines` = per-season sub-lines (a plan carrying demand_periods,
+    // itemised the way the retailer bills each season); otherwise a
+    // single flat line (the network-level demand charge).
+    if (bi.demand) {
+      const dm = bi.demand;
+      rows += '<div class="bill-section-head">Demand charge</div>';
+      const dmLines = (dm.lines && dm.lines.length) ? dm.lines : [dm];
+      dmLines.forEach(ln => {
+        rows += `<div class="breakdown-row">
+          <div class="breakdown-label">${ln.label}${this._timeRangeHtml(ln.time_range)}<br>
+            <span style="font-size:11px;opacity:0.7">${(ln.peak_kw || 0).toFixed(2)}&thinsp;kW peak &times; ${((ln.rate_per_kw_per_day || 0) * 100).toFixed(2)}&thinsp;c/kW/day &times; ${ln.days}&thinsp;days</span>
+          </div>
+          <div class="breakdown-value">$${(ln.amount || 0).toFixed(2)}</div>
+        </div>`;
+      });
+    }
+
+    // Controlled Load — device(s) wired to a CL register, priced separately
+    // at the plan's flat CL rate instead of the general import tiers below.
+    if (bi.controlled_load) {
+      rows += '<div class="bill-section-head">Controlled load</div>';
+      bi.controlled_load.lines.forEach(line => {
+        rows += `<div class="breakdown-row">
+          <div class="breakdown-label">${line.label}<br>
+            <span style="font-size:11px;opacity:0.7">${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh</span>
+          </div>
+          <div class="breakdown-value">$${line.amount.toFixed(2)}</div>
+        </div>`;
+      });
+    }
+
+    // Energy (usage) lines
+    rows += '<div class="bill-section-head">Usage charges</div>';
+    bi.energy_lines.forEach(line => {
+      rows += `<div class="breakdown-row">
+        <div class="breakdown-label">${line.label}${this._timeRangeHtml(line.time_range)}<br>
+          <span style="font-size:11px;opacity:0.7">${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh</span>
+        </div>
+        <div class="breakdown-value">$${line.amount.toFixed(2)}</div>
+      </div>`;
+    });
+
+    // Feed-in credit — one line per FiT tier/window (e.g. a capped "top up"
+    // rate separate from the base feed-in rate), same as a real bill.
+    const f = bi.fit;
+    if (f.kwh > 0 && f.lines && f.lines.length) {
+      rows += '<div class="bill-section-head bill-fit">Solar / feed-in credit</div>';
+      f.lines.forEach(line => {
+        const rateLabel = line.rate_c != null
+          ? `${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh`
+          : `spot price &times; ${line.kwh.toFixed(1)}&thinsp;kWh`;
+        rows += `<div class="breakdown-row bill-fit">
+          <div class="breakdown-label" style="color:inherit">${line.label}${this._timeRangeHtml(line.time_range)}<br>
+            <span style="font-size:11px;opacity:0.7">${rateLabel}</span>
+          </div>
+          <div class="breakdown-value" style="color:inherit">&minus;$${line.amount.toFixed(2)}</div>
+        </div>`;
+      });
+    }
+
+    // VPP participation credit
+    if (bi.vpp_credit) {
+      rows += '<div class="bill-section-head bill-fit">VPP credit</div>';
+      rows += `<div class="breakdown-row bill-fit">
+        <div class="breakdown-label" style="color:inherit">VPP participation credit</div>
+        <div class="breakdown-value" style="color:inherit">&minus;$${bi.vpp_credit.toFixed(2)}</div>
+      </div>`;
+    }
+
+    // PEA (Price Efficiency Adjustment — Flow Power)
+    if (bi.pea_credit != null || bi.pea_breakdown) {
+      const pb = bi.pea_breakdown;
+      rows += '<div class="bill-section-head bill-fit">Other credits</div>';
+      if (pb) {
+        const creditSign = bi.pea_credit >= 0 ? '&minus;' : '+';
+        const creditAbs = Math.abs(bi.pea_credit).toFixed(2);
+        rows += `<div class="breakdown-row bill-fit">
+          <div class="breakdown-label" style="color:inherit">Price Efficiency Adjustment<br>
+            <span style="font-size:11px;opacity:0.7">
+              LWAP ${pb.lwap_c.toFixed(3)}c &minus; TWAP ${pb.twap_c.toFixed(3)}c = CPEA ${pb.cpea_c.toFixed(3)}c<br>
+              PEA = CPEA &minus; BPEA ${pb.bpea_c.toFixed(1)}c
+              = <strong>${pb.pea_c.toFixed(3)}c/kWh</strong>
+              &times; ${pb.total_kwh.toFixed(1)}&thinsp;kWh
+            </span>
+          </div>
+          <div class="breakdown-value" style="color:inherit">${creditSign}$${creditAbs}</div>
+        </div>`;
+      } else {
+        rows += `<div class="breakdown-row bill-fit">
+          <div class="breakdown-label" style="color:inherit">Price Efficiency Adjustment<br>
+            <span style="font-size:11px;opacity:0.7">Estimated — actual amount varies</span>
+          </div>
+          <div class="breakdown-value" style="color:inherit">&minus;$${bi.pea_credit.toFixed(2)}</div>
+        </div>`;
+      }
+    }
+
+    // Conditional day-credits (e.g. GloBird ZEROHERO's $1/day)
+    if (bi.conditional_credits) {
+      rows += '<div class="bill-section-head bill-fit">Conditional credits</div>';
+      Object.entries(bi.conditional_credits).forEach(([label, c]) => {
+        rows += `<div class="breakdown-row bill-fit">
+          <div class="breakdown-label" style="color:inherit">${label}${this._timeRangeHtml(c.time_range)}<br>
+            <span style="font-size:11px;opacity:0.7">Earned ${c.days_earned}/${c.days_total}&thinsp;days</span>
+          </div>
+          <div class="breakdown-value" style="color:inherit">&minus;$${c.amount.toFixed(2)}</div>
+        </div>`;
+      });
+    }
+
+    // Total + GST
+    rows += `<div class="bill-total-row">
+      <span>Total (inc. GST)</span><span>$${bi.total.toFixed(2)}</span>
+    </div>`;
+    rows += `<div class="bill-gst-row">
+      <span>GST included (1/11)</span><span>$${bi.gst_included.toFixed(2)}</span>
+    </div>`;
+
+    if (bi.optimisation_note) {
+      rows += `<div class="bill-note">${bi.optimisation_note}</div>`;
+    }
+    if (bi.spot_note) {
+      rows += `<div class="bill-spot-note">${bi.spot_note}</div>`;
+    }
+
+    return rows;
+  }
+
+  // Compact plan card for a period section (see _renderPeriodSection) — same
+  // visual language as the full plan-card (title, coloured cost banner,
+  // itemised breakdown via _renderBillRows) but with no hourly chart: a
+  // period's alternatives are priced against just that period's own usage
+  // slice (_rank_plans_for_period in plan_calculator.py), which carries no
+  // hour-of-day averages to chart from. Colour legend matches the main flat
+  // view: amber=the plan actually held that period, deep-cyan=cheapest
+  // contender, green=cheaper than the actual bill, red=pricier.
+  _renderPeriodPlanCard(planName, billItems, total, isCurrentPlan, isCheapest, savings, showBreakdown, strategy) {
+    let bannerColor, savingsLabel;
+    if (isCurrentPlan) {
+      bannerColor = GridLensCard.HOUSEHOLD_COLOR;
+      savingsLabel = 'ACTUAL BILL THIS PERIOD';
+    } else if (isCheapest) {
+      bannerColor = GridLensCard.SOC_COLOR;
+      savingsLabel = savings < -0.05 ? `SAVE $${Math.abs(savings).toFixed(2)}` : 'CHEAPEST THIS PERIOD';
+    } else if (savings < -0.05) {
+      bannerColor = GridLensCard.SELLING_COLOR;
+      savingsLabel = `SAVE $${Math.abs(savings).toFixed(2)}`;
+    } else {
+      bannerColor = GridLensCard.SPEND_COLOR;
+      savingsLabel = `COSTS $${savings.toFixed(2)} more`;
+    }
+    const breakdownHtml = (showBreakdown && billItems)
+      ? `<div class="breakdown-section">${this._renderBillRows(billItems)}</div>` : '';
+    const strategyHtml = strategy ? `
+      <div class="strategy-box">
+        <div class="strategy-title">📋 Optimisation Strategy</div>
+        <div class="strategy-text">${strategy}</div>
+      </div>` : '';
+    return `
+      <div class="plan-card period-plan-card${isCurrentPlan ? ' current-plan' : ''}" data-retailer="${this._esc(this._retailerOf(planName))}">
+        <div class="plan-title">${this._esc(planName)}</div>
+        <div class="cost-display" style="background:${bannerColor}">
+          <div class="cost-amount">$${total.toFixed(2)}</div>
+          <div class="cost-label">${savingsLabel}</div>
+        </div>
+        ${breakdownHtml}
+        ${strategyHtml}
+      </div>`;
+  }
+
+  // One vertical section per bill boundary: the plan actually held that period
+  // (priced from its own real usage), then the top `topN` cheapest contenders
+  // re-priced against that SAME period's own usage slice and ranked — not a
+  // shortlist carried over from the whole-window ranking, since a short or
+  // unusual period can genuinely favour a different plan (see
+  // _rank_plans_for_period's docstring in plan_calculator.py). `topN` can be
+  // Infinity ("Show best: All").
+  _renderPeriodSection(period, topN, showBreakdown) {
+    const curTotal = period.current_plan_total || 0;
+
+    const allAlts = period.alternatives || [];
+    const alts = Number.isFinite(topN) ? allAlts.slice(0, topN) : allAlts;
+    // Cheapest across the actual plan AND its shown contenders together — not
+    // just the contenders — so an alternative only gets the "cheapest" banner
+    // when it genuinely beats (or ties) what was actually held, same rule the
+    // single-period flat view uses.
+    const minTotal = alts.reduce((m, a) => Math.min(m, a.total), curTotal);
+
+    // One cost-sorted grid, actual plan included inline rather than pulled into
+    // its own row above — easier to compare at a glance. isCurrentPlan still
+    // forces the amber banner regardless of where it lands in the sort.
+    const cards = [
+      {
+        total: curTotal,
+        html: this._renderPeriodPlanCard(
+          period.current_plan_name || '(unknown plan)', period.current_plan_bill_items,
+          curTotal, true, false, 0, showBreakdown, null,
+        ),
+      },
+      ...alts.map(a => {
+        const bi = (a.breakdown || {}).bill_items || null;
+        const isCheapest = Math.abs(a.total - minTotal) < 0.01;
+        return {
+          total: a.total,
+          html: this._renderPeriodPlanCard(
+            a.plan_key, bi, a.total, false, isCheapest, a.total - curTotal, showBreakdown, a.strategy,
+          ),
+        };
+      }),
+    ];
+    cards.sort((a, b) => a.total - b.total);
+    const cardsHtml = cards.map(c => c.html).join('');
+
+    const dateRange = this._fmtBillDateRange(period.start_date, period.end_date);
+    const countNote = allAlts.length > alts.length
+      ? ` <span class="period-alt-count">(best ${alts.length} of ${allAlts.length} alternatives)</span>` : '';
+
+    return `
+      <div class="period-section">
+        <div class="period-section-head">
+          <span class="period-section-dates">${dateRange}</span>
+          <span class="period-section-days">${period.days}&thinsp;day${period.days === 1 ? '' : 's'}${countNote}</span>
+        </div>
+        <div class="plan-grid">${cardsHtml}</div>
+      </div>`;
+  }
+
   async fetchHistory() {
     try {
       const res = await fetch('/api/grid_lens/plan_history');
@@ -656,6 +939,27 @@ class GridLensCard extends HTMLElement {
         /* Quieter than .bill-note — informational, not a caveat: this plan is
            variable-rate, so the lines above are period averages by design. */
         .bill-spot-note { font-size: 11px; color: var(--secondary-text-color); font-style: italic; padding: 4px 0; }
+        /* A window spanning a plan-history switch (see _plan_history_segments):
+           one full itemised bill per plan actually held, stacked vertically —
+           however many that is — instead of one merged table. */
+        .bill-multi-segment-note {
+          font-size: 11px; color: var(--secondary-text-color); font-style: italic;
+          padding: 0 0 6px;
+        }
+        .bill-segment {
+          border: 1px solid var(--divider-color); border-radius: 8px;
+          padding: 4px 10px 8px; margin-bottom: 10px;
+        }
+        .bill-segment-head {
+          display: flex; justify-content: space-between; align-items: baseline;
+          gap: 8px; padding: 6px 0 4px; border-bottom: 1px solid var(--divider-color);
+          flex-wrap: wrap;
+        }
+        .bill-segment-plan { font-size: 13px; font-weight: 700; color: var(--primary-text-color); }
+        .bill-segment-dates { font-size: 11px; color: var(--secondary-text-color); white-space: nowrap; }
+        .bill-multi-segment-total {
+          border-top: 2px solid var(--divider-color);
+        }
         .spike-section { margin-top: 4px; }
         .spike-row { display: flex; align-items: center; gap: 6px; font-size: 11px; padding: 2px 0; }
         .spike-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }
@@ -712,7 +1016,31 @@ class GridLensCard extends HTMLElement {
           white-space: nowrap; cursor: pointer;
         }
         .greedy-toggle input[type="checkbox"] { margin: 0; cursor: pointer; }
+        .topn-control {
+          display: inline-flex; align-items: center; gap: 5px;
+          font-size: 12px; color: var(--secondary-text-color); white-space: nowrap;
+        }
+        .topn-control select {
+          padding: 3px 5px; border: 1px solid var(--divider-color); border-radius: 4px;
+          background: var(--card-background-color); color: var(--primary-text-color);
+          font-size: 12px;
+        }
         .plan-card[hidden] { display: none; }
+        /* One vertical block per bill boundary (see _renderPeriodSection) — a plan
+           switch inside the comparison window splits it into these instead of one
+           flat plan-card grid. */
+        .period-section {
+          padding: 4px 16px 8px;
+          border-bottom: 1px solid var(--divider-color);
+        }
+        .period-section:last-child { border-bottom: none; }
+        .period-section-head {
+          display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+          padding: 12px 0 4px;
+        }
+        .period-section-dates { font-size: 15px; font-weight: 600; color: var(--primary-text-color); }
+        .period-section-days { font-size: 12px; color: var(--secondary-text-color); }
+        .period-alt-count { opacity: 0.75; }
         .strategy-text { font-size: 12px; color: var(--secondary-text-color); line-height: 1.4; white-space: pre-line; }
         .error { padding: 16px; color: var(--error-color); text-align: center; }
         .loading { padding: 16px; text-align: center; color: var(--secondary-text-color); }
@@ -826,6 +1154,22 @@ class GridLensCard extends HTMLElement {
       (detA.breakdown?.total || 0) - (detB.breakdown?.total || 0)
     );
 
+    // "Show best N" declutter filter — the current plan is always shown regardless
+    // of its rank (there must always be a baseline to compare against), then the
+    // cheapest N alternatives on top of it. Only applies to the flat single-period
+    // view below; a multi-period view applies its own per-period version of this
+    // inside _renderPeriodSection, since "cheapest" means something different once
+    // there's more than one period to rank against.
+    const topN = this._topN;
+    if (Number.isFinite(topN)) {
+      const curEntry = plansToShow.find(([n]) => n === currentPlanName);
+      const rest = plansToShow.filter(([n]) => n !== currentPlanName).slice(0, topN);
+      plansToShow = curEntry ? [curEntry, ...rest] : rest;
+      plansToShow.sort(([, detA], [, detB]) =>
+        (detA.breakdown?.total || 0) - (detB.breakdown?.total || 0)
+      );
+    }
+
     // Totals needed for colour-coding (avoid ?? for broad browser compat)
     const _cpEntry = currentPlanName ? planDetails[currentPlanName] : null;
     const _cpRaw = _cpEntry && _cpEntry.breakdown ? _cpEntry.breakdown.total : null;
@@ -903,164 +1247,33 @@ class GridLensCard extends HTMLElement {
       let breakdownHtml = '';
       if (showBreakdown) {
         const bi = breakdown.bill_items;
-        if (bi) {
-          // Section order deliberately mirrors a real retailer bill (fixed
-          // charges first, then usage, then export credits, then bonus
-          // credits, then total) so a customer can tick this card off
-          // against their actual bill line by line — see the GloBird ZEROHERO
-          // reconciliation this was modelled on. Don't reorder without
-          // re-checking against a real bill sample.
-          let rows = '';
-
-          // Supply charge
-          const s = bi.supply;
-          rows += '<div class="bill-section-head">Daily supply charge</div>';
-          rows += `<div class="breakdown-row">
-            <div class="breakdown-label">Supply charge<br>
-              <span style="font-size:11px;opacity:0.7">${(s.rate_per_day * 100).toFixed(2)}&thinsp;c/day &times; ${s.days}&thinsp;days</span>
-            </div>
-            <div class="breakdown-value">$${s.amount.toFixed(2)}</div>
-          </div>`;
-
-          // Subscription fee (e.g. Amber $25/month)
-          if (bi.subscription) {
-            const sub = bi.subscription;
-            rows += '<div class="bill-section-head">Subscription fee</div>';
-            rows += `<div class="breakdown-row">
-              <div class="breakdown-label">Membership subscription<br>
-                <span style="font-size:11px;opacity:0.7">$${sub.rate_per_month.toFixed(2)}/month &times; ${sub.months.toFixed(1)}&thinsp;months</span>
+        if (bi && bi.is_multi_segment && bi.segments && bi.segments.length) {
+          // The window covers more than one plan (a plan-history switch fell
+          // inside it — see _plan_history_segments/_compute_multi_segment_bill_items
+          // in plan_calculator.py): one real, fully itemised bill per plan actually
+          // held, dynamically however many that is — not a blended/merged table,
+          // since a "Peak" line from two different retailers matches neither plan's
+          // real bill. Each segment reuses the exact same row renderer as a normal
+          // single-plan bill, just scoped to that plan's own date range.
+          const segHtml = bi.segments.map(seg => `
+            <div class="bill-segment">
+              <div class="bill-segment-head">
+                <span class="bill-segment-plan">${this._esc(seg.plan_name)}</span>
+                <span class="bill-segment-dates">${this._fmtBillDateRange(seg.start_date, seg.end_date)} &middot; ${seg.days}&thinsp;day${seg.days === 1 ? '' : 's'}</span>
               </div>
-              <div class="breakdown-value">$${sub.amount.toFixed(2)}</div>
-            </div>`;
-          }
-
-          // Demand charge (peak-kW), only present when on a demand tariff.
-          // `dm.lines` = per-season sub-lines (a plan carrying demand_periods,
-          // itemised the way the retailer bills each season); otherwise a
-          // single flat line (the network-level demand charge).
-          if (bi.demand) {
-            const dm = bi.demand;
-            rows += '<div class="bill-section-head">Demand charge</div>';
-            const dmLines = (dm.lines && dm.lines.length) ? dm.lines : [dm];
-            dmLines.forEach(ln => {
-              rows += `<div class="breakdown-row">
-                <div class="breakdown-label">${ln.label}${this._timeRangeHtml(ln.time_range)}<br>
-                  <span style="font-size:11px;opacity:0.7">${(ln.peak_kw || 0).toFixed(2)}&thinsp;kW peak &times; ${((ln.rate_per_kw_per_day || 0) * 100).toFixed(2)}&thinsp;c/kW/day &times; ${ln.days}&thinsp;days</span>
-                </div>
-                <div class="breakdown-value">$${(ln.amount || 0).toFixed(2)}</div>
-              </div>`;
-            });
-          }
-
-          // Controlled Load — device(s) wired to a CL register, priced separately
-          // at the plan's flat CL rate instead of the general import tiers below.
-          if (bi.controlled_load) {
-            rows += '<div class="bill-section-head">Controlled load</div>';
-            bi.controlled_load.lines.forEach(line => {
-              rows += `<div class="breakdown-row">
-                <div class="breakdown-label">${line.label}<br>
-                  <span style="font-size:11px;opacity:0.7">${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh</span>
-                </div>
-                <div class="breakdown-value">$${line.amount.toFixed(2)}</div>
-              </div>`;
-            });
-          }
-
-          // Energy (usage) lines
-          rows += '<div class="bill-section-head">Usage charges</div>';
-          bi.energy_lines.forEach(line => {
-            rows += `<div class="breakdown-row">
-              <div class="breakdown-label">${line.label}${this._timeRangeHtml(line.time_range)}<br>
-                <span style="font-size:11px;opacity:0.7">${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh</span>
+              ${this._renderBillRows(seg.bill_items)}
+            </div>`).join('');
+          breakdownHtml = `
+            <div class="breakdown-section bill-multi-segment">
+              <div class="bill-multi-segment-note">Plan changed during this period — showing each plan's own bill below.</div>
+              ${segHtml}
+              <div class="bill-total-row bill-multi-segment-total">
+                <span>Combined total across ${bi.segments.length} plans (inc. GST)</span><span>$${bi.total.toFixed(2)}</span>
               </div>
-              <div class="breakdown-value">$${line.amount.toFixed(2)}</div>
             </div>`;
-          });
 
-          // Feed-in credit — one line per FiT tier/window (e.g. a capped "top up"
-          // rate separate from the base feed-in rate), same as a real bill.
-          const f = bi.fit;
-          if (f.kwh > 0 && f.lines && f.lines.length) {
-            rows += '<div class="bill-section-head bill-fit">Solar / feed-in credit</div>';
-            f.lines.forEach(line => {
-              const rateLabel = line.rate_c != null
-                ? `${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh`
-                : `spot price &times; ${line.kwh.toFixed(1)}&thinsp;kWh`;
-              rows += `<div class="breakdown-row bill-fit">
-                <div class="breakdown-label" style="color:inherit">${line.label}${this._timeRangeHtml(line.time_range)}<br>
-                  <span style="font-size:11px;opacity:0.7">${rateLabel}</span>
-                </div>
-                <div class="breakdown-value" style="color:inherit">&minus;$${line.amount.toFixed(2)}</div>
-              </div>`;
-            });
-          }
-
-          // VPP participation credit
-          if (bi.vpp_credit) {
-            rows += '<div class="bill-section-head bill-fit">VPP credit</div>';
-            rows += `<div class="breakdown-row bill-fit">
-              <div class="breakdown-label" style="color:inherit">VPP participation credit</div>
-              <div class="breakdown-value" style="color:inherit">&minus;$${bi.vpp_credit.toFixed(2)}</div>
-            </div>`;
-          }
-
-          // PEA (Price Efficiency Adjustment — Flow Power)
-          if (bi.pea_credit != null || bi.pea_breakdown) {
-            const pb = bi.pea_breakdown;
-            rows += '<div class="bill-section-head bill-fit">Other credits</div>';
-            if (pb) {
-              const creditSign = bi.pea_credit >= 0 ? '&minus;' : '+';
-              const creditAbs = Math.abs(bi.pea_credit).toFixed(2);
-              rows += `<div class="breakdown-row bill-fit">
-                <div class="breakdown-label" style="color:inherit">Price Efficiency Adjustment<br>
-                  <span style="font-size:11px;opacity:0.7">
-                    LWAP ${pb.lwap_c.toFixed(3)}c &minus; TWAP ${pb.twap_c.toFixed(3)}c = CPEA ${pb.cpea_c.toFixed(3)}c<br>
-                    PEA = CPEA &minus; BPEA ${pb.bpea_c.toFixed(1)}c
-                    = <strong>${pb.pea_c.toFixed(3)}c/kWh</strong>
-                    &times; ${pb.total_kwh.toFixed(1)}&thinsp;kWh
-                  </span>
-                </div>
-                <div class="breakdown-value" style="color:inherit">${creditSign}$${creditAbs}</div>
-              </div>`;
-            } else {
-              rows += `<div class="breakdown-row bill-fit">
-                <div class="breakdown-label" style="color:inherit">Price Efficiency Adjustment<br>
-                  <span style="font-size:11px;opacity:0.7">Estimated — actual amount varies</span>
-                </div>
-                <div class="breakdown-value" style="color:inherit">&minus;$${bi.pea_credit.toFixed(2)}</div>
-              </div>`;
-            }
-          }
-
-          // Conditional day-credits (e.g. GloBird ZEROHERO's $1/day)
-          if (bi.conditional_credits) {
-            rows += '<div class="bill-section-head bill-fit">Conditional credits</div>';
-            Object.entries(bi.conditional_credits).forEach(([label, c]) => {
-              rows += `<div class="breakdown-row bill-fit">
-                <div class="breakdown-label" style="color:inherit">${label}${this._timeRangeHtml(c.time_range)}<br>
-                  <span style="font-size:11px;opacity:0.7">Earned ${c.days_earned}/${c.days_total}&thinsp;days</span>
-                </div>
-                <div class="breakdown-value" style="color:inherit">&minus;$${c.amount.toFixed(2)}</div>
-              </div>`;
-            });
-          }
-
-          // Total + GST
-          rows += `<div class="bill-total-row">
-            <span>Total (inc. GST)</span><span>$${bi.total.toFixed(2)}</span>
-          </div>`;
-          rows += `<div class="bill-gst-row">
-            <span>GST included (1/11)</span><span>$${bi.gst_included.toFixed(2)}</span>
-          </div>`;
-
-          if (bi.optimisation_note) {
-            rows += `<div class="bill-note">${bi.optimisation_note}</div>`;
-          }
-          if (bi.spot_note) {
-            rows += `<div class="bill-spot-note">${bi.spot_note}</div>`;
-          }
-
-          breakdownHtml = `<div class="breakdown-section">${rows}</div>`;
+        } else if (bi) {
+          breakdownHtml = `<div class="breakdown-section">${this._renderBillRows(bi)}</div>`;
 
         } else if (breakdown.energy_cost !== undefined || breakdown.note) {
           // Fallback: market-linked without bill_items
@@ -1224,6 +1437,13 @@ class GridLensCard extends HTMLElement {
           <input type="checkbox" id="epc-exclude-greedy" ${this._excludeGreedy ? 'checked' : ''} ${_busy ? 'disabled' : ''}>
           Exclude Greedy Consumption
         </label>
+        <label class="topn-control" title="How many alternative plans to show — the plan you're actually on is always shown too, regardless of rank.">
+          Show best
+          <select id="epc-topn" ${_busy ? 'disabled' : ''}>
+            ${[3, 5, 10, 20].map(n => `<option value="${n}"${this._topN === n ? ' selected' : ''}>${n}</option>`).join('')}
+            <option value="all"${!Number.isFinite(this._topN) ? ' selected' : ''}>All</option>
+          </select>
+        </label>
         <button id="epc-history-btn" class="nav-btn${this._showHistory ? ' active' : ''}">History</button>
         <a href="/api/grid_lens/diagnostic_export" download class="nav-btn" title="Download diagnostic zip for bug reporting" style="text-decoration:none;">&#8659; Diagnostic</a>
       </div>`;
@@ -1239,9 +1459,21 @@ class GridLensCard extends HTMLElement {
       </div>`
     ).join('');
 
+    // A window with a plan-history switch in it comes back as more than one
+    // `period` (see plan_calculator.py's `periods` construction) — one vertical
+    // section per bill boundary, each with its own actual bill + top-N
+    // contenders for that specific period. No switch (the common case, or a
+    // stale cached response from before this field existed) falls back to the
+    // flat single-grid view above, just with the same "Show best N" filter
+    // already applied to `plansToShow`.
+    const periodsArr = this._data.periods || [];
+    const periodsHtml = (periodsArr.length > 1)
+      ? periodsArr.map(p => this._renderPeriodSection(p, topN, showBreakdown)).join('')
+      : `<div class="plan-grid">${plansHtml}${skeletonsHtml}</div>`;
+
     const bodyHtml = this._showHistory
       ? this.renderHistoryPanel(planNames)
-      : `<div class="plan-grid">${plansHtml}${skeletonsHtml}</div>`;
+      : periodsHtml;
 
     this.shadowRoot.innerHTML = `
       ${styles}
@@ -1328,6 +1560,15 @@ class GridLensCard extends HTMLElement {
       const s = this.shadowRoot.getElementById('epc-start')?.value || this._startDate;
       const e = this.shadowRoot.getElementById('epc-end')?.value   || this._endDate;
       triggerFetch(s, e, 'epc-calc');
+    });
+
+    // Purely a display filter over data already fetched and fully ranked — no
+    // refetch needed, just a re-render.
+    this.shadowRoot.getElementById('epc-topn')?.addEventListener('change', (ev) => {
+      const v = ev.target.value;
+      this._topN = v === 'all' ? Infinity : (parseInt(v, 10) || 5);
+      try { localStorage.setItem('epc-top-n', v); } catch (_) {}
+      this.render();
     });
 
     this.shadowRoot.getElementById('epc-zoom-in')?.addEventListener('click', () => {

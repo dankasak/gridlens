@@ -194,6 +194,12 @@ class PlanCalculator:
         # with the sensor-backed devices above.
         self.declared_loads: list[dict] = self._parse_declared_loads(entry)
         self.current_plan_override: str | None = entry.data.get("current_plan")
+        # Full plan-switch history log ({date, plan_name} entries), set by the
+        # PlanDataView/PlanStreamView handlers in __init__.py for a custom date-range
+        # calculation. When a switch falls inside [start_date, end_date), this drives
+        # the multi-segment actual-cost split in calculate_plan_costs instead of the
+        # single current_plan_override above — see _plan_history_segments.
+        self.plan_history_entries: list[dict] | None = None
 
         # Household's own network (DNSP) tariff code(s), parsed once. None = not
         # configured = never filter (see calculate_plan_costs).
@@ -425,7 +431,9 @@ class PlanCalculator:
         end_date: datetime = None,
         on_plan_ready=None,  # async callable(plan_key, detail, meta) — called after each plan
         on_progress=None,    # async callable(message, step, total) — called after each data fetch
+        on_period_progress=None,  # async callable(message, step, total) — see _rank_plans_for_period
         exclude_greedy: bool = False,
+        skip_period_alternatives: bool = False,  # see `periods` construction below
     ) -> dict[str, Any]:
         """Calculate costs for all plans based on historical usage.
 
@@ -440,6 +448,14 @@ class PlanCalculator:
                 the LP for scoring ALTERNATIVE plans only — never the current plan's actual
                 bill, computed separately above) has its tracked Greedy Consumption energy
                 (greedy_energy.py) subtracted first. See _get_deferrable_data.
+            skip_period_alternatives: When True, a multi-period `periods` result still gets
+                each period's correct actual-usage bill (cheap — no LP), but skips ranking
+                every candidate plan against each period (an extra LP solve per plan per
+                period, on top of the whole-window loop — real time for a large plan
+                catalogue). Set by GridLensCoordinator's unattended background refresh,
+                which repeats on its own schedule forever and has no interactive card
+                watching it pay that cost; PlanDataView/PlanStreamView (someone actually
+                looking at the Plan Comparison card) leave this False.
         """
         # Default to last 30 days if not specified (UTC-aware)
         if end_date is None:
@@ -653,6 +669,29 @@ class PlanCalculator:
                 "%d plan display name(s) are shared by more than one plan and are "
                 "being suffixed with the plan id to keep them distinct: %s",
                 len(_dup_keys), ", ".join(sorted(_dup_keys)))
+
+        # If a plan-switch history log was supplied for this calculation (custom
+        # date-range views — see PlanDataView/PlanStreamView), work out whether the
+        # window actually spans a switch. len<=1 means "no switch in this window":
+        # current_plan_override is set to that one plan (identical to the old
+        # single-lookup behaviour) and current_plan_segments stays None so the
+        # per-plan loop below takes its normal single-plan path unchanged. A real
+        # multi-plan split anchors current_plan_override to the LAST segment (the
+        # plan actually held as of end_date, i.e. "now") purely so current_plan_name
+        # below — and therefore the label shown to the user — is the plan they're
+        # actually on, while current_plan_segments drives the real per-day-correct
+        # dollar total in the loop.
+        current_plan_segments: list[tuple[str, datetime, datetime]] | None = None
+        if self.plan_history_entries:
+            _segs = self._plan_history_segments(self.plan_history_entries, start_date, end_date)
+            if len(_segs) > 1:
+                current_plan_segments = _segs
+                self.current_plan_override = _segs[-1][0]
+                _LOGGER.info(
+                    "Plan history spans %d plan(s) within this window: %s",
+                    len(_segs), " -> ".join(f"{name} from {s.date()}" for name, s, _e in _segs))
+            elif len(_segs) == 1:
+                self.current_plan_override = _segs[0][0]
 
         # Identify the current plan (the one the user is actually on).
         # Only this plan uses real sensor data; all other plans are LP-optimised.
@@ -928,26 +967,42 @@ class PlanCalculator:
                 # stays sensor-priced only when export itself is spot-priced (a plan
                 # can have a fixed import tariff but a dynamic FiT); otherwise it's
                 # tariff-priced from actual export_data, same as import.
-                export_actual = None
-                if plan.spot_export_pricing and self.export_price_sensor and grid_export_data:
-                    export_actual = await self._calculate_cost_with_prices(
-                        grid_export_data, self.export_price_sensor, "export"
+                # A window spanning a plan switch is priced per-segment against each
+                # plan's own real usage (see _plan_history_segments); falls back to
+                # the normal whole-window path (None) when there's no switch, or a
+                # segment plan is market-linked (see
+                # _compute_multi_segment_bill_items's docstring) — a PEA-eligible
+                # segment (Flow Power) is handled, not a fallback trigger.
+                bi = None
+                if current_plan_segments:
+                    bi = await self._compute_multi_segment_bill_items(
+                        current_plan_segments, usage_data, grid_export_data,
+                        export_fine_data, cl_devices, _dup_keys,
+                        aemo_price_cache=_aemo_price_cache,
                     )
-                bi = self._compute_bill_items(
-                    plan, usage_data, grid_export_data, actual_days,
-                    import_cost_actual=0.0,
-                    export_credit_actual=export_actual,
-                    comparison_total=None,
-                    opt_result=None,
-                    pea_result=pea_results.get(plan_key),
-                    export_fine_data=export_fine_data,
-                    cl_devices=cl_devices,
-                )
+                if bi is None:
+                    export_actual = None
+                    if plan.spot_export_pricing and self.export_price_sensor and grid_export_data:
+                        export_actual = await self._calculate_cost_with_prices(
+                            grid_export_data, self.export_price_sensor, "export"
+                        )
+                    bi = self._compute_bill_items(
+                        plan, usage_data, grid_export_data, actual_days,
+                        import_cost_actual=0.0,
+                        export_credit_actual=export_actual,
+                        comparison_total=None,
+                        opt_result=None,
+                        pea_result=pea_results.get(plan_key),
+                        export_fine_data=export_fine_data,
+                        cl_devices=cl_devices,
+                    )
                 bd = plan_optimization_results[plan_key]['breakdown']
                 bd['bill_items'] = bi
                 bd['total'] = bi['total']
-                bd['total_energy_cost'] = round(
-                    sum(l['amount'] for l in bi['energy_lines']) - bi['fit']['credit'], 2)
+                bd['total_energy_cost'] = bi.get('total_energy_cost')
+                if bd['total_energy_cost'] is None:
+                    bd['total_energy_cost'] = round(
+                        sum(l['amount'] for l in bi['energy_lines']) - bi['fit']['credit'], 2)
                 bd['supply_charge'] = bi['supply']['amount']
                 if bi.get('conditional_credits'):
                     bd['conditional_credits'] = bi['conditional_credits']
@@ -1016,6 +1071,93 @@ class PlanCalculator:
         for plan_name, cost in plan_costs.items():
             savings[f"{plan_name}_vs_current"] = cost - current_plan_total
 
+        # ── Per-period breakdown (Plan Comparison card's bill-boundary sections) ──
+        # One entry per bill boundary: the plan actually held that period, priced
+        # from that period's own actual usage (already computed above — reused,
+        # not recomputed), plus every OTHER candidate plan re-priced against that
+        # same period's own usage slice and ranked cheapest-first (see
+        # _rank_plans_for_period — a real per-period LP solve, not a shortlist
+        # approximated from the whole-window ranking, so a short/unusual period
+        # can surface a different top plan than the window-wide comparison would).
+        # A window with no plan-history switch in it still gets exactly one period
+        # spanning the whole range, reusing the whole-window results computed
+        # above with no extra LP solves — this is the only shape the Plan
+        # Comparison card renders from; there's no separate flat/non-period view.
+        multi_bi = None
+        if current_plan_segments:
+            _cur_bd = (plan_optimization_results.get(current_plan_name) or {}).get('breakdown') or {}
+            _cur_bi = _cur_bd.get('bill_items') or {}
+            if _cur_bi.get('is_multi_segment'):
+                multi_bi = _cur_bi
+            else:
+                _LOGGER.info(
+                    "Plan history spans multiple plans but the current-plan bill "
+                    "wasn't segment-split (market-linked/PEA plan involved?) — "
+                    "falling back to a single whole-window period.")
+
+        periods = []
+        if multi_bi:
+            _period_total = len(current_plan_segments)
+            for _period_idx, ((plan_name, seg_start, seg_end), seg_detail) in enumerate(zip(
+                current_plan_segments, multi_bi['segments']
+            ), start=1):
+                # Ranking every candidate plan against a period's own usage slice is
+                # `len(_candidate_plans)` more LP solves ON TOP of the whole-window
+                # loop above, once per period — for a multi-period window this can
+                # take real time with nothing to show for it on the stream, which is
+                # exactly what tripped a "calculation stream failed" client-side
+                # timeout during testing (a long silent gap with zero SSE writes
+                # after the last 'plan' event). Report progress per plan priced so
+                # the stream keeps writing throughout, not just during the
+                # whole-window loop before it.
+                async def _period_progress(done, total, _pi=_period_idx, _pt=_period_total):
+                    if on_period_progress:
+                        await on_period_progress(
+                            f"Ranking alternatives for period {_pi}/{_pt} ({done}/{total} plans)",
+                            done, total,
+                        )
+                ranked = [] if skip_period_alternatives else await self._rank_plans_for_period(
+                    seg_start, seg_end, seg_detail['days'],
+                    usage_data, grid_export_data, solar_data, true_load_data, deferrable_data,
+                    deferrable_loads, spot_retail, export_fine_data, cl_devices,
+                    _dup_keys, _candidate_plans, exclude_plan_name=plan_name,
+                    progress_cb=_period_progress, aemo_price_cache=_aemo_price_cache,
+                )
+                periods.append({
+                    'start_date': seg_start.isoformat(),
+                    'end_date': seg_end.isoformat(),
+                    'days': seg_detail['days'],
+                    'current_plan_name': plan_name,
+                    'current_plan_total': seg_detail['bill_items']['total'],
+                    'current_plan_bill_items': seg_detail['bill_items'],
+                    'alternatives': ranked,
+                })
+        else:
+            periods.append({
+                'start_date': start_date.isoformat(),
+                'end_date': end_date.isoformat(),
+                'days': actual_days,
+                'current_plan_name': current_plan_name,
+                'current_plan_total': current_plan_total,
+                'current_plan_bill_items': (
+                    (plan_optimization_results.get(current_plan_name) or {}).get('breakdown') or {}
+                ).get('bill_items'),
+                'alternatives': sorted(
+                    (
+                        {
+                            'plan_key': k,
+                            'total': (v.get('breakdown') or {}).get('total', plan_costs.get(k, 0)),
+                            'breakdown': v.get('breakdown') or {},
+                            'strategy': v.get('strategy'),
+                            'plan_info': v.get('plan_info'),
+                        }
+                        for k, v in plan_optimization_results.items()
+                        if k != current_plan_name
+                    ),
+                    key=lambda r: r['total'],
+                ),
+            })
+
         return {
             "current_plan_energy_cost": current_plan_energy_cost,
             "current_plan_monthly_fee": next(
@@ -1027,6 +1169,7 @@ class PlanCalculator:
             "current_plan_name": current_plan_name,
             "alternative_plans": plan_costs,
             "plan_details": plan_optimization_results,  # New: detailed results for dashboard
+            "periods": periods,  # One entry per bill boundary — see the comment above this return.
             "energy_flows": energy_flows,  # New: for energy flow visualization
             "deferrable_devices": [
                 {"name": d["name"], "sensor_id": d["sensor_id"]}
@@ -1535,6 +1678,265 @@ class PlanCalculator:
                     "time_range": format_window_range(window),
                 }
         return round(total, 2), detail
+
+    @staticmethod
+    def _slice_by_time(records: list[dict], seg_start: datetime, seg_end: datetime) -> list[dict]:
+        """Records with seg_start <= timestamp < seg_end, same half-open convention
+        as the segment boundaries from _plan_history_segments."""
+        if not records:
+            return records
+        return [r for r in records if seg_start <= r['timestamp'] < seg_end]
+
+    def _segment_pea_result(
+        self, seg_plan, seg_usage: list[dict], seg_start: datetime, seg_end: datetime,
+        aemo_price_cache: dict[str, list[dict]] | None,
+    ) -> dict | None:
+        """PEA credit (Flow Power's Price Efficiency Adjustment) for one segment's
+        own usage slice, from the same whole-window 5-min AEMO price series the
+        main per-plan loop already fetched (see calculate_plan_costs' PEA section
+        above) — sliced down to this segment's own time range rather than
+        re-fetched, since the whole-window series already covers it. Returns None
+        for a plan with no `aemo_price_sensor`, or if that sensor's series wasn't
+        fetched/available (logged, not silently substituted with a wrong credit).
+        """
+        aemo_sensor = getattr(seg_plan, 'aemo_price_sensor', None)
+        if not aemo_sensor:
+            return None
+        price_series = (aemo_price_cache or {}).get(aemo_sensor)
+        if not price_series:
+            _LOGGER.warning(
+                "%s needs PEA pricing from %s for %s–%s but no price series was "
+                "fetched for it; that segment's bill omits the PEA credit",
+                seg_plan.plan_name, aemo_sensor, seg_start.date(), seg_end.date())
+            return None
+        seg_prices = self._slice_by_time(price_series, seg_start, seg_end)
+        bpea = getattr(seg_plan, 'bpea', 0.017)
+        return self._compute_pea_credit(seg_usage, seg_prices, bpea)
+
+    async def _compute_multi_segment_bill_items(
+        self,
+        segments: list[tuple[str, datetime, datetime]],
+        usage_data: list[dict],
+        export_data: list[dict],
+        export_fine_data: list[dict] | None,
+        cl_devices: list[dict],
+        dup_keys: set[str],
+        aemo_price_cache: dict[str, list[dict]] | None = None,
+    ) -> dict | None:
+        """Actual-usage bill items for a window that spans one or more plan
+        switches: each segment is priced against its OWN real usage slice and
+        its OWN plan's tariff (via the normal single-plan _compute_bill_items),
+        then the dollar totals are summed. See _plan_history_segments.
+
+        Deliberately does NOT try to merge each segment's itemised energy_lines
+        into one blended line-per-rate table — a "Peak" line from GloBird and a
+        "Peak" line from AGL are different rates for different plans, and
+        merging them would show a line that matches nothing on either real
+        bill (see CLAUDE.md's bill-breakdown-must-match-a-real-bill principle).
+        Instead each segment's own full bill_items sits under 'segments' for
+        an itemised per-period view; the top-level fields are the roll-up sum.
+
+        A PEA-eligible segment (Flow Power) gets its own sliced PEA credit — see
+        _segment_pea_result. Returns None (caller falls back to the whole-window
+        path) only if a segment's plan is `is_market_linked` (sensor-priced
+        import/export, not tariff-priced — a different mechanism PEA-slicing
+        doesn't help with) or isn't in the current plan catalogue at all.
+        """
+        all_plans = self._get_plans()
+        seg_details = []
+        for plan_name, seg_start, seg_end in segments:
+            seg_plan = next(
+                (p for p in all_plans if self._plan_key(p, dup_keys) == plan_name), None
+            )
+            if seg_plan is None:
+                _LOGGER.warning(
+                    "Plan history names '%s' for %s–%s but it's not in the current "
+                    "plan catalogue; falling back to the whole-window current-plan path",
+                    plan_name, seg_start.date(), seg_end.date())
+                return None
+            if seg_plan.is_market_linked:
+                _LOGGER.info(
+                    "%s (%s–%s) is market-linked (sensor-priced); multi-segment actual "
+                    "billing doesn't support that yet, falling back to whole-window pricing",
+                    plan_name, seg_start.date(), seg_end.date())
+                return None
+            seg_days = round((seg_end - seg_start).total_seconds() / 86400)
+            if seg_days <= 0:
+                continue
+            seg_usage = self._slice_by_time(usage_data, seg_start, seg_end)
+            seg_export = self._slice_by_time(export_data, seg_start, seg_end)
+            seg_export_fine = self._slice_by_time(export_fine_data or [], seg_start, seg_end)
+            seg_export_actual = None
+            if seg_plan.spot_export_pricing and self.export_price_sensor and seg_export:
+                seg_export_actual = await self._calculate_cost_with_prices(
+                    seg_export, self.export_price_sensor, "export"
+                )
+            seg_pea = self._segment_pea_result(seg_plan, seg_usage, seg_start, seg_end, aemo_price_cache)
+            bi = self._compute_bill_items(
+                seg_plan, seg_usage, seg_export, seg_days,
+                import_cost_actual=0.0,
+                export_credit_actual=seg_export_actual,
+                pea_result=seg_pea,
+                export_fine_data=seg_export_fine,
+                cl_devices=cl_devices,
+            )
+            seg_details.append({
+                'plan_name': plan_name,
+                'start_date': seg_start.isoformat(),
+                'end_date': seg_end.isoformat(),
+                'days': seg_days,
+                'bill_items': bi,
+            })
+
+        if not seg_details:
+            return None
+
+        total = round(sum(d['bill_items']['total'] for d in seg_details), 2)
+        total_energy_cost = round(sum(
+            sum(l['amount'] for l in d['bill_items']['energy_lines']) - d['bill_items']['fit']['credit']
+            for d in seg_details
+        ), 2)
+        gross_charges = round(sum(d['bill_items']['gross_charges'] for d in seg_details), 2)
+        gst_included = round(sum(d['bill_items']['gst_included'] for d in seg_details), 2)
+        supply_amount = round(sum(d['bill_items']['supply']['amount'] for d in seg_details), 2)
+        fit_credit = round(sum(d['bill_items']['fit']['credit'] for d in seg_details), 2)
+        fit_kwh = round(sum(d['bill_items']['fit']['kwh'] for d in seg_details), 4)
+        plan_names = ", ".join(dict.fromkeys(d['plan_name'] for d in seg_details))  # de-duped, order kept
+
+        return {
+            'is_multi_segment': True,
+            'segments': seg_details,
+            'supply': {'amount': supply_amount, 'days': sum(d['days'] for d in seg_details)},
+            'fit': {'credit': fit_credit, 'kwh': fit_kwh, 'total_export_kwh': fit_kwh, 'lines': []},
+            'energy_lines': [],
+            'conditional_credits': None,
+            'gross_charges': gross_charges,
+            'gst_included': gst_included,
+            'total': total,
+            'total_energy_cost': total_energy_cost,
+            'note': (
+                f"Spans a plan change ({plan_names}) — see 'segments' for the real "
+                f"itemised bill from each period; the totals above are the sum."
+            ),
+        }
+
+    async def _price_plan_for_period(
+        self,
+        plan,
+        seg_start: datetime,
+        seg_end: datetime,
+        seg_days: int,
+        usage_data: list[dict],
+        export_data: list[dict],
+        solar_data: list[dict],
+        base_load_data: list[dict],
+        deferrable_loads: list[dict],
+        spot_series,
+        export_fine_data: list[dict] | None,
+        cl_devices: list[dict],
+        aemo_price_cache: dict[str, list[dict]] | None = None,
+    ) -> dict:
+        """Price ONE plan over an arbitrary window — the same LP-optimised-battery
+        (or simple, if no battery) alternative-plan pricing the main per-plan loop
+        above uses for the whole comparison window, just scoped to whatever data
+        slice the caller passes in. Shared by that whole-window loop (called with
+        the whole window's unsliced data — see the `periods` construction at the
+        end of calculate_plan_costs) and _rank_plans_for_period (segment-sliced
+        data), so the two pricing paths can't drift apart.
+
+        Deliberately doesn't build an hourly_profile/spikes — those are chart-only
+        fields a compact per-period contender card doesn't render, and computing
+        them needs the whole-window hour-of-day averages this function never
+        receives. A PEA-eligible plan (Flow Power) gets its own sliced PEA credit
+        via _segment_pea_result, same as the current-plan segment path.
+        """
+        if self.has_battery and self.battery_optimizer and solar_data:
+            cost, opt_result = await self._calculate_plan_cost_with_battery_optimization(
+                plan, solar_data, base_load_data, export_data,
+                deferrable_loads=deferrable_loads, spot_series=spot_series,
+            )
+            fixed_credit = getattr(plan, 'fixed_daily_credit', 0.0) * seg_days
+            total = cost - fixed_credit
+            pea_result = self._segment_pea_result(plan, usage_data, seg_start, seg_end, aemo_price_cache)
+            bi = self._compute_bill_items(
+                plan, usage_data, export_data, seg_days,
+                comparison_total=total, opt_result=opt_result, pea_result=pea_result,
+                export_fine_data=export_fine_data, cl_devices=cl_devices,
+                is_spot_priced=bool(spot_series),
+            )
+        else:
+            total = self._calculate_plan_cost_simple(base_load_data, plan, spot_series=spot_series)
+            total -= getattr(plan, 'fixed_daily_credit', 0.0) * seg_days
+            bi = {'total': round(total, 2), 'note': 'No battery optimisation available for this period'}
+        return {
+            'total': round(total, 2),
+            'breakdown': {'bill_items': bi, 'total': round(total, 2)},
+            'strategy': plan.describe_strategy(),
+            'plan_info': plan.get_plan_info(),
+        }
+
+    async def _rank_plans_for_period(
+        self,
+        seg_start: datetime,
+        seg_end: datetime,
+        seg_days: int,
+        usage_data: list[dict],
+        export_data: list[dict],
+        solar_data: list[dict],
+        true_load_data: list[dict],
+        deferrable_data: list[dict],
+        deferrable_loads: list[dict],
+        spot_retail: dict,
+        export_fine_data: list[dict] | None,
+        cl_devices: list[dict],
+        dup_keys: set[str],
+        candidate_plans: list,
+        exclude_plan_name: str | None,
+        progress_cb=None,  # async callable(done, total) — called after each plan priced
+        aemo_price_cache: dict[str, list[dict]] | None = None,
+    ) -> list[dict]:
+        """Price every candidate plan against ONE period's own usage slice and
+        return them ranked cheapest-first — the "top N contenders for that
+        period" the Plan Comparison card shows under each bill-boundary section.
+        Deliberately a real per-period LP solve for every plan, not a shortlist
+        approximated from the whole-window ranking: a short or unusual period can
+        genuinely favour a different plan than the whole window would suggest.
+
+        ``progress_cb``, when given, fires after every plan — this loop can run
+        for a genuinely long time (another full LP pass per period on top of the
+        whole-window loop) with nothing else on the stream to show for it
+        otherwise, which is what tripped a client-side "stream failed" timeout
+        during testing (see calculate_plan_costs' `periods` construction).
+        """
+        seg_usage = self._slice_by_time(usage_data, seg_start, seg_end)
+        seg_export = self._slice_by_time(export_data, seg_start, seg_end)
+        seg_solar = self._slice_by_time(solar_data, seg_start, seg_end) if solar_data else []
+        seg_true_load = self._slice_by_time(true_load_data, seg_start, seg_end)
+        seg_deferrable = self._slice_by_time(deferrable_data, seg_start, seg_end) if deferrable_data else []
+        seg_base_load = self._subtract_ev_from_load(seg_true_load, seg_deferrable)
+        seg_export_fine = self._slice_by_time(export_fine_data or [], seg_start, seg_end)
+
+        results = []
+        priceable = [p for p in candidate_plans if self._plan_key(p, dup_keys) != exclude_plan_name]
+        for i, plan in enumerate(priceable, start=1):
+            plan_key = self._plan_key(plan, dup_keys)
+            try:
+                r = await self._price_plan_for_period(
+                    plan, seg_start, seg_end, seg_days, seg_usage, seg_export, seg_solar, seg_base_load,
+                    deferrable_loads, spot_retail.get(plan_key), seg_export_fine, cl_devices,
+                    aemo_price_cache=aemo_price_cache,
+                )
+            except Exception:
+                _LOGGER.exception(
+                    "Failed pricing %s for period %s–%s; leaving it out of that "
+                    "period's ranking rather than failing the whole calculation",
+                    plan_key, seg_start.date(), seg_end.date())
+            else:
+                results.append({'plan_key': plan_key, **r})
+            if progress_cb:
+                await progress_cb(i, len(priceable))
+        results.sort(key=lambda r: r['total'])
+        return results
 
     def _compute_bill_items(
         self,
@@ -2714,6 +3116,56 @@ class PlanCalculator:
                 "export_rate": round(exp_rate, 4),
             })
         return result
+
+    @staticmethod
+    def _history_entry_dt(date_str: str, tz) -> datetime:
+        """Parse a plan-history entry's bare 'YYYY-MM-DD' into local midnight."""
+        y, m, d = (int(x) for x in date_str[:10].split('-'))
+        return datetime(y, m, d, tzinfo=tz)
+
+    def _plan_history_segments(
+        self, entries: list[dict], start_date: datetime, end_date: datetime,
+    ) -> list[tuple[str, datetime, datetime]]:
+        """Split [start_date, end_date) into (plan_name, seg_start, seg_end) runs
+        wherever a plan-history entry falls strictly inside the window.
+
+        This generalises the old single "plan active at start_date" lookup
+        (formerly __init__.py's _plan_from_history, since removed) to handle a switch that happens
+        *during* the comparison window rather than picking one plan for the
+        whole range: a household that switched plans mid-window was genuinely
+        on two different tariffs, and each side of the switch should be priced
+        against its own real usage — not have the whole window silently
+        misattributed to whichever plan the window's start date happens to land
+        on either side of (see docs/GRIDLENS_CHECKLIST.md 2026-09-15).
+
+        Returns [] if no entry qualifies for any part of the window (unknown
+        plan) — same "leave current_plan_override alone" contract the old
+        function had. Returns a single segment spanning the whole window when
+        there's no switch inside it, so callers can special-case len() <= 1
+        as "business as usual".
+        """
+        if not entries:
+            return []
+        tz = getattr(start_date, 'tzinfo', None) or timezone.utc
+        dated = sorted(
+            ((self._history_entry_dt(e['date'], tz), e['plan_name']) for e in entries),
+            key=lambda t: t[0],
+        )
+        # Switch points strictly inside the window split it into segments.
+        boundaries = sorted({start_date, end_date} | {
+            dt for dt, _ in dated if start_date < dt < end_date
+        })
+        segments = []
+        for seg_start, seg_end in zip(boundaries, boundaries[1:]):
+            if seg_end <= seg_start:
+                continue
+            active = None
+            for dt, plan_name in dated:
+                if dt <= seg_start:
+                    active = plan_name
+            if active:
+                segments.append((active, seg_start, seg_end))
+        return segments
 
     def _detect_current_plan(self, days: int) -> tuple:
         """Return (supply_charge, plan_key) for the current plan."""
