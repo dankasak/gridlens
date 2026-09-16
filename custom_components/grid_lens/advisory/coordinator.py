@@ -790,9 +790,9 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         )
         # Capped rate windows (e.g. GloBird ZEROHERO's 50 kWh/day free-import window)
         # on the user's actual current plan — without this the live dispatch would
-        # treat the free tier as unlimited. A no-op ([], [], {}) for the common case
+        # treat the free tier as unlimited. A no-op ([], [], {}, {}) for the common case
         # of a plan with no capped rates.
-        import_caps, export_caps, _cap_labels = build_rate_caps(
+        import_caps, export_caps, _import_cap_labels, _export_cap_labels = build_rate_caps(
             self._plan, bundle.start, bundle.slots, bundle.slot_minutes
         )
         # Conditional day-credits (e.g. GloBird ZEROHERO's "$1/day when imports
