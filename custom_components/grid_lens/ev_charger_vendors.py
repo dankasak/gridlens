@@ -54,7 +54,15 @@ EV_CHARGER_VENDORS: list[dict[str, Any]] = [
         "note": (
             "Live-confirmed 2026-09-11. No stateful switch — this charger's setpoint "
             "floor is 6 A, so wire the Start/Stop button pair on the next screen rather "
-            "than a Control Entity switch."
+            "than a Control Entity switch. Grid Lens's start/stop buttons already press "
+            "ha-wattpilot's own force-state register only on an actual on/off change — "
+            "this already matches how the charger's own app pauses a session (car stays "
+            "plugged in and authenticated; only current delivery stops), not a full "
+            "stop-and-restart. Separately, ha-wattpilot also exposes a `switch.*_charge_pause` "
+            "entity (disabled by default — enable it under Settings > Devices & Services > "
+            "Entities > Disabled) that lets the charger's own firmware insert its own "
+            "autonomous pauses independent of Grid Lens's commands; leave it OFF so it "
+            "can't fight the optimizer's schedule."
         ),
         "patterns": {
             "setpoint": r"^number\..*_max_charging_current$",

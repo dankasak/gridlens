@@ -1136,6 +1136,18 @@ Phase auto-derivation and each vendor's exact step/rounding semantics are still 
 beyond the Wattpilot's own 1–32 A single number entity — every other vendor named above is
 still stub-only.
 
+**Vendor note surfacing (2026-09-16).** A vendor's `note` field in `EV_CHARGER_VENDORS`
+(previously dev-only documentation, never shown to a user) is now carried by the options
+flow (`self._load_vendor_note`, set in `async_step_load_ev_brand`) into the following
+`load_modulating` screen's description, under a "Charger brand note" heading — empty when
+no note applies (an unrecognised brand, or "Other"). Wattpilot's note now covers two things:
+its start/stop buttons already act as the vendor's own pause (a crossing-only press of
+ha-wattpilot's force-state register — car stays plugged in, only current delivery stops;
+see `modulating_controller.py`'s `_write_setpoint`), so nothing extra was needed there; and
+ha-wattpilot separately exposes a disabled-by-default `switch.*_charge_pause` entity that,
+if enabled and left on, lets the charger's own firmware insert autonomous pauses outside
+Grid Lens's control — the note tells the user to find and leave it off.
+
 ---
 
 ## 7. Greedy Consumption

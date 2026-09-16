@@ -1033,6 +1033,12 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         self._loads: list | None = None
         self._editing: int | None = None
         self._load_steps: list[str] = []
+        # Set by async_step_load_ev_brand when the picked vendor carries a `note` —
+        # surfaced on the very next screen (async_step_load_modulating) so a hardware
+        # quirk the wizard can't fill in for the user (e.g. a firmware setting that
+        # fights Grid Lens's own on/off control) isn't buried in a code comment only a
+        # developer ever reads. Cleared whenever "Other"/no note applies.
+        self._load_vendor_note: str = ""
         # True when the wizard was entered straight from the menu, so "save and
         # continue" saves and exits instead of walking on to the plan/API steps.
         self._loads_only: bool = False
@@ -1639,6 +1645,7 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             vendor_id = str(user_input.get("vendor", "other") or "other")
             vendor = vendor_by_id(vendor_id)
+            self._load_vendor_note = ""
             if vendor:
                 found = detect_ev_charger(self.hass, vendor_id)
                 for field in ("setpoint", "plug_sensor", "start_button", "stop_button", "switch"):
@@ -1647,6 +1654,7 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 for field, value in vendor.get("defaults", {}).items():
                     if not load.get(field):
                         load[field] = value
+                self._load_vendor_note = str(vendor.get("note", "") or "")
             return await self._next_load_step()
 
         return self.async_show_form(
@@ -1844,7 +1852,13 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                     selector.EntitySelectorConfig(domain="button")
                 ),
             }),
-            description_placeholders={"name": self._load_display_name(load)},
+            description_placeholders={
+                "name": self._load_display_name(load),
+                "vendor_note": (
+                    f"\n\n**Charger brand note:** {self._load_vendor_note}"
+                    if self._load_vendor_note else ""
+                ),
+            },
         )
 
     async def async_step_load_soc(self, user_input=None):
