@@ -819,22 +819,25 @@ def versioned_plans_from_history(plan_dict: dict, history: dict,
 
 def build_rate_caps(
     plan: RetailerPlan, start: datetime, n_slots: int, slot_minutes: int = 60,
-) -> tuple[list[Dict], list[Dict], Dict]:
+) -> tuple[list[Dict], list[Dict], Dict, Dict]:
     """Build BatteryOptimizer.optimize_hourly_schedule's import_caps/export_caps
     hour-mask descriptors from a plan's per-slot rate lookup, grouping slots by rate
     label so multiple slots sharing the same capped rate definition (e.g. every hour
     of GloBird ZEROHERO's daily free-import window) share one daily_cap_kwh/
     rate_after_cap budget rather than each getting its own.
 
-    Also returns cap_labels: {round(rate, 4): "<label> (first N kWh/day)",
-    round(rate_after_cap, 4): "<label> (after N kWh/day)"} for callers building a
-    cost breakdown by rate value that want distinct, unambiguous labels for the
-    free and post-cap tiers instead of two rows that otherwise look identical —
-    mirrors PlanCalculator._split_capped_kwh's labelling for the actual-usage
-    bill-reporting path.
+    Also returns import_cap_labels and export_cap_labels — each
+    {round(rate, 4): "<label> (first N kWh/day)",
+     round(rate_after_cap, 4): "<label> (after N kWh/day)"} — for callers
+    building a cost breakdown by rate value that want distinct, unambiguous
+    labels for the free and post-cap tiers instead of two rows that otherwise
+    look identical — mirrors PlanCalculator._split_capped_kwh's labelling for
+    the actual-usage bill-reporting path. Kept as two dicts, not one shared
+    one, so an export-only label can never leak into a caller's import-side
+    rate→label mapping (or vice versa) just because the rate value collides.
 
-    Returns ([], [], {}) for a plan with no capped rates (the common case) — the
-    optimizer then behaves exactly as it did before caps existed.
+    Returns ([], [], {}, {}) for a plan with no capped rates (the common
+    case) — the optimizer then behaves exactly as it did before caps existed.
 
     ``start`` is added to in its original tz (usually UTC) and only converted to
     Australia/Sydney per resulting instant — matching PlanCalculator's rate-window
@@ -847,9 +850,7 @@ def build_rate_caps(
         from backports.zoneinfo import ZoneInfo
     tz = ZoneInfo("Australia/Sydney")
 
-    cap_labels: Dict = {}
-
-    def _build(get_info) -> list[Dict]:
+    def _build(get_info, cap_labels: Dict) -> list[Dict]:
         groups: Dict[str, Dict] = {}
         for t in range(n_slots):
             dt = (start + timedelta(minutes=t * slot_minutes)).astimezone(tz)
@@ -880,9 +881,20 @@ def build_rate_caps(
                                   f"{_base} (after {cap:g} {_unit}{_avg})")
         return list(groups.values())
 
-    import_caps = _build(plan.get_import_rate_info)
-    export_caps = _build(plan.get_export_rate_info)
-    return import_caps, export_caps, cap_labels
+    # Separate dicts per direction — an import tier and an export tier can
+    # land on the same rate value (e.g. a 0c free-import window and a 0c
+    # no-export-credit window), and a single shared dict would let whichever
+    # direction is built second silently overwrite the other's label, or
+    # worse, leak an export-only label (e.g. "Happy Hour FiT (first N kWh/day)")
+    # into the caller's import-side rate→label mapping and back into it as a
+    # phantom zero-kWh "energy line". See feedback_capped_rate_labels memory
+    # and the Flow Power Happy Hour FiT-section duplication it caused
+    # (2026-09-16).
+    import_cap_labels: Dict = {}
+    export_cap_labels: Dict = {}
+    import_caps = _build(plan.get_import_rate_info, import_cap_labels)
+    export_caps = _build(plan.get_export_rate_info, export_cap_labels)
+    return import_caps, export_caps, import_cap_labels, export_cap_labels
 
 
 def build_conditional_credits(

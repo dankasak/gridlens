@@ -2113,17 +2113,21 @@ class PlanCalculator:
             dummy_slots = [{'hour': h, 'import_kwh': 0.0, 'import_cost': 0.0,
                             'export_kwh': 0.0, 'export_credit': 0.0} for h in range(48)]
             dummy_sections = plan.get_display_breakdown({'schedule': dummy_slots}).get('sections', [])
-            # cap_labels (from build_rate_caps, carried on opt_result) wins on collision —
-            # same precedence, and same reasoning, as the actual-usage branch above: it
-            # explicitly names both the free/under-cap and after-cap portions so they
-            # never render as the same indistinguishable label.
+            # import_cap_labels (from build_rate_caps, carried on opt_result) wins on
+            # collision — same precedence, and same reasoning, as the actual-usage
+            # branch above: it explicitly names both the free/under-cap and
+            # after-cap portions so they never render as the same indistinguishable
+            # label. Import-only, deliberately — merging the export side's cap
+            # labels here would leak e.g. "Happy Hour FiT (first N kWh/day)" into
+            # this import mapping and, via all_rates below, into a phantom
+            # zero-kWh energy_lines row (see build_rate_caps's docstring).
             rate_to_label: dict = {
                 **{
                     round(s['rate'], 4): s['title']
                     for s in dummy_sections
                     if s.get('cost', 0) >= 0 and s.get('rate', 0) >= 0
                 },
-                **(opt_result.get('cap_labels', {}) if opt_result else {}),
+                **(opt_result.get('import_cap_labels', {}) if opt_result else {}),
             }
 
             all_rates = sorted(set(tier_data.keys()) | set(rate_to_label.keys()), reverse=True)
@@ -2336,16 +2340,18 @@ class PlanCalculator:
         # Label every FiT tier the plan declares (even ones with zero export so
         # far), same precedence as energy_lines: the plan's own flat label first,
         # the cap-split "(first/after N kWh/day)" label wins when it applies.
-        # export_cap_labels is populated on the current-plan fixed-FiT path
-        # (_split_capped_kwh); opt_result['cap_labels'] carries the same
-        # free/after-cap labels for the LP path (build_rate_caps emits them for
-        # both directions) so a capped alt-plan FiT gets "(after N kWh/day)" on
-        # its post-cap line instead of a bare "Solar Export".
+        # export_cap_labels (this method's local dict) is populated on the
+        # current-plan fixed-FiT path (_split_capped_kwh); opt_result's
+        # 'export_cap_labels' carries the same free/after-cap labels for the LP
+        # path (build_rate_caps, export-direction only — see its docstring for
+        # why it's kept separate from the import side) so a capped alt-plan
+        # FiT gets "(after N kWh/day)" on its post-cap line instead of a bare
+        # "Solar Export".
         fit_rate_to_label: dict = {
             round(float(r['rate']), 4): r.get('label', 'Solar Export')
             for r in plan.get_export_rate_defs() if r.get('rate') is not None
         }
-        fit_rate_to_label.update(opt_result.get('cap_labels', {}) if opt_result else {})
+        fit_rate_to_label.update(opt_result.get('export_cap_labels', {}) if opt_result else {})
         fit_rate_to_label.update(export_cap_labels)
         fit_rate_to_label[-1.0] = 'Feed-in (spot price)'
 
@@ -3757,7 +3763,8 @@ class PlanCalculator:
         # Capped rate windows (e.g. GloBird ZEROHERO's 50 kWh/day free-import window,
         # or a capped Super Export credit) — without this the LP would treat the free
         # tier as unlimited and dump/pull arbitrary kWh through it.
-        import_caps, export_caps, cap_labels = build_rate_caps(plan, start_time, T)
+        import_caps, export_caps, import_cap_labels, export_cap_labels = build_rate_caps(
+            plan, start_time, T)
         # Conditional day-credits (e.g. GloBird ZEROHERO's "$1/day when imports
         # are 0.03 kWh/hour or less, 6pm-9pm") — without this the comparison
         # would understate a plan carrying one by up to its full annual value,
@@ -3808,8 +3815,12 @@ class PlanCalculator:
         )
         # Carried through to _compute_bill_items so capped-rate tiers in the cost
         # breakdown get a real label (e.g. "Free Window... (over cap)") instead of
-        # falling into the generic "Energy" bucket.
-        result['cap_labels'] = cap_labels
+        # falling into the generic "Energy" bucket. Kept as two direction-scoped
+        # dicts (see build_rate_caps) so an export label like "Happy Hour FiT
+        # (first N kWh/day)" can't leak into the import energy_lines mapping and
+        # reappear there as a phantom zero-kWh line.
+        result['import_cap_labels'] = import_cap_labels
+        result['export_cap_labels'] = export_cap_labels
         _LOGGER.warning(
             "Optimiser solver=%s  import=%.1f kWh ($%.2f)  export=%.1f kWh ($%.2f)  net=$%.2f",
             result.get('solver', '?'),

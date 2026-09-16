@@ -92,7 +92,7 @@ def _install_stubs() -> None:
     rates = _mod("gl.advisory.rates")
     rates.PlanRateForecaster = type("PlanRateForecaster", (), {})
     rp = _mod("gl.retailer_plans")
-    rp.build_rate_caps = lambda *a, **k: ([], [], {})
+    rp.build_rate_caps = lambda *a, **k: ([], [], {}, {})
     rp.build_conditional_credits = lambda *a, **k: []
 
     # schedule_grid has zero HA imports by design, so load the REAL module under the
