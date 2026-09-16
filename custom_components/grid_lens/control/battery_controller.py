@@ -173,9 +173,6 @@ class BatteryController:
         soc_pct = max(0.0, min(100.0, soc_pct))
         return await self.driver.set_backup_reserve(soc_pct)
 
-    async def read_soc(self) -> Optional[float]:
-        return await self._read_soc()
-
     async def verify_applied(self) -> Optional[bool]:
         """Does the live hardware mode still match ``current_action``?
 

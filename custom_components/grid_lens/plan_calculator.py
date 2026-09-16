@@ -58,7 +58,6 @@ from .const import (
     DEFAULT_DEMAND_WINDOW_HOURS,
     DEFAULT_MIN_CHARGE_CURRENT_A,
     DEFAULT_SUPPLY_VOLTAGE,
-    POPULAR_EV_PLANS,
 )
 from .entity_lookup import resolve_device_name, async_get_energy_dashboard_names
 
@@ -1258,30 +1257,6 @@ class PlanCalculator:
             "hourly": hourly_flows,
             "summary": summary,
         }
-
-    async def _calculate_cost_breakdown(
-        self, usage_data: list[dict], export_data: list[dict]
-    ) -> tuple[float, float]:
-        """Return (import_cost, export_credit) as separate components for bill display."""
-        total_import_kwh = sum(d["value"] for d in usage_data) if usage_data else 0.0
-        total_export_kwh = sum(d["value"] for d in export_data) if export_data else 0.0
-
-        if self.import_price_sensor and usage_data:
-            import_cost = await self._calculate_cost_with_prices(
-                usage_data, self.import_price_sensor, "import"
-            )
-        else:
-            import_cost = total_import_kwh * 0.15
-
-        export_credit = 0.0
-        if self.export_price_sensor and export_data:
-            export_credit = await self._calculate_cost_with_prices(
-                export_data, self.export_price_sensor, "export"
-            )
-        elif export_data:
-            export_credit = total_export_kwh * 0.05
-
-        return import_cost, export_credit
 
     def _compute_demand_charge(
         self,

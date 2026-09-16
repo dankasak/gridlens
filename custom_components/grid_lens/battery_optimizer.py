@@ -552,32 +552,6 @@ class BatteryOptimizer:
             return f"removing any of these alone restores feasibility: {', '.join(culprits)}"
         return "a combination of deferrable devices together (no single device's removal restores feasibility)"
 
-    def calculate_no_battery_cost(
-        self,
-        solar_profile: List[float],
-        load_profile: List[float],
-        import_rates: List[float],
-        export_rates: List[float],
-    ) -> Dict:
-        """Baseline cost with no battery (all surplus exported, all deficit imported)."""
-        total_import_kwh = total_export_kwh = 0.0
-        total_import_cost = total_export_credit = 0.0
-        for t in range(min(len(solar_profile), len(load_profile))):
-            net = solar_profile[t] - load_profile[t]
-            if net >= 0:
-                total_export_kwh   += net
-                total_export_credit += net * export_rates[t]
-            else:
-                total_import_kwh   += -net
-                total_import_cost  += -net * import_rates[t]
-        return {
-            'total_import_kwh':    total_import_kwh,
-            'total_export_kwh':    total_export_kwh,
-            'total_import_cost':   total_import_cost,
-            'total_export_credit': total_export_credit,
-            'net_cost':            total_import_cost - total_export_credit,
-        }
-
     # ------------------------------------------------------------------
     # MILP implementation — scipy (HiGHS-backed) first, PuLP/CBC as a last resort
     # ------------------------------------------------------------------

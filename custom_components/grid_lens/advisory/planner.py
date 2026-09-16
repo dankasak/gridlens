@@ -6,7 +6,7 @@ verification. Nothing here writes to the battery.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Optional
 
 from homeassistant.util import dt as dt_util

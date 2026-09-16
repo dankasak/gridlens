@@ -78,26 +78,6 @@ class DailyEnergyArchive:
             self._data.setdefault("days", {})
             self._loaded = True
 
-    # ---------------------------------------------------------------- queries
-
-    async def async_get_days(self) -> dict[str, dict[str, float]]:
-        """All recorded days ({iso_date: {metric: kwh}}). Returned dict is a copy."""
-        await self._ensure_loaded()
-        return {d: dict(v) for d, v in self._data["days"].items()}
-
-    async def async_monthly_distribution(self, metric: str) -> dict[int, list[float]]:
-        """Daily values of one metric bucketed by calendar month (1-12), sorted.
-
-        This is the empirical per-month distribution long-horizon comparisons
-        sample from ("percentage of days at a given PV output").
-        """
-        await self._ensure_loaded()
-        buckets: dict[int, list[float]] = {}
-        for day_iso, metrics in self._data["days"].items():
-            if metric in metrics:
-                buckets.setdefault(int(day_iso[5:7]), []).append(metrics[metric])
-        return {m: sorted(v) for m, v in sorted(buckets.items())}
-
     # ---------------------------------------------------------------- writing
 
     def _sensors(self) -> dict[str, str]:

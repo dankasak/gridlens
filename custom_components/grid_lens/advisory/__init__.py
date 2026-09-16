@@ -9,7 +9,7 @@ from .forecast import (
 )
 from .models import AdvisoryResult, ForecastBundle
 from .planner import AdvisoryPlanner
-from .rates import PlanRateForecaster, RateForecaster, wholesale_from_forecast_sensor
+from .rates import PlanRateForecaster, RateForecaster
 
 __all__ = [
     "ForecastProvider",
@@ -21,5 +21,4 @@ __all__ = [
     "AdvisoryPlanner",
     "RateForecaster",
     "PlanRateForecaster",
-    "wholesale_from_forecast_sensor",
 ]

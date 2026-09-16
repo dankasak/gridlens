@@ -63,24 +63,6 @@ class InverterState:
     error_message: Optional[str] = None
     extra: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> dict[str, Any]:
-        d = {
-            "status": self.status.value,
-            "is_curtailed": self.is_curtailed,
-            "soc_pct": self.soc_pct,
-            "battery_power_w": self.battery_power_w,
-            "battery_capacity_wh": self.battery_capacity_wh,
-            "soh_pct": self.soh_pct,
-            "pv_power_w": self.pv_power_w,
-            "grid_power_w": self.grid_power_w,
-            "load_power_w": self.load_power_w,
-            "power_limit_pct": self.power_limit_pct,
-            "backup_reserve_pct": self.backup_reserve_pct,
-            "error_message": self.error_message,
-        }
-        d.update(self.extra)
-        return d
-
 
 class InverterController(ABC):
     """Abstract base for all inverter drivers.

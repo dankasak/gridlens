@@ -74,31 +74,3 @@ class PlanRateForecaster:
     @staticmethod
     def _hour_key(dt: datetime) -> datetime:
         return dt_util.as_local(dt).replace(minute=0, second=0, microsecond=0)
-
-
-def wholesale_from_forecast_sensor(hass, entity_id: str) -> dict[datetime, float]:
-    """Read a forward wholesale curve ($/kWh) from a sensor exposing parallel
-    ``timestamps`` + ``wholesale_cents`` attributes (e.g. AEMO predispatch surfaced by the
-    Flow Power forecast sensor). This is raw market data, not the retailer's rate calc.
-    """
-    st = hass.states.get(entity_id)
-    if st is None:
-        return {}
-    timestamps = st.attributes.get("timestamps", []) or []
-    wholesale = st.attributes.get("wholesale_cents", []) or []
-    buckets: dict[datetime, list[float]] = {}
-    for ts, cents in zip(timestamps, wholesale):
-        if isinstance(ts, datetime):
-            dt = ts
-        elif isinstance(ts, str):
-            dt = dt_util.parse_datetime(ts)
-            if dt is None:
-                try:
-                    dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S%z")
-                except (ValueError, TypeError):
-                    continue
-        else:
-            continue
-        hk = dt_util.as_local(dt).replace(minute=0, second=0, microsecond=0)
-        buckets.setdefault(hk, []).append(float(cents) / 100.0)
-    return {hk: sum(v) / len(v) for hk, v in buckets.items()}

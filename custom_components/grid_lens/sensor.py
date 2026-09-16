@@ -12,7 +12,7 @@ from homeassistant.helpers.entity_registry import async_get as async_get_entity_
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
-    DOMAIN, PLANS, METRICS, METRIC_INFO, PLAN_NAMES,
+    DOMAIN, PLANS, METRICS,
     CONF_DEFERRABLE_LOAD_SENSORS, CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_SWITCHES, CONF_DEFERRABLE_LOAD_SOC_SENSORS,
     CONF_DEFERRABLE_LOAD_SETPOINT, CONF_DEFERRABLE_LOAD_PHASES,

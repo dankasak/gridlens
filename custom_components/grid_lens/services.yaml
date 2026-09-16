@@ -85,8 +85,8 @@ clear_charge_target:
         text:
 
 calculate_period:
-  name: Calculate Plan Data for Period
-  description: Calculate and populate all plan sensors for a specified date range. This will run optimization for each plan and create hourly data you can graph.
+  name: Calculate Plan Data for Period (deprecated)
+  description: Deprecated and non-functional - calling this raises an error. Use the Grid Lens dashboard for plan comparisons. The per-hour sensor population this used to do was removed; the service is kept only so existing automations fail loudly rather than silently vanish.
   fields:
     start_date:
       name: Start Date
