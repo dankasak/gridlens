@@ -2174,9 +2174,16 @@ arrays reading back on defaults.
 
 ## 13. Coverage
 
-Proof-of-concept: **NSW — Ausgrid**. Endeavour, Essential, and other states in progress.
-VPP bolt-on programs and Controlled Load are designed and schema-live in production, with
-real-data population partway through — see `VPP_CONTROLLED_LOAD_HANDOFF.md` before touching.
+**NSW — Ausgrid** (169 plans, the mature/verified coverage). **NSW — Endeavour Energy**
+started 2026-09-18 (27 plans onboarded as of 2026-09-19, ~69 more candidate offers identified —
+see `gridlens-api/docs/OPEN_ITEMS.md` "Endeavour Energy" for the live count). Essential Energy
+(NSW's third DNSP) and every other state not yet started. Expansion order and rationale
+(real 2025 CER/CEC installed-base data, not a guess): finish NSW (Endeavour → Essential) → QLD
+(Energex → Ergon) → VIC (blocked on a separate Victorian Energy Compare data pipeline — CDR
+PRD doesn't cover VIC) → SA/ACT → WA (lowest priority — non-NEM WEM market, Synergy
+near-monopoly retailer). VPP bolt-on programs and Controlled Load are designed and schema-live
+in production, with real-data population partway through — see `VPP_CONTROLLED_LOAD_HANDOFF.md`
+before touching.
 
 ---
 
