@@ -3803,7 +3803,30 @@ class PlanCalculator:
             result['total_export_kwh'], result['total_export_credit'],
             result['net_cost'],
         )
-        
+
+        # The idealised LP schedule above assumes every scheduled kWh is actually
+        # drawn/sold. control/executor.py's live materiality filter refuses to command
+        # a real grid force-charge or forced export below a threshold share of the
+        # slot — see dispatch_realism.py. Apply the same filter here so a plan's
+        # projected cost/savings reflects what Grid Lens would actually execute,
+        # not an unfiltered solver output (found 2026-09-18: this inflated a
+        # battery-dispatch plan's projected grid import ~3x — see
+        # GRIDLENS_CHECKLIST.md).
+        from .dispatch_realism import realize_schedule
+        result['schedule'] = realize_schedule(result['schedule'], dt_h=1.0)
+        result['total_import_kwh'] = sum(s.get('import_kwh', 0.0) for s in result['schedule'])
+        result['total_export_kwh'] = sum(s.get('export_kwh', 0.0) for s in result['schedule'])
+        result['total_import_cost'] = sum(s.get('import_cost', 0.0) for s in result['schedule'])
+        result['total_export_credit'] = sum(s.get('export_credit', 0.0) for s in result['schedule'])
+        result['net_cost'] = result['total_import_cost'] - result['total_export_credit']
+        _LOGGER.warning(
+            "Realised     solver=%s  import=%.1f kWh ($%.2f)  export=%.1f kWh ($%.2f)  net=$%.2f",
+            result.get('solver', '?'),
+            result['total_import_kwh'], result['total_import_cost'],
+            result['total_export_kwh'], result['total_export_credit'],
+            result['net_cost'],
+        )
+
         # Build a 24-h average day profile from the LP schedule so the dashboard
         # charts show plan-specific import/export patterns rather than historical data.
         N = len(deferrable_loads or [])

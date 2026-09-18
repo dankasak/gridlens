@@ -114,6 +114,8 @@ def _bootstrap():
     bc_stub = types.ModuleType("gl.control.battery_controller")
     bc_stub.BatteryController = type("BatteryController", (), {})
     sys.modules["gl.control.battery_controller"] = bc_stub
+    # Real dispatch_realism.py — executor.py imports its threshold constants.
+    _load(os.path.join(_COMPONENT, "dispatch_realism.py"), "gl.dispatch_realism")
     _load(os.path.join(_COMPONENT, "control", "executor.py"),
           "gl.control.executor", package="gl.control")
     _load(os.path.join(_COMPONENT, "const.py"), "gl.const", package="gl")

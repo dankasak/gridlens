@@ -25,6 +25,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.event import async_track_time_change
 from homeassistant.util import dt as dt_util
 
+from ..dispatch_realism import (
+    EXPORT_MIN_FRACTION,
+    EXPORT_MIN_W,
+    GRID_CHARGE_MIN_FRACTION,
+    GRID_CHARGE_MIN_W,
+)
 from ..inverters.base import BatteryAction
 from .battery_controller import BatteryController
 
@@ -272,8 +278,11 @@ class ScheduleExecutor:
     # watts, and that limit caps TOTAL battery charge power — so charging at ~135 W would
     # throttle the solar charge and dump the surplus PV to a $0 export while the battery
     # sits half-empty. Self-consumption instead pulls the battery up from all surplus PV.
-    _GRID_CHARGE_MIN_W = 250.0
-    _GRID_CHARGE_MIN_FRACTION = 0.5
+    # Single-sourced from dispatch_realism.py, which mirrors this materiality rule
+    # for the (offline) plan-comparison LP — see that module's docstring for why the
+    # rule itself is duplicated rather than shared while the threshold values aren't.
+    _GRID_CHARGE_MIN_W = GRID_CHARGE_MIN_W
+    _GRID_CHARGE_MIN_FRACTION = GRID_CHARGE_MIN_FRACTION
     # $/kWh — at/below this, the slot's import is genuinely free (GloBird-style windows).
     _FREE_RATE_EPS = 1e-6
 
@@ -316,8 +325,8 @@ class ScheduleExecutor:
     # (the discharge-side twin of the charge/grid-charge import-spike bug). A tiny LP
     # discharge nibble (e.g. ~135 W to cover overnight load) must NOT become a
     # force_discharge for the same reason a tiny grid nibble must not become a force_charge.
-    _EXPORT_MIN_W = 250.0
-    _EXPORT_MIN_FRACTION = 0.5
+    _EXPORT_MIN_W = EXPORT_MIN_W
+    _EXPORT_MIN_FRACTION = EXPORT_MIN_FRACTION
 
     def _resolve_discharge(self, iv: DispatchInterval) -> tuple[BatteryAction, float]:
         """Split a DISCHARGE slot into its real execution intent.

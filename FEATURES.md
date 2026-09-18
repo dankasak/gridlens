@@ -489,6 +489,16 @@ lets a plan with FiT above its import rate farm unlimited arbitrage.
 - **Deferrable devices stay in the energy balance** — `def_i` is priced via import/export
   like any other load. A past bug was double-counting them in *reporting*, not in the model;
   don't "fix" it by re-adding deferred energy to import.
+- **Execution-realism filter (`dispatch_realism.py`, added 2026-09-18)** — the raw LP
+  schedule assumes every scheduled kWh is actually drawn/sold; `control/executor.py`
+  refuses to command a real grid force-charge or forced export below a materiality
+  threshold (a real share of the slot AND above an absolute floor — see that module).
+  `plan_calculator.py` now runs every alternative plan's LP schedule through the same
+  filter before pricing it, so a plan's projected import/cost/savings can't include
+  dispatch behaviour Grid Lens's live controller would never actually execute. Found
+  comparing AGL Battery Rewards against Origin Battery Maximiser: a sub-threshold
+  "top the battery up before the evening export window" sliver was being priced at
+  face value. Current plan is unaffected (it's priced from actual usage, never the LP).
 
 ---
 
