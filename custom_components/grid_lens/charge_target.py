@@ -23,8 +23,12 @@ import math as _math
 
 def read_target(data: dict, sensor_id: str) -> dict | None:
     """The stored target for sensor_id — {"percent": float, "target_iso": str} — or
-    None if unset. A percent <= 0 or a missing/blank target_iso is treated as unset
-    (mirrors write_target's own clearing rule)."""
+    None unless BOTH halves are set. Deliberately stricter than write_target's own
+    storage rule: a half-set entry (only percent, or only target_iso, committed so
+    far — see read_raw) is real, persisted state while the user is still filling in
+    the pair through the two separate tile entities, but it must never read as an
+    active target here, since this is what gates the LP optimizer
+    (ChargeTargetStore.async_get_active)."""
     entry = data.get(sensor_id)
     if not entry:
         return None
@@ -38,15 +42,41 @@ def read_target(data: dict, sensor_id: str) -> dict | None:
     return {"percent": percent, "target_iso": target_iso}
 
 
+def read_raw(data: dict, sensor_id: str) -> dict | None:
+    """The stored entry for sensor_id exactly as held — {"percent": float,
+    "target_iso": str} — with no completeness check, unlike read_target. A half-set
+    entry (only one of percent/target_iso ever committed) is returned as-is rather
+    than None, so each of number.py/datetime.py's paired entities can restore and
+    merge its own half without the other one appearing to have been cleared. Never
+    use this to decide whether a target is actually live — that's read_target's job."""
+    entry = data.get(sensor_id)
+    if not entry:
+        return None
+    try:
+        percent = float(entry.get("percent", 0.0))
+    except (TypeError, ValueError):
+        percent = 0.0
+    return {"percent": percent, "target_iso": entry.get("target_iso") or ""}
+
+
 def write_target(data: dict, sensor_id: str, percent: float, target_iso: str) -> dict:
     """Return a new dict with sensor_id's target set to (percent, target_iso).
 
-    Clears the target entirely (rather than storing a partial/zero entry) when
-    either half is missing — percent <= 0, or target_iso blank — so a cleared
-    device reads back as "no target" from read_target with nothing stale left over.
+    Only clears the entry entirely when BOTH halves are unset (percent <= 0 AND
+    target_iso blank) — an explicit clear, as sent by
+    services.handle_clear_charge_target and by async_get_active's own
+    auto-clear-on-reach-or-expiry, both of which call this with (0.0, ""). A single
+    missing half is stored as a genuine partial entry instead of being discarded:
+    number.py/datetime.py's paired entities each write only their own half (after
+    reading the other back via read_raw to carry it forward), so if percent is set
+    before target_iso ever lands in the store, that percent write must survive
+    rather than being wiped out the instant it's made because the other half isn't
+    there yet. read_target still treats a partial entry as "no active target" for
+    the optimizer — only write_target's storage rule changed, not what counts as
+    live.
     """
     data = dict(data)
-    if percent <= 0 or not target_iso:
+    if percent <= 0 and not target_iso:
         data.pop(sensor_id, None)
         return data
     data[sensor_id] = {"percent": float(percent), "target_iso": target_iso}

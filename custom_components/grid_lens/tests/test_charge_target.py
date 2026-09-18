@@ -42,22 +42,56 @@ def test_read_write_roundtrip():
     check("unset device reads None", ct.read_target(data, "sensor.other") is None)
 
 
-def test_write_clears_on_zero_or_blank():
+def test_write_clears_only_when_both_halves_blank():
     data = ct.write_target({}, "sensor.ev", 80.0, "2026-09-15T07:00:00+10:00")
     check("nonzero+datetime present", "sensor.ev" in data)
-    cleared = ct.write_target(data, "sensor.ev", 0.0, "2026-09-15T07:00:00+10:00")
-    check("percent<=0 clears the entry", "sensor.ev" not in cleared)
-    check("percent<=0 reads back None", ct.read_target(cleared, "sensor.ev") is None)
-    cleared2 = ct.write_target(data, "sensor.ev", 80.0, "")
-    check("blank datetime clears the entry", "sensor.ev" not in cleared2)
+    cleared = ct.write_target(data, "sensor.ev", 0.0, "")
+    check("both blank clears the entry", "sensor.ev" not in cleared)
+    check("cleared entry reads back None", ct.read_target(cleared, "sensor.ev") is None)
+
+
+def test_write_retains_partial_entry_instead_of_clearing():
+    # Regression: setting only the percent entity (before the datetime entity has
+    # ever been set) must not be discarded just because target_iso is still blank —
+    # this was the "setting one field resets the other" UI bug. A single missing
+    # half is a genuine in-progress state, not an explicit clear (that's percent<=0
+    # AND target_iso blank together — see test_write_clears_only_when_both_halves_blank).
+    percent_only = ct.write_target({}, "sensor.ev", 50.0, "")
+    check("percent-only write is retained", "sensor.ev" in percent_only)
+    check("percent-only reads as inactive (not both halves set)", ct.read_target(percent_only, "sensor.ev") is None)
+    check("percent-only round-trips via read_raw", ct.read_raw(percent_only, "sensor.ev") == {"percent": 50.0, "target_iso": ""})
+
+    time_only = ct.write_target({}, "sensor.ev", 0.0, "2026-09-15T07:00:00+10:00")
+    check("time-only write is retained", "sensor.ev" in time_only)
+    check("time-only reads as inactive (not both halves set)", ct.read_target(time_only, "sensor.ev") is None)
+    check(
+        "time-only round-trips via read_raw",
+        ct.read_raw(time_only, "sensor.ev") == {"percent": 0.0, "target_iso": "2026-09-15T07:00:00+10:00"},
+    )
+
+    # Setting the second half afterwards (as number.py/datetime.py do: read_raw the
+    # existing entry, then write_target with the other half carried forward) must
+    # complete the pair rather than clobbering the first half that was already there.
+    completed = ct.write_target(percent_only, "sensor.ev", 50.0, "2026-09-15T07:00:00+10:00")
+    got = ct.read_target(completed, "sensor.ev")
+    check("completing the pair makes it active", got is not None, got)
+    check("completed percent preserved", got["percent"] == 50.0, got)
+    check("completed target_iso preserved", got["target_iso"] == "2026-09-15T07:00:00+10:00", got)
 
 
 def test_read_rejects_partial_entry():
-    # A hand-edited or corrupted store entry missing one half must not read as active.
+    # A hand-edited or corrupted store entry missing one half must not read as active
+    # via read_target (the gate for the optimizer) — but read_raw must still surface it
+    # as-is for the paired entities to display/merge.
     data = {"sensor.ev": {"percent": 90.0}}  # no target_iso
-    check("missing target_iso reads None", ct.read_target(data, "sensor.ev") is None)
+    check("missing target_iso reads None via read_target", ct.read_target(data, "sensor.ev") is None)
+    check("missing target_iso still visible via read_raw", ct.read_raw(data, "sensor.ev") == {"percent": 90.0, "target_iso": ""})
     data2 = {"sensor.ev": {"target_iso": "2026-09-15T07:00:00+10:00"}}  # no percent
-    check("missing percent reads None", ct.read_target(data2, "sensor.ev") is None)
+    check("missing percent reads None via read_target", ct.read_target(data2, "sensor.ev") is None)
+    check(
+        "missing percent still visible via read_raw",
+        ct.read_raw(data2, "sensor.ev") == {"percent": 0.0, "target_iso": "2026-09-15T07:00:00+10:00"},
+    )
 
 
 def test_is_reached():
@@ -113,7 +147,8 @@ def test_slot_for_datetime_rounds_up_and_bounds():
 
 def main():
     test_read_write_roundtrip()
-    test_write_clears_on_zero_or_blank()
+    test_write_clears_only_when_both_halves_blank()
+    test_write_retains_partial_entry_instead_of_clearing()
     test_read_rejects_partial_entry()
     test_is_reached()
     test_is_expired()

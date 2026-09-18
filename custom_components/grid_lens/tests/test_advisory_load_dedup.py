@@ -16,6 +16,7 @@ Run:  python3 test_advisory_load_dedup.py
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
 import sys
@@ -182,6 +183,52 @@ def test_dedup_shorter_deferrable_vector_treated_as_zero():
     defer = [0.4, 0.4]  # only two hours provided
     out = _subtract(_Stub(defer), load)
     assert out == [0.6, 0.6, 1.0, 1.0], out
+
+
+def test_deferrable_for_horizon_never_shortens_the_list():
+    """Regression for the live 2026-09-19 bug: a device with nothing to schedule today
+    (daily_kwh<=0) used to be dropped entirely from _deferrable_for_horizon's output,
+    silently shifting every LATER device's position in the optimizer's own arrays
+    (DispatchInterval.deferrable_w, ev_soc_status, deferrable_names/...) down by one.
+    LoadControlManager/ModulatingLoadController read those arrays back by each
+    device's FIXED, config-index-aligned position, with no way to detect a shift —
+    found live: Tameeka's Aircon (config index 5, daily_kwh genuinely 0.00 that tick)
+    pushed Wattpilot (index 6) one past the end of the resulting 6-long array, so its
+    live charge current froze at 0W despite an active ad-hoc charge target needing it
+    at full power. The list must always have exactly one entry per input device, in
+    the same order, whatever daily_kwh/max_kw happen to be."""
+    deferrable_for_horizon = AdvisoryCoordinator.__dict__["_deferrable_for_horizon"]
+
+    class _Bundle:
+        start = None
+        slot_minutes = 30
+        slots = 4
+
+    class _Coord:
+        hass = types.SimpleNamespace(data={}, states={})
+        entry = types.SimpleNamespace(entry_id="test_entry")
+        _deferrable_params = [
+            {"sensor_id": "sensor.a", "daily_kwh": 5.0, "max_kw": 2.0, "name": "A"},
+            # The inert-today device — this is what used to vanish.
+            {"sensor_id": "sensor.b", "daily_kwh": 0.0, "max_kw": 1.0, "name": "B"},
+            {"sensor_id": "sensor.c", "daily_kwh": 3.0, "max_kw": 7.0, "name": "C"},
+        ]
+
+        def _device_override(self, sensor_id):
+            return None
+
+        async def _charge_target(self, sensor_id, live_soc_percent):
+            return None
+
+    out = asyncio.run(deferrable_for_horizon(_Coord(), _Bundle()))
+    assert len(out) == 3, f"expected all 3 devices to keep their position, got {len(out)}: {out}"
+    assert out[0]["sensor_id"] == "sensor.a" and out[0]["daily_kwh"] == 5.0
+    assert out[1]["sensor_id"] == "sensor.b" and out[1]["daily_kwh"] == 0.0, (
+        "the inert device must still be PRESENT (just contributing nothing), not omitted"
+    )
+    # The device after the inert one must keep its OWN values, unshifted.
+    assert out[2]["sensor_id"] == "sensor.c"
+    assert out[2]["daily_kwh"] == 3.0 and out[2]["max_kw"] == 7.0
 
 
 # --------------------------------------------------------------------------- runner

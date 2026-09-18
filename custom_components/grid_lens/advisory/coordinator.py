@@ -401,7 +401,15 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         the forecast line the Power Chart card draws straight from it) keeps planning
         around the device's normal schedule and shows a charge that will never
         physically happen, e.g. an EV charger left on Force Off overnight — found
-        2026-08-12."""
+        2026-08-12.
+
+        Returns exactly one entry per device in self._deferrable_params, in the same
+        order — a device with nothing to schedule is made inert (see below), never
+        omitted. This list's positions are load-bearing: LoadControlManager and
+        ModulatingLoadController read the optimizer's resulting per-slot arrays back
+        by this same positional index (their own, fixed at the full config's device
+        count), so a shorter list here silently shifts every later device's meaning
+        out from under them — found live 2026-09-19."""
         from ..schedule_grid import slot_allowed
 
         store = self.hass.data.get(DOMAIN, {}).get(
@@ -410,8 +418,22 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         out = []
         for dev in (self._deferrable_params or []):
             daily, maxkw = dev.get("daily_kwh", 0.0), dev.get("max_kw", 0.0)
-            if daily <= 0 or maxkw <= 0:
-                continue
+            # A device with nothing to schedule today (daily<=0) or genuinely no rated
+            # power (maxkw<=0) is still APPENDED, just inert — never skipped. Skipping
+            # used to shorten this list relative to LoadControlManager.controllers'
+            # fixed, config-index-aligned dict, shifting every LATER device's position
+            # in every array the optimizer builds (DispatchInterval.deferrable_w,
+            # ev_soc_status, deferrable_names/_sensor_ids/_max_kw) down by one for each
+            # earlier device skipped — invisible to index-based downstream readers, which
+            # have no way to detect the shift and fall out of bounds to a silent 0.0
+            # rather than erroring. Found live 2026-09-19: Tameeka's Aircon (config index
+            # 5) had a genuine 0.00 kWh/day this tick, which pushed Wattpilot (index 6,
+            # the very next configured device) one slot past the end of a 6-long array —
+            # `index < len(dw)` false, `_device_power_now` silently returned 0.0 — while
+            # an active ad-hoc charge target on Wattpilot needed it charging at max power
+            # right then. daily<=0/maxkw<=0 still makes THIS device correctly inert in the
+            # solve on its own (see below) — the fix is only that its position must never
+            # disappear and shift what comes after it.
             # SOC ceiling: only activates when BOTH a sensor and a positive capacity are
             # configured (see CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT) AND that sensor gives a
             # real live reading right now. A flaky/unavailable sensor just leaves this

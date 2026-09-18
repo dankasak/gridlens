@@ -191,6 +191,57 @@ def test_multi_day_and_multi_device_independence():
     check("device 1's total energy unchanged", abs(after_totals[1] - before_totals[1]) < 1e-6)
 
 
+def test_never_moves_energy_past_its_own_charge_target_deadline():
+    """Regression for the live 2026-09-18 bug: a device with an active "charge
+    to X% by Y" target (see charge_target.py) has its pre-deadline energy
+    already placed by the raw LP solve to satisfy the hard floor constraint
+    (Σ def_i[t] for t < floor_slot[i] — see optimize_hourly_schedule). Slot 0
+    (before the deadline) is expensive grid import; slot 1 (at/after the
+    deadline, floor_slot=1) is free export-covered — cheaper, so without a
+    floor_slot bound this pass would happily move slot 0's energy into slot 1,
+    which is exactly what was observed live: a 75%-by-11:30 target whose raw
+    solve met the floor got displayed as finishing hours late, all on solar.
+    """
+    dev = [{'max_kw': 2.0, 'daily_kwh': 1.0, 'hour_mask': None}]
+    schedule = [
+        _row(import_kwh=0.5, import_rate=1.00, defer=[1.0]),  # before the deadline
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.0]),  # at/after the deadline — cheaper
+    ]
+    consolidate_deferrable_schedule(
+        schedule, dev, dt=0.5, slots_per_day=48, floor_slot={0: 1},
+    )
+    check("pre-deadline energy stays in the pre-deadline slot",
+          schedule[0]['deferrable_per_device'][0] == 1.0,
+          f"got {schedule[0]['deferrable_per_device'][0]}")
+    check("nothing leaks into the at/after-deadline slot",
+          schedule[1]['deferrable_per_device'][0] == 0.0,
+          f"got {schedule[1]['deferrable_per_device'][0]}")
+
+
+def test_floor_slot_does_not_restrict_days_outside_the_deadline():
+    """A day entirely after the deadline must still consolidate normally —
+    only the calendar day the deadline actually falls inside gets clipped.
+    Here floor_slot sits exactly on the day-1 boundary (t0 == floor_slot), so
+    day 1 is untouched by the clip (t0 < floor_slot < t1 is false) and should
+    still front-load its own energy into its own cheapest slot."""
+    dev = [{'max_kw': 2.0, 'daily_kwh': 1.0, 'hour_mask': None}]
+    schedule = [
+        _row(import_kwh=0.0, import_rate=0.10, defer=[0.0]),  # day 0
+        _row(import_kwh=0.0, import_rate=0.10, defer=[0.0]),  # day 0
+        _row(import_kwh=0.0, import_rate=0.10, defer=[0.0]),  # day 1 — cheap
+        _row(import_kwh=1.0, import_rate=1.00, defer=[1.0]),  # day 1 — expensive
+    ]
+    consolidate_deferrable_schedule(
+        schedule, dev, dt=0.5, slots_per_day=2, floor_slot={0: 2},
+    )
+    check("day-1 (entirely after the deadline) still consolidates into its own cheapest slot",
+          schedule[2]['deferrable_per_device'][0] == 1.0,
+          f"got {schedule[2]['deferrable_per_device'][0]}")
+    check("day-1's expensive slot is emptied by the move",
+          schedule[3]['deferrable_per_device'][0] == 0.0,
+          f"got {schedule[3]['deferrable_per_device'][0]}")
+
+
 def test_deferrable_kwh_field_kept_in_sync():
     """The aggregate 'deferrable_kwh' field (used for display) must always
     equal the sum of deferrable_per_device after consolidation."""
@@ -214,6 +265,8 @@ if __name__ == "__main__":
     test_respects_hour_mask()
     test_respects_max_kw_cap_per_slot()
     test_multi_day_and_multi_device_independence()
+    test_never_moves_energy_past_its_own_charge_target_deadline()
+    test_floor_slot_does_not_restrict_days_outside_the_deadline()
     test_deferrable_kwh_field_kept_in_sync()
     if _FAILURES:
         print(f"\nFAIL — {len(_FAILURES)} failure(s): {_FAILURES}")

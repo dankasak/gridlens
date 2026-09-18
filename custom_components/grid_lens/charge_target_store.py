@@ -55,19 +55,24 @@ class ChargeTargetStore:
             self._loaded = True
 
     async def async_get_raw(self, sensor_id: str) -> dict | None:
-        """The stored {"percent", "target_iso"} for sensor_id with no reach/expiry
-        check — what the number.py/datetime.py entities restore their own state
-        from, so a half-set target (only one of the two entities configured so far)
-        still shows correctly on each entity individually."""
+        """The stored {"percent", "target_iso"} for sensor_id exactly as held, with no
+        completeness or reach/expiry check — what the number.py/datetime.py entities
+        restore/merge their own state from, so a half-set target (only one of the two
+        entities configured so far) still shows correctly on each entity individually
+        instead of appearing cleared. Never use this to gate control logic — it can
+        return a partial entry; see async_get_active for that."""
         await self._ensure_loaded()
-        return ct.read_target(self._data, sensor_id)
+        return ct.read_raw(self._data, sensor_id)
 
     async def async_get_active(self, sensor_id: str, current_percent: float | None) -> dict | None:
         """The target for sensor_id if it is still live, else None — auto-clearing it
         first if the live SOC has already reached it or its deadline has passed.
         `current_percent` is the device's live SOC reading right now (None if
-        unavailable, in which case only the deadline can expire it)."""
-        target = await self.async_get_raw(sensor_id)
+        unavailable, in which case only the deadline can expire it). Uses read_target
+        (not async_get_raw/read_raw) so a half-set target — only one of the paired
+        percent/datetime entities written so far — can never reach the optimizer."""
+        await self._ensure_loaded()
+        target = ct.read_target(self._data, sensor_id)
         if target is None:
             return None
         reached = ct.is_reached(target["percent"], current_percent)

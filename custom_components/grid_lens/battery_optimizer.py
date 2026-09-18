@@ -216,6 +216,7 @@ def consolidate_deferrable_schedule(
     dt: float,
     slots_per_day: int,
     protected_hours=None,
+    floor_slot: dict[int, int] | None = None,
 ) -> None:
     """Post-process pass: collapse each deferrable device's fragmented per-slot
     LP allocation into the fewest contiguous blocks per calendar day, without
@@ -257,6 +258,18 @@ def consolidate_deferrable_schedule(
     ``_slot_marginal_tiers``) decides where energy actually lands; a plain
     "fill the earliest slots" pass would happily shove energy into an
     expensive overnight hour and get correctly rejected for the whole day.
+
+    ``floor_slot`` (device index -> absolute horizon slot, from
+    optimize_hourly_schedule's own floor_slot/track_slots — see charge_target.py)
+    marks a device's ad-hoc "charge to X% by Y" deadline. This pass must never
+    move that device's pre-deadline energy to a slot at or after floor_slot[i]:
+    the LP's floor row only constrains Σ def_i[t] for t < floor_slot[i], so it's
+    exactly the guarantee this cost-tie-break reshuffle would otherwise silently
+    defeat by relocating floor-satisfying energy into a cheaper slot that
+    happens to fall after the deadline (found live 2026-09-18: a 75%-by-11:30
+    target whose raw solve met the floor got displayed/dispatched as finishing
+    at 14:00, all-solar, because consolidation only ever respected calendar-day
+    boundaries, not the device's own deadline).
     """
     protected = protected_hours or set()
     T = len(schedule)
@@ -264,9 +277,16 @@ def consolidate_deferrable_schedule(
     for i, dev in enumerate(deferrable_loads):
         mask = dev.get('hour_mask')
         cap_kwh = dev['max_kw'] * dt
+        dev_floor = floor_slot.get(i) if floor_slot else None
         for d in range(n_days):
             t0 = d * slots_per_day
             t1 = min(t0 + slots_per_day, T)
+            # Only clip when the deadline actually falls inside this calendar
+            # day — a day entirely before it (deadline already passed as of
+            # t0) or entirely after it (not yet binding within this day) is
+            # left at its normal full-day range.
+            if dev_floor is not None and t0 < dev_floor < t1:
+                t1 = dev_floor
             eligible = [
                 t for t in range(t0, t1)
                 # Only fully-available slots are eligible for consolidation — a
@@ -1351,7 +1371,7 @@ class BatteryOptimizer:
             )
             consolidate_deferrable_schedule(
                 schedule, deferrable_loads, dt=dt, slots_per_day=slots_per_day,
-                protected_hours=protected_hours,
+                protected_hours=protected_hours, floor_slot=floor_slot,
             )
             total_import_kwh = sum(r['import_kwh'] for r in schedule)
             total_export_kwh = sum(r['export_kwh'] for r in schedule)
