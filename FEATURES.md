@@ -2174,9 +2174,11 @@ arrays reading back on defaults.
 
 ## 13. Coverage
 
-**NSW — Ausgrid** (169 plans, the mature/verified coverage). **NSW — Endeavour Energy**
-started 2026-09-18 (27 plans onboarded as of 2026-09-19, ~69 more candidate offers identified —
-see `gridlens-api/docs/OPEN_ITEMS.md` "Endeavour Energy" for the live count). Essential Energy
+**NSW — Ausgrid** (172 plans). **NSW — Endeavour Energy** started 2026-09-18, its onboardable
+candidate pool now exhausted as of 2026-09-19 (51 plans onboarded, including 5 resolved via
+retailer fact-sheet research — CovaU/Diamond cap-period and day-coverage-gap fixes; remainder
+needs a curated market-linked model, same as Ausgrid's own equivalent gap — see
+`gridlens-api/docs/OPEN_ITEMS.md` "Endeavour Energy" for the live breakdown). Essential Energy
 (NSW's third DNSP) and every other state not yet started. Expansion order and rationale
 (real 2025 CER/CEC installed-base data, not a guess): finish NSW (Endeavour → Essential) → QLD
 (Energex → Ergon) → VIC (blocked on a separate Victorian Energy Compare data pipeline — CDR
