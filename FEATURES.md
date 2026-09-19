@@ -2179,8 +2179,10 @@ candidate pool now exhausted as of 2026-09-19 (51 plans onboarded, including 5 r
 retailer fact-sheet research — CovaU/Diamond cap-period and day-coverage-gap fixes; remainder
 needs a curated market-linked model, same as Ausgrid's own equivalent gap — see
 `gridlens-api/docs/OPEN_ITEMS.md` "Endeavour Energy" for the live breakdown). **QLD — Energex**
-onboarded 2026-09-19 (111 plans; 13 market-linked candidates remain pending a price-sensor
-model, same gap class as NSW's). **QLD — Ergon** and NSW's third DNSP (Essential Energy) not
+onboarded 2026-09-19 (124 plans — 111 standard + 13 market-linked, the latter wired
+2026-09-20 to the real AEMO QLD1 spot price via the existing `spot_pricing` model, same
+mechanism §"Spot pricing for market-linked alternatives" above; adder unverified for Energex,
+see `gridlens-api/docs/OPEN_ITEMS.md`). **QLD — Ergon** and NSW's third DNSP (Essential Energy) not
 yet started. Expansion order and rationale
 (real 2025 CER/CEC installed-base data, not a guess): finish NSW (Endeavour → Essential) → QLD
 (Energex → Ergon) → VIC (blocked on a separate Victorian Energy Compare data pipeline — CDR
