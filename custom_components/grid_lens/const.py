@@ -122,6 +122,14 @@ CONF_IMPORT_PRICE_SENSOR = "import_price_sensor"
 CONF_EXPORT_PRICE_SENSOR = "export_price_sensor"
 CONF_DISTRIBUTOR = "distributor"
 CONF_STATE = "state"
+
+# Household's own postcode, e.g. "2610". Blank/unset disables the filter
+# entirely — a plan whose own included_postcodes doesn't cover this postcode
+# is dropped from the comparison ranking (see plan_calculator.calculate_plan_costs).
+# Local-only: never sent to the GridLens API, matching CONF_NETWORK_TARIFF_CODES
+# just below. Was previously collected on the first setup screen and read by
+# nothing (see async_step_user's docstring in config_flow.py); revived
+# 2026-09-22 on the "current plan" step, now actually wired to a filter.
 CONF_POSTCODE = "postcode"
 
 # Whether the customer's *current* meter is on a network demand tariff class

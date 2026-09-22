@@ -292,6 +292,10 @@ class PlanFromData(RetailerPlan):
         # household's own configured code are set and don't intersect.
         eligibility = plan_data.get("eligibility") or {}
         self.required_network_tariff_codes = eligibility.get("required_network_tariff_codes")
+        # Postcodes (comma-string, ranges OK) this plan is offered in — same public
+        # catalogue data, same "None means no restriction" contract as the tariff
+        # codes just above. See plan_calculator._plan_included_postcodes.
+        self.included_postcodes = eligibility.get("included_postcodes")
 
         self._import_rates = plan_data.get("import_rates", [])
         self._export_rates = plan_data.get("export_rates", [])

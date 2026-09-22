@@ -104,6 +104,34 @@ required code is public catalogue data, not customer data.
 `const.py` (`CONF_NETWORK_TARIFF_CODES`, `parse_network_tariff_codes`), `config_flow.py`,
 `www/cards/grid-lens-card.js`.
 
+**Postcode filtering (2026-09-22).** Same shape and same reasoning as network-tariff-code
+matching just above, for a coarser problem: geographic scoping in Grid Lens otherwise stops
+at state + DNSP network (see `config_flow.py`'s `_load_coverage`), so a household can still
+see plans a retailer only offers in part of that network's footprint. A plan carries this as
+`eligibility.included_postcodes` (comma-separated postcodes and/or inclusive ranges, e.g.
+`"2000-2999,2610"`; `null`/absent = no restriction, the common case). The household enters
+their own postcode via the "Postcode (optional)" field on the Current Plan step (initial
+setup **and** Reconfigure) — this is the same `CONF_POSTCODE` key that used to sit on the
+first setup screen and was read by nothing (see `config_flow.py`'s `async_step_user`
+docstring); it's now wired to an actual filter. Blank/unset means "don't know", which
+disables the filter entirely. Once set, `calculate_plan_costs` drops any candidate plan
+whose included postcodes don't cover the household's, **except** the plan the household is
+actually detected as being on, which always stays priceable. **Local-only**, same as the
+tariff-code filter: the household's own postcode never leaves their HA instance. A plan's
+own `included_postcodes` is public catalogue data, not customer data.
+
+Populating `included_postcodes` is currently manual, via `gridlens-editor`'s plan form — the
+CDR PRD source data carries this natively as `geography.includedPostcodes`
+(`gridlens-api/verification/cdr_prd_plan_data.md`), but `prd_sync.py`'s bulk-authoring
+pipeline doesn't extract it yet (see `OPEN_ITEMS.md`). Existing plans are all `NULL`
+(unrestricted), so this ships with zero behaviour change until a plan is explicitly scoped.
+
+**Files:** `plan_calculator.py` (`_plan_included_postcodes`), `retailer_plans.py`,
+`const.py` (`CONF_POSTCODE`), `config_flow.py`, `strings.json`/`translations/en.json`;
+API side: `gridlens-api/app/plan_models.py`, `plan_transform.py`, `plan_serialize.py`,
+`plan_admin.py`, `main.py` (guarded `ALTER TABLE`); editor: `gridlens-editor/main_window.py`
+(`PLAN_COLUMNS`), `main_window.ui`.
+
 **Plan data** comes from the private `gridlens-api` (MySQL, temporally versioned —
 `slug@date` rows). The HA side never sees another user's data and never sends usage data
 out; the API only *delivers plan definitions*. See `PRIVACY_DATA_INVENTORY.md` in the API

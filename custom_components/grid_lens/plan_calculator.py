@@ -53,6 +53,7 @@ from .const import (
     CONF_DEFERRABLE_LOAD_DUMMY_CL_IN_AGGREGATE,
     CONF_HAS_DEMAND_TARIFF,
     CONF_NETWORK_TARIFF_CODES,
+    CONF_POSTCODE,
     CONF_STATE,
     parse_network_tariff_codes,
     DEFAULT_DEMAND_WINDOW_HOURS,
@@ -206,6 +207,11 @@ class PlanCalculator:
             entry.data.get(CONF_NETWORK_TARIFF_CODES)
         )
 
+        # Household's own postcode. Blank/unset = not configured = never filter
+        # (see calculate_plan_costs) — same "don't know, don't filter" contract
+        # as network_tariff_codes above.
+        self.postcode: str | None = (entry.data.get(CONF_POSTCODE) or "").strip() or None
+
         # Initialize battery optimizer if battery is configured
         self.battery_optimizer = None
         if self.has_battery:
@@ -274,6 +280,32 @@ class PlanCalculator:
         if not raw:
             return set()
         return {c.strip().upper() for c in raw.split(",") if c.strip()}
+
+    @staticmethod
+    def _plan_included_postcodes(plan) -> set[int]:
+        """Parse `plan.included_postcodes` (comma-string of postcodes and/or
+        inclusive ranges like "2000-2999", or None) into a normalized set of
+        ints. Empty set means "no restriction" — never filters. Malformed
+        entries are skipped rather than raising, so one bad hand-typed range
+        in the editor can't take the whole plan out of every comparison."""
+        raw = getattr(plan, "included_postcodes", None)
+        if not raw:
+            return set()
+        postcodes: set[int] = set()
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                if "-" in part:
+                    start_s, end_s = part.split("-", 1)
+                    start, end = int(start_s), int(end_s)
+                    postcodes.update(range(min(start, end), max(start, end) + 1))
+                else:
+                    postcodes.add(int(part))
+            except ValueError:
+                continue
+        return postcodes
 
     def _get_plans(self) -> list[RetailerPlan]:
         """Return plan objects from API data. Tier filtering is enforced by the API.
@@ -820,6 +852,22 @@ class PlanCalculator:
                 or not self._plan_required_codes(p)
                 or self._plan_required_codes(p) & self.network_tariff_codes
             ]
+
+        # Postcode filter: drop plans not offered at the household's own postcode.
+        # Same "both sides known, current plan always kept" contract as the
+        # tariff-code filter above.
+        if self.postcode:
+            try:
+                _household_postcode = int(self.postcode)
+            except ValueError:
+                _household_postcode = None
+            if _household_postcode is not None:
+                _candidate_plans = [
+                    p for p in _candidate_plans
+                    if self._plan_key(p, _dup_keys) == current_plan_name
+                    or not self._plan_included_postcodes(p)
+                    or _household_postcode in self._plan_included_postcodes(p)
+                ]
 
         all_plans_ordered = sorted(
             _candidate_plans,
