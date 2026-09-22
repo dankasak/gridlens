@@ -80,10 +80,13 @@ is SOC-guardrail- and inverter-HAL-specific):
      plan's own SOC trajectory".
   2. **Battery headroom, rate and energy.** ``battery_headroom_w`` (free discharge rate
      right now) caps the draw; ``battery_headroom_kwh`` (energy to the configured minimum
-     SOC) must cover the *whole* budget, since a back-loaded spill means the battery can be
-     down by the full budget before the refill lands. Both come from
-     ``LoadControlManager``; either missing (no battery, no capacity, unreadable sensor)
-     fails the condition closed — same discipline as every other Greedy Consumption input.
+     SOC) caps it too, via the steady rate that would use no more than that energy over the
+     *whole* window in the worst case a back-loaded spill never shows up to repay it — a
+     proportional clamp on the rate, not an all-or-nothing bar against the household's
+     entire forecast waste (fixed 2026-09-20 — see ``_forecast_surplus_target_w``'s
+     docstring). Both come from ``LoadControlManager``; either missing (no battery, no
+     capacity, unreadable sensor) fails the condition closed — same discipline as every
+     other Greedy Consumption input.
 """
 from __future__ import annotations
 
@@ -371,9 +374,22 @@ class DeferrableLoadController:
 
         * ``battery_headroom_w`` — free discharge rate right now — caps the draw; if that
           cap drops it back below the minimum-worthwhile draw, the condition is blocked.
-        * ``battery_headroom_kwh`` — energy to the configured minimum SOC — must cover the
-          *whole* budget, because a back-loaded spill means the battery can be down by the
-          full budget before the refill lands.
+        * ``battery_headroom_kwh`` — energy to the configured minimum SOC — bounds the
+          *rate*, not the pass/fail: ``battery_headroom_kwh / forecast_hours`` is the
+          steady draw that, sustained for the whole window, uses no more than that energy
+          in the worst case the spill never shows up to repay it (a back-loaded spill can
+          leave the battery down by the full amount drawn before the refill lands). Fixed
+          2026-09-20: this used to require the *whole* ``forecast_spill_kwh`` — the entire
+          household's forecast waste, not this device's own draw — to fit in headroom, an
+          all-or-nothing bar a modest battery can essentially never clear on a day with a
+          large spill (a 24 kWh battery can never have >21.6 kWh of headroom to a 10% min
+          SOC, so it permanently failed against a 30+ kWh spill regardless of time of day
+          or actual SOC — see GRIDLENS_CHECKLIST.md, 2026-09-20). ``min(rate_w,
+          battery_headroom_w, battery_safe_rate_w)`` folds this in as one more proportional
+          clamp on the rate a modulating load can safely be pinned to, same as the other
+          two; an on/off load still can't do partial, so this only reduces to a pass/fail
+          for it — but now against what *this device* would draw over the window, not the
+          whole house's spill.
 
         A third, optional gate — ``ac_output_headroom_w``
         (``LoadControlManager._ac_output_headroom_w``) — clamps the draw again when the
@@ -399,18 +415,19 @@ class DeferrableLoadController:
         if battery_headroom_w is None or battery_headroom_kwh is None:
             self._greedy_blocked = "no_battery_headroom"
             return 0.0
-        if battery_headroom_w <= 0.0 or battery_headroom_kwh + 1e-6 < forecast_spill_kwh:
+        if battery_headroom_w <= 0.0:
             self._greedy_blocked = "no_battery_headroom"
             return 0.0
-        target_w = min(rate_w, battery_headroom_w)
+        battery_safe_rate_w = battery_headroom_kwh * 1000.0 / forecast_hours
+        target_w = min(rate_w, battery_headroom_w, battery_safe_rate_w)
+        if target_w + 1e-6 < min_draw:
+            self._greedy_blocked = "no_battery_headroom"
+            return 0.0
         if ac_output_headroom_w is not None:
             target_w = min(target_w, ac_output_headroom_w)
             if target_w + 1e-6 < min_draw:
                 self._greedy_blocked = "no_ac_output_headroom"
                 return 0.0
-        if target_w + 1e-6 < min_draw:
-            self._greedy_blocked = "no_battery_headroom"
-            return 0.0
         return self._forecast_surplus_snap_w(target_w)
 
     def _actual_state(self) -> Optional[bool]:

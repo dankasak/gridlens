@@ -434,7 +434,8 @@ async def _run_surplus_ac_output_headroom_clamps_and_blocks():
 
     # AC headroom exactly clearing this on/off device's all-or-nothing bar -> still fires
     # (an on/off load has no partial state to clamp INTO — see
-    # ModulatingLoadController's own forecast-surplus test for the proportional case).
+    # test_modulating_load_control.py's _run_forecast_surplus_pins_to_battery_safe_rate
+    # for the proportional case a modulating load gets instead).
     hass3 = FakeHass()
     hass3.states.set("switch.x", "off")
     c3 = DeferrableLoadController(hass3, name="X3", switch_entity_id="switch.x", max_w=2000.0)

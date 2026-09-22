@@ -943,6 +943,50 @@ async def _run_export_surplus_bar_is_min_for_modulating():
     assert onoff.status()["greedy_reason"] is None
 
 
+async def _run_forecast_surplus_pins_to_battery_safe_rate():
+    """Fixed 2026-09-20: a modulating load can take a PARTIAL draw, so a battery that can't
+    fund the *ideal* forecast-surplus rate for the whole window must pin the device to
+    whatever rate it CAN safely sustain — not block the condition outright the way an
+    on/off load's all-or-nothing bar has to.
+
+    12 kWh spill over 4 h = an ideal 3000 W rate (well above the 1380 W floor). The battery
+    has plenty of instantaneous rate (5000 W) but only 8 kWh of headroom to its min SOC —
+    not enough to fund the full 12 kWh ideal budget, so the OLD all-or-nothing check
+    (``battery_headroom_kwh >= forecast_spill_kwh``) would have blocked this entirely
+    (``no_battery_headroom``, target 0). The fix pins the draw to
+    ``battery_headroom_kwh / forecast_hours`` = 2000 W instead — still funded safely for
+    the whole window in the worst case the spill never arrives, and still well above the
+    floor, so the device runs at 2000 W rather than not at all."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    mod = _mk(hass)  # 7.4 kW nominal, 7360 W cap, 1380 W floor
+    mod.set_greedy(True)
+    mod.set_greedy_forecast_surplus(True)
+    await mod.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
+                    forecast_spill_kwh=12.0, forecast_hours=4.0,
+                    battery_headroom_w=5000.0, battery_headroom_kwh=8.0)
+    st = mod.status()
+    assert st["greedy_reason"] == "forecast_surplus"
+    assert st["greedy_blocked"] is None
+    assert st["forecast_target_w"] == 2000.0
+
+    # Headroom too thin even for the pinned rate to clear the floor -> still blocked, same
+    # as before (this isn't "always fire at SOME rate", it's "fire at a safe rate or not
+    # at all", the floor still applies).
+    hass2 = FakeHass()
+    _evse(hass2, mx=32)
+    mod2 = _mk(hass2)
+    mod2.set_greedy(True)
+    mod2.set_greedy_forecast_surplus(True)
+    await mod2.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
+                     forecast_spill_kwh=12.0, forecast_hours=4.0,
+                     battery_headroom_w=5000.0, battery_headroom_kwh=1.0)
+    st2 = mod2.status()
+    assert st2["greedy_reason"] is None
+    assert st2["greedy_blocked"] == "no_battery_headroom"
+    assert st2["forecast_target_w"] == 0.0
+
+
 async def _run_apply_records_but_never_writes():
     """The 5-minute tick decides; only the fast loop writes (one writer = unbypassable
     write economy)."""
@@ -1877,6 +1921,7 @@ if __name__ == "__main__":
         # readback / greedy / identity
         ("actual_state_reads_setpoint", test_actual_state_reads_setpoint_not_switch),
         ("export_bar_min_vs_max", lambda: _run_async(_run_export_surplus_bar_is_min_for_modulating)),
+        ("forecast_surplus_pins_to_battery_safe_rate", lambda: _run_async(_run_forecast_surplus_pins_to_battery_safe_rate)),
         ("apply_records_never_writes", lambda: _run_async(_run_apply_records_but_never_writes)),
         ("join_key_falls_back_to_setpoint", test_join_key_falls_back_to_setpoint),
         ("status_publishes_modulating", test_status_publishes_modulating_fields),

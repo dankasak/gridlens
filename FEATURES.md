@@ -1261,13 +1261,24 @@ same fields the LP optimiser already uses; not a control-specific duplicate):
 - **`battery_headroom_w`** (`_battery_headroom_w`) — free discharge rate right now (rated
   max minus whatever's already discharging) — caps the draw so it never asks for more than
   the battery can give this instant.
-- **`battery_headroom_kwh`** (`_battery_headroom_kwh`, new) — energy to the configured
-  minimum SOC (`(soc − min_soc)/100 × battery_capacity`) — must cover the *whole* budget,
-  because a back-loaded spill (all the waste lands right before the window's reservation
-  point) means the battery can be down by the full budget just before the refill arrives.
+- **`battery_headroom_kwh`** (`_battery_headroom_kwh`) — energy to the configured minimum
+  SOC (`(soc − min_soc)/100 × battery_capacity`) — caps the draw via
+  `battery_headroom_kwh / forecast_hours`, the steady rate that uses no more than that
+  energy over the *whole* window in the worst case a back-loaded spill (all the waste lands
+  right before the window's reservation point) never shows up to repay it.
 
-Only when both clear does running the device draw the battery down instead of the grid, with
-that hole refilled by the very spill being bet on. **No battery configured, no capacity
+Both gates fold into one `min(rate_w, battery_headroom_w, battery_safe_rate_w)` clamp on the
+rate — a **proportional** pin for a modulating device (it runs at whatever rate the battery
+can safely fund, not the full ideal rate), reducing to pass/fail only for an on/off device
+(no partial state to pin to). **Fixed 2026-09-20:** `battery_headroom_kwh` used to have to
+cover the *entire* `forecast_spill_kwh` — the whole household's forecast waste, not what this
+one device would actually draw — which a modest battery can never clear on a big-spill day
+regardless of SOC or time of day (a 24 kWh battery, 10% min SOC, tops out at 21.6 kWh of
+headroom, so it permanently failed against any spill bigger than that) and left condition #3
+silently dead on exactly the days it exists for. See `docs/GRIDLENS_CHECKLIST.md`, 2026-09-20.
+
+Only when both gates clear does running the device draw the battery down instead of the grid,
+with that hole refilled by the very spill being bet on. **No battery configured, no capacity
 configured, or an unreadable sensor means no buffer exists — the condition fails closed and
 never fires**, same discipline as conditions #1 and #2's missing-sensor handling. Recorded as
 `greedy_blocked = "no_battery_headroom"` whenever the spill rate alone would have driven a
