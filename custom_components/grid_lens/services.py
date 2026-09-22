@@ -18,6 +18,8 @@ SERVICE_SET_DEFERRABLE_SCHEDULE = "set_deferrable_schedule"
 SERVICE_CLEAR_DEFERRABLE_SCHEDULE = "clear_deferrable_schedule"
 SERVICE_SET_CHARGE_TARGET = "set_charge_target"
 SERVICE_CLEAR_CHARGE_TARGET = "clear_charge_target"
+SERVICE_SET_DAILY_TARGET = "set_daily_target"
+SERVICE_CLEAR_DAILY_TARGET = "clear_daily_target"
 
 
 async def async_setup_services(hass: HomeAssistant, entry) -> None:
@@ -174,6 +176,52 @@ async def async_setup_services(hass: HomeAssistant, entry) -> None:
         """Cancel a device's ad-hoc charge target, if one is set."""
         await _write_charge_target(call.data.get("sensor_id"), 0.0, "")
 
+    async def handle_set_daily_target(call: ServiceCall) -> None:
+        """Pin a device (or "master") to an explicit Daily Target percent — the
+        automation-friendly alternative to setting the number entity by hand.
+        Unlike Today Boost, 0% is a legitimate explicit value (not a clear), so
+        this always pins; use clear_daily_target to unpin a device back to
+        following the master. Takes effect from the next advisory tick and
+        applies to every day in the rolling horizon, not a single date — see
+        FEATURES.md §9b."""
+        sensor_id = call.data.get("sensor_id")
+        percent = call.data.get("percent")
+        if not sensor_id:
+            raise HomeAssistantError("sensor_id is required (or \"master\")")
+        if percent is None:
+            raise HomeAssistantError("percent is required")
+        store = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_daily_targets")
+        if store is None:
+            raise HomeAssistantError("Grid Lens Daily Target store is not available")
+        if sensor_id == "master":
+            await store.async_set_master(float(percent))
+            _LOGGER.warning("Daily Target master set: %.0f%%", float(percent))
+            return
+        configured = entry.data.get("deferrable_load_sensors", []) or []
+        if sensor_id not in configured:
+            raise HomeAssistantError(
+                f"{sensor_id} is not a configured deferrable load "
+                f"(configured: {', '.join(configured) or 'none'})"
+            )
+        await store.async_set(sensor_id, float(percent))
+        _LOGGER.warning("Daily Target for %s set: %.0f%%", sensor_id, float(percent))
+
+    async def handle_clear_daily_target(call: ServiceCall) -> None:
+        """Unpin a device's Daily Target so it goes back to following the master
+        percent. Not valid for "master" itself — clear that by setting it back
+        to 100 via set_daily_target."""
+        sensor_id = call.data.get("sensor_id")
+        if not sensor_id or sensor_id == "master":
+            raise HomeAssistantError(
+                "sensor_id is required and must be a configured deferrable load "
+                "(the master target has no unset state — set it back to 100 instead)"
+            )
+        store = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_daily_targets")
+        if store is None:
+            raise HomeAssistantError("Grid Lens Daily Target store is not available")
+        await store.async_clear(sensor_id)
+        _LOGGER.warning("Daily Target for %s cleared (following master)", sensor_id)
+
     # Register services
     hass.services.async_register(
         DOMAIN,
@@ -191,6 +239,12 @@ async def async_setup_services(hass: HomeAssistant, entry) -> None:
     )
     hass.services.async_register(
         DOMAIN, SERVICE_CLEAR_CHARGE_TARGET, handle_clear_charge_target
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_DAILY_TARGET, handle_set_daily_target
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_CLEAR_DAILY_TARGET, handle_clear_daily_target
     )
 
     _LOGGER.info(f"Registered service: {DOMAIN}.{SERVICE_CALCULATE_PERIOD}")

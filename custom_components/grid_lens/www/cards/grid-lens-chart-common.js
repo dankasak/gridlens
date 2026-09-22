@@ -499,6 +499,234 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
     + `<line class="xhair" x1="0" x2="0" y1="${g.mt}" y2="${g.h - g.mb}" stroke="var(--ink2)" stroke-width="1" opacity="0"/></svg>`;
 }
 
+// ----------------------------------------------------- Daily Target helpers
+//
+// Shared by grid-lens-advisory-card.js (the compact header on the Power Flow
+// page — "the 1st page" — carries the master slider + solar forecast +
+// per-device expander since 2026-09-22) and grid-lens-daily-target-card.js
+// (the original standalone card — still installed and registered, just no
+// longer seeded onto the default Settings view now that its primary UI lives
+// in the advisory header). Centralised here, not duplicated per-card, after
+// this exact "two cards' entity resolvers/logic quietly drift apart" mistake
+// already happened once in this codebase (see HOT_WATER_RE/deferColorFor
+// above, and FEATURES.md's Daily Target §9b for the full history).
+//
+// See FEATURES.md §9b for what Daily Target is / why it's named that; see the
+// weatherFor() comment below for why the icons are a placeholder, not real
+// weather data.
+
+// Canonical device list — every configured deferrable load (published by
+// sensor.py's _build_deferrable_loads as one sensor's `deferrable_loads`
+// attribute array).
+export function resolveDeferrableLoads(hass) {
+  if (!hass) return [];
+  for (const eid of Object.keys(hass.states)) {
+    if (!eid.startsWith('sensor.')) continue;
+    const a = hass.states[eid].attributes;
+    if (a && Array.isArray(a.deferrable_loads)) return a.deferrable_loads;
+  }
+  return [];
+}
+
+export function resolveDailyTargetMasterEid(hass) {
+  if (!hass) return null;
+  for (const eid of Object.keys(hass.states)) {
+    if (!eid.startsWith('number.')) continue;
+    const a = hass.states[eid].attributes || {};
+    if (a.daily_target_scope === 'master') return eid;
+  }
+  return null;
+}
+
+export function resolveDailyTargetEidFor(hass, energyEntity) {
+  if (!hass || !energyEntity) return null;
+  for (const eid of Object.keys(hass.states)) {
+    if (!eid.startsWith('number.')) continue;
+    const a = hass.states[eid].attributes || {};
+    if (a.daily_target_scope === 'device' && a.deferrable_sensor_id === energyEntity) return eid;
+  }
+  return null;
+}
+
+// Today Boost, if active for this device — plain `deferrable_sensor_id` alone is
+// ambiguous (Today Boost and the ad-hoc charge-target percent below already share
+// it with no other marker — pre-existing, not fixed here), so this also requires
+// NEITHER of the other two roles' own marker attributes to be present.
+export function resolveBoostEidFor(hass, energyEntity) {
+  if (!hass || !energyEntity) return null;
+  for (const eid of Object.keys(hass.states)) {
+    if (!eid.startsWith('number.')) continue;
+    const a = hass.states[eid].attributes || {};
+    if (a.deferrable_sensor_id === energyEntity
+        && !('daily_target_scope' in a) && !('charge_target_role' in a)) return eid;
+  }
+  return null;
+}
+
+export function resolveChargeTargetPercentEidFor(hass, energyEntity) {
+  if (!hass || !energyEntity) return null;
+  for (const eid of Object.keys(hass.states)) {
+    if (!eid.startsWith('number.')) continue;
+    const a = hass.states[eid].attributes || {};
+    if (a.charge_target_role === 'percent' && a.deferrable_sensor_id === energyEntity) return eid;
+  }
+  return null;
+}
+
+// `configOverride` = a card's own `solar_forecast_entity` config, if set — always wins.
+// Otherwise scans for a Solcast-shaped sensor (detailedHourly/detailedForecast array of
+// {period_start, pv_estimate}), preferring one whose id contains "tomorrow" — the array
+// SHAPE alone can't distinguish Solcast's today/tomorrow sensors (both carry the same
+// schema), so this is a best-effort heuristic, not full auto-discovery. A non-Solcast
+// install should set `solar_forecast_entity` explicitly.
+export function resolveSolarForecastEid(hass, configOverride) {
+  if (configOverride) return configOverride;
+  if (!hass) return null;
+  let fallback = null;
+  for (const eid of Object.keys(hass.states)) {
+    if (!eid.startsWith('sensor.')) continue;
+    const a = hass.states[eid].attributes || {};
+    const arr = a.detailedHourly || a.detailedForecast;
+    if (!Array.isArray(arr) || !arr.length || !('pv_estimate' in arr[0])) continue;
+    if (eid.includes('tomorrow')) return eid;
+    if (!fallback) fallback = eid;
+  }
+  return fallback;
+}
+
+export function solarArrayFor(hass, eid) {
+  const st = eid && hass && hass.states[eid];
+  if (!st) return null;
+  const arr = st.attributes.detailedHourly || st.attributes.detailedForecast;
+  return Array.isArray(arr) && arr.length ? arr : null;
+}
+
+// Forecast kWh for local calendar day `dayOffset` (0 = today, 1 = tomorrow, …), counting
+// only slots at or after `fromHour:fromMinute` within that day — used both for "today's
+// REMAINING forecast" (fromHour/fromMinute = now) and, at the same cutoff on other days,
+// to build a like-for-like reference for the weather bucketing (see solarSummary) so a
+// late-afternoon check isn't compared against a full day's worth of sun and made to look
+// artificially rainier than it is.
+export function daySlotKwh(arr, dayOffset, fromHour, fromMinute) {
+  const now = new Date();
+  const dayStart = new Date(
+    now.getFullYear(), now.getMonth(), now.getDate() + dayOffset, fromHour, fromMinute,
+  ).getTime();
+  const dayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate() + dayOffset + 1).getTime();
+  let total = 0;
+  for (let i = 0; i < arr.length; i++) {
+    const t = new Date(arr[i].period_start).getTime();
+    if (!Number.isFinite(t) || t < dayStart || t >= dayEnd) continue;
+    const next = i + 1 < arr.length ? new Date(arr[i + 1].period_start).getTime() : t + 3600000;
+    const hours = Math.max(0, Math.min(1, (next - t) / 3600000));
+    const kw = parseFloat(arr[i].pv_estimate);
+    if (Number.isFinite(kw)) total += kw * hours;
+  }
+  return total;
+}
+
+// PLACEHOLDER (2026-09-22): no real weather-condition data behind these icons, just a
+// self-relative bucketing of forecast kWh against the best comparable day visible in the
+// SAME forecast array (never a hardcoded absolute kWh number, so it reads sensibly on a
+// 3kW system and a 15kW system alike, per the project's generic-design rule). Ordered
+// brightest-first; the first tier whose `min` the ratio clears wins. Swap point for nicer
+// rendered/animated icons later — any AI-generated art for that belongs in gridlens-api,
+// never in this public repo; plain mdi icons (as shipped) are fine here.
+const WEATHER_TIERS = [
+  { min: 0.75, icon: 'mdi:weather-sunny', label: 'Sunny' },
+  { min: 0.45, icon: 'mdi:weather-partly-cloudy', label: 'Partly cloudy' },
+  { min: 0.20, icon: 'mdi:weather-cloudy', label: 'Cloudy' },
+  { min: 0, icon: 'mdi:weather-pouring', label: 'Rainy' },
+];
+
+export function weatherFor(ratio) {
+  if (ratio == null || !Number.isFinite(ratio)) {
+    return { icon: 'mdi:weather-sunny', label: 'Forecast unavailable', dim: true };
+  }
+  for (const tier of WEATHER_TIERS) {
+    if (ratio >= tier.min) return { icon: tier.icon, label: tier.label, dim: false };
+  }
+  return { ...WEATHER_TIERS[WEATHER_TIERS.length - 1], dim: false };
+}
+
+// { todayKwh, tomorrowKwh, todayWeather, tomorrowWeather } for the resolved solar entity.
+// References for the ratio bucketing are the best comparable day found within the SAME
+// forecast array (offsets -1..6, covering however many days Solcast happens to have
+// returned) — never a hardcoded kWh number.
+export function solarSummary(hass, solarEid) {
+  const arr = solarArrayFor(hass, solarEid);
+  if (!arr) {
+    return { todayKwh: null, tomorrowKwh: null, todayWeather: weatherFor(null), tomorrowWeather: weatherFor(null) };
+  }
+  const now = new Date();
+  const nowHour = now.getHours();
+  const nowMinute = now.getMinutes();
+
+  const todayKwh = daySlotKwh(arr, 0, nowHour, nowMinute);
+  const tomorrowKwh = daySlotKwh(arr, 1, 0, 0);
+
+  let refRemaining = 0;
+  let refFull = 0;
+  for (let offset = -1; offset <= 6; offset++) {
+    refRemaining = Math.max(refRemaining, daySlotKwh(arr, offset, nowHour, nowMinute));
+    refFull = Math.max(refFull, daySlotKwh(arr, offset, 0, 0));
+  }
+
+  return {
+    todayKwh,
+    tomorrowKwh,
+    todayWeather: weatherFor(refRemaining > 0 ? todayKwh / refRemaining : null),
+    tomorrowWeather: weatherFor(refFull > 0 ? tomorrowKwh / refFull : null),
+  };
+}
+
+export function fmtKwh(v) {
+  return v == null || !Number.isFinite(v) ? '–' : `${v.toFixed(1)} kWh`;
+}
+
+// NOT the same as the existing clampPct() above (0-100, battery SOC) — Daily Target
+// percents go up to 300, a deliberately distinct name so importers can never confuse
+// the two ranges.
+export function clampTargetPct(v) {
+  v = parseFloat(v);
+  if (!Number.isFinite(v)) return 100;
+  return Math.max(0, Math.min(300, v));
+}
+
+export function localMidnightDaysAgo(n) {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - n);
+  return d;
+}
+
+// Same recorder query Today Boost's own sparkline uses (originally
+// grid-lens-load-control-card.js's _fetchHistory) — a plain N-day average, since
+// Daily Target only needs "what's typical" for the kWh readout next to a slider,
+// not the day-by-day series.
+export async function fetchDailyAverageKwh(hass, eid, historyDays = 14) {
+  try {
+    const res = await hass.callWS({
+      type: 'recorder/statistics_during_period',
+      start_time: localMidnightDaysAgo(historyDays - 1).toISOString(),
+      end_time: new Date().toISOString(),
+      statistic_ids: [eid],
+      period: 'day',
+      types: ['change'],
+    });
+    const rows = (res && res[eid]) || [];
+    const st = hass.states && hass.states[eid];
+    const divisor = (st && st.attributes && st.attributes.unit_of_measurement) === 'Wh' ? 1000.0 : 1.0;
+    const kwhs = rows
+      .map((r) => (r.change == null ? null : Math.max(0, +r.change) / divisor))
+      .filter((v) => v != null && !isNaN(v));
+    if (!kwhs.length) return 0;
+    return kwhs.reduce((s, v) => s + v, 0) / kwhs.length;
+  } catch (e) {
+    return null;
+  }
+}
+
 // Shared inner CSS (no <style> wrapper) — imported by both the chart-card base class
 // and the standalone advisory-status card so both look consistent without depending on
 // class inheritance to share styling.

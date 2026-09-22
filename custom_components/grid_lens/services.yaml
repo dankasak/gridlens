@@ -84,6 +84,57 @@ clear_charge_target:
       selector:
         text:
 
+set_daily_target:
+  name: Set Daily Target
+  description: >
+    Pin a deferrable load (or "master", which applies to every device with no
+    explicit override of its own) to a percent-of-average daily kWh target —
+    e.g. 50% to skip most of the EV's usual charge on a rainy day, or 150% to
+    top it up more than usual. Takes effect from the next advisory tick and
+    applies to every day in the rolling horizon, not a single date — set it in
+    the morning and it caps what's left of today too, not just future days.
+    Unlike Today Boost, 0% is a legitimate explicit value (skip the device
+    entirely), so this always pins the device; use clear_daily_target to unpin
+    it back to following the master. Values above 100% are allowed. Persists
+    until explicitly cleared (or the master is set back to 100) — it does not
+    auto-revert at midnight, since the advisory plan may already be relying on
+    it for a still-future slot.
+  fields:
+    sensor_id:
+      name: Device energy sensor (or "master")
+      description: >
+        The deferrable device's configured energy sensor entity id, or the
+        literal string "master" to set the all-devices default.
+      required: true
+      example: "sensor.ev_charger_energy"
+      selector:
+        text:
+    percent:
+      name: Target percent
+      description: Percent of the device's (or master's) usual average daily kWh.
+      required: true
+      example: 50
+      selector:
+        number:
+          min: 0
+          max: 300
+          unit_of_measurement: "%"
+
+clear_daily_target:
+  name: Clear Daily Target
+  description: >
+    Unpin a deferrable load's Daily Target so it goes back to following the
+    master percent. Not valid for "master" itself — set that back to 100
+    with set_daily_target instead.
+  fields:
+    sensor_id:
+      name: Device energy sensor
+      description: The deferrable device's configured energy sensor entity id.
+      required: true
+      example: "sensor.ev_charger_energy"
+      selector:
+        text:
+
 calculate_period:
   name: Calculate Plan Data for Period (deprecated)
   description: Deprecated and non-functional - calling this raises an error. Use the Grid Lens dashboard for plan comparisons. The per-hour sensor population this used to do was removed; the service is kept only so existing automations fail loudly rather than silently vanish.

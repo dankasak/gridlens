@@ -116,6 +116,16 @@ async def async_setup_entry(
                 GridLensDeferrableOverrideNumber(entry, store, sensor_id, name, max_kw)
             )
 
+        # Daily Target: one master target (config-entry-wide) plus one per-device
+        # target — independent of Today Boost, same device list.
+        daily_target_store = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_daily_targets")
+        entities.append(GridLensMasterTargetPercentNumber(entry, daily_target_store))
+        for i, sensor_id in enumerate(sensors):
+            name = _device_display_name(hass, sensor_id)
+            entities.append(
+                GridLensDeferrableTargetPercentNumber(entry, daily_target_store, sensor_id, name)
+            )
+
     # One ad-hoc charge-target percent per SOC-tracked deferrable device (paired with a
     # matching datetime.*_charge_target_time entity in datetime.py) — "100% by 7am
     # Saturday" before a trip. Gated on soc_sensor + soc_capacity_kwh being configured,
@@ -357,6 +367,191 @@ class GridLensChargeTargetPercentNumber(NumberEntity):
             target_iso = existing["target_iso"] if existing else ""
             await self._store.async_set(self._sensor_id, value, target_iso)
         self._attr_native_value = value if value > 0 else 0.0
+        self.async_write_ha_state()
+
+
+class GridLensMasterTargetPercentNumber(NumberEntity):
+    """Daily Target master percent — the default percent-of-average daily kWh
+    target applied to every deferrable device that has no explicit per-device
+    override of its own (see GridLensDeferrableTargetPercentNumber). "It's
+    raining, dial everything back to 60%" without having to touch each device
+    individually.
+
+    Named "Daily Target", not "Tomorrow" (its original name, changed
+    2026-09-22): the scaled figure applies to EVERY day in the advisory LP's
+    rolling horizon, not one calendar date, and takes effect from the next
+    advisory tick (~2 min) regardless of what time of day you set it — a
+    rainy-morning change applies to whatever's left of today too, not just
+    tomorrow. See daily_target_rules.py's docstring and FEATURES.md §9b.
+
+    100 = every un-pinned device uses its normal 14-day historical average
+    unchanged (today's behaviour). Supports >100% (e.g. 150% to top everything
+    up ahead of a few cloudy days). Reads/writes through the shared
+    DailyTargetStore; like Today Boost this persists until explicitly changed
+    back — see daily_target_rules.py's docstring for why it does NOT
+    auto-revert to 100% at midnight.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Daily Target — All Devices"
+    _attr_icon = "mdi:weather-partly-rainy"
+    _attr_native_min_value = 0.0
+    _attr_native_max_value = 300.0
+    _attr_native_step = 5.0
+    _attr_native_unit_of_measurement = "%"
+    _attr_mode = NumberMode.SLIDER
+
+    def __init__(self, entry: ConfigEntry, store) -> None:
+        self._store = store
+        self._entry_id = entry.entry_id
+        self._attr_unique_id = f"{entry.entry_id}_daily_target_master"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_native_value = 100.0
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._store is not None:
+            self._attr_native_value = await self._store.async_get_master()
+            from .daily_targets import update_signal
+            from homeassistant.helpers.dispatcher import async_dispatcher_connect
+
+            async def _on_update(_key: str) -> None:
+                # Re-reads on ANY key's signal, not just MASTER_KEY: cheap (one store
+                # read, no I/O), and a device-key signal just re-confirms the same
+                # master value rather than doing anything wrong.
+                self._attr_native_value = await self._store.async_get_master()
+                self.async_write_ha_state()
+
+            self.async_on_remove(
+                async_dispatcher_connect(
+                    self.hass, update_signal(self._entry_id), _on_update,
+                )
+            )
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        # daily_target_scope lets a card find this one entity unambiguously (no
+        # deferrable_sensor_id to join on — it's config-entry-wide, not per-device).
+        return {"daily_target_scope": "master"}
+
+    async def async_set_native_value(self, value: float) -> None:
+        if self._store is not None:
+            await self._store.async_set_master(value)
+        self._attr_native_value = value
+        self.async_write_ha_state()
+
+
+class GridLensDeferrableTargetPercentNumber(NumberEntity):
+    """Daily Target per-device percent-of-average daily kWh target — "the EV
+    battery is big enough that I don't need a full charge every day, dial it
+    to 40%" or "skip hot water, it's going to rain, dial to 0%". Scales what
+    AdvisoryCoordinator treats as this device's daily_kwh target (see
+    advisory/coordinator.py's _apply_daily_targets) before Today Boost's own
+    same-day absolute override (if active) is applied on top — Today Boost
+    still wins outright when both are set, since it's a more specific "I need
+    X kWh today" signal than a percent-of-average.
+
+    Named "Daily Target", not "Tomorrow" (its original name, changed
+    2026-09-22): it takes effect from the next advisory tick (~2 min)
+    regardless of what time of day you change it, and applies to every day in
+    the rolling horizon, not one calendar date — dialing this down at 8am on a
+    rainy morning caps what's left of TODAY too, it isn't scoped to tomorrow.
+    It only affects energy not yet drawn, though — it can't claw back a charge
+    that already finished earlier in the day. See daily_target_rules.py's
+    docstring and FEATURES.md §9b.
+
+    Displayed value is always the device's *effective* percent: its own pin if
+    one is set, otherwise whatever the master slider currently reads (see
+    extra_state_attributes' is_override to tell the two apart in the card).
+    Supports >100%. Unlike Today Boost, 0% is a legitimate explicit value here
+    (skip the device), so writing 0 does NOT clear the override the way it
+    does for Today Boost — clearing is a separate "reset to master" action
+    (see DailyTargetStore.async_clear / the grid_lens.clear_daily_target
+    service), which the card exposes as its own button.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:weather-partly-rainy"
+    _attr_native_min_value = 0.0
+    _attr_native_max_value = 300.0
+    _attr_native_step = 5.0
+    _attr_native_unit_of_measurement = "%"
+    _attr_mode = NumberMode.SLIDER
+
+    def __init__(self, entry: ConfigEntry, store, sensor_id: str, name: str) -> None:
+        self._store = store
+        self._entry_id = entry.entry_id
+        self._sensor_id = sensor_id
+        self._attr_name = f"{name} Daily Target"
+        self._attr_unique_id = f"{entry.entry_id}_daily_target_{sensor_id}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_native_value = 100.0
+        self._is_override = False
+        self._master_percent = 100.0
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        await self._refresh_from_store()
+        if self._store is not None:
+            from .daily_targets import MASTER_KEY, update_signal
+            from homeassistant.helpers.dispatcher import async_dispatcher_connect
+
+            async def _on_update(key: str) -> None:
+                # Repaint on our OWN sensor_id changing (pinned/cleared via the
+                # service, bypassing our own async_set_native_value) or on MASTER_KEY
+                # changing (we may be displaying it right now, unpinned) — any other
+                # device's key is irrelevant to us.
+                if key == self._sensor_id or key == MASTER_KEY:
+                    await self._refresh_from_store()
+                    self.async_write_ha_state()
+
+            self.async_on_remove(
+                async_dispatcher_connect(
+                    self.hass, update_signal(self._entry_id), _on_update,
+                )
+            )
+
+    async def _refresh_from_store(self) -> None:
+        if self._store is None:
+            return
+        self._is_override = await self._store.async_is_override(self._sensor_id)
+        self._master_percent = await self._store.async_get_master()
+        self._attr_native_value = await self._store.async_get_effective(self._sensor_id)
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        # deferrable_sensor_id is the same join-key convention Today Boost and the
+        # charge-target entities use, but that attribute ALONE is ambiguous — both
+        # Today Boost (number.py:270) and the charge-target percent (number.py's
+        # GridLensChargeTargetPercentNumber, ~line 352) already carry only
+        # deferrable_sensor_id on an SOC-tracked device, so a naive
+        # `a.deferrable_sensor_id === energyEntity` scan (e.g. this card family's
+        # existing _boostFor()) can't tell entities of different roles apart —
+        # pre-existing, not introduced here. daily_target_scope disambiguates
+        # THIS entity's own role so a new card's resolver doesn't repeat that
+        # mistake for a third time.
+        return {
+            "deferrable_sensor_id": self._sensor_id,
+            "daily_target_scope": "device",
+            "is_override": self._is_override,
+            "master_percent": self._master_percent,
+        }
+
+    async def async_set_native_value(self, value: float) -> None:
+        # Any explicit write — including 0 — pins this device away from the master;
+        # see the class docstring for why 0 can't double as "clear" here.
+        if self._store is not None:
+            await self._store.async_set(self._sensor_id, value)
+        self._attr_native_value = value
+        self._is_override = True
         self.async_write_ha_state()
 
 

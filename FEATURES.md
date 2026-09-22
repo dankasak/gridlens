@@ -1692,6 +1692,137 @@ as `gridlens-editor` (docs/CLAUDE.md).
 
 ---
 
+## 9b. Daily Target
+
+**What it does.** Scales a deferrable device's daily-kWh target as a **percent of its
+14-day average** — "the EV's battery is big enough it doesn't need a full charge every
+day, dial it to 40%" or "skip hot water, it's going to rain, dial to 0%" — without
+hand-computing an absolute kWh figure the way Today Boost (§9) requires. A **master**
+target (`number.*_daily_target_master`) sets the default for every device with no pin of
+its own; setting a **per-device** target (`number.*_<device>_daily_target`) **replaces**
+the master's influence on that device (not multiplicative — pinning the EV to 100% while
+the master sits at 60% for a cloudy day means the EV alone still gets its full usual
+target). Values above 100% are allowed (e.g. 150% ahead of a run of cloudy days).
+
+**Where it lives (relocated 2026-09-22).** The default, always-visible home is
+`grid-lens-advisory-card`'s **compact header** — the "Optimiser & Plan" bar at the top of
+the **Power Flow view** (the landing page): both solar forecast boxes and the master
+slider sit right in that header, with a chevron expander next to the slider that drops
+down the full per-device list on demand, so the collapsed bar stays a genuinely slim
+status line. The original standalone `grid-lens-daily-target-card` (master slider + solar
+header + every device, always expanded) still exists and is still registered as a
+Lovelace resource, but is no longer seeded onto the default Settings view — it's there for
+anyone who wants Daily Target as its own card on a different dashboard. Both cards are
+built from the SAME exported functions in `grid-lens-chart-common.js` ("Daily Target
+helpers" section) rather than keeping two copies that could drift — one slider per device
+with its 14-day average and computed "≈X kWh at this rate" readout, a "Follow master"
+reset button when a device is pinned, and **both today's remaining forecast solar and
+tomorrow's** (with a placeholder weather icon each) for context while dialing.
+
+**Named "Daily Target", not "Tomorrow Planning" (its original name — renamed 2026-09-22,
+same day it shipped).** The feature grew out of investigating a "battery charged off grid
+for no reason" report (see the checklist's 2026-09-21 entry): the charge was actually
+rational (a real next-evening VPP export window), but exposed that there was no way to
+tell the optimizer "the EV doesn't need its usual full charge" to reduce that kind of
+grid top-up. "Tomorrow Planning" was the first name, matching the evening-before-checking-
+the-forecast mental model — but it's mechanically wrong: the LP applies the SAME scaled
+`daily_kwh` figure to **every day-chunk in its rolling horizon**, not one calendar date,
+and it takes effect from the very next advisory tick (~2 min) regardless of what time of
+day you set it. Set it at 8am on a rainy morning and it caps what's left of TODAY too, not
+just tomorrow — "next 24 hours" would be *even less* accurate, since it implies a bounded
+window when the real behaviour is "this daily figure until you change it back," persisting
+across every day in the horizon, not just the next 24h. Renamed to a term that doesn't
+imply a specific day at all.
+
+**The rainy-morning case, specifically — what it can and can't do.** Using it in the
+morning for the current day works exactly like using it the evening before for the next
+one: same store, same mechanism, no special-casing needed. But it only affects **energy
+not yet drawn**. If a device (the EV, say) already finished its charge overnight before
+you noticed the rain and dialled things down at 8am, the lower target won't claw that back
+— it just caps further draw for the rest of today (and every day after, until reset). For
+a device that hasn't run yet today (hot water heating in the afternoon), the morning
+adjustment fully applies. This is why the card shows **both** today's remaining forecast
+and tomorrow's, not just tomorrow's — a tomorrow-only header would be the wrong number to
+look at on a rainy morning, actively misleading someone using the feature for today.
+
+**Why 0% can't mean "clear" here (unlike Today Boost's 0 kWh).** Today Boost's 0 kWh is
+meaningless as a boost, so it doubles as the "unset" sentinel. Daily Target's 0% is a
+*meaningful, explicit* target (skip the device entirely), so it can't do double duty —
+clearing a device's pin (falling back to the master) is its own action, either the card's
+"Follow master" button or the `grid_lens.clear_daily_target` service. Writing any value,
+including 0, via the number entity always pins.
+
+**Persistence — deliberately NOT auto-reset at midnight**, even though that was the
+initial instinct (mirroring what Today Boost *used* to do). `override_expiry.py`/
+`daily_target_rules.py` document why: the advisory LP plans on a rolling horizon, so a
+plan built before midnight can already be relying on a scaled target for a still-future
+slot — auto-expiring it mid-plan would silently revert the plan out from under itself with
+no notice, exactly the 2026-07-31 Today Boost incident this avoids repeating. A pinned
+target instead persists until explicitly changed, with a once-per-day persistent
+notification if it's still active past the day it was set (same UX as Today Boost's own
+carry-over notice).
+
+**Interaction with Today Boost (§9) and the ad-hoc charge target (§9a).** Ordering in
+`advisory/coordinator.py._deferrable_device_params()`: Daily Target's percent-scale
+(`_apply_daily_targets`) runs first, adjusting the historical `daily_kwh` baseline; Today
+Boost's absolute override (`_apply_overrides`) then runs on top and **wins outright** for a
+device where it's active — a same-day "I need X kWh today" is a more specific signal than a
+percent-of-average. A device with an **active ad-hoc charge target** bypasses both: the LP
+uses the target's SOC-gap floor instead of `daily_kwh` while the target is live
+(`battery_optimizer.py`'s `ev_soc_idx` path, §9a) — the card annotates a device's row when
+either of these is overriding its slider so the number displayed isn't mistaken for what
+will actually happen.
+
+**Weather icons are a placeholder.** There's no real weather-condition data behind them —
+just a self-relative bucketing of forecast kWh against the best comparable day visible in
+the same Solcast forecast array (never a hardcoded absolute kWh number, so it reads
+sensibly on a 3kW system and a 15kW system alike). See the card's `weatherFor()`/
+`_solarSummary()` — the intended swap point for nicer rendered/animated icons later. Any
+AI-generated icon/animation art for that would live in `gridlens-api`, never in this public
+repo, per the project's asset-location rule; plain mdi icons (as shipped) are fine here.
+
+**Scope note.** Only devices with a real energy sensor (`CONF_DEFERRABLE_LOAD_SENSORS`) get
+a Daily Target entity, same set as Today Boost. Declared/estimated ("dummy") devices
+(`CONF_DEFERRABLE_LOAD_DUMMY_*`) are not included — they're not currently part of the live
+advisory/dispatch plan at all (`_deferrable_device_params()` only calls
+`calc._get_deferrable_data()`, which is sensor-history-only; declared loads are parsed by
+a separate `_parse_declared_loads()` used only by the plan-comparison path), a pre-existing
+gap this feature didn't create and doesn't fix.
+
+**Files:** `daily_target_rules.py` (pure carry-over logic, no HA imports —
+`tests/test_daily_targets.py`), `daily_targets.py` (shared `Store`-backed
+`DailyTargetStore`), `number.py` (`GridLensMasterTargetPercentNumber`,
+`GridLensDeferrableTargetPercentNumber` — join key `deferrable_sensor_id` +
+`daily_target_scope` state attributes, disambiguating from Today Boost/charge-target's own
+use of `deferrable_sensor_id`), `services.py`/`services.yaml`
+(`set_daily_target`/`clear_daily_target`), `advisory/coordinator.py`
+(`_apply_daily_targets`, called before `_apply_overrides` in `_deferrable_device_params`),
+`www/cards/grid-lens-chart-common.js`'s "Daily Target helpers" section (resolvers,
+`solarSummary`/`weatherFor`, `fetchDailyAverageKwh` — shared by both card files below),
+`www/cards/grid-lens-advisory-card.js` (primary home, compact header — `_dt*` methods),
+`www/cards/grid-lens-daily-target-card.js` (standalone card, unseeded but still available).
+
+**Unverified** — added 2026-09-21, renamed + today/tomorrow forecast header added
+2026-09-22, relocated into the advisory-card header (and the shared logic centralised into
+`grid-lens-chart-common.js`) later the same day. `py_compile`/`node --check`'d clean at
+every step, the pure carry-over logic unit-tested, and the backend round-trip (services →
+entities → advisory log lines showing a scaled `daily_kwh`) was live-verified on the dev
+rig repeatedly. The card's visual layout (including the weather-icon boxes and the new
+expander) is **not yet clicked through by the owner** (no browser/display in this dev
+container — same caveat as `grid-lens-charge-target-card` above and `gridlens-editor`,
+docs/CLAUDE.md). Two real bugs were already caught and fixed via live verification before
+the owner ever saw it working: (1) the number entities went stale when written through the
+new services (a path other than the entity's own slider) until a
+`charge_target_store.py`-style dispatcher signal was added — see
+`feedback_store_backed_entity_dispatcher_sync` in the assistant's own memory notes for this
+repo; (2) a method/property name collision (`_masterEid` used as both a class method and a
+cached instance property) crashed the original standalone card on its second `hass`
+update, surfaced only in the browser as "configuration error", not by `node --check` — see
+`feedback_js_card_name_collision_check` for the grep-based check now run before shipping
+any card change.
+
+---
+
 ## 10. Cards & the default dashboard
 
 All cards **auto-discover** their entities by attribute fingerprint — never a naming
@@ -1725,8 +1856,9 @@ Callers passing no `rightAxis` are byte-for-byte unchanged (verified against the
 | `grid-lens-soc-chart-card` | Battery SOC curve, planned vs measured, full height. Kept alongside the Power Flow chart's SOC overlay on purpose: the overlay is at-a-glance context next to dispatch, this is the divergence diagnostic for whether control is actually tracking the plan. |
 | `grid-lens-cash-chart-card` | Cumulative cost/credit. |
 | `grid-lens-dispatch-chart-card` | Planned EMS mode timeline. |
-| `grid-lens-advisory-card` | Plan status header (plan name/solver/last-run time, status badge), control-mode timeline, deferrable-load recommendations. `compact: true` config renders just the header — used as a slim "optimiser & plan" status bar at the top of the Power Flow view; `title` config overrides the header text in that mode. `show_current_rates: true` adds a one-line buy/sell readout ("Buy 22c/kWh · Sell 3c/kWh") under the plan-status line — the rate for the slot covering now, from the same `trajectory` attribute. Just the numbers; the rate *graph* is `grid-lens-price-chart-card`. Off by default and **not** used by the seed anymore — the Power Flow view shows the current rate on the `grid-lens-powerflow-card` Grid node instead (2026-09-11). Still available for a dashboard that has no Power Flow card. Works in the full card too. |
+| `grid-lens-advisory-card` | Plan status header (plan name/solver/last-run time, status badge), control-mode timeline, deferrable-load recommendations, **plus Daily Target (§9b, relocated 2026-09-22): today/tomorrow solar forecast + master slider in the header, per-device sliders behind a chevron expander** — same header content in both compact and full layouts. `compact: true` config renders just the header (incl. the Daily Target block) — used as a slim "optimiser & plan" status bar at the top of the Power Flow view; `title` config overrides the header text in that mode. `show_current_rates: true` adds a one-line buy/sell readout ("Buy 22c/kWh · Sell 3c/kWh") under the plan-status line — the rate for the slot covering now, from the same `trajectory` attribute. Just the numbers; the rate *graph* is `grid-lens-price-chart-card`. Off by default and **not** used by the seed anymore — the Power Flow view shows the current rate on the `grid-lens-powerflow-card` Grid node instead (2026-09-11). Still available for a dashboard that has no Power Flow card. Works in the full card too. |
 | `grid-lens-load-control-card` | One row per deferrable load: Today Boost, greedy toggles, Off now / On now / Auto, and live greedy status. |
+| `grid-lens-daily-target-card` | Standalone Daily Target card (§9b) — same content as `grid-lens-advisory-card`'s header block, always expanded, no chevron. No longer seeded onto the default Settings view (2026-09-22) since the advisory-card header is now the default home; still installed/registered for a dashboard that wants it as its own card. |
 | `grid-lens-charge-target-card` | One row per SOC-tracked deferrable load: ad-hoc "charge to X% by a datetime" target (§9a) — a percent tile + a datetime tile, auto-paired via the `charge_target_role`/`deferrable_sensor_id` state attributes, plus a plain-text "Target: 95% by Sat, 2:22 am" / "No target set" status line. Empty state when no device has SOC tracking configured. |
 | `grid-lens-defer-schedule-card` | The 7 × 48 allowed-run-times editor. |
 | `grid-lens-flex-row-card` | Layout helper — per-child `flex` control, stacks below a breakpoint, and collapses children that hide themselves (native `conditional` cards) out of the row. |
@@ -2211,14 +2343,18 @@ custom_components/grid_lens/
 ├── plan_sensors.py          per-plan metric sensors
 ├── switch.py                battery control + per-device control & greedy switches
 ├── select.py                Force On/Off/Auto override
-├── number.py                Today Boost, Minimum Export Price, charge-target percent — §9a
+├── number.py                Today Boost, Minimum Export Price, charge-target percent — §9a,
+│                            Daily Target master/per-device percent — §9b
 ├── datetime.py              charge-target deadline entity — §9a
-├── services.py/.yaml        set/clear schedule, calculate_period, set/clear charge_target
+├── services.py/.yaml        set/clear schedule, calculate_period, set/clear charge_target,
+│                            set/clear daily_target — §9b
 ├── schedule_grid.py         7x48 grid helpers (slot_allowed, week_from_hours)
 ├── deferrable_schedules.py  schedule Store
 ├── deferrable_overrides.py  boost Store
 ├── charge_target.py         ad-hoc charge-target pure maths (slot rounding, reach/expiry) — §9a
 ├── charge_target_store.py   ad-hoc charge-target Store — §9a
+├── daily_target_rules.py    Daily Target pure carry-over logic — §9b
+├── daily_targets.py         Daily Target Store (master + per-device) — §9b
 ├── load_estimation.py       LoadEstimator + EstimateStore — synthetic energy sensor for an
 │                            unmonitored controllable load (aircon w/ no feedback), §5
 ├── load_estimate_math.py    pure sample-accept/EMA/integration logic behind LoadEstimator

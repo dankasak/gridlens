@@ -267,11 +267,52 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             if combined:
                 hod = calc._aggregate_kwh_by_hod(combined)
                 self._deferrable_load_hod = [float(hod.get(h, 0.0)) for h in range(24)]
-            return await self._apply_overrides(defs or [])
+            scaled = await self._apply_daily_targets(defs or [])
+            return await self._apply_overrides(scaled)
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Advisory: deferrable device params unavailable: %s", err)
             self._deferrable_load_hod = [0.0] * 24
             return []
+
+    async def _apply_daily_targets(self, defs: list) -> list:
+        """Scale each device's historical daily_kwh by its Daily Target percent
+        (its own explicit pin if set, else the master slider — see
+        daily_targets.DailyTargetStore) — "the EV doesn't need its usual full
+        charge" or "skip hot water, it's going to rain" without having to
+        override the whole kWh figure by hand the way Today Boost requires.
+
+        Named "Daily Target", not "Tomorrow" (changed 2026-09-22): this applies
+        the SAME scaled figure to every day in the horizon this method builds
+        for, from whatever day-chunk "now" falls in onward — not one calendar
+        date. Setting it at 8am on a rainy morning caps what's left of TODAY's
+        day-chunk too, not just future days; it just can't claw back energy a
+        device already drew earlier in the day. See daily_target_rules.py.
+
+        Runs BEFORE _apply_overrides deliberately: Today Boost is a same-day, more
+        specific "I need X kWh today" absolute override and must still win outright
+        when both are active for a device — this only adjusts the historical baseline
+        that Today Boost would otherwise replace wholesale anyway. A device with an
+        active ad-hoc charge target (see _charge_target/_deferrable_for_horizon) bypasses
+        both of these — the LP uses the target's SOC-gap floor instead of daily_kwh for
+        that device while the target is live (battery_optimizer.py's ev_soc_idx path) —
+        so scaling daily_kwh here is a no-op for it until the target clears, same as it
+        already is for Today Boost.
+        """
+        store = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_daily_targets")
+        if store is None:
+            return defs
+        out = []
+        for dev in defs:
+            pct = await store.async_get_effective(dev.get("sensor_id", ""))
+            if abs(pct - 100.0) > 1e-9:
+                scaled_kwh = dev.get("daily_kwh", 0.0) * pct / 100.0
+                _LOGGER.warning(
+                    "Daily Target for %s: %.0f%% -> %.1f kWh (was %.1f historical)",
+                    dev.get("name"), pct, scaled_kwh, dev.get("daily_kwh", 0.0),
+                )
+                dev = {**dev, "daily_kwh": scaled_kwh}
+            out.append(dev)
+        return out
 
     async def _apply_overrides(self, defs: list) -> list:
         """Substitute each device's active override (if any) for the historical

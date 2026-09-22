@@ -442,6 +442,14 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
             "type": "custom:grid-lens-load-control-card", "title": "Deferrable Loads",
             "grid_options": {"columns": "full"},
         })
+        # Daily Target (percent-of-average master + per-device targets, FEATURES.md §9b)
+        # is NOT seeded here (was, 2026-09-21 to 2026-09-22) — its default-visible home
+        # is now grid-lens-advisory-card's compact header on the Power Flow view (solar
+        # forecast + master slider always shown there, per-device sliders behind an
+        # expander), so a second copy on Settings would just be a redundant, easy-to-
+        # forget-to-keep-in-sync UI. grid-lens-daily-target-card.js still exists and is
+        # still registered as a Lovelace resource for anyone who wants it as its own
+        # card on a different dashboard.
         # Ad-hoc "charge to X% by a datetime" target — FEATURES.md §9a. Only meaningful
         # for a device with SOC tracking configured (same condition as show_ev above —
         # the card itself auto-discovers per device, but the heading/card are only worth
@@ -600,7 +608,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260916a"
+    _CARD_VERSION = "20260922d"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -618,6 +626,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         f"/grid_lens/cards/grid-lens-boost-tuning-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-charge-target-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-defer-schedule-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-daily-target-card.js?v={_CARD_VERSION}",
     ]
     stale_urls = {
         "/grid_lens/cards/electricity-plan-comparison-card.js",
@@ -628,6 +637,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         # (PowerflowCardView) 2026-08-02 — the base path itself changed, so the
         # version-mismatch check below won't catch it; needs the explicit stale entry.
         "/grid_lens/cards/grid-lens-powerflow-card.js",
+        # Renamed to grid-lens-daily-target-card.js 2026-09-22 (see FEATURES.md §9b) —
+        # same "base path itself changed" reasoning as the powerflow-card entry above.
+        "/grid_lens/cards/grid-lens-tomorrow-planning-card.js",
     }
     try:
         lovelace_data = hass.data.get("lovelace")
@@ -1927,6 +1939,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, entry.entry_id
     )
 
+    # Daily Target: per-device + master percent-of-average targets — shared
+    # between the number.py entity pair (writers) and AdvisoryCoordinator (reader).
+    # Same "created before platforms are forwarded" reasoning as the stores above.
+    from .daily_targets import DailyTargetStore
+    hass.data[DOMAIN][f"{entry.entry_id}_daily_targets"] = DailyTargetStore(
+        hass, entry.entry_id
+    )
+
     # Weekly per-weekday availability schedules for deferrable loads (edited on the
     # dashboard schedule card; replaces the static hours config when set for a device).
     # Preloaded here so sensor.py's sync attribute builder can read the cache.
@@ -2102,6 +2122,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(f"{entry.entry_id}_load_control", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_overrides", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_charge_targets", None)
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_daily_targets", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_schedules", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_load_estimators", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_power_estimators", None)
