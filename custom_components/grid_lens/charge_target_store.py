@@ -26,6 +26,7 @@ from homeassistant.util import dt as dt_util
 
 from . import charge_target as ct
 from .const import DOMAIN
+from .reoptimize import request_reoptimize
 
 STORE_VERSION = 1
 
@@ -92,4 +93,5 @@ class ChargeTargetStore:
         await self._ensure_loaded()
         self._data = ct.write_target(self._data, sensor_id, percent, target_iso)
         await self._store.async_save(self._data)
+        request_reoptimize(self._hass, self._entry_id)
         async_dispatcher_send(self._hass, update_signal(self._entry_id), sensor_id)

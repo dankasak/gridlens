@@ -46,7 +46,7 @@ import {
   fmtC, resolveDeferrableLoads, resolveDailyTargetMasterEid, resolveDailyTargetEidFor,
   resolveBoostEidFor, resolveChargeTargetPercentEidFor, resolveSolarForecastEid, solarSummary,
   fmtKwh, clampTargetPct, fetchDailyAverageKwh,
-} from './grid-lens-chart-common.js?v=20260923b';
+} from './grid-lens-chart-common.js?v=20260923c';
 
 const DAILY_TARGET_HISTORY_REFRESH_MS = 15 * 60000;
 
@@ -162,6 +162,7 @@ class GridLensAdvisoryCard extends HTMLElement {
       generated_at: a.generated_at,
       reason: a.reason,
       restored: a.restored === true,
+      is_optimizing: a.is_optimizing === true,
     };
 
     // Toggle chips live in this card but reflect OTHER entities' state, so their states
@@ -511,6 +512,7 @@ class GridLensAdvisoryCard extends HTMLElement {
         ${this._dtInlineHtml()}
         <div class="hd-right">
           ${this._toggleChipsHtml()}
+          ${s.is_optimizing ? '<span class="opt-dot" title="Optimizer is running — recalculating the plan now"></span>' : ''}
           <div class="badge ${s.restored ? 'stale' : (s.status === 'ok' ? 'ok' : '')}">${s.restored ? 'LAST PLAN' : esc((s.status || 'unknown').toUpperCase())}</div>
         </div>
       </div>

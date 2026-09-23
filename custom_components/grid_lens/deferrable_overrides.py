@@ -34,6 +34,7 @@ from homeassistant.util import dt as dt_util
 from .const import DOMAIN
 from .entity_lookup import resolve_device_name
 from .override_expiry import mark_notified, read_value, should_notify_carryover, write_value
+from .reoptimize import request_reoptimize
 
 STORE_VERSION = 1
 
@@ -45,6 +46,7 @@ def _today_local() -> str:
 class DeferrableOverrideStore:
     def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
         self._hass = hass
+        self._entry_id = entry_id
         self._store = Store(hass, STORE_VERSION, f"{DOMAIN}_deferrable_overrides_{entry_id}")
         self._data: dict = {}
         self._loaded = False
@@ -83,3 +85,4 @@ class DeferrableOverrideStore:
         await self._ensure_loaded()
         self._data = write_value(self._data, sensor_id, value_kwh, _today_local())
         await self._store.async_save(self._data)
+        request_reoptimize(self._hass, self._entry_id)

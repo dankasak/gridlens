@@ -37,7 +37,14 @@ class AdvisoryDispatchSensor(CoordinatorEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict:
         data = self.coordinator.data or {}
-        attrs: dict = {"status": data.get("status")}
+        attrs: dict = {
+            "status": data.get("status"),
+            # True for the duration of an in-flight optimizer run — pushed the moment the
+            # run starts (see AdvisoryCoordinator._async_update_data), not just once it's
+            # done, so a card can show a "recalculating" cue immediately after a user
+            # changes a value that triggers reoptimize.py's immediate re-run.
+            "is_optimizing": self.coordinator.is_optimizing,
+        }
         if data.get("reason"):
             attrs["reason"] = data["reason"]
         if data.get("status") == "ok":

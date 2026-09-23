@@ -76,6 +76,12 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             hass, _LOGGER, name=f"{DOMAIN}_advisory", update_interval=UPDATE_INTERVAL
         )
         self.entry = entry
+        # True for the duration of an in-flight _run() — the immediate-reoptimize feature
+        # (see reoptimize.py) and the card's "optimizing" indicator both read this. Flipped
+        # (and pushed via async_update_listeners) around the try/finally in
+        # _async_update_data below, since a run can take a few seconds and callers want to
+        # know it's happening before the new plan lands, not just after.
+        self.is_optimizing = False
         self._plan = None
         self._load_forecaster = FlatLoadForecaster()
         self._meta_refreshed = None
@@ -797,11 +803,20 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
 
     # ------------------------------------------------------------------ update
     async def _async_update_data(self) -> dict:
+        # Push the "running" transition to listeners NOW, before the run itself starts —
+        # _run() can take a few seconds (LP solve + forecast build), and the card's
+        # optimizing indicator (see FEATURES.md) needs to show up at the start of that
+        # window, not only after the new plan lands with the rest of this method's
+        # normal end-of-update notification.
+        self.is_optimizing = True
+        self.async_update_listeners()
         try:
             result = await self._run()
         except Exception as err:  # noqa: BLE001 — never propagate to break the platform
             _LOGGER.exception("Advisory update failed: %s", err)
             result = {"status": "error", "reason": str(err)}
+        finally:
+            self.is_optimizing = False
         # Changing update_interval here is honoured when the coordinator reschedules its
         # next refresh — far more robust than a manually-chained async_call_later, which
         # could silently stop retrying (as it did in practice, leaving the card blank until

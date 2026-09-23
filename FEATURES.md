@@ -595,6 +595,45 @@ plan restore so the Battery Plan card isn't blank for 10 minutes.
 
 ---
 
+## 3b. Immediate re-optimize on input change
+
+**What it does.** Any user-facing write that changes what the LP plans against —
+Minimum Export Price, Today Boost, an ad-hoc Charge Target, Daily Target (master or
+per-device), a deferrable device's weekly schedule, or a Force On/Off/Auto override —
+kicks `AdvisoryCoordinator.async_request_refresh()` immediately instead of leaving the
+change to wait for the advisory's normal ~2 min tick. Both write paths (the dashboard
+entity AND the equivalent `grid_lens.set_*`/`clear_*` service) trigger it, since the
+hook lives in the shared store each one writes through, not in the entity/service layer
+itself — see `reoptimize.py`'s docstring for the exact list of call sites
+(`charge_target_store.py`, `daily_targets.py`, `deferrable_overrides.py`,
+`deferrable_schedules.py`, `control/load_control_manager.py.set_override`, and
+`number.py`'s `GridLensMinExportPriceNumber` directly, since it has no backing store).
+
+`DataUpdateCoordinator.async_request_refresh()` already debounces/coalesces, so a value
+changed while a run is already in flight just collapses into that run rather than
+queuing a second one — callers never check "is it already running" themselves.
+
+**Visual cue.** `AdvisoryCoordinator.is_optimizing` is true for the duration of an
+in-flight run, pushed to listeners the moment the run *starts* (not just when it ends),
+and exposed as the `is_optimizing` attribute on `sensor.*_planned_dispatch`. The Battery
+Plan / status card (`grid-lens-advisory-card.js`, `compact` mode included) renders a
+small pulsing dot (`.opt-dot` in `grid-lens-chart-common.js`'s shared `STYLE`) next to
+the status badge while it's true. On this install the LP solve is sub-second, so the dot
+is only visible briefly — it's there for slower solves (larger horizons, a PuLP
+fallback) where the delay is actually perceptible.
+
+**Files:** `reoptimize.py` (new), `advisory/coordinator.py`, `advisory/dispatch_sensor.py`,
+`www/cards/grid-lens-advisory-card.js`, `www/cards/grid-lens-chart-common.js`.
+
+**Deliberately excluded.** Toggles that don't change what the LP plans against — the
+battery-control switch, a device's enable switch, the three Greedy Consumption switches,
+and `GridLensModulatingMaxCurrentNumber`'s live current ceiling — don't trigger this. The
+LP already plans independently of whether control is enabled (those switches only gate
+*actuation* of an already-computed plan), and the modulating current ceiling narrows a
+live 30s command, not an LP input.
+
+---
+
 ## 3a. Shade correction (layer 2 input)
 
 **What it does.** Learns a per-hour-of-day derate curve for a fixed, static solar

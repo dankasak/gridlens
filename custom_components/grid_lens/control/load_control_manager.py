@@ -67,6 +67,7 @@ from ..const import (
     MODULATION_INTERVAL_SECONDS,
 )
 from ..inverters.base import BatteryAction
+from ..reoptimize import request_reoptimize
 from .executor import DispatchInterval
 from .load_controller import DeferrableLoadController
 
@@ -463,6 +464,10 @@ class LoadControlManager:
         want = None if mode is None else (mode == "on")
         await c.set_override(want, dt_util.now(), actuate=actuate)
         self._notify(index)
+        # A Force On/Off/Auto change moves this device's availability mask for the LP
+        # (see advisory/coordinator.py's _deferrable_for_horizon) — re-plan now rather
+        # than leaving the rest of the horizon planned around the old mask for up to 2 min.
+        request_reoptimize(self.hass, self.entry.entry_id)
         if want is None and actuate and self._enabled.get(index, False):
             now = dt_util.now()
             await self._tick_device(index, now)

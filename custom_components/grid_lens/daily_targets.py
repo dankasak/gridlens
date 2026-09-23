@@ -32,6 +32,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .entity_lookup import resolve_device_name
+from .reoptimize import request_reoptimize
 from .daily_target_rules import (
     MASTER_KEY,
     clear_percent,
@@ -111,6 +112,7 @@ class DailyTargetStore:
         self._data = write_percent(self._data, MASTER_KEY, percent, _today_local())
         await self._store.async_save(self._data)
         async_dispatcher_send(self._hass, update_signal(self._entry_id), MASTER_KEY)
+        request_reoptimize(self._hass, self._entry_id)
 
     async def async_get_effective(self, sensor_id: str) -> float:
         """sensor_id's own explicit override if set, else the current master percent."""
@@ -128,6 +130,7 @@ class DailyTargetStore:
         self._data = write_percent(self._data, sensor_id, percent, _today_local())
         await self._store.async_save(self._data)
         async_dispatcher_send(self._hass, update_signal(self._entry_id), sensor_id)
+        request_reoptimize(self._hass, self._entry_id)
 
     async def async_clear(self, sensor_id: str) -> None:
         """Unpin sensor_id so it goes back to following the master percent."""
@@ -135,3 +138,4 @@ class DailyTargetStore:
         self._data = clear_percent(self._data, sensor_id)
         await self._store.async_save(self._data)
         async_dispatcher_send(self._hass, update_signal(self._entry_id), sensor_id)
+        request_reoptimize(self._hass, self._entry_id)

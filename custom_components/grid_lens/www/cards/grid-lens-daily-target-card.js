@@ -26,7 +26,7 @@ import {
   STYLE, esc, resolveDeferrableLoads, resolveDailyTargetMasterEid, resolveDailyTargetEidFor,
   resolveBoostEidFor, resolveChargeTargetPercentEidFor, resolveSolarForecastEid, solarSummary,
   fmtKwh, clampTargetPct, fetchDailyAverageKwh,
-} from './grid-lens-chart-common.js?v=20260923b';
+} from './grid-lens-chart-common.js?v=20260923c';
 
 const HISTORY_REFRESH_MS = 15 * 60000;
 

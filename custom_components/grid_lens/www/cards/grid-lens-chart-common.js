@@ -891,6 +891,11 @@ export const STYLE = `
            border:1px solid var(--border); color:var(--ink2); }
   .badge.ok { color:var(--good); border-color:color-mix(in srgb,var(--good) 40%,transparent); }
   .badge.stale { color:var(--solar); border-color:color-mix(in srgb,var(--solar) 45%,transparent); }
+  /* Optimizer-running cue (see AdvisoryCoordinator.is_optimizing) — a plain pulsing dot,
+     not a spinner, so it reads at a glance without implying indeterminate progress. */
+  @keyframes gl-optimizing-pulse { 0%,100% { opacity:1; } 50% { opacity:.25; } }
+  .opt-dot { width:7px; height:7px; border-radius:50%; background:var(--good); flex:none;
+             animation: gl-optimizing-pulse 1.1s ease-in-out infinite; }
   .sec { margin-top:14px; }
   .sec h4 { margin:0 0 4px; font-size:12px; font-weight:600; color:var(--ink2); }
   .legend { display:flex; gap:14px; font-size:11px; color:var(--ink2); margin:2px 0 6px; flex-wrap:wrap; }

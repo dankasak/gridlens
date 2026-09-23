@@ -99,6 +99,9 @@ def _bootstrap():
     rs_stub = types.ModuleType("gl.runtime_settings")
     rs_stub.get_live_number = lambda hass, entry_id, suffix, default: default
     sys.modules["gl.runtime_settings"] = rs_stub
+    # Real reoptimize.py — only needs the already-stubbed homeassistant.core.HomeAssistant
+    # (type hint only) and gl.const, so it loads for real rather than needing a fake.
+    _load(os.path.join(_COMPONENT, "reoptimize.py"), "gl.reoptimize", package="gl")
     lc = _load(os.path.join(_COMPONENT, "control", "load_controller.py"),
                "gl.control.load_controller", package="gl.control")
     lcm = _load(os.path.join(_COMPONENT, "control", "load_control_manager.py"),

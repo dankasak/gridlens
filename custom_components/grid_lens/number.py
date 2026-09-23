@@ -27,6 +27,7 @@ from .const import (
     DEFAULT_SUPPLY_VOLTAGE,
     DEFAULT_MIN_CHARGE_CURRENT_A,
 )
+from .reoptimize import request_reoptimize
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -209,6 +210,7 @@ class GridLensMinExportPriceNumber(RestoreEntity, NumberEntity):
     _attr_mode = NumberMode.BOX
 
     def __init__(self, entry: ConfigEntry) -> None:
+        self._entry_id = entry.entry_id
         self._attr_unique_id = f"{entry.entry_id}_min_export_price"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry.entry_id)},
@@ -231,6 +233,7 @@ class GridLensMinExportPriceNumber(RestoreEntity, NumberEntity):
     async def async_set_native_value(self, value: float) -> None:
         self._attr_native_value = value
         self.async_write_ha_state()
+        request_reoptimize(self.hass, self._entry_id)
 
 
 class GridLensDeferrableOverrideNumber(NumberEntity):

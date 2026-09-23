@@ -20,6 +20,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
+from .reoptimize import request_reoptimize
 from .schedule_grid import read_week, write_week
 
 STORE_VERSION = 1
@@ -27,6 +28,8 @@ STORE_VERSION = 1
 
 class DeferrableScheduleStore:
     def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
+        self._hass = hass
+        self._entry_id = entry_id
         self._store = Store(hass, STORE_VERSION, f"{DOMAIN}_deferrable_schedules_{entry_id}")
         self._data: dict = {}
         self._loaded = False
@@ -55,3 +58,4 @@ class DeferrableScheduleStore:
             self._data, sensor_id, week, dt_util.now().date().isoformat()
         )
         await self._store.async_save(self._data)
+        request_reoptimize(self._hass, self._entry_id)
