@@ -82,6 +82,7 @@ def _install_stubs() -> None:
     const.DOMAIN = "grid_lens"
     const.CONF_HAS_DEMAND_TARIFF = "has_demand_tariff"
     const.DEFAULT_DEMAND_WINDOW_HOURS = [15, 16, 17, 18, 19, 20]
+    const.CONF_SHADE_CORRECTION_ENABLED = "shade_correction_enabled"
     forecast = _mod("gl.advisory.forecast")
     forecast.FlatLoadForecaster = type("FlatLoadForecaster", (), {})
     forecast.ForecastProvider = type("ForecastProvider", (), {})
