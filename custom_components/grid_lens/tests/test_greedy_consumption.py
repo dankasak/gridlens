@@ -1076,6 +1076,44 @@ async def _run_manager_end_to_end_forecast_below_floor_tick():
     assert len(_turn_ons(hass2)) == 0
 
 
+async def _run_manager_end_to_end_reservation_does_not_inflate_safe_rate():
+    """Real incident, 2026-09-20/21 (GRIDLENS_CHECKLIST.md): a genuine spill inside a
+    RESERVATION-clipped window must not borrow the battery harder just because the
+    reservation happened to shrink the window. Same shape as
+    ``_run_manager_end_to_end_surplus_tick`` (6 kW export waste covering the whole
+    remaining slice), but here the window is clipped short by a real planned battery
+    discharge ~1.5h out — not by the plan simply running out of data.
+
+    22.8% SOC / 10% min SOC / 24 kWh capacity -> 3.072 kWh headroom. Honestly measured
+    against the full 9h look-ahead, that caps the safe rate at ~341 W — nowhere near the
+    2 kW this on/off device needs. But naively dividing by the ~1.23h reservation-clipped
+    window inflates the safe rate past 2 kW, which is exactly the mechanism that fired the
+    real aircon with the battery already low and no more sun for hours. Must stay off."""
+    m, hass = _mgr(grid_power_sensor="sensor.grid_power",
+                   extra_data=_forecast_battery_data(battery_capacity=24.0,
+                                                      battery_min_soc=10.0))
+    hass.states.set("sensor.grid_power", "500")    # importing right now — nothing live-free
+    hass.states.set("sensor.battery_soc", "22.8")  # the actual reading at incident time
+    hass.states.set("sensor.battery_power", "0")
+    _NOW[0] = _T0
+    # 3 slots (1.5h) of genuine $0 export waste (6 kW spilling), then a real 5 kW discharge
+    # reservation. import_rate stays priced throughout so this can only be condition #3
+    # (forecast surplus) — nothing is live-free, same as the real incident at 9pm.
+    plan = (_slots([(0.3, 0.0, 6000.0)] * 3, start=_T0 - timedelta(minutes=1))
+            + _slots([(0.3, 0.28, 0.0, 0.0, BatteryAction.DISCHARGE, 5000.0)] * 4,
+                     start=_T0 + timedelta(hours=1.5) - timedelta(minutes=1)))
+    m.set_plan(plan, updated_at=_T0)
+    await m.set_entitled(True)
+    await m.enable(0)  # first tick establishes "off" (plan wants off, no greedy yet)
+    assert len(_turn_ons(hass)) == 0
+    await m.set_greedy(0, True)
+    await m.set_greedy_forecast_surplus(0, True)
+    later = _T0 + timedelta(minutes=16)  # past the 15-min min-off debounce
+    await m._tick_device(0, later)
+    assert len(_turn_ons(hass)) == 0
+    assert m.controllers[0].status()["greedy_blocked"] == "no_battery_headroom"
+
+
 def test_manager_notify_on_every_tick():
     """The control switch entity's state listener fires on every tick, not just on user
     actions (2026-09-11) — so the Load Control card shows live greedy state instead of
@@ -1206,6 +1244,7 @@ if __name__ == "__main__":
         ("manager_end_to_end_below_floor_export_tick", lambda: _run_async(_run_manager_end_to_end_below_floor_export_tick)),
         ("manager_end_to_end_surplus_tick", lambda: _run_async(_run_manager_end_to_end_surplus_tick)),
         ("manager_end_to_end_forecast_below_floor_tick", lambda: _run_async(_run_manager_end_to_end_forecast_below_floor_tick)),
+        ("manager_end_to_end_reservation_does_not_inflate_safe_rate", lambda: _run_async(_run_manager_end_to_end_reservation_does_not_inflate_safe_rate)),
     ]
     passed = 0
     for name, fn in tests:

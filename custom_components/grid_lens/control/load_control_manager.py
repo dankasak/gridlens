@@ -559,11 +559,27 @@ class LoadControlManager:
         battery_headroom_w: Optional[float] = None
         battery_headroom_kwh: Optional[float] = None
         ac_output_headroom_w: Optional[float] = None
+        battery_safe_window_h: Optional[float] = None
         if controller.greedy and controller.greedy_forecast_surplus:
             spill_kwh, spill_hours = self._forecast_surplus_budget(index, now)
             battery_headroom_w = self._battery_headroom_w()
             battery_headroom_kwh = self._battery_headroom_kwh()
             ac_output_headroom_w = self._ac_output_headroom_w()
+            # Which window to size the battery-safe-rate cap against (see
+            # DeferrableLoadController._forecast_surplus_target_w's docstring). A
+            # RESERVATION-clipped window must NOT be used here: dividing the (roughly
+            # fixed) battery headroom by a window that keeps shrinking toward a real
+            # planned discharge makes the "safe" rate rise the closer that reservation
+            # gets — exactly backwards (found 2026-09-20/21, an aircon fired at 22.8% SOC
+            # with hours of no solar ahead; the true 9h picture had ~340W of safe rate,
+            # nowhere near enough, but a reservation ~1h40 out inflated it past 1.8kW).
+            # A window that's merely short because the plan itself doesn't extend
+            # further (no reservation involved) is a genuine, honestly-measured
+            # opportunity and keeps using its own span, same as before this fix.
+            _, reservation_hit = self._reservation_window_end(index, now)
+            battery_safe_window_h = (
+                GREEDY_SURPLUS_LOOKAHEAD_HOURS if reservation_hit else spill_hours
+            )
         if controller.greedy and not self._grid_power_sensor and not self._warned_no_grid_power:
             # Greedy's export-surplus condition is the one that catches a house spilling
             # kilowatts at a $0 export price, and it is silently unavailable without this
@@ -594,6 +610,7 @@ class LoadControlManager:
                 ac_output_headroom_w=ac_output_headroom_w,
                 min_export_price=self._min_export_price(),
                 soc_cutoff=self._soc_cutoff_active(index),
+                battery_safe_window_h=battery_safe_window_h,
             )
         except Exception as err:  # noqa: BLE001 — a bad device tick must not kill the timer
             _LOGGER.error("Load control tick failed for %s: %s", self.controllers[index].name, err)
@@ -877,6 +894,33 @@ class LoadControlManager:
             return 0.0, "off"
         return target_w, source
 
+    def _reservation_window_end(
+        self, index: int, now: datetime
+    ) -> tuple[datetime, bool]:
+        """``(window_end, hit)`` — where the forecast-surplus look-ahead window ends, and
+        whether it was actually cut short by a real planned battery reservation
+        (``BatteryAction.DISCHARGE`` at >= ``_RESERVED_DISCHARGE_MIN_W``) rather than
+        simply running past the end of the available plan data or the nominal look-ahead.
+
+        Factored out of ``_forecast_surplus_budget`` (2026-09-21) so the manager can tell
+        these two "the window is short" cases apart: the caller needs to know WHY it's
+        short, not just how short, to pick the right denominator for the battery-safe-rate
+        cap in ``DeferrableLoadController._forecast_surplus_target_w`` — see that call
+        site in ``_tick_device`` for why the distinction matters.
+        """
+        plan = self._plan
+        nominal_end = now + timedelta(hours=GREEDY_SURPLUS_LOOKAHEAD_HOURS)
+        window_end = nominal_end
+        if not plan:
+            return window_end, False
+        for iv in plan:
+            if iv.start >= nominal_end:
+                break
+            if (iv.action == BatteryAction.DISCHARGE
+                    and iv.power_w >= _RESERVED_DISCHARGE_MIN_W):
+                return min(window_end, max(iv.start, now)), True
+        return window_end, False
+
     def _forecast_surplus_budget(
         self, index: int, now: datetime
     ) -> tuple[Optional[float], float]:
@@ -917,19 +961,8 @@ class LoadControlManager:
         controller = self.controllers.get(index)
         if not plan or controller is None:
             return None, 0.0
-        nominal_end = now + timedelta(hours=GREEDY_SURPLUS_LOOKAHEAD_HOURS)
         export_waste_ceiling = max(0.0, self._min_export_price())
-
-        # First planned material battery drawdown inside the look-ahead -> the window ends
-        # there (or at the nominal end, whichever is sooner).
-        window_end = nominal_end
-        for pos, iv in enumerate(plan):
-            if iv.start >= nominal_end:
-                break
-            if (iv.action == BatteryAction.DISCHARGE
-                    and iv.power_w >= _RESERVED_DISCHARGE_MIN_W):
-                window_end = min(window_end, max(iv.start, now))
-                break
+        window_end, _reservation_hit = self._reservation_window_end(index, now)
 
         spill_kwh = 0.0
         covered_h = 0.0

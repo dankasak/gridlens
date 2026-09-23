@@ -236,6 +236,7 @@ class DeferrableLoadController:
         battery_headroom_kwh: Optional[float] = None,
         ac_output_headroom_w: Optional[float] = None,
         min_export_price: float = 0.0,
+        battery_safe_window_h: Optional[float] = None,
     ) -> bool:
         """True if Greedy Consumption says "on" right now, independent of the plan.
 
@@ -245,8 +246,11 @@ class DeferrableLoadController:
         the original "export price ≤ $0" bar exactly.
 
         ``forecast_spill_kwh`` / ``forecast_hours`` / ``battery_headroom_w`` /
-        ``battery_headroom_kwh`` / ``ac_output_headroom_w`` drive the proportional
-        forecast-surplus condition (see ``_forecast_surplus_target_w``). It also sets
+        ``battery_headroom_kwh`` / ``ac_output_headroom_w`` / ``battery_safe_window_h``
+        drive the proportional forecast-surplus condition (see
+        ``_forecast_surplus_target_w`` — ``battery_safe_window_h`` is the manager's choice
+        of window for the battery-safe-rate cap, NOT necessarily ``forecast_hours``; see
+        that method's docstring for why the two must not be conflated). It also sets
         ``self._greedy_forecast_target_w`` — the power that condition wants — which the
         manager reads for a modulating device.
 
@@ -308,7 +312,7 @@ class DeferrableLoadController:
                     return True
         target_w = self._forecast_surplus_target_w(
             forecast_spill_kwh, forecast_hours, battery_headroom_w, battery_headroom_kwh,
-            ac_output_headroom_w,
+            ac_output_headroom_w, battery_safe_window_h,
         )
         if target_w > 0.0:
             self._greedy_forecast_target_w = target_w
@@ -352,6 +356,7 @@ class DeferrableLoadController:
         battery_headroom_w: Optional[float] = None,
         battery_headroom_kwh: Optional[float] = None,
         ac_output_headroom_w: Optional[float] = None,
+        battery_safe_window_h: Optional[float] = None,
     ) -> float:
         """Power (W) the *proportional* forecast-surplus condition wants this device to
         draw right now — 0.0 when it isn't firing (see module docstring).
@@ -375,21 +380,37 @@ class DeferrableLoadController:
         * ``battery_headroom_w`` — free discharge rate right now — caps the draw; if that
           cap drops it back below the minimum-worthwhile draw, the condition is blocked.
         * ``battery_headroom_kwh`` — energy to the configured minimum SOC — bounds the
-          *rate*, not the pass/fail: ``battery_headroom_kwh / forecast_hours`` is the
-          steady draw that, sustained for the whole window, uses no more than that energy
-          in the worst case the spill never shows up to repay it (a back-loaded spill can
-          leave the battery down by the full amount drawn before the refill lands). Fixed
-          2026-09-20: this used to require the *whole* ``forecast_spill_kwh`` — the entire
-          household's forecast waste, not this device's own draw — to fit in headroom, an
-          all-or-nothing bar a modest battery can essentially never clear on a day with a
-          large spill (a 24 kWh battery can never have >21.6 kWh of headroom to a 10% min
-          SOC, so it permanently failed against a 30+ kWh spill regardless of time of day
-          or actual SOC — see GRIDLENS_CHECKLIST.md, 2026-09-20). ``min(rate_w,
+          *rate*, not the pass/fail: ``battery_headroom_kwh / battery_safe_window_h`` is
+          the steady draw that, sustained for the whole window, uses no more than that
+          energy in the worst case the spill never shows up to repay it (a back-loaded
+          spill can leave the battery down by the full amount drawn before the refill
+          lands). Fixed 2026-09-20: this used to require the *whole* ``forecast_spill_kwh``
+          — the entire household's forecast waste, not this device's own draw — to fit in
+          headroom, an all-or-nothing bar a modest battery can essentially never clear on a
+          day with a large spill (a 24 kWh battery can never have >21.6 kWh of headroom to
+          a 10% min SOC, so it permanently failed against a 30+ kWh spill regardless of
+          time of day or actual SOC — see GRIDLENS_CHECKLIST.md, 2026-09-20). ``min(rate_w,
           battery_headroom_w, battery_safe_rate_w)`` folds this in as one more proportional
           clamp on the rate a modulating load can safely be pinned to, same as the other
           two; an on/off load still can't do partial, so this only reduces to a pass/fail
           for it — but now against what *this device* would draw over the window, not the
           whole house's spill.
+
+          **``battery_safe_window_h`` is chosen by the manager and is NOT always
+          ``forecast_hours``** (fixed 2026-09-21, see GRIDLENS_CHECKLIST.md).
+          ``forecast_hours`` can be a reservation-clipped ``covered_h`` — it shrinks toward
+          the plan's next *real* planned discharge, and dividing the (roughly constant)
+          headroom by a shrinking denominator makes the "safe" rate rise the closer that
+          reservation gets, exactly backwards, when the clip is a real reservation rather
+          than just the plan running out of data. Found live 2026-09-20/21: an aircon fired
+          at 22.8% SOC with hours of no solar ahead — the honest full-window picture capped
+          the safe rate at ~340W, well under any on/off device's full-draw bar, but a
+          reservation ~1h40 out inflated it past 1.8kW. The manager passes the fixed
+          nominal look-ahead instead whenever the window was actually reservation-clipped,
+          and ``forecast_hours`` itself otherwise (a window that's short only because the
+          plan doesn't extend further is a genuine, honestly-measured opportunity and keeps
+          scaling normally — see ``LoadControlManager._tick_device``). Falls back to
+          ``forecast_hours`` if not supplied, for any caller that doesn't pass it.
 
         A third, optional gate — ``ac_output_headroom_w``
         (``LoadControlManager._ac_output_headroom_w``) — clamps the draw again when the
@@ -418,7 +439,8 @@ class DeferrableLoadController:
         if battery_headroom_w <= 0.0:
             self._greedy_blocked = "no_battery_headroom"
             return 0.0
-        battery_safe_rate_w = battery_headroom_kwh * 1000.0 / forecast_hours
+        safe_window_h = battery_safe_window_h if battery_safe_window_h else forecast_hours
+        battery_safe_rate_w = battery_headroom_kwh * 1000.0 / safe_window_h
         target_w = min(rate_w, battery_headroom_w, battery_safe_rate_w)
         if target_w + 1e-6 < min_draw:
             self._greedy_blocked = "no_battery_headroom"
@@ -465,6 +487,7 @@ class DeferrableLoadController:
         ac_output_headroom_w: Optional[float] = None,
         min_export_price: float = 0.0,
         soc_cutoff: bool = False,
+        battery_safe_window_h: Optional[float] = None,
     ) -> None:
         """Reconcile the switch toward the plan (plus Greedy Consumption, if enabled)
         for this tick.
@@ -523,6 +546,7 @@ class DeferrableLoadController:
             import_rate, export_rate, grid_power_w, schedule_allows,
             forecast_spill_kwh, forecast_hours, battery_headroom_w,
             battery_headroom_kwh, ac_output_headroom_w, min_export_price,
+            battery_safe_window_h,
         )
         plan_on = self.desired_on(planned_w)
         if plan_on and self._greedy_reason is not None:
