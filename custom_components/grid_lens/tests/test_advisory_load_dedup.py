@@ -49,9 +49,12 @@ def _install_stubs() -> None:
     uc.DataUpdateCoordinator = type("DataUpdateCoordinator", (), {})
     storage = _mod("homeassistant.helpers.storage")
     storage.Store = type("Store", (), {})
+    debounce = _mod("homeassistant.helpers.debounce")
+    debounce.Debouncer = type("Debouncer", (), {})
     helpers.event = event
     helpers.update_coordinator = uc
     helpers.storage = storage
+    helpers.debounce = debounce
     ha.helpers = helpers
 
     util = _mod("homeassistant.util")

@@ -14,6 +14,7 @@ from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import statistics_during_period
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -48,6 +49,16 @@ UPDATE_INTERVAL = timedelta(minutes=2)
 # waiting for the next slow tick. The Sigen SOC sensor in particular can take several
 # minutes to appear after a HAOS restart.
 WAITING_INTERVAL = timedelta(seconds=20)
+# DataUpdateCoordinator's own async_request_refresh() is debounced by a REQUEST_REFRESH_
+# DEFAULT_COOLDOWN of 10s — fine for a coordinator no one manually pokes, but reoptimize.py
+# exists precisely so a dashboard change re-plans "right away" (see FEATURES.md §3b). At
+# the 10s default, only the FIRST of several changes made within 10s of each other runs
+# immediately; the rest collapse into one trailing catch-up run at the 10s mark, which
+# read as "the immediate re-optimize only works once" (found live 2026-09-23 testing the
+# optimizing-dot dwell fix — the dot really did stop reappearing, not just render wrong).
+# Short enough that repeat manual triggers each feel immediate, long enough that a
+# slider firing several onInput events per second still collapses to one solve.
+REOPTIMIZE_DEBOUNCE_COOLDOWN = 1.5
 STORE_VERSION = 1
 # Only restore a persisted plan this fresh — beyond it the forward horizon is stale
 # enough that a blank card until the first live run is preferable.
@@ -73,7 +84,10 @@ DEFAULT_LOAD_SENSOR = "sensor.sigen_0_lifetime_consumed_energy"
 class AdvisoryCoordinator(DataUpdateCoordinator):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(
-            hass, _LOGGER, name=f"{DOMAIN}_advisory", update_interval=UPDATE_INTERVAL
+            hass, _LOGGER, name=f"{DOMAIN}_advisory", update_interval=UPDATE_INTERVAL,
+            request_refresh_debouncer=Debouncer(
+                hass, _LOGGER, cooldown=REOPTIMIZE_DEBOUNCE_COOLDOWN, immediate=True,
+            ),
         )
         self.entry = entry
         # True for the duration of an in-flight _run() — the immediate-reoptimize feature
