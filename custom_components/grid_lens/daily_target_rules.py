@@ -14,13 +14,22 @@ its own explicit action (`clear_percent`), never implied by writing a
 particular numeric value — see FEATURES.md §9b.
 
 Named "Daily Target", not "Tomorrow" (its original name, changed 2026-09-22):
-the LP applies the scaled figure to EVERY day-chunk in its rolling horizon, not
-one calendar date, and it takes effect from the next ~2-min advisory tick
-regardless of what time of day you set it — set it at 8am on a rainy morning
-and it applies to whatever's left of today (and every day after, until you
-change it back), not just "tomorrow". See FEATURES.md §9b for the full
-mechanics, including the important caveat that it only affects energy not yet
-drawn — it can't claw back a charge that already finished earlier today.
+the LP applies the scaled figure to EVERY day-chunk in its rolling horizon, and
+it takes effect from the next ~2-min advisory tick regardless of what time of
+day you set it — set it at 8am on a rainy morning and it applies to whatever's
+left of today (and every day after, until you change it back), not just
+"tomorrow". See FEATURES.md §9b for the full mechanics, including the
+important caveat that it only affects energy not yet drawn — it can't claw
+back a charge that already finished earlier today.
+
+Each day-chunk is a REAL calendar date (fixed 2026-09-23 —
+battery_optimizer.py's slot_day_index/_day_groups): earlier, day-chunks were
+a rolling 24h window counted from whenever the advisory solve last started,
+so a same-day reduction (e.g. an EV scaled down for a cloudy today) could be
+silently satisfied out of TOMORROW's cheaper solar instead — the exact
+opposite of the intent. Today's target is now bound to today's real remaining
+hours and can no longer be laundered into a different day just because that
+day is cheaper.
 
 Like Today Boost (and unlike the ad-hoc charge target), a set percent does NOT
 auto-expire at local midnight. It used to for Today Boost, and that was reverted

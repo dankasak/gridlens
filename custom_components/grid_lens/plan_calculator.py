@@ -15,7 +15,7 @@ from homeassistant.helpers.entity_registry import async_get as async_get_entity_
 from .battery_optimizer import BatteryOptimizer
 from .retailer_plans import (
     plans_from_api_data, versioned_plans_from_history, build_rate_caps,
-    build_conditional_credits, RetailerPlan, PlanFromData,
+    build_conditional_credits, slot_calendar_day_index, RetailerPlan, PlanFromData,
     rate_time_ranges, format_window_range, cap_label_base,
 )
 from .const import (
@@ -3903,6 +3903,11 @@ class PlanCalculator:
         # since it's a distinct mechanism from build_rate_caps's continuous
         # price tranches. A no-op ([]) for a plan without one.
         conditional_credits = build_conditional_credits(plan, start_time, T)
+        # Real calendar-day boundaries for the LP's per-device daily-total constraint —
+        # mirrors advisory/planner.py's live-control path so a plan shown in "compare
+        # plans" can't silently disagree with what live control would actually do for
+        # the same inputs. See battery_optimizer.py's slot_day_index docstring.
+        slot_day_index = slot_calendar_day_index(start_time, T)
 
         # Translate each device's stored weekly schedule (per-weekday half-hour grid,
         # painted on the dashboard schedule card) into a per-LP-hour mask so the
@@ -3943,6 +3948,7 @@ class PlanCalculator:
                 export_caps=export_caps,
                 conditional_credits=conditional_credits,
                 min_export_price=self._get_min_export_price(),
+                slot_day_index=slot_day_index,
             )
         )
         # Carried through to _compute_bill_items so capped-rate tiers in the cost

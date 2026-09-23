@@ -28,7 +28,9 @@ _COMPONENT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.dirname(_COMPONENT))  # so "custom_components.grid_lens" resolves if needed
 sys.path.insert(0, _COMPONENT)
 
-from retailer_plans import PlanFromData, build_conditional_credits  # noqa: E402
+from retailer_plans import (  # noqa: E402
+    PlanFromData, build_conditional_credits, slot_calendar_day_index,
+)
 
 _FAILURES: list[str] = []
 
@@ -126,11 +128,38 @@ def test_day_index_survives_midwindow_horizon_start():
           len(tomorrow_slots) == 6, f"tomorrow_slots={len(tomorrow_slots)}")
 
 
+def test_slot_calendar_day_index_matches_build_conditional_credits_extraction():
+    """slot_calendar_day_index was extracted out of build_conditional_credits'
+    own per-slot toordinal loop (day-boundary fix, 2026-09-23) so battery_
+    optimizer.py's deferrable-load day-chunking can share the exact same
+    real-calendar-date logic. Regression-guard: the extraction must not have
+    changed build_conditional_credits' own values — every masked slot's
+    day_index must still equal what the standalone function returns for the
+    same start/n_slots/slot_minutes."""
+    plan = PlanFromData(ZEROHERO_PLAN)
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Australia/Sydney")
+    start_local = datetime(2026, 7, 22, 19, 0, tzinfo=tz)
+    start = start_local.astimezone(timezone.utc)
+    n_slots = int(36 * 60 / 30)
+    out = build_conditional_credits(plan, start, n_slots, slot_minutes=30)
+    all_days = slot_calendar_day_index(start, n_slots, slot_minutes=30)
+    check("every slot has a real day key (no -1 sentinel)",
+          all(d != -1 for d in all_days), f"all_days={all_days}")
+    check("length matches n_slots", len(all_days) == n_slots, f"got {len(all_days)}")
+    cc = out[0]
+    mismatches = [t for t in range(n_slots) if cc["hour_mask"][t]
+                  and cc["day_index"][t] != all_days[t]]
+    check("masked slots' day_index matches the standalone helper exactly",
+          not mismatches, f"mismatches at {mismatches}")
+
+
 if __name__ == "__main__":
     test_plan_from_data_parses_credit()
     test_plan_from_data_no_credits_by_default()
     test_build_conditional_credits_masks_window_hours()
     test_day_index_survives_midwindow_horizon_start()
+    test_slot_calendar_day_index_matches_build_conditional_credits_extraction()
     if _FAILURES:
         print(f"\nFAIL — {len(_FAILURES)} failure(s): {_FAILURES}")
         sys.exit(1)

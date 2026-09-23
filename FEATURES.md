@@ -1856,13 +1856,25 @@ rational (a real next-evening VPP export window), but exposed that there was no 
 tell the optimizer "the EV doesn't need its usual full charge" to reduce that kind of
 grid top-up. "Tomorrow Planning" was the first name, matching the evening-before-checking-
 the-forecast mental model — but it's mechanically wrong: the LP applies the SAME scaled
-`daily_kwh` figure to **every day-chunk in its rolling horizon**, not one calendar date,
-and it takes effect from the very next advisory tick (~2 min) regardless of what time of
-day you set it. Set it at 8am on a rainy morning and it caps what's left of TODAY too, not
-just tomorrow — "next 24 hours" would be *even less* accurate, since it implies a bounded
-window when the real behaviour is "this daily figure until you change it back," persisting
-across every day in the horizon, not just the next 24h. Renamed to a term that doesn't
-imply a specific day at all.
+`daily_kwh` figure to **every day-chunk in its rolling horizon**, and it takes effect from
+the very next advisory tick (~2 min) regardless of what time of day you set it. Set it at
+8am on a rainy morning and it caps what's left of TODAY too, not just tomorrow — "next 24
+hours" would be *even less* accurate, since it implies a bounded window when the real
+behaviour is "this daily figure until you change it back," persisting across every day in
+the horizon, not just the next 24h. Renamed to a term that doesn't imply a specific day at
+all.
+
+**Day-boundary fix (2026-09-23).** For the feature's first day live, "day-chunk" secretly
+meant a rolling 24h window counted from whenever the advisory solve last started, not a
+real calendar day — found live when an EV charger scaled to 25% (~2.5kWh) on a cloudy day
+had that entire target scheduled for the **following, sunnier morning** instead of that
+day, defeating the whole point of a same-day reduction (see the checklist's 2026-09-23
+entry). Fixed in `battery_optimizer.py` (`slot_day_index`/`_day_groups`, built per-horizon
+from `retailer_plans.slot_calendar_day_index`): every day-chunk, including today's, is now
+bound to a real local calendar date. A same-day target is satisfied within today's actual
+remaining hours and can no longer be quietly fulfilled a day later just because that day
+happens to be cheaper — the "next 24 hours" mental model above is now also literally
+correct for what's left of today, not just close enough.
 
 **The rainy-morning case, specifically — what it can and can't do.** Using it in the
 morning for the current day works exactly like using it the evening before for the next

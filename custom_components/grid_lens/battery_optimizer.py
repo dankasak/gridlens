@@ -209,6 +209,48 @@ def _front_load_device_day(schedule: List[Dict], dev_idx: int, slots: List[int],
         row['export_credit'] = new_e * row['export_rate']
 
 
+def _day_groups(
+    T: int, slots_per_day: int, slot_day_index: List[int] | None,
+) -> list[tuple[int, list[int]]]:
+    """Chronologically-ordered (day_key, [absolute slot indices]) groups
+    spanning T slots — the single source of truth for "what counts as one
+    day" shared by _lp_scipy's daily-total constraint and
+    consolidate_deferrable_schedule's post-process, so the two can never
+    disagree about where a day boundary falls (that class of two-mechanisms-
+    disagreeing bug is exactly what floor_slot's own plumbing between these
+    two functions exists to prevent — see this module's 2026-09-18 incident
+    note below).
+
+    slot_day_index[t], when supplied (see retailer_plans.slot_calendar_day_index),
+    is a real local calendar-date key for slot t — grouping by it means day 0
+    is "today, from horizon-start to local midnight", not a rolling
+    slots_per_day-sized window from t=0. day_key values are opaque; only their
+    count/order/membership matters to callers.
+
+    slot_day_index=None (the default) reproduces the old positional
+    t // slots_per_day chunking exactly — every caller that hasn't been
+    updated to pass a real day index gets byte-identical behaviour.
+    """
+    groups: list[tuple[int, list[int]]] = []
+    if slot_day_index:
+        index: dict[int, int] = {}
+        for t in range(T):
+            key = slot_day_index[t] if t < len(slot_day_index) else t // slots_per_day
+            pos = index.get(key)
+            if pos is None:
+                index[key] = len(groups)
+                groups.append((key, [t]))
+            else:
+                groups[pos][1].append(t)
+    else:
+        n_days = math.ceil(T / slots_per_day) if slots_per_day else (1 if T else 0)
+        for d in range(n_days):
+            t0 = d * slots_per_day
+            t1 = min(t0 + slots_per_day, T)
+            groups.append((d, list(range(t0, t1))))
+    return groups
+
+
 def consolidate_deferrable_schedule(
     schedule: List[Dict],
     deferrable_loads: List[Dict],
@@ -217,6 +259,7 @@ def consolidate_deferrable_schedule(
     slots_per_day: int,
     protected_hours=None,
     floor_slot: dict[int, int] | None = None,
+    slot_day_index: List[int] | None = None,
 ) -> None:
     """Post-process pass: collapse each deferrable device's fragmented per-slot
     LP allocation into the fewest contiguous blocks per calendar day, without
@@ -273,22 +316,24 @@ def consolidate_deferrable_schedule(
     """
     protected = protected_hours or set()
     T = len(schedule)
-    n_days = (T + slots_per_day - 1) // slots_per_day
+    day_groups = _day_groups(T, slots_per_day, slot_day_index)
     for i, dev in enumerate(deferrable_loads):
         mask = dev.get('hour_mask')
         cap_kwh = dev['max_kw'] * dt
         dev_floor = floor_slot.get(i) if floor_slot else None
-        for d in range(n_days):
-            t0 = d * slots_per_day
-            t1 = min(t0 + slots_per_day, T)
+        for _key, day_slots in day_groups:
             # Only clip when the deadline actually falls inside this calendar
             # day — a day entirely before it (deadline already passed as of
             # t0) or entirely after it (not yet binding within this day) is
-            # left at its normal full-day range.
-            if dev_floor is not None and t0 < dev_floor < t1:
-                t1 = dev_floor
+            # left at its normal full-day range. Must check day_slots[0] <
+            # dev_floor here (not just filter unconditionally): a day entirely
+            # AFTER the deadline has every t >= dev_floor, so an unconditional
+            # `t < dev_floor` filter would silently empty it instead of
+            # leaving it untouched.
+            if dev_floor is not None and day_slots and day_slots[0] < dev_floor <= day_slots[-1]:
+                day_slots = [t for t in day_slots if t < dev_floor]
             eligible = [
-                t for t in range(t0, t1)
+                t for t in day_slots
                 # Only fully-available slots are eligible for consolidation — a
                 # fractionally-masked slot (half-hour schedule at hourly LP
                 # resolution) has a tighter per-slot cap than cap_kwh, so moving a
@@ -350,8 +395,22 @@ class BatteryOptimizer:
         export_caps: List[Dict] = None,
         conditional_credits: List[Dict] = None,
         min_export_price: float = 0.0,
+        slot_day_index: List[int] = None,
     ) -> Dict:
         """Return an optimal hourly schedule minimising net energy cost.
+
+        slot_day_index: optional list[int], length T, one real local calendar-
+          date key per slot (build with retailer_plans.slot_calendar_day_index,
+          from the horizon's actual start datetime) — used to chunk the
+          per-device daily-total constraint and the EV/device SOC day-0 window
+          (see the module docstring's "Daily totals"/"EV/device SOC" entries)
+          by REAL calendar day instead of a rolling slots_per_day-sized window
+          counted from t=0. Left None (the default), day chunking falls back
+          to the old t // slots_per_day behaviour — a horizon starting mid-day
+          then treats "day 0" as "the next 24h from now", which can let a
+          same-day-scoped target (e.g. a Daily Target set because today is
+          cloudy) get satisfied by TOMORROW's cheaper solar instead, defeating
+          the point of scoping it to today. See _day_groups/GRIDLENS_CHECKLIST.md.
 
         conditional_credits: optional list of day-scoped all-or-nothing bonus
           descriptors, each {'label': str, 'condition': 'max_import_kwh',
@@ -484,7 +543,8 @@ class BatteryOptimizer:
                                      terminal_soc_value=terminal_soc_value,
                                      import_caps=import_caps, export_caps=export_caps,
                                      conditional_credits=conditional_credits,
-                                     min_export_price=min_export_price)
+                                     min_export_price=min_export_price,
+                                     slot_day_index=slot_day_index)
         except ImportError:
             _LOGGER.warning(
                 "PuLP not yet installed — using greedy fallback. "
@@ -505,6 +565,7 @@ class BatteryOptimizer:
                 import_caps=import_caps, export_caps=export_caps,
                 conditional_credits=conditional_credits,
                 min_export_price=min_export_price,
+                slot_day_index=slot_day_index,
             )
             _LOGGER.warning(
                 "LP optimisation failed (%s) — using greedy fallback. Likely cause: %s.",
@@ -582,7 +643,8 @@ class BatteryOptimizer:
                      timestep_hours=1.0,
                      soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
                      terminal_soc_value=None, import_caps=None, export_caps=None,
-                     conditional_credits=None, min_export_price=0.0):
+                     conditional_credits=None, min_export_price=0.0,
+                     slot_day_index=None):
         """Build and solve the LP. Raises on failure so caller can fall back.
 
         Chain is scipy → PuLP/CBC → (caller's greedy fallback).
@@ -623,7 +685,8 @@ class BatteryOptimizer:
                                   terminal_soc_value=terminal_soc_value,
                                   import_caps=import_caps, export_caps=export_caps,
                                   conditional_credits=conditional_credits,
-                                  min_export_price=min_export_price)
+                                  min_export_price=min_export_price,
+                                  slot_day_index=slot_day_index)
         except ImportError:
             pass  # scipy not available — try PuLP
         except Exception as exc:
@@ -657,7 +720,8 @@ class BatteryOptimizer:
                   timestep_hours=1.0,
                   soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
                   terminal_soc_value=None, import_caps=None, export_caps=None,
-                  conditional_credits=None, min_export_price=0.0):
+                  conditional_credits=None, min_export_price=0.0,
+                  slot_day_index=None):
         import numpy as np
         from scipy.optimize import linprog
         from scipy.sparse import lil_matrix
@@ -672,15 +736,24 @@ class BatteryOptimizer:
                           self.max_charge_rate_kw, self.max_discharge_rate_kw)
         N = len(deferrable_loads)       # number of individual deferrable devices
         slots_per_day = int(round(24 / dt))
-        n_days = math.ceil(T / slots_per_day)
-        # A day-chunk is "truncated" when the rolling horizon ends partway through it
-        # (chunks are anchored to horizon start, not midnight — see the deferrable
-        # daily-total constraint below for why only such chunks get relaxed). Given
-        # t1 = min(t0+slots_per_day, T), only the LAST chunk can ever be short.
-        truncated_days = {
-            d for d in range(n_days)
-            if min((d + 1) * slots_per_day, T) - d * slots_per_day < slots_per_day
-        }
+        # day_groups chunks the horizon by REAL local calendar day when slot_day_index
+        # is supplied (the caller's job — see retailer_plans.slot_calendar_day_index),
+        # not by a rolling slots_per_day-sized window counted from t=0. Only the
+        # horizon's chronologically LAST group is ever "truncated" (relaxed to a ≤ cap
+        # below rather than a hard equality) — that's specifically because the far edge
+        # of a rolling horizon can land mid-window with no real opportunity in view
+        # (the next rolling replan a few minutes later picks up the real one). TODAY
+        # (the first group) is equally short whenever the horizon doesn't start at local
+        # midnight, but for a completely different reason — it's genuinely in view, not
+        # a horizon-length artifact — so it stays a hard, correctly-prorated equality
+        # just like any full day. Relaxing today too would let the LP satisfy today's
+        # quota by scheduling it all tomorrow instead whenever tomorrow is cheaper,
+        # which is the exact bug this parameter exists to fix (GRIDLENS_CHECKLIST.md).
+        day_groups = _day_groups(T, slots_per_day, slot_day_index)
+        n_days = len(day_groups)
+        truncated_days = set()
+        if day_groups and len(day_groups[-1][1]) < slots_per_day:
+            truncated_days.add(day_groups[-1][0])
 
         # Peak-demand shaving: add one auxiliary variable P (peak kW), constrained
         # to be ≥ grid import in every demand-window hour and priced at the demand
@@ -711,7 +784,7 @@ class BatteryOptimizer:
         # (advisory/coordinator.py), so day 1+ is never acted on before it gets recomputed
         # with fresh SOC data anyway — it stays on the plain flat daily_kwh mechanism below,
         # unchanged. See CONF_DEFERRABLE_LOAD_SOC_MAX_PERCENT in const.py for the config side.
-        day0_slots = min(slots_per_day, T)
+        day0_slots = len(day_groups[0][1]) if day_groups else min(slots_per_day, T)
         ev_soc_idx: dict[int, int] = {}      # device index -> its SOC variable block start
         ev_soc_specs: dict[int, dict] = {}    # device index -> {capacity_kwh, max_kwh, initial_kwh, eta}
         # Per-device SOC-tracking/floor windows for an ad-hoc dated charge target
@@ -970,10 +1043,14 @@ class BatteryOptimizer:
         # track_slots above). A truncated chunk never contributed an equality row to
         # begin with (it's already a ≤-cap row in A_ub), so it displaces nothing.
         n_ev_soc = len(ev_soc_idx)
-        n_track_days = {i: math.ceil(track_slots[i] / slots_per_day) for i in ev_soc_idx}
+        # Calendar days can be irregular length (today is usually short), so this
+        # counts actual day_groups each device's tracking window overlaps and are NOT
+        # truncated, rather than assuming every day is a uniform slots_per_day long
+        # (ceil(track_slots/slots_per_day) only worked under the old positional
+        # chunking, where a device's window could only ever touch full-length days).
         displaced_full_day_rows = sum(
-            sum(1 for d in range(n_track_days[i]) if d not in truncated_days)
-            for i in ev_soc_idx
+            1 for i in ev_soc_idx for key, day_slots in day_groups
+            if day_slots and day_slots[0] < track_slots[i] and key not in truncated_days
         )
         n_eq = (
             2*T + N * n_full_days
@@ -1040,27 +1117,25 @@ class BatteryOptimizer:
         eq_row = 2 * T
         for i, dev in enumerate(deferrable_loads):
             mask = dev.get('hour_mask')
-            for d in range(n_days):
-                t0 = d * slots_per_day
-                t1 = min(t0 + slots_per_day, T)
+            for day_key, slots in day_groups:
                 # SOC-tracked devices (ev_soc_idx) have every day-chunk their tracked
                 # window touches handled entirely below by their own state variable +
                 # floor row — never by this flat equality/cap, or the two would fight
                 # (this one has no notion of the device's live headroom under its
                 # configured ceiling, and could force it past that ceiling).
-                if i in ev_soc_idx and t0 < track_slots[i]:
+                if i in ev_soc_idx and slots and slots[0] < track_slots[i]:
                     continue
                 # Fraction-aware: a 0.5-masked slot contributes half a slot of
                 # deliverable capacity (see the ub scaling above).
                 avail_slots = (
-                    sum(float(mask[t]) for t in range(t0, t1)) if mask else (t1 - t0)
+                    sum(float(mask[t]) for t in slots) if mask else float(len(slots))
                 )
-                requested = dev['daily_kwh'] * (t1 - t0) / slots_per_day
+                requested = dev['daily_kwh'] * len(slots) / slots_per_day
                 deliverable = avail_slots * dev['max_kw'] * dt
                 target = min(requested, deliverable)
                 # Truncated chunks are a ≤ cap, not an equality (see above), so falling
                 # short there is by design and not worth reporting as a lost target.
-                if d not in truncated_days:
+                if day_key not in truncated_days:
                     first_target.setdefault(i, target)
                     if requested - deliverable > 1e-6 and i not in clamped:
                         clamped[i] = {
@@ -1071,8 +1146,8 @@ class BatteryOptimizer:
                             'available_hours': avail_slots * dt,
                             'max_kw': dev['max_kw'],
                         }
-                cols = [(5 + i) * T + t for t in range(t0, t1)]
-                if d in truncated_days:
+                cols = [(5 + i) * T + t for t in slots]
+                if day_key in truncated_days:
                     daily_ub_specs.append((cols, target))
                 else:
                     for col in cols:
@@ -1372,6 +1447,7 @@ class BatteryOptimizer:
             consolidate_deferrable_schedule(
                 schedule, deferrable_loads, dt=dt, slots_per_day=slots_per_day,
                 protected_hours=protected_hours, floor_slot=floor_slot,
+                slot_day_index=slot_day_index,
             )
             total_import_kwh = sum(r['import_kwh'] for r in schedule)
             total_export_kwh = sum(r['export_kwh'] for r in schedule)

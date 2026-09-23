@@ -298,11 +298,15 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         override the whole kWh figure by hand the way Today Boost requires.
 
         Named "Daily Target", not "Tomorrow" (changed 2026-09-22): this applies
-        the SAME scaled figure to every day in the horizon this method builds
-        for, from whatever day-chunk "now" falls in onward — not one calendar
-        date. Setting it at 8am on a rainy morning caps what's left of TODAY's
+        the SAME scaled figure to every day-chunk in the horizon this method
+        builds for, from whatever REAL CALENDAR DAY "now" falls in onward.
+        Setting it at 8am on a rainy morning caps what's left of TODAY's
         day-chunk too, not just future days; it just can't claw back energy a
-        device already drew earlier in the day. See daily_target_rules.py.
+        device already drew earlier in the day. Day-chunks are bound to real
+        calendar dates (battery_optimizer.py's slot_day_index/_day_groups,
+        fixed 2026-09-23) — today's reduced target is satisfied within today's
+        own remaining hours and can no longer be quietly fulfilled out of a
+        cheaper day instead. See daily_target_rules.py.
 
         Runs BEFORE _apply_overrides deliberately: Today Boost is a same-day, more
         specific "I need X kWh today" absolute override and must still win outright

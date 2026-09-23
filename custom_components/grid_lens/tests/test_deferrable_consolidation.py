@@ -242,6 +242,55 @@ def test_floor_slot_does_not_restrict_days_outside_the_deadline():
           f"got {schedule[3]['deferrable_per_device'][0]}")
 
 
+def test_slot_day_index_confines_consolidation_to_real_calendar_days():
+    """Day-boundary fix (2026-09-23) regression-guard: without slot_day_index,
+    a horizon that starts mid-day still gets chunked positionally
+    (t // slots_per_day), which can group part of TODAY together with part of
+    TOMORROW into one "day" — letting this pass legally move energy across a
+    real midnight boundary just because it's cheaper there. Supplying
+    slot_day_index (real calendar-day keys, see
+    retailer_plans.slot_calendar_day_index) must prevent that: today's slots
+    and tomorrow's slots become separate groups, so a cheaper tomorrow slot is
+    no longer "the same day" and energy must stay put.
+
+    Concretely: slot 0 is today, expensive, holding the device's energy; slot
+    2 is tomorrow, free/cheap. slots_per_day=4 nominally groups all 4 slots as
+    one chunk when slot_day_index is absent (T==slots_per_day, unchanged from
+    today's positional behaviour) — demonstrating the pre-fix shape. With
+    slot_day_index=[today, today, tomorrow, tomorrow], the same starting
+    schedule must NOT move slot 0's energy into slot 2.
+    """
+    dev = [{'max_kw': 1.0, 'daily_kwh': 1.0, 'hour_mask': None}]
+
+    def _fresh_schedule():
+        return [
+            _row(import_kwh=1.0, import_rate=1.00, defer=[1.0]),  # today — expensive
+            _row(import_kwh=0.0, import_rate=1.00, defer=[0.0]),  # today
+            _row(export_kwh=0.0, export_rate=0.0, defer=[0.0]),   # tomorrow — free/cheap
+            _row(export_kwh=0.0, export_rate=0.0, defer=[0.0]),   # tomorrow
+        ]
+
+    without_index = _fresh_schedule()
+    consolidate_deferrable_schedule(without_index, dev, dt=1.0, slots_per_day=4)
+    check("without slot_day_index, positional chunking treats all 4 slots as one day "
+          "(pre-fix shape — energy free to move into the cheaper tomorrow slot)",
+          without_index[2]['deferrable_per_device'][0] == 1.0,
+          f"got {without_index[2]['deferrable_per_device'][0]}")
+
+    with_index = _fresh_schedule()
+    consolidate_deferrable_schedule(
+        with_index, dev, dt=1.0, slots_per_day=4,
+        slot_day_index=[900, 900, 901, 901],
+    )
+    check("with slot_day_index, today's energy stays within today's own slots",
+          with_index[0]['deferrable_per_device'][0] == 1.0,
+          f"got {with_index[0]['deferrable_per_device'][0]}")
+    check("tomorrow's (cheaper) slots stay untouched by today's energy",
+          with_index[2]['deferrable_per_device'][0] == 0.0
+          and with_index[3]['deferrable_per_device'][0] == 0.0,
+          f"got {with_index[2]['deferrable_per_device'][0]}, {with_index[3]['deferrable_per_device'][0]}")
+
+
 def test_deferrable_kwh_field_kept_in_sync():
     """The aggregate 'deferrable_kwh' field (used for display) must always
     equal the sum of deferrable_per_device after consolidation."""
@@ -267,6 +316,7 @@ if __name__ == "__main__":
     test_multi_day_and_multi_device_independence()
     test_never_moves_energy_past_its_own_charge_target_deadline()
     test_floor_slot_does_not_restrict_days_outside_the_deadline()
+    test_slot_day_index_confines_consolidation_to_real_calendar_days()
     test_deferrable_kwh_field_kept_in_sync()
     if _FAILURES:
         print(f"\nFAIL — {len(_FAILURES)} failure(s): {_FAILURES}")

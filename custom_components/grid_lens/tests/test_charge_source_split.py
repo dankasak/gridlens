@@ -120,6 +120,11 @@ def _bootstrap():
     models_stub.AdvisoryResult = type("AdvisoryResult", (), {})
     models_stub.ForecastBundle = type("ForecastBundle", (), {})
     sys.modules["gl.advisory.models"] = models_stub
+    # planner.py's day-boundary fix (2026-09-23) pulls in slot_calendar_day_index for
+    # real calendar-day chunking — not needed for _classify, stub it out like the rest.
+    retailer_plans_stub = types.ModuleType("gl.retailer_plans")
+    retailer_plans_stub.slot_calendar_day_index = lambda *a, **k: []
+    sys.modules["gl.retailer_plans"] = retailer_plans_stub
 
     planner = _load(os.path.join(_COMPONENT, "advisory", "planner.py"),
                     "gl.advisory.planner", package="gl.advisory")

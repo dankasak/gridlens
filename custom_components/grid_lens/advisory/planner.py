@@ -14,6 +14,7 @@ from homeassistant.util import dt as dt_util
 from ..battery_optimizer import BatteryOptimizer
 from ..control.executor import DispatchInterval
 from ..inverters.base import BatteryAction
+from ..retailer_plans import slot_calendar_day_index
 from .models import AdvisoryResult, ForecastBundle
 
 _LOGGER = logging.getLogger(__name__)
@@ -76,6 +77,15 @@ class AdvisoryPlanner:
         terminal_value = (
             self._terminal_soc_value(bundle) if self.soft_terminal_soc else None
         )
+        # Real calendar-day boundaries for the LP's per-device daily-total constraint —
+        # this horizon starts at "now" (bundle.start), not local midnight, so without
+        # this the LP would treat "day 0" as a rolling 24h window and could satisfy a
+        # same-day-scoped target (e.g. a Daily Target lowered because today is cloudy)
+        # out of TOMORROW's cheaper solar instead. See battery_optimizer.py's
+        # slot_day_index docstring / GRIDLENS_CHECKLIST.md.
+        slot_day_index = slot_calendar_day_index(
+            bundle.start, bundle.slots, bundle.slot_minutes
+        )
         result = self.optimizer.optimize_hourly_schedule(
             bundle.solar_kwh,
             bundle.load_kwh,
@@ -95,6 +105,7 @@ class AdvisoryPlanner:
             export_caps=export_caps,
             conditional_credits=conditional_credits,
             min_export_price=self.min_export_price,
+            slot_day_index=slot_day_index,
         )
 
         devs = deferrable_loads or []

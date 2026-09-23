@@ -901,6 +901,31 @@ def build_rate_caps(
     return import_caps, export_caps, import_cap_labels, export_cap_labels
 
 
+def slot_calendar_day_index(start: datetime, n_slots: int, slot_minutes: int = 60) -> list[int]:
+    """Real local calendar-date ordinal for every slot in a horizon starting at
+    `start` — one entry per slot, every slot gets a value (unlike
+    build_conditional_credits' per-credit hour_mask'd day_index below, which
+    uses -1 for a slot outside that credit's own window; every slot here is
+    "in scope" for a whole-horizon caller like battery_optimizer's deferrable
+    day-chunking).
+
+    NOT t // slots_per_day: the LP horizon starts at "now" rather than local
+    midnight, so a fixed-width slots_per_day chunk can land mid-day (e.g. a
+    horizon starting 7pm would chunk-boundary at 7pm the next day, splitting
+    one real calendar day in two). Real dates group correctly regardless of
+    what time the solve happens to start.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    tz = ZoneInfo("Australia/Sydney")
+    return [
+        (start + timedelta(minutes=t * slot_minutes)).astimezone(tz).toordinal()
+        for t in range(n_slots)
+    ]
+
+
 def build_conditional_credits(
     plan: RetailerPlan, start: datetime, n_slots: int, slot_minutes: int = 60,
 ) -> list[Dict]:
@@ -919,24 +944,21 @@ def build_conditional_credits(
     except ImportError:
         from backports.zoneinfo import ZoneInfo
     tz = ZoneInfo("Australia/Sydney")
+    all_days = slot_calendar_day_index(start, n_slots, slot_minutes)
 
     out: list[Dict] = []
     for credit in plan.get_conditional_credits():
         window = credit.get("window") or {}
         mask = [0] * n_slots
-        # Real calendar-date ordinal per masked slot (-1 = unmasked), NOT
-        # t // slots_per_day: the LP horizon starts at "now" rather than local
-        # midnight, so a fixed-width slots_per_day chunk can land mid-window
-        # (e.g. horizon starting 7pm would chunk-boundary at 7pm the next day,
-        # splitting a 6-9pm window in two) — which would double the $1/day
-        # credit across two binaries for what's really one calendar day. Real
-        # dates group correctly regardless of what time the plan happens to run.
+        # -1 = unmasked (outside this credit's own window) — see
+        # slot_calendar_day_index's docstring for why real dates are used
+        # instead of t // slots_per_day.
         day_index = [-1] * n_slots
         for t in range(n_slots):
             dt = (start + timedelta(minutes=t * slot_minutes)).astimezone(tz)
             if PlanFromData._in_window(window, dt):
                 mask[t] = 1
-                day_index[t] = dt.toordinal()
+                day_index[t] = all_days[t]
         if any(mask):
             out.append({
                 "label": credit.get("label", "Conditional Credit"),
