@@ -10,7 +10,7 @@
 import {
   GW, GML, GMR, GridLensChartCardBase,
   clampPct, esc, fmtPct, fmtC, fmtHour, smoothPath, gradDef, xAxisTicks, actionLabel, reasonFor, execMode,
-} from './grid-lens-chart-common.js?v=20260910b';
+} from './grid-lens-chart-common.js?v=20260923b';
 
 class GridLensSocChartCard extends GridLensChartCardBase {
   get title() { return 'SOC — planned vs measured'; }

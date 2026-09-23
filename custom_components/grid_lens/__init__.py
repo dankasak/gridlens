@@ -19,6 +19,8 @@ from .const import (
     CONF_LOAD_POWER_SENSOR, CONF_GRID_POWER_SENSOR, CONF_ENERGY_SENSOR,
     CONF_BATTERY_CHARGE_POWER_SENSOR, CONF_BATTERY_DISCHARGE_POWER_SENSOR,
     CONF_DEFERRABLE_LOAD_SOC_SENSORS,
+    CONF_SOLAR_SENSOR, CONF_SHADE_CORRECTION_ENABLED, CONF_SHADE_FORECAST_POWER_SENSOR,
+    CONF_SHADE_CORRECTION_WINDOW_DAYS, DEFAULT_SHADE_CORRECTION_WINDOW_DAYS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -620,7 +622,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260923a"
+    _CARD_VERSION = "20260923c"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -2012,6 +2014,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except Exception as _arch_err:  # noqa: BLE001
         _LOGGER.warning("Daily energy archive setup failed: %s", _arch_err)
 
+    # Shade correction (see shade_correction.py) — opt-in, and needs CONF_SOLAR_SENSOR
+    # (actual production) configured before there's anything to learn from. The forecast
+    # power entity is NOT resolved here at setup time — Solcast (cloud_polling) may not
+    # have finished loading yet on a fresh restart, and resolving once here would
+    # permanently miss it for this HA session (found live 2026-09-23: the coordinator
+    # came up right after a restart and logged exactly that). The coordinator re-attempts
+    # resolution on its own fast retry timer instead (see ShadeCorrectionCoordinator).
+    # Must be set up before the advisory coordinator below so its first refresh can
+    # already see it in hass.data.
+    if entry.data.get(CONF_SHADE_CORRECTION_ENABLED, False):
+        try:
+            actual_entity = entry.data.get(CONF_SOLAR_SENSOR)
+            if not actual_entity:
+                _LOGGER.warning(
+                    "Shade correction enabled but no solar production sensor configured "
+                    "(Energy dashboard 'solar' source / Sensors step) — skipping."
+                )
+            else:
+                from .shade_correction import ShadeCorrectionCoordinator
+                _shade = ShadeCorrectionCoordinator(
+                    hass, entry, entry.data.get(CONF_SHADE_FORECAST_POWER_SENSOR), actual_entity,
+                    entry.data.get(CONF_SHADE_CORRECTION_WINDOW_DAYS, DEFAULT_SHADE_CORRECTION_WINDOW_DAYS),
+                )
+                hass.data[DOMAIN][f"{entry.entry_id}_shade_correction"] = _shade
+                entry.async_create_background_task(
+                    hass, _shade.async_refresh(), name="grid_lens_shade_correction_learn"
+                )
+        except Exception as _shade_err:  # noqa: BLE001
+            _LOGGER.warning("Shade correction setup failed: %s", _shade_err)
+
     # Advisory mode (forecast-fed planning, read-only). Independent coordinator so it
     # never disturbs the manual plan-comparison flow. Best-effort — failures don't block.
     try:
@@ -2145,6 +2177,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         hass.data[DOMAIN].pop(entry.entry_id)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_advisory", None)
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_shade_correction", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_control", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_load_control", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_overrides", None)

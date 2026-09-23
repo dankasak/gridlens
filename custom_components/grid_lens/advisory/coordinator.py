@@ -20,7 +20,12 @@ from homeassistant.util import dt as dt_util
 
 from .. import charge_target as ct
 from ..battery_optimizer import BatteryOptimizer
-from ..const import CONF_HAS_DEMAND_TARIFF, DEFAULT_DEMAND_WINDOW_HOURS, DOMAIN
+from ..const import (
+    CONF_HAS_DEMAND_TARIFF,
+    CONF_SHADE_CORRECTION_ENABLED,
+    DEFAULT_DEMAND_WINDOW_HOURS,
+    DOMAIN,
+)
 from ..schedule_grid import rolling_window_hours
 from .demand import (
     billing_days_remaining,
@@ -92,6 +97,17 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
 
     def _soc_sensor(self) -> str:
         return self._cfg("battery_soc_sensor", "") or DEFAULT_SOC_SENSOR
+
+    def _shade_factors(self) -> list | None:
+        """24-length hour-of-day derate curve from shade_correction.py, or None when the
+        feature is off/unconfigured — see that module's docstring. Reads the coordinator
+        directly rather than caching it here, since __init__.py rebuilds it fresh on
+        every options-flow reload (same entry.entry_id-keyed hass.data lookup every
+        other cross-coordinator reference in this file uses)."""
+        shade = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_shade_correction")
+        if shade is None or not self._cfg(CONF_SHADE_CORRECTION_ENABLED, False):
+            return None
+        return shade.factors
 
     def _read_soc(self) -> float | None:
         st = self.hass.states.get(self._soc_sensor())
@@ -831,6 +847,7 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             PlanRateForecaster(self._plan),
             self._load_forecaster,
             slot_minutes=SLOT_MINUTES,
+            shade_factors=self._shade_factors(),
         )
         n_slots = int(HORIZON_HOURS * 60 / SLOT_MINUTES)
         bundle = provider.build(n_slots)

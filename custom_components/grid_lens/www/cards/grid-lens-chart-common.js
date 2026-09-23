@@ -601,6 +601,74 @@ export function solarArrayFor(hass, eid) {
   return Array.isArray(arr) && arr.length ? arr : null;
 }
 
+// Solcast (and providers shaped like it) split its forecast across one sensor PER DAY
+// (forecast_today, _tomorrow, _day_3..7 — each entity's detailedHourly/detailedForecast
+// covers ONLY that one calendar day, confirmed live: forecast_today's slots are all
+// today's date, forecast_tomorrow's are all tomorrow's). solarSummary's day-offset
+// slicing (below) needs a single array spanning multiple days — reading off just one
+// resolved entity silently produces 0 for every day that entity doesn't cover (e.g.
+// resolveSolarForecastEid's "prefer tomorrow" tie-break meant `todayKwh` was ALWAYS 0,
+// found live 2026-09-23 the day after Daily Target shipped this). `configOverride` (a
+// card's explicit solar_forecast_entity option) is honoured as the sole source
+// unchanged — assumed to already be a genuinely multi-day array, not one of Solcast's
+// per-day splits. With no override, scan every currently-loaded Solcast-shaped sensor
+// and merge their slots into one time-ordered array.
+export function combinedSolarArray(hass, configOverride) {
+  if (configOverride) return solarArrayFor(hass, configOverride) || [];
+  if (!hass) return [];
+  const byStart = new Map();
+  for (const eid of Object.keys(hass.states)) {
+    if (!eid.startsWith('sensor.')) continue;
+    const a = hass.states[eid].attributes || {};
+    const arr = a.detailedHourly || a.detailedForecast;
+    if (!Array.isArray(arr) || !arr.length || !('pv_estimate' in arr[0])) continue;
+    for (const row of arr) {
+      if (row && row.period_start) byStart.set(row.period_start, row);
+    }
+  }
+  return [...byStart.values()].sort((a, b) => new Date(a.period_start) - new Date(b.period_start));
+}
+
+// Shade correction (see shade_correction.py's module docstring): a per-hour-of-day
+// derate for a fixed obstruction (trees, a roofline) the forecast provider has no way to
+// model, learned server-side from comparing the forecast against actual production.
+// Shape-based auto-discovery, same pattern as resolveSolarForecastEid above — any sensor
+// carrying a 24-length `hourly_factors` attribute qualifies, not just this install's one
+// current source. Returns null (never guesses) when nothing matches, which
+// applyShadeCorrection treats as "nothing to apply" rather than an error.
+export function resolveShadeCorrectionEid(hass, configOverride) {
+  if (configOverride) return configOverride;
+  if (!hass) return null;
+  for (const eid of Object.keys(hass.states)) {
+    if (!eid.startsWith('sensor.')) continue;
+    const factors = (hass.states[eid].attributes || {}).hourly_factors;
+    if (Array.isArray(factors) && factors.length === 24) return eid;
+  }
+  return null;
+}
+
+// Multiplies each slot's pv_estimate (and its P10/P90 bounds, so they stay consistent
+// with the corrected central estimate) by the shade-correction factor for that slot's
+// LOCAL hour. `arr` is returned unchanged — not mutated — when no shade-correction
+// sensor is found, since the feature is opt-in server-side and its absence here just
+// means there's nothing to correct.
+export function applyShadeCorrection(arr, hass, configOverride) {
+  const eid = resolveShadeCorrectionEid(hass, configOverride);
+  const factors = eid && (hass.states[eid].attributes || {}).hourly_factors;
+  if (!Array.isArray(factors) || factors.length !== 24) return arr;
+  return arr.map((row) => {
+    const hour = new Date(row.period_start).getHours();
+    const f = factors[hour];
+    if (!Number.isFinite(f)) return row;
+    const scaled = { ...row };
+    for (const k of ['pv_estimate', 'pv_estimate10', 'pv_estimate90']) {
+      const v = parseFloat(row[k]);
+      if (Number.isFinite(v)) scaled[k] = v * f;
+    }
+    return scaled;
+  });
+}
+
 // Forecast kWh for local calendar day `dayOffset` (0 = today, 1 = tomorrow, …), counting
 // only slots at or after `fromHour:fromMinute` within that day — used both for "today's
 // REMAINING forecast" (fromHour/fromMinute = now) and, at the same cutoff on other days,
@@ -653,9 +721,21 @@ export function weatherFor(ratio) {
 // References for the ratio bucketing are the best comparable day found within the SAME
 // forecast array (offsets -1..6, covering however many days Solcast happens to have
 // returned) — never a hardcoded kWh number.
-export function solarSummary(hass, solarEid) {
-  const arr = solarArrayFor(hass, solarEid);
-  if (!arr) {
+//
+// `configOverride` is a config OVERRIDE entity id (a card's own solar_forecast_entity
+// option), not a pre-resolved one — combinedSolarArray needs to know whether a single
+// entity was explicitly chosen (honoured as-is) or nothing was configured (merge every
+// day-sensor). Passing an already-resolved id (e.g. resolveSolarForecastEid's result)
+// here would be treated as an explicit override and skip the merge — don't do that.
+//
+// `shadeConfigOverride` is the same idea for shade correction (usually left unset —
+// auto-discovered). Applied to every day in the merged array uniformly (not just
+// "today"), so the weather-bucketing comparison below stays apples-to-apples: corrected
+// against corrected, not corrected against raw.
+export function solarSummary(hass, configOverride, shadeConfigOverride) {
+  const merged = combinedSolarArray(hass, configOverride);
+  const arr = applyShadeCorrection(merged, hass, shadeConfigOverride);
+  if (!arr.length) {
     return { todayKwh: null, tomorrowKwh: null, todayWeather: weatherFor(null), tomorrowWeather: weatherFor(null) };
   }
   const now = new Date();

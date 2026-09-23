@@ -595,6 +595,64 @@ plan restore so the Battery Plan card isn't blank for 10 minutes.
 
 ---
 
+## 3a. Shade correction (layer 2 input)
+
+**What it does.** Learns a per-hour-of-day derate curve for a fixed, static solar
+obstruction (trees, a neighbouring roofline) that a weather-based forecast provider has
+no way to know about — it models panel geometry, weather and terrain, not a specific
+household's shading. Compares the forecast provider's own live "power now" reading
+against actual production (`sensor.*` configured as Solar Production in Sensors),
+hour-by-hour over a trailing window, via HA recorder statistics — no external API calls.
+Feeds the learned curve into the advisory layer's `ForecastProvider` (§3), so it corrects
+what the battery optimiser plans against, not just a display number.
+
+**Opt-in, off by default** — added 2026-09-23 as a general Grid Lens feature (works with
+any forecast provider whose "power now" entity matches the shape below, not just
+Solcast; needs both a forecast entity and an actual-production sensor configured and
+trustworthy before it's safe to feed into dispatch decisions).
+
+**Entities**
+| Entity | What it holds |
+|---|---|
+| `sensor.*_solar_forecast_shade_corrected` | Raw forecast power × the current hour's learned factor. Attributes: `hourly_factors` (24-length, hour-of-day → multiplier), `hourly_samples` (matched-day count per hour), `raw_forecast_w`, `current_hour_factor`, `window_days`, `computed_at`, `forecast_entity_id`, `actual_entity_id`. |
+
+**Config (Configure → Shade correction).** `shade_correction_enabled` (bool, default
+off), `shade_forecast_power_sensor` (optional override), `shade_correction_window_days`
+(7–90, default 30).
+
+**Auto-discovery.** The forecast "power now" entity is found by shape, not name — any
+`sensor` with `device_class: power`, `state_class: measurement`, and `estimate10`/
+`estimate90` attributes (Solcast's convention; generic enough for another provider using
+the same shape). Falls back to `sensor.solcast_pv_forecast_power_now` (documented
+example default, only used if it actually exists) if shape-scanning finds no unique
+match, then to the config override; skips setup entirely with a logged warning if
+nothing resolves. The actual-production side reuses `CONF_SOLAR_SENSOR` — already
+collected for every install from the HA Energy dashboard's "solar" source — rather than
+inventing a second entity-resolution path.
+
+**Learning.** Every 3h: pull `statistics_during_period` for both entities over
+`window_days` (hourly buckets — `mean` for the forecast's power entity, `change` for the
+actual production energy entity, since recorder's `sum` stat is a running cumulative
+total, not a per-bucket delta). Bucket the ratio actual/forecast by **local hour-of-day
+only** (not month×hour — this install's 90-day recorder retention isn't enough to fill a
+12×24 grid with confidence); an hour needs ≥5 matched days before its factor moves off
+1.0 (or its last learned value), and any single ratio is clamped to [0, 1.3] so one bad
+statistics row can't dominate a median. Deliberately hour-of-day-only means precision
+trades off against the recorder retention window — it re-learns as the trailing window
+slides through the seasons rather than remembering last winter's curve.
+
+**Files:** `shade_correction.py`, `entity_lookup.py` (`resolve_forecast_power_sensor`),
+`advisory/forecast.py` (`ForecastProvider.shade_factors`), `advisory/coordinator.py`
+(`_shade_factors`).
+
+**Verification.** Live-tested 2026-09-23 on this install (real tree shading, factors
+learned as low as 0.18 at 7am and 0.35 at 5pm from 28-30 matched days) — entity renders
+correctly, `sensor.*_planned_dispatch`'s `sources.shade_correction_applied` confirms the
+optimiser is consuming the corrected values. Not yet observed over multiple real dispatch
+cycles / a season boundary.
+
+---
+
 ## 4. Battery control (layer 3)
 
 **What it does.** Actuates the battery to follow the plan, through a brand-agnostic

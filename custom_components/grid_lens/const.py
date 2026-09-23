@@ -417,6 +417,32 @@ CONF_LOAD_POWER_SENSOR = "load_power_sensor"
 # from /plans/list.
 CONF_VPP_PROGRAM = "vpp_program"
 
+# Shade correction (see shade_correction.py): a fixed, time-of-day obstruction (trees,
+# a neighbouring roofline) that a generic solar forecast provider has no way to know
+# about, so it consistently over-forecasts the same hours. Opt-in — off by default,
+# same discipline as the deferrable-load control features — because it needs a solar
+# forecast entity AND CONF_SOLAR_SENSOR (actual production) both configured and both
+# trustworthy before it's safe to feed back into the battery optimizer's forecast.
+CONF_SHADE_CORRECTION_ENABLED = "shade_correction_enabled"
+# Override for the forecast provider's live "power right now" entity — auto-discovered
+# by shape (see entity_lookup.resolve_forecast_power_sensor) when unset. Only needed
+# when auto-discovery is ambiguous (e.g. more than one Solcast rooftop site) or the
+# household's forecast provider doesn't match the Solcast attribute shape at all.
+CONF_SHADE_FORECAST_POWER_SENSOR = "shade_forecast_power_sensor"
+# Trailing window (days) of recorder statistics used to learn the per-hour derate
+# curve. Longer = smoother/more stable estimate but slower to track seasonal sun-angle
+# drift (a tree's shadow moves through the year); shorter = adapts faster but noisier
+# on a run of cloudy days. 90 days is also the recorder's retention ceiling on this
+# install (see CLAUDE.md's TimescaleDB note) — a larger value just clamps to whatever
+# history actually exists.
+CONF_SHADE_CORRECTION_WINDOW_DAYS = "shade_correction_window_days"
+DEFAULT_SHADE_CORRECTION_WINDOW_DAYS = 30
+# Documented, overridable example default — NOT assumed to exist. This is simply the
+# entity_id the popular `solcast_solar` HACS integration has always used for its "Power
+# Now" sensor; resolve_forecast_power_sensor() tries shape-based auto-discovery first
+# and only falls back to this literal id.
+DEFAULT_SOLCAST_POWER_NOW_ENTITY = "sensor.solcast_pv_forecast_power_now"
+
 
 def parse_hours_spec(spec: str | None) -> set[int] | None:
     """Parse a deferrable-load availability spec into a set of local hours (0-23).

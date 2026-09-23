@@ -74,12 +74,19 @@ class ForecastProvider:
         *,
         entities: Optional[dict[str, str]] = None,
         slot_minutes: int = 60,
+        shade_factors: Optional[Sequence[float]] = None,
     ) -> None:
         self.hass = hass
         self.rate_forecaster = rate_forecaster
         self.load_forecaster = load_forecaster or FlatLoadForecaster()
         self.e = {**_DEFAULTS, **(entities or {})}
         self.slot_minutes = int(slot_minutes)
+        # 24-length hour-of-day multiplier from shade_correction.py, or None when the
+        # feature is disabled/unconfigured — a static obstruction (trees, a roofline) a
+        # weather-based forecast provider has no way to know about (see that module's
+        # docstring). Applied per-slot below so the optimizer plans against corrected
+        # solar, not just whatever a display sensor shows.
+        self.shade_factors = list(shade_factors) if shade_factors else None
 
     def build(self, n_slots: int = 24) -> Optional[ForecastBundle]:
         slot = self.slot_minutes
@@ -90,10 +97,13 @@ class ForecastProvider:
         # pv_estimate is average kW over the period → per-slot energy = kW × dt.
         attr = "detailedForecast" if slot < 60 else "detailedHourly"
         solar_map = self._solar_by_slot(attr, slot)
-        solar = [
-            max(0.0, solar_map.get(start + timedelta(minutes=i * slot), 0.0)) * dt
-            for i in range(n_slots)
-        ]
+        solar = []
+        for i in range(n_slots):
+            slot_start = start + timedelta(minutes=i * slot)
+            kw = max(0.0, solar_map.get(slot_start, 0.0))
+            if self.shade_factors is not None:
+                kw *= self.shade_factors[dt_util.as_local(slot_start).hour]
+            solar.append(kw * dt)
 
         imp, exp = self.rate_forecaster.rates(start, n_slots, slot)
         if not imp or not exp:
@@ -114,6 +124,7 @@ class ForecastProvider:
                     1 for i in range(n_slots)
                     if (start + timedelta(minutes=i * slot)) in solar_map
                 ),
+                "shade_correction_applied": self.shade_factors is not None,
                 "rate_model": type(self.rate_forecaster).__name__,
                 "load_model": type(self.load_forecaster).__name__,
                 "slot_minutes": slot,

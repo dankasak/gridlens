@@ -26,7 +26,7 @@ import {
   STYLE, esc, resolveDeferrableLoads, resolveDailyTargetMasterEid, resolveDailyTargetEidFor,
   resolveBoostEidFor, resolveChargeTargetPercentEidFor, resolveSolarForecastEid, solarSummary,
   fmtKwh, clampTargetPct, fetchDailyAverageKwh,
-} from './grid-lens-chart-common.js?v=20260922a';
+} from './grid-lens-chart-common.js?v=20260923b';
 
 const HISTORY_REFRESH_MS = 15 * 60000;
 
@@ -197,7 +197,7 @@ class GridLensDailyTargetCard extends HTMLElement {
 
   _paint() {
     if (!this.shadowRoot.querySelector('.card')) this._renderShell();
-    const solar = solarSummary(this._hass, this._solarEidCache);
+    const solar = solarSummary(this._hass, this._config.solar_forecast_entity);
     this._paintSolarBox('today', solar.todayKwh, solar.todayWeather);
     this._paintSolarBox('tomorrow', solar.tomorrowKwh, solar.tomorrowWeather);
 

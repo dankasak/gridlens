@@ -150,6 +150,7 @@
         "title": "Grid Lens",
         "menu_options": {
           "deferrable_loads": "Deferrable loads (add, edit or remove an appliance)",
+          "shade_correction": "Shade correction (learn a solar forecast bias from your own history)",
           "api_key": "API key & connection",
           "full_reconfigure": "Reconfigure everything (sensors, battery, loads & plan)"
         }
@@ -338,6 +339,20 @@
           "vpp_program": "If you're enrolled in a retailer VPP credit program on top of your plan (e.g. AGL Bring Your Own Battery), select it here. Independent of your plan choice. Leave as 'None / not enrolled' if you're not in one.",
           "network_tariff_codes": "Some plans only apply to a specific network tariff (found on your bill, e.g. 'EA116'). Enter your code(s), comma-separated, to hide plans that don't match. Leave blank if you don't know it — nothing is filtered until you set this, and it's never sent to Grid Lens.",
           "postcode": "Some plans are only offered in specific postcode areas. Enter yours to hide plans that aren't available there. Leave blank if you'd rather see everything — nothing is filtered until you set this, and it's never sent to Grid Lens."
+        }
+      },
+      "shade_correction": {
+        "title": "Shade Correction",
+        "description": "If trees or a neighbouring roofline consistently shade your panels at certain times of day, your solar forecast provider has no way to know — it models weather and panel geometry, not your specific obstruction. This learns a per-hour correction from comparing your forecast against your own actual production history, and (when enabled) feeds it into the battery optimiser's forecast too, not just a display sensor.\n\n{solar_sensor_status}",
+        "data": {
+          "shade_correction_enabled": "Enable shade correction",
+          "shade_forecast_power_sensor": "Forecast power sensor (optional override)",
+          "shade_correction_window_days": "Learning window (days)"
+        },
+        "data_description": {
+          "shade_correction_enabled": "Off by default. Needs a solar production sensor (set on the Sensors step) — leave off until that's configured.",
+          "shade_forecast_power_sensor": "Auto-detected when left blank (looks for a Solcast-shaped 'power now' sensor). Only set this if you have more than one forecast source, or auto-detection can't find yours.",
+          "shade_correction_window_days": "How many days of history to learn the correction from. Longer is smoother but slower to track seasonal changes in the sun's angle through the obstruction; shorter adapts faster but is noisier."
         }
       },
       "api_key": {

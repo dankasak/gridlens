@@ -46,7 +46,7 @@ import {
   fmtC, resolveDeferrableLoads, resolveDailyTargetMasterEid, resolveDailyTargetEidFor,
   resolveBoostEidFor, resolveChargeTargetPercentEidFor, resolveSolarForecastEid, solarSummary,
   fmtKwh, clampTargetPct, fetchDailyAverageKwh,
-} from './grid-lens-chart-common.js?v=20260922a';
+} from './grid-lens-chart-common.js?v=20260923b';
 
 const DAILY_TARGET_HISTORY_REFRESH_MS = 15 * 60000;
 
@@ -290,7 +290,7 @@ class GridLensAdvisoryCard extends HTMLElement {
   _dtInlineHtml() {
     const hass = this._hass;
     if (!hass) return '';
-    const solar = solarSummary(hass, this._dtSolarEid);
+    const solar = solarSummary(hass, this._config.solar_forecast_entity);
     const solarChip = (label, kwh, weather) => `
       <div class="dt-solar-chip${weather.dim ? ' dim' : ''}"
            title="${esc(label)}: ${kwh == null ? 'unavailable' : fmtKwh(kwh)} — ${esc(weather.label)}">

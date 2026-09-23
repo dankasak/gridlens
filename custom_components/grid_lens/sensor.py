@@ -88,6 +88,13 @@ async def async_setup_entry(
     for tracker in greedy_trackers.values():
         sensors.append(GridLensGreedyEnergySensor(tracker, entry))
 
+    # Shade correction (opt-in; see shade_correction.py). Coordinator only exists in
+    # hass.data when the feature is enabled AND both entities it needs resolved.
+    shade_coordinator = hass.data[DOMAIN].get(f"{entry.entry_id}_shade_correction")
+    if shade_coordinator is not None:
+        from .shade_correction import ShadeCorrectedForecastPowerSensor
+        sensors.append(ShadeCorrectedForecastPowerSensor(shade_coordinator, entry))
+
     async_add_entities(sensors)
 
 

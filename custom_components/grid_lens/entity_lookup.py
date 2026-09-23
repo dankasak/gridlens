@@ -141,3 +141,29 @@ def resolve_power_sensor(hass: HomeAssistant, *anchors: Optional[str]) -> Option
             return best
         # Ambiguous multi-power-sensor device with no good name match — don't guess.
     return None
+
+
+def resolve_forecast_power_sensor(hass: HomeAssistant) -> Optional[str]:
+    """Find the solar forecast provider's live "power right now" entity by shape, not name.
+
+    Matches the pattern shading_correction.py needs: a continuous power measurement of
+    what the forecast provider currently predicts for THIS instant (as opposed to a
+    day-ahead total) — recorded by the recorder alongside actual production, so the two
+    can be compared hour-by-hour. Solcast's `solcast_solar` integration is the only
+    provider on this install, but nothing here assumes that: any forecast sensor with a
+    `device_class: power`, `state_class: measurement` and a P10/P90 confidence-interval
+    pair (`estimate10`/`estimate90`, Solcast's attribute names, but generic enough that
+    another provider using the same convention would also match) qualifies. Returns None
+    — never guesses — when there's not exactly one match, so the caller falls back to
+    a configured override or a documented default entity_id.
+    """
+    matches = []
+    for state in hass.states.async_all("sensor"):
+        attrs = state.attributes
+        if attrs.get("device_class") != "power" or attrs.get("state_class") != "measurement":
+            continue
+        if "estimate10" in attrs and "estimate90" in attrs:
+            matches.append(state.entity_id)
+    if len(matches) == 1:
+        return matches[0]
+    return None

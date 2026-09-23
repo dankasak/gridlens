@@ -113,6 +113,10 @@
           </tbody>
         </table>
 
+        <h2 id="shade-correction">Shade correction</h2>
+        <p>If trees or a neighbouring roofline consistently shade your panels at certain times of day, your solar forecast provider has no way to know — it models weather and panel geometry, not your specific obstruction, so it over-forecasts the same hours every day regardless of cloud cover. Shade correction learns a per-hour correction by comparing your forecast against your own actual production history (via Home Assistant's own recorder — no data leaves your instance for this), and feeds it into the battery optimiser's forecast, not just a display number.</p>
+        <p>Off by default. Turn it on under <strong>Settings → Devices &amp; Services → Grid Lens → Configure → Shade correction</strong> — it needs a <strong>Solar production</strong> sensor configured (see <a href="#sensors">Required sensors</a> above) to learn from. The forecast sensor it compares against is auto-detected; you only need to pick one manually if you run more than one forecast source.</p>
+
         <h2 id="deferrable">Deferrable loads</h2>
         <p>A deferrable load is electricity usage you can shift to a cheaper time of day — for example an EV charger, pool pump, hot water system, or air conditioner.</p>
         <p>To include a deferrable load in the optimisation, you need a sensor that measures its consumption. Grid Lens will model what each plan would cost if you shifted that load to its cheapest window.</p>

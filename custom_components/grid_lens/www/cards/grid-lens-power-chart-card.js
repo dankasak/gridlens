@@ -16,7 +16,7 @@
  */
 import {
   GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor, clampPct, fmtPct,
-} from './grid-lens-chart-common.js?v=20260910b';
+} from './grid-lens-chart-common.js?v=20260923b';
 
 // Free-energy shading (see _freeEnergyBands). CSS custom props rather than literals so
 // both bands follow the viewer's light/dark theme like every other colour on this card;

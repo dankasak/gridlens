@@ -65,11 +65,6 @@ class PlanMetricSensor(CoordinatorEntity, SensorEntity):
         return icons.get(metric, "mdi:chart-line")
 
     @property
-    def entity_id(self) -> str:
-        """Return the entity ID."""
-        return f"sensor.{self._plan_id}_{self._metric}"
-
-    @property
     def native_value(self) -> Any:
         """Return the sensor value from coordinator data."""
         if not self.coordinator.data:

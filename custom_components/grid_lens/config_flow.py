@@ -97,6 +97,10 @@ from .const import (
     GRIDLENS_DEFAULT_API_URL,
     STATES,
     DISTRIBUTORS,
+    CONF_SHADE_CORRECTION_ENABLED,
+    CONF_SHADE_FORECAST_POWER_SENSOR,
+    CONF_SHADE_CORRECTION_WINDOW_DAYS,
+    DEFAULT_SHADE_CORRECTION_WINDOW_DAYS,
 )
 from .credentials import async_load_credentials, async_save_credentials
 from .inverters import INVERTER_BRANDS, detect_inverter_brand
@@ -1054,7 +1058,7 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         reconfigure wizard from the top just to reach the field at the end."""
         return self.async_show_menu(
             step_id="init",
-            menu_options=["deferrable_loads", "api_key", "full_reconfigure"],
+            menu_options=["deferrable_loads", "shade_correction", "api_key", "full_reconfigure"],
         )
 
     async def async_step_deferrable_loads(self, user_input=None):
@@ -2052,6 +2056,56 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         return self.async_show_form(
             step_id="current_plan",
             data_schema=schema,
+        )
+
+    async def async_step_shade_correction(self, user_input=None):
+        """Enable/configure shade correction (see shade_correction.py's module docstring
+        for what it does and why). Standalone step, saved directly against the entry's
+        own current data — same pattern as async_step_api_key below — rather than
+        threaded through the full wizard's `_sensor_data` handoff, since this is reached
+        straight from the menu far more often than via the full reconfigure walk.
+        """
+        entry_data = self._config_entry.data
+        solar_sensor = entry_data.get(CONF_SOLAR_SENSOR)
+
+        if user_input is not None:
+            new_data = {
+                **self._config_entry.data,
+                CONF_SHADE_CORRECTION_ENABLED: user_input.get(CONF_SHADE_CORRECTION_ENABLED, False),
+                CONF_SHADE_FORECAST_POWER_SENSOR: user_input.get(CONF_SHADE_FORECAST_POWER_SENSOR) or None,
+                CONF_SHADE_CORRECTION_WINDOW_DAYS: user_input.get(
+                    CONF_SHADE_CORRECTION_WINDOW_DAYS, DEFAULT_SHADE_CORRECTION_WINDOW_DAYS
+                ),
+            }
+            self.hass.config_entries.async_update_entry(self._config_entry, data=new_data)
+            return self.async_create_entry(title="", data={})
+
+        schema = {
+            vol.Optional(
+                CONF_SHADE_CORRECTION_ENABLED,
+                default=entry_data.get(CONF_SHADE_CORRECTION_ENABLED, False),
+            ): selector.BooleanSelector(),
+            vol.Optional(
+                CONF_SHADE_FORECAST_POWER_SENSOR,
+                description={"suggested_value": entry_data.get(CONF_SHADE_FORECAST_POWER_SENSOR)},
+            ): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor")),
+            vol.Optional(
+                CONF_SHADE_CORRECTION_WINDOW_DAYS,
+                default=entry_data.get(CONF_SHADE_CORRECTION_WINDOW_DAYS, DEFAULT_SHADE_CORRECTION_WINDOW_DAYS),
+            ): vol.All(vol.Coerce(int), vol.Range(min=7, max=90)),
+        }
+
+        return self.async_show_form(
+            step_id="shade_correction",
+            data_schema=vol.Schema(schema),
+            description_placeholders={
+                "solar_sensor_status": (
+                    f"✓ using {solar_sensor} for actual production."
+                    if solar_sensor
+                    else "⚠ no solar production sensor configured (Configure → Full "
+                    "Reconfigure → Sensors) — this feature needs one to learn from."
+                ),
+            },
         )
 
     async def async_step_api_key(self, user_input=None):
