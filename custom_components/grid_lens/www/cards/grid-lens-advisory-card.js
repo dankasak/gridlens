@@ -49,6 +49,9 @@ import {
 } from './grid-lens-chart-common.js?v=20260923c';
 
 const DAILY_TARGET_HISTORY_REFRESH_MS = 15 * 60000;
+// Minimum time the optimizing dot stays visible once triggered, regardless of how
+// quickly the underlying run actually finishes — see the constructor's _optDotUntil.
+const OPT_DOT_MIN_MS = 900;
 
 class GridLensAdvisoryCard extends HTMLElement {
   constructor() {
@@ -63,6 +66,13 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._applied = null;
     this._sig = '';
     this._dark = false;
+    // Minimum-dwell for the optimizing dot (see _paint's showOptDot) — on a fast
+    // install the LP solve can finish in well under 200ms, faster than a human can
+    // register a flash. Forces the dot to stay visible for OPT_DOT_MIN_MS from
+    // whenever it last turned true, even after is_optimizing itself has already
+    // flipped back to false, via a one-shot setTimeout repaint (see set hass() below).
+    this._optDotUntil = 0;
+    this._optHideTimer = null;
     // Daily Target (FEATURES.md §9b) — relocated here 2026-09-22 from its own standalone
     // card so the solar forecast + master slider are visible on the Power Flow page
     // without a trip to Settings; the per-device sliders live behind the expander below
@@ -164,6 +174,21 @@ class GridLensAdvisoryCard extends HTMLElement {
       restored: a.restored === true,
       is_optimizing: a.is_optimizing === true,
     };
+
+    // Extend the dot's forced-visible window every time we see is_optimizing true —
+    // covers both the moment it starts AND (since the coordinator's own listener push
+    // means we may see "true" more than once before "false" lands) a run that's still
+    // going. A trailing setTimeout repaints once the window closes, so the dot goes
+    // away on its own even though nothing else about hass has changed by then.
+    if (this._summary.is_optimizing) {
+      this._optDotUntil = Date.now() + OPT_DOT_MIN_MS;
+      if (!this._optHideTimer) {
+        this._optHideTimer = setTimeout(() => {
+          this._optHideTimer = null;
+          this._paint();
+        }, OPT_DOT_MIN_MS + 20);
+      }
+    }
 
     // Toggle chips live in this card but reflect OTHER entities' state, so their states
     // have to be part of the repaint signature — otherwise flipping one wouldn't redraw
@@ -512,7 +537,7 @@ class GridLensAdvisoryCard extends HTMLElement {
         ${this._dtInlineHtml()}
         <div class="hd-right">
           ${this._toggleChipsHtml()}
-          ${s.is_optimizing ? '<span class="opt-dot" title="Optimizer is running — recalculating the plan now"></span>' : ''}
+          ${Date.now() < this._optDotUntil ? '<span class="opt-dot" title="Optimizer is running — recalculating the plan now"></span>' : ''}
           <div class="badge ${s.restored ? 'stale' : (s.status === 'ok' ? 'ok' : '')}">${s.restored ? 'LAST PLAN' : esc((s.status || 'unknown').toUpperCase())}</div>
         </div>
       </div>
