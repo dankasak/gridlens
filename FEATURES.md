@@ -612,15 +612,25 @@ itself — see `reoptimize.py`'s docstring for the exact list of call sites
 `DataUpdateCoordinator.async_request_refresh()` already debounces/coalesces, so a value
 changed while a run is already in flight just collapses into that run rather than
 queuing a second one — callers never check "is it already running" themselves.
+`AdvisoryCoordinator` passes a custom `request_refresh_debouncer` (`Debouncer(...,
+cooldown=REOPTIMIZE_DEBOUNCE_COOLDOWN=1.5, immediate=True)`) rather than accepting HA's
+own 10s default — at 10s, only the first of several changes made within 10s of each
+other actually ran immediately; the rest silently collapsed into one trailing catch-up
+run at the 10s mark (found live 2026-09-23: read as "the immediate re-optimize/optimizing
+dot only works once", not a debounce cooldown). 1.5s keeps the "collapse a burst of rapid
+changes into one solve" protection (a slider firing several onInput events per second)
+while a normal, spaced-out change still feels immediate.
 
 **Visual cue.** `AdvisoryCoordinator.is_optimizing` is true for the duration of an
 in-flight run, pushed to listeners the moment the run *starts* (not just when it ends),
 and exposed as the `is_optimizing` attribute on `sensor.*_planned_dispatch`. The Battery
 Plan / status card (`grid-lens-advisory-card.js`, `compact` mode included) renders a
 small pulsing dot (`.opt-dot` in `grid-lens-chart-common.js`'s shared `STYLE`) next to
-the status badge while it's true. On this install the LP solve is sub-second, so the dot
-is only visible briefly — it's there for slower solves (larger horizons, a PuLP
-fallback) where the delay is actually perceptible.
+the status badge while it's true, held visible for a minimum `OPT_DOT_MIN_MS` (900ms)
+from whenever it last went true regardless of how fast the run actually finishes — on
+this install the LP solve is sub-200ms, faster than a human can register a flash without
+that forced minimum. Genuinely slower solves (larger horizons, a PuLP fallback) still
+stay visible for their actual, longer duration on top of that floor.
 
 **Files:** `reoptimize.py` (new), `advisory/coordinator.py`, `advisory/dispatch_sensor.py`,
 `www/cards/grid-lens-advisory-card.js`, `www/cards/grid-lens-chart-common.js`.
