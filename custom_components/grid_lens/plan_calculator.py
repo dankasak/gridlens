@@ -465,6 +465,8 @@ class PlanCalculator:
         on_period_progress=None,  # async callable(message, step, total) — see _rank_plans_for_period
         exclude_greedy: bool = False,
         skip_period_alternatives: bool = False,  # see `periods` construction below
+        whatif_battery_kwh: float | None = None,
+        whatif_solar_pct: float | None = None,
     ) -> dict[str, Any]:
         """Calculate costs for all plans based on historical usage.
 
@@ -487,7 +489,22 @@ class PlanCalculator:
                 which repeats on its own schedule forever and has no interactive card
                 watching it pay that cost; PlanDataView/PlanStreamView (someone actually
                 looking at the Plan Comparison card) leave this False.
+            whatif_battery_kwh: "What if?" hypothetical battery size in kWh, or None to
+                use the household's real configured battery (or none, if unconfigured)
+                unchanged. 0 simulates having no battery at all, even on an install that
+                really has one. See the "What-if analysis" note above `_get_plans` — this
+                is the ONE deliberate, clearly-labelled exception to "the plan the user is
+                actually on is never run through the LP": a hypothetical battery/solar size
+                has no real meter data to price from, so even the held plan must go through
+                the same LP path as every alternative when either override is set.
+            whatif_solar_pct: "What if?" hypothetical solar production, as a percentage of
+                the household's real measured solar (0 = no solar, 100 = unchanged, 200 =
+                double), or None to leave solar unchanged. A simple production-scaling
+                approximation (ignores inverter clipping / orientation changes for a
+                differently-shaped array) rather than a true panel-physics model — adequate
+                for a comparison estimate, not a substitute for an installer quote.
         """
+        whatif_active = whatif_battery_kwh is not None or whatif_solar_pct is not None
         # Default to last 30 days if not specified (UTC-aware)
         if end_date is None:
             end_date = datetime.now(timezone.utc)
@@ -671,6 +688,20 @@ class PlanCalculator:
         # Base load = true household demand minus deferrable loads.
         # The LP will re-optimise when to deliver the same total kWh per day.
         base_load_data = self._subtract_ev_from_load(true_load_data, deferrable_data)
+
+        # ── What-if solar scaling ────────────────────────────────────────────────
+        # Must happen AFTER true_load_data/base_load_data above, which need the
+        # REAL solar to correctly back out real household demand from real grid
+        # import/export. Every use of `solar_data` from here down — the hour-of-day
+        # chart average, the energy-flow payload, and every plan's LP/simple pricing
+        # call — sees the hypothetical (scaled) series instead, a single point of
+        # substitution rather than threading two parallel solar series through the
+        # rest of the function.
+        if whatif_active and whatif_solar_pct is not None and solar_data:
+            _solar_scale = max(0.0, whatif_solar_pct) / 100.0
+            solar_data = [
+                {**d, 'value': d['value'] * _solar_scale} for d in solar_data
+            ]
 
         # SOC by hour-of-day for chart display (uses HA statistics mean, fast).
         soc_hod_avg: dict = {}
@@ -874,13 +905,64 @@ class PlanCalculator:
             key=lambda p: 0 if self._plan_key(p, _dup_keys) == current_plan_name else 1,
         )
 
+        # ── What-if battery override ─────────────────────────────────────────────
+        # `_calculate_plan_cost_with_battery_optimization` reads `self.battery_optimizer`
+        # directly rather than taking one as an argument, so a hypothetical battery size
+        # is applied by temporarily swapping the instance's own battery config for the
+        # scope of the pricing loop below, restored right after it (see `_orig_has_battery`
+        # below). Safe because `_calc_lock()` (see __init__.py) guarantees no other
+        # `calculate_plan_costs` call runs concurrently against this same PlanCalculator's
+        # config entry, and every caller of this method builds a fresh `PlanCalculator` per
+        # request anyway.
+        _orig_has_battery = self.has_battery
+        _orig_battery_optimizer = self.battery_optimizer
+        if whatif_active and whatif_battery_kwh is not None:
+            if whatif_battery_kwh <= 0:
+                self.has_battery = False
+                self.battery_optimizer = None
+            else:
+                if _orig_has_battery and self.battery_capacity > 0:
+                    # Scale rate limits with capacity so a "bigger battery" isn't
+                    # modelled as the same charge/discharge power as the real one.
+                    _rate_ratio = whatif_battery_kwh / self.battery_capacity
+                    _max_charge = self.battery_max_charge_rate * _rate_ratio
+                    _max_discharge = self.battery_max_discharge_rate * _rate_ratio
+                    _efficiency = self.battery_efficiency
+                    _min_soc = self.battery_min_soc
+                    _max_soc = self.battery_max_soc
+                else:
+                    # No real battery configured to scale from — assume a
+                    # conservative, common 0.5C charge/discharge rate.
+                    _max_charge = whatif_battery_kwh * 0.5
+                    _max_discharge = whatif_battery_kwh * 0.5
+                    _efficiency = 95.0
+                    _min_soc = 10.0
+                    _max_soc = 90.0
+                self.has_battery = True
+                self.battery_optimizer = BatteryOptimizer(
+                    capacity_kwh=whatif_battery_kwh,
+                    max_charge_rate_kw=_max_charge,
+                    max_discharge_rate_kw=_max_discharge,
+                    efficiency_percent=_efficiency,
+                    min_soc_percent=_min_soc,
+                    max_soc_percent=_max_soc,
+                )
+                _LOGGER.info(
+                    "What-if battery: %.1f kWh (%.2f/%.2f kW charge/discharge)",
+                    whatif_battery_kwh, _max_charge, _max_discharge,
+                )
+
         for plan in all_plans_ordered:
             plan_key = self._plan_key(plan, _dup_keys)
             is_current = (plan_key == current_plan_name)
             opt_result = None
 
             # ── Cost + optimisation ──────────────────────────────────────────────────
-            if is_current:
+            # `and not whatif_active` — a what-if request has no real meter data for a
+            # hypothetical battery/solar size, so the held plan is priced through the
+            # exact same LP/simple path as every alternative in that case (see
+            # `calculate_plan_costs`'s `whatif_battery_kwh`/`whatif_solar_pct` docstring).
+            if is_current and not whatif_active:
                 # The plan actually held isn't hypothetical — price it from what
                 # really happened, never from the LP's optimal-dispatch fantasy
                 # (opt_result stays None for the rest of this iteration; see the
@@ -944,7 +1026,12 @@ class PlanCalculator:
 
             # ── Hourly profile ───────────────────────────────────────────────────────
             lp_day_profile = opt_result.get('day_profile') if opt_result else None
-            if lp_day_profile and not is_current:
+            # `whatif_active or not is_current` — under a what-if override the current
+            # plan has its own real opt_result/lp_day_profile too (see the `is_current
+            # and not whatif_active` gate above), so it renders from that hypothetical
+            # LP schedule exactly like an alternative, not from the real-usage profile
+            # in the `else` branch below.
+            if lp_day_profile and (whatif_active or not is_current):
                 # deferrable_per_device here is positioned exactly like the deferrable_loads
                 # list passed into _calculate_plan_cost_with_battery_optimization above (its
                 # N == len(deferrable_loads)) — so the same visible/hidden positions apply.
@@ -1004,7 +1091,7 @@ class PlanCalculator:
                         slot['soc_percent']   = round(soc_hod_avg.get(h, 0.0), 1)
 
             # ── Bill items ───────────────────────────────────────────────────────────
-            if is_current and not plan.is_market_linked:
+            if is_current and not plan.is_market_linked and not whatif_active:
                 # Actual-usage path: energy_lines, FiT and conditional credits are all
                 # derived from usage_data/export_data priced against the plan's own
                 # tariff (opt_result is None here, so no LP-schedule branch can fire).
@@ -1054,7 +1141,7 @@ class PlanCalculator:
                 if bi.get('conditional_credits'):
                     bd['conditional_credits'] = bi['conditional_credits']
                 plan_costs[plan_key] = bi['total']
-            elif is_current:
+            elif is_current and not whatif_active:
                 pass  # market-linked current plan: already priced above from the sensor feed
             else:
                 plan_optimization_results[plan_key]['breakdown']['bill_items'] = \
@@ -1099,6 +1186,11 @@ class PlanCalculator:
                         if d["sensor_id"] in visible_sensor_ids
                     ],
                 })
+
+        # Restore the household's real battery config now that every plan (including
+        # the current one, if a what-if override was active) has been priced.
+        self.has_battery = _orig_has_battery
+        self.battery_optimizer = _orig_battery_optimizer
 
         # Final current-plan total (fallback if current plan not in plan_costs).
         current_supply = (
@@ -1227,6 +1319,23 @@ class PlanCalculator:
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
             "calculation_date": datetime.now().isoformat(),
+            # The household's REAL configured battery size (never the what-if
+            # override — self.battery_capacity is untouched by it, and
+            # self.has_battery is restored above before this dict is built), so
+            # the What-If panel can default its battery input to "what I actually
+            # have" rather than 0. 0 here genuinely means "no battery configured".
+            "household_battery_kwh": self.battery_capacity if self.has_battery else 0.0,
+            # Present only to flag a "what if?" scenario to the frontend — every
+            # dollar figure above (including the current plan's) is then a
+            # hypothetical LP result, not a real bill. See `whatif_battery_kwh`/
+            # `whatif_solar_pct` on this method.
+            "whatif": (
+                {
+                    "battery_kwh": whatif_battery_kwh,
+                    "solar_pct": whatif_solar_pct,
+                }
+                if whatif_active else None
+            ),
             **savings,
         }
 

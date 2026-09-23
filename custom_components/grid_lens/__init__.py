@@ -524,6 +524,18 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
 _HEAVY_OPT_ARRAYS = ("schedule", "day_profile")
 
 
+def _parse_optional_float(raw: str | None) -> float | None:
+    """Parse a query-string float, or None for absent/blank/unparseable — the
+    "leave unchanged" sentinel every What-If override param uses (0 is a real,
+    distinct value: "simulate having none")."""
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 def _slim_stream_detail(detail):
     """Return a copy of a per-plan detail dict with the whole-period hourly arrays
     stripped from `optimization`. Everything the comparison card actually renders
@@ -608,7 +620,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260922d"
+    _CARD_VERSION = "20260923a"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -845,8 +857,16 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     status=404
                 )
 
-            # Custom date range: recalculate on-the-fly and return directly.
-            if start_date or end_date:
+            # What-If overrides parsed up front — they force the on-the-fly recalculation
+            # branch below even with no explicit date range (the coordinator's cached
+            # data was never computed with any override, so serving it would silently
+            # ignore battery_kwh/solar_pct and return a real result mislabeled as one).
+            _whatif_battery_kwh = _parse_optional_float(request.query.get('battery_kwh'))
+            _whatif_solar_pct = _parse_optional_float(request.query.get('solar_pct'))
+
+            # Custom date range (or a What-If override): recalculate on-the-fly and
+            # return directly.
+            if start_date or end_date or _whatif_battery_kwh is not None or _whatif_solar_pct is not None:
                 from .plan_calculator import PlanCalculator
                 from .plan_cache import async_fetch_plans
                 from homeassistant.helpers.storage import Store
@@ -881,7 +901,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 # request) on the same entry.
                 async with _calc_lock(self.hass, entry_obj.entry_id):
                     response_data = await calculator.calculate_plan_costs(
-                        start_date, end_date, exclude_greedy=_exclude_greedy
+                        start_date, end_date, exclude_greedy=_exclude_greedy,
+                        whatif_battery_kwh=_whatif_battery_kwh,
+                        whatif_solar_pct=_whatif_solar_pct,
                     )
                 _LOGGER.info(f"Custom date range calculation complete: {response_data.get('usage_days')} days")
                 return web.Response(
@@ -909,6 +931,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 'start_date': coordinator.data.get('start_date', ''),
                 'end_date': coordinator.data.get('end_date', ''),
                 'calculation_date': coordinator.data.get('calculation_date', ''),
+                'household_battery_kwh': coordinator.data.get('household_battery_kwh', 0.0),
             }
 
             return web.Response(
@@ -1167,6 +1190,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             start_date = _parse_date(request.query.get('start_date'))
             end_date   = _parse_date(request.query.get('end_date'))
             exclude_greedy = request.query.get('exclude_greedy') == 'true'
+            whatif_battery_kwh = _parse_optional_float(request.query.get('battery_kwh'))
+            whatif_solar_pct = _parse_optional_float(request.query.get('solar_pct'))
 
             entries = self.hass.config_entries.async_entries(DOMAIN)
             if not entries:
@@ -1298,6 +1323,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     on_progress=on_fetch_progress,
                     on_period_progress=on_period_progress,
                     exclude_greedy=exclude_greedy,
+                    whatif_battery_kwh=whatif_battery_kwh,
+                    whatif_solar_pct=whatif_solar_pct,
                 )
             if isinstance(result, dict) and isinstance(result.get('plan_details'), dict):
                 result['plan_details'] = {

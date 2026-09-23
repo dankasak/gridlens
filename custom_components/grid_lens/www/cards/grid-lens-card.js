@@ -14,6 +14,19 @@ class GridLensCard extends HTMLElement {
     this._excludeGreedy = false; // "exclude greedy consumption" checkbox — see setConfig
     this._topN = 5;              // "Show best N" declutter filter — see setConfig
 
+    // "What if?" panel — hypothetical battery/solar sizing. Not persisted across
+    // reloads (unlike excludeGreedy/topN above): this is a one-off exploration
+    // mode, not a standing preference, so a fresh page load always starts back
+    // on the household's real comparison. `_whatifBatteryKwh`/`_whatifSolarPct`
+    // are the input field STRINGS (not numbers) so an empty/blank field can be
+    // told apart from "0" while typing; `_whatifApplied` is the snapshot of both
+    // actually sent with the last fetch (what `this._data.whatif` reflects),
+    // which can lag the live input values until Apply is clicked again.
+    this._showWhatif = false;
+    this._whatifBatteryKwh = null;
+    this._whatifSolarPct = null;
+    this._whatifApplied = null;  // {batteryKwh, solarPct} | null
+
     this._history = null;
     this._editingId = null;
     this._addingNew = false;
@@ -56,11 +69,19 @@ class GridLensCard extends HTMLElement {
     }
   }
 
+  // Fragment identifying the currently-applied What-If override, if any — folded
+  // into every cache key so a "no battery, 0% solar" scenario can never be served
+  // from a cache entry populated by the real comparison (or a different scenario).
+  _whatifCacheFrag() {
+    if (!this._whatifApplied) return '';
+    return `whatif:${this._whatifApplied.batteryKwh}:${this._whatifApplied.solarPct}`;
+  }
+
   async fetchData(startDate = null, endDate = null, forceRefresh = false) {
     if (!this._connected || this._fetching) return;
 
     // Return cached result instantly when navigating back to the card.
-    const cacheKey = `${startDate || ''}|${endDate || ''}|${this._excludeGreedy}`;
+    const cacheKey = `${startDate || ''}|${endDate || ''}|${this._excludeGreedy}|${this._whatifCacheFrag()}`;
     if (!forceRefresh) {
       const hit = GridLensCard._cache[cacheKey];
       if (hit) {
@@ -104,6 +125,11 @@ class GridLensCard extends HTMLElement {
       ? `?start_date=${rangeStart}&end_date=${rangeEnd}` : '';
     if (this._excludeGreedy) {
       params += params ? '&exclude_greedy=true' : '?exclude_greedy=true';
+    }
+    if (this._whatifApplied) {
+      const add = (k, v) => { params += params ? `&${k}=${v}` : `?${k}=${v}`; };
+      if (this._whatifApplied.batteryKwh !== null) add('battery_kwh', this._whatifApplied.batteryKwh);
+      if (this._whatifApplied.solarPct !== null) add('solar_pct', this._whatifApplied.solarPct);
     }
     const src = new EventSource(`/api/grid_lens/plan_stream${params}`);
     this._activeSource = src;
@@ -154,7 +180,7 @@ class GridLensCard extends HTMLElement {
       this._fetching    = false;
       const full = JSON.parse(e.data);
       this._data = full;
-      const cacheKey = `${startDate || ''}|${endDate || ''}|${this._excludeGreedy}`;
+      const cacheKey = `${startDate || ''}|${endDate || ''}|${this._excludeGreedy}|${this._whatifCacheFrag()}`;
       GridLensCard._cache[cacheKey] = full;
       this._updateDatesFromData(startDate);
       this.render();
@@ -1121,6 +1147,35 @@ class GridLensCard extends HTMLElement {
           border: 1px solid var(--divider-color);
         }
         .hist-btn-del { background: var(--error-color, #F44336); }
+        .whatif-panel {
+          display: flex; flex-wrap: wrap; align-items: flex-end; gap: 16px;
+          padding: 12px 16px; margin: 0 16px 12px;
+          background: var(--secondary-background-color);
+          border: 1px solid var(--divider-color); border-radius: 8px;
+        }
+        .whatif-field { display: flex; flex-direction: column; gap: 3px; }
+        .whatif-field label { font-size: 11px; color: var(--secondary-text-color); }
+        .whatif-field input {
+          width: 110px; padding: 5px 7px;
+          border: 1px solid var(--divider-color); border-radius: 4px;
+          background: var(--card-background-color); color: var(--primary-text-color);
+          font-size: 13px;
+        }
+        .whatif-presets { display: flex; gap: 6px; flex-wrap: wrap; }
+        .whatif-note { flex-basis: 100%; font-size: 11px; color: var(--secondary-text-color); }
+        .whatif-banner {
+          margin: 0 16px 12px; padding: 8px 14px; border-radius: 6px;
+          background: repeating-linear-gradient(
+            45deg, var(--warning-color, #ff9800) 0, var(--warning-color, #ff9800) 10px,
+            rgba(255,152,0,0.15) 10px, rgba(255,152,0,0.15) 20px);
+          color: var(--primary-text-color); font-size: 13px; font-weight: 500;
+          display: flex; align-items: center; justify-content: space-between; gap: 12px;
+        }
+        .whatif-banner button {
+          background: var(--card-background-color); color: var(--primary-text-color);
+          border: 1px solid var(--divider-color); border-radius: 4px;
+          padding: 3px 10px; cursor: pointer; font-size: 12px; white-space: nowrap;
+        }
       </style>
     `;
 
@@ -1445,8 +1500,50 @@ class GridLensCard extends HTMLElement {
           </select>
         </label>
         <button id="epc-history-btn" class="nav-btn${this._showHistory ? ' active' : ''}">History</button>
+        <button id="epc-whatif-btn" class="nav-btn${(this._showWhatif || this._whatifApplied) ? ' active' : ''}"
+                title="Simulate a different battery/solar system size, including none at all">What if?</button>
         <a href="/api/grid_lens/diagnostic_export" download class="nav-btn" title="Download diagnostic zip for bug reporting" style="text-decoration:none;">&#8659; Diagnostic</a>
       </div>`;
+
+    // Prefills default to the household's REAL configured setup (household_battery_kwh,
+    // 100% solar) so opening the panel shows "your current system" — the user then
+    // drags one or both down (0 = none) or up (a bigger system) to see the effect.
+    const _realBatteryKwh = this._data.household_battery_kwh ?? 0;
+    const _batteryInputVal = this._whatifBatteryKwh ?? String(_realBatteryKwh);
+    const _solarInputVal = this._whatifSolarPct ?? '100';
+    const whatifPanelHtml = this._showWhatif ? `
+      <div class="whatif-panel">
+        <div class="whatif-field">
+          <label for="epc-whatif-battery">Battery size (kWh)</label>
+          <input type="number" id="epc-whatif-battery" min="0" step="0.5" value="${_esc(_batteryInputVal)}" ${_busy ? 'disabled' : ''}>
+        </div>
+        <div class="whatif-field">
+          <label for="epc-whatif-solar">Solar production (% of your real system)</label>
+          <input type="number" id="epc-whatif-solar" min="0" step="10" value="${_esc(_solarInputVal)}" ${_busy ? 'disabled' : ''}>
+        </div>
+        <div class="whatif-presets">
+          <button id="epc-whatif-none" class="nav-btn" ${_busy ? 'disabled' : ''}>No solar or battery</button>
+          <button id="epc-whatif-current" class="nav-btn" ${_busy ? 'disabled' : ''}>My current setup</button>
+          <button id="epc-whatif-apply" ${_busy ? 'disabled' : ''}>${_busy ? 'Calculating…' : 'Apply'}</button>
+          ${this._whatifApplied ? `<button id="epc-whatif-clear" class="nav-btn" ${_busy ? 'disabled' : ''}>Exit what-if</button>` : ''}
+        </div>
+        <div class="whatif-note">
+          Estimates every plan — including the one you're on — as if it were run through
+          this hypothetical system, so it's the LP's optimal-dispatch result rather than
+          your actual bill. Solar is your real measured production scaled by this
+          percentage (0% = no solar), not a true panel-physics model.
+        </div>
+      </div>` : '';
+
+    const whatifBannerHtml = this._data.whatif ? `
+      <div class="whatif-banner">
+        <span>&#9888; What-if scenario — ${
+          this._data.whatif.battery_kwh != null ? `${this._data.whatif.battery_kwh} kWh battery` : 'your real battery'
+        }, ${
+          this._data.whatif.solar_pct != null ? `${this._data.whatif.solar_pct}% solar` : 'your real solar'
+        }. Every total below is hypothetical, not your actual bill.</span>
+        <button id="epc-whatif-banner-clear" ${_busy ? 'disabled' : ''}>Exit what-if</button>
+      </div>` : '';
 
     const skeletonCount = (this._streamPhase === 'optimising' && this._plansTotal > 0)
       ? Math.max(0, this._plansTotal - this._plansDone) : 0;
@@ -1479,6 +1576,8 @@ class GridLensCard extends HTMLElement {
       ${styles}
       <ha-card>
         ${dateControlsHtml}
+        ${whatifPanelHtml}
+        ${whatifBannerHtml}
         ${bodyHtml}
       </ha-card>`;
 
@@ -1587,6 +1686,60 @@ class GridLensCard extends HTMLElement {
       if (this._showHistory && this._history === null) this.fetchHistory();
       this.render();
     });
+
+    this.shadowRoot.getElementById('epc-whatif-btn')?.addEventListener('click', () => {
+      this._showWhatif = !this._showWhatif;
+      this.render();
+    });
+
+    // Track the fields as the user types WITHOUT re-rendering on every keystroke —
+    // a re-render replaces the <input> mid-keystroke (see the retailer filter's own
+    // note above on the same problem), so the value is only read back on Apply/preset.
+    this.shadowRoot.getElementById('epc-whatif-battery')?.addEventListener('input', (ev) => {
+      this._whatifBatteryKwh = ev.target.value;
+    });
+    this.shadowRoot.getElementById('epc-whatif-solar')?.addEventListener('input', (ev) => {
+      this._whatifSolarPct = ev.target.value;
+    });
+
+    const _applyWhatif = (batteryStr, solarStr) => {
+      const b = parseFloat(batteryStr);
+      const s = parseFloat(solarStr);
+      this._whatifBatteryKwh = Number.isFinite(b) ? String(b) : null;
+      this._whatifSolarPct = Number.isFinite(s) ? String(s) : null;
+      this._whatifApplied = {
+        batteryKwh: Number.isFinite(b) ? b : null,
+        solarPct: Number.isFinite(s) ? s : null,
+      };
+      const s0 = this.shadowRoot.getElementById('epc-start')?.value || this._startDate;
+      const e0 = this.shadowRoot.getElementById('epc-end')?.value   || this._endDate;
+      triggerFetch(s0, e0, 'epc-whatif-apply');
+    };
+
+    this.shadowRoot.getElementById('epc-whatif-apply')?.addEventListener('click', () => {
+      const bVal = this.shadowRoot.getElementById('epc-whatif-battery')?.value ?? this._whatifBatteryKwh;
+      const sVal = this.shadowRoot.getElementById('epc-whatif-solar')?.value ?? this._whatifSolarPct;
+      _applyWhatif(bVal, sVal);
+    });
+
+    this.shadowRoot.getElementById('epc-whatif-none')?.addEventListener('click', () => {
+      _applyWhatif('0', '0');
+    });
+
+    this.shadowRoot.getElementById('epc-whatif-current')?.addEventListener('click', () => {
+      _applyWhatif(String(this._data.household_battery_kwh ?? 0), '100');
+    });
+
+    const _clearWhatif = () => {
+      this._whatifApplied = null;
+      this._whatifBatteryKwh = null;
+      this._whatifSolarPct = null;
+      const s0 = this.shadowRoot.getElementById('epc-start')?.value || this._startDate;
+      const e0 = this.shadowRoot.getElementById('epc-end')?.value   || this._endDate;
+      triggerFetch(s0, e0, 'epc-whatif-clear');
+    };
+    this.shadowRoot.getElementById('epc-whatif-clear')?.addEventListener('click', _clearWhatif);
+    this.shadowRoot.getElementById('epc-whatif-banner-clear')?.addEventListener('click', _clearWhatif);
 
     if (this._showHistory) {
       this.shadowRoot.getElementById('epc-add-btn')?.addEventListener('click', () => {

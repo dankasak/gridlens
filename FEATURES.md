@@ -439,6 +439,39 @@ single startup 502 left `current_plan_name` `None` and advisory mode stuck "wait
 hours — see `GRIDLENS_CHECKLIST.md`.
 **Files:** `plan_cache.py` (new), `__init__.py` (`GridLensCoordinator`), `advisory/coordinator.py`.
 
+**"What if?" hypothetical battery/solar sizing (added 2026-09-23).** A collapsible panel
+in the Plan Comparison toolbar (`grid-lens-card.js`, next to History) with two inputs —
+battery size in kWh and solar production as a % of the household's real measured
+production — plus "No solar or battery" (0/0) and "My current setup" presets. Answers
+"what would my bill look like with a bigger/smaller/no system", including 0 kWh battery
+and 0% solar to see the household's cost with neither.
+
+**Solar is scaled, not re-simulated**: the real measured solar series is multiplied by
+`solar_pct / 100` (0% = none, 100% = unchanged, 200% = double) — a production-scaling
+approximation, not a panel-physics model, so it doesn't account for inverter clipping or a
+differently-oriented array. **Battery is a fresh hypothetical `BatteryOptimizer`**: its
+charge/discharge rate scales proportionally from the household's real configured rates
+when a real battery exists, or defaults to a conservative 0.5C when it doesn't (e.g.
+simulating a battery on a solar-only or no-battery-no-solar household).
+
+⚠ **The one deliberate exception to "the current plan is never run through the LP"**
+(the invariant documented earlier in this section). A hypothetical battery/solar size has
+no real meter data to price against, so when either override is active, the plan the
+household is actually on is priced through the exact same LP/simple path as every
+alternative — the response's `whatif: {battery_kwh, solar_pct}` field (`null` when no
+override is active) tells the frontend to render the hazard-striped "hypothetical, not
+your real bill" banner instead of the normal actual-bill treatment. Multi-segment
+plan-switch-history pricing (the `periods` construction) is bypassed for the same reason —
+a what-if request always renders as a single flat comparison over the whole window.
+
+**Files:** `plan_calculator.py` (`calculate_plan_costs`'s `whatif_battery_kwh`/
+`whatif_solar_pct` params — see its docstring for the full mechanism, including how the
+instance's own `battery_optimizer`/`has_battery` are temporarily swapped for the pricing
+loop), `__init__.py` (`PlanDataView`/`PlanStreamView` — `?battery_kwh=`/`?solar_pct=`
+query params on both `/plan_data` and `/plan_stream`; `battery_kwh`/`solar_pct` alone,
+with no date range, still forces the on-the-fly recalculation branch rather than serving
+stale cached real data mislabeled as a what-if result), `www/cards/grid-lens-card.js`.
+
 ---
 
 ## 2. The optimiser (layer 2 core)
