@@ -131,7 +131,7 @@
         </div>
 
         <h2 id="boost">Today Boost</h2>
-        <p>Grid Lens learns how much energy each deferrable load needs per day from its own sensor, averaged over the last 14 days. When today isn't typical — a long drive tomorrow, guests staying — override it with <strong>Today Boost</strong> on the Deferrable Loads card.</p>
+        <p>Grid Lens learns how much energy each deferrable load needs per day from its own sensor, averaged over the last 14 days. When today isn't typical — a long drive tomorrow, guests staying — override it with <strong>Today Boost</strong>, on the Power Flow page's expandable device panel or on the Deferrable Loads card (same controls, either place).</p>
         <p>Set the kWh you actually need today; 0 means "use the historical average". The plan re-solves around it immediately.</p>
         <p>A small bar chart next to the input shows each device's actual daily use over the last two weeks, with the average of those days beside it — so you can see what "typical" is before deciding how far above it to go.</p>
         <p>If you ask for more than the load's allowed window can physically deliver, the card shows you that ceiling rather than silently ignoring the excess.</p>
@@ -165,7 +165,7 @@
         <h2 id="load-control">Load control</h2>
         <p>Grid Lens can also switch simple on/off appliances — anything exposed to Home Assistant as a <code>switch</code> entity that draws roughly a fixed power when running (a pool pump, a smart-plug-fed charger, a resistive heater) — <strong>or as a <code>climate</code> entity</strong>, so an air conditioner works the same way. Grid Lens only ever decides when it runs, never its mode or target temperature — those stay under your own control.</p>
         <p>An EV charger that accepts a charging-current limit is handled differently, and better — see <a href="#ev-chargers">EV chargers</a> below.</p>
-        <p>Assign a control switch (or climate entity) to a deferrable load via <strong>Grid Lens → Configure</strong>. Each controllable load then gets its own controls on the Deferrable Loads card:</p>
+        <p>Assign a control switch (or climate entity) to a deferrable load via <strong>Grid Lens → Configure</strong>. Each controllable load then gets its own controls — on the Power Flow page's expandable device panel and on the Deferrable Loads card:</p>
         <table class="compare-table">
           <thead><tr><th>Control</th><th>Default</th><th>What it does</th></tr></thead>
           <tbody>
@@ -234,14 +234,14 @@
 
         <p>If you have already set up the <strong>Power Flow card</strong>, you have told Grid Lens this entity once and it is filled in for you &mdash; the card's <code>grid_power_entity</code> is the same reading with the same sign convention, so the setup form offers it back rather than asking twice. Otherwise the field starts blank: the other energy sensors come from your Home Assistant Energy dashboard, but that dashboard only records cumulative energy and has no live power reading to borrow.</p>
 
-        <p>If it is blank and Greedy Consumption is on, the Deferrable Loads card says so &mdash; the appliance's greedy line reads <em>&ldquo;export is being wasted, but no grid power sensor is set&rdquo;</em> rather than pretending it is still waiting for surplus.</p>
+        <p>If it is blank and Greedy Consumption is on, the Power Flow page's device panel (or the Deferrable Loads card) says so &mdash; the appliance's greedy line reads <em>&ldquo;export is being wasted, but no grid power sensor is set&rdquo;</em> rather than pretending it is still waiting for surplus.</p>
         <p>Note this is a <em>power</em> (W) sensor, not one of the cumulative kWh sensors from your Energy dashboard.</p>
         <p>Grid Lens keeps a running <strong>Greedy Consumption</strong> energy sensor per appliance, tracked from the moment you enable it (there's no way to know retroactively what ran opportunistically before that). It's what powers the Plan Comparison page's <strong>Exclude Greedy Consumption</strong> checkbox — see <a href="#dashboard">View the dashboard</a>.</p>
 
         <h2 id="observability">Seeing why it acted</h2>
         <p>Anything that acts on your house should be able to explain itself. Every automated decision Grid Lens makes is visible on the dashboard:</p>
         <ul>
-          <li><strong>Deferrable Loads card</strong> — per appliance: whether Grid Lens is controlling it, which greedy trigger is currently holding it on, or why greedy is blocked. When the forecast-surplus trigger is armed, a progress bar shows how close it is to firing.</li>
+          <li><strong>Power Flow page's device panel (or the Deferrable Loads card)</strong> — per appliance: whether Grid Lens is controlling it, which greedy trigger is currently holding it on, or why greedy is blocked. When the forecast-surplus trigger is armed, a progress bar shows how close it is to firing.</li>
           <li><strong>Power Flow card</strong> — a badge appears on an appliance while <em>greedy</em>, rather than the plan, is the reason it's running. Hover it for the numbers behind the decision. Each appliance node also has a small hide button (bottom-left corner) if you'd rather it not clutter the diagram — hiding it also drops that device's line from the "Power — measured &amp; forecast" chart and its bar from the Plan Comparison breakdown, but it's still just a display choice: schedule, controls, optimisation and every dollar figure for that device keep working as normal. Turn it back on from that appliance's own "Show In Power Flow" switch under Settings.</li>
           <li><strong>Power Chart card</strong> — free-energy shading. <span style="color:#c2410c"><strong>Orange</strong></span> marks periods where the plan expects to spill energy it can't sell; <span style="color:#0d9488"><strong>teal</strong></span> marks free import windows. Diagonal stripes on a device's own line mark stretches it was actually running because of Greedy Consumption rather than the plan. Hover a band for the detail. A deferrable load with its own battery also gets a dashed <strong>predicted SOC</strong> line on the right-hand 0&ndash;100% axis, in that device's colour; if its charge ceiling is cutting the plan short, a faint flat line marks the ceiling and the hover tooltip names how much charge was held back.</li>
           <li><strong>Entity attributes</strong> — every Grid Lens switch exposes its full decision state for use in your own automations and templates.</li>

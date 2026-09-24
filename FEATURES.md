@@ -1075,20 +1075,19 @@ people fighting over one switch.
 - Deliberately **decoupled** from the battery `ControlManager`: load control has zero
   brand-specific logic and must work on a house with no battery at all.
 
-**Card layout — every row the same shape.** `grid-lens-load-control-card.js` always
-renders the segmented Off now/On now/Auto control *and* all three Greedy buttons for
-every device, even one with no control switch configured at all — disabled and dimmed,
-with a tooltip explaining why, rather than omitted. Rows for a controllable and a
-forecast-only device line up identically instead of the row width jumping around
-depending on what's wired up.
+**Card layout — every row the same shape.** Every row always renders the segmented Off
+now/On now/Auto control *and* all three Greedy buttons for every device, even one with no
+control switch configured at all — disabled and dimmed, with a tooltip explaining why,
+rather than omitted. Rows for a controllable and a forecast-only device line up identically
+instead of the row width jumping around depending on what's wired up. This row shape isn't
+owned by one card — see §6b below for where it actually renders.
 
-**Tooltips.** Every hint on this card (disabled-control reasons, Greedy button
-explanations, the boost ceiling note, sparkline bar dates) is a custom JS-delegated
-popup (`_initTooltip`/`data-tip` in `grid-lens-load-control-card.js`), not the native
-`title=""` attribute — shows in ~150 ms on hover instead of the browser's own ~1 s
-delay, and instantly on keyboard/touch focus (every `[data-tip]` element carries
-`tabindex="0"` so touch and keyboard can reach it, since native title tooltips are
-unreliable to trigger by tap).
+**Tooltips.** Every hint on this UI (disabled-control reasons, Greedy button explanations,
+the boost ceiling note, sparkline bar dates) is a custom JS-delegated popup (`attachTooltip`/
+`data-tip`, `grid-lens-chart-common.js`), not the native `title=""` attribute — shows in
+~150 ms on hover instead of the browser's own ~1 s delay, and instantly on keyboard/touch
+focus (every `[data-tip]` element carries `tabindex="0"` so touch and keyboard can reach it,
+since native title tooltips are unreliable to trigger by tap).
 
 ---
 
@@ -1339,6 +1338,74 @@ see `modulating_controller.py`'s `_write_setpoint`), so nothing extra was needed
 ha-wattpilot separately exposes a disabled-by-default `switch.*_charge_pause` entity that,
 if enabled and left on, lets the charger's own firmware insert autonomous pauses outside
 Grid Lens's control — the note tells the user to find and leave it off.
+
+---
+
+## 6b. Where load control renders (merged into the Power Flow header, 2026-09-24)
+
+**What changed.** §6/§6a's per-device row (sparkline, Today Boost, the 3 Greedy toggles,
+Off now/On now/Auto, the live status lines, the LoadEstimator debug panel) used to live only
+on `grid-lens-load-control-card.js`, seeded onto the Settings view as "Deferrable Loads". It
+now ALSO renders inline in `grid-lens-advisory-card.js`'s compact header — the "Optimiser &
+Plan" bar at the top of the Power Flow page — behind the same chevron expander Daily Target
+(§9b) already uses there, one row per device, alongside that row's %-of-average slider. This
+removes having the same per-device deferrable-load block live on two separate pages, and
+puts same-day actions (Today Boost, Greedy, On/Off) on the page a user actually looks at
+first, instead of requiring a trip to Settings.
+
+**Where it lives now.** `grid-lens-load-control-card.js` is NOT seeded onto Settings by
+default any more (mirroring Daily Target's own 2026-09-22 relocation, §9b) — but the card
+itself, and its Lovelace resource registration, are unchanged: it's still fully functional
+and available for anyone who wants it as its own card on a different dashboard. Every
+resolver (`controlSwitchFor`, `overrideSelectFor`, `greedySwitchFor`, `maxCurrentFor`,
+`estimatorFor`, `socCapFor`, `windowHours`, `boostCeiling`, `resolveLoadControlRows`) and
+every HTML-producing function (`greedyLine`, `modulationLine`, `currentReadoutHtml`,
+`maxCurrentHtml`, `socCapHtml`, `sparklineHtml`, `estimatorToggleHtml`, `estimatorPanelHtml`,
+`controlHtml`, `greedyButtonsHtml`, `boostInputHtml`, `attachTooltip`) moved into
+`grid-lens-chart-common.js`'s "Load control helpers" section, imported by both cards, rather
+than living only in `grid-lens-load-control-card.js` — the same fix already applied once to
+Today Boost/charge-target entity resolution (§9b), now applied here for the same reason: two
+cards' copies of this logic had already started to drift (the standalone card's own boost
+resolver was missing exclusions the shared one already had — fixed as part of this move).
+
+Every HTML-producing function takes an `opts.prefix` string so its own CSS class names don't
+collide — `grid-lens-advisory-card.js` already uses the bare class `.row` for something
+unrelated (the mode-transition timeline), so its call sites pass `{ prefix: 'dt-' }` and
+`grid-lens-load-control-card.js`'s call sites pass none, keeping its class names unchanged.
+
+**Same fix that touched the sparkline (see below) applies to `grid-lens-load-control-card.js`
+itself too** — since `sparklineHtml()`/`estimatorToggleHtml()` are shared functions, the
+misalignment fix reaches both cards from the one change.
+
+**Files:** `grid-lens-chart-common.js` ("Load control helpers" section — everything above),
+`grid-lens-load-control-card.js` (thin per-instance wrapper: constructor state, `hass`
+signature diffing, `_paint()` calling into chart-common.js), `grid-lens-advisory-card.js`
+(`_dt*` methods — `_dtPanelHtml()` calls the same chart-common.js functions with
+`{ prefix: 'dt-' }`), `custom_components/grid_lens/__init__.py` (`_build_seed_views` — the
+Settings seed entry removed, with the surrounding "Control" heading re-gated on SOC-tracking
+so it isn't left orphaned with zero cards under it on an install with no SOC-tracked device
+and no battery).
+
+**Row-alignment bug fixed in the same change.** A screenshot showed the Today Boost box,
+Greedy icons, and segmented control at inconsistent x-positions row to row. Root cause: the
+sparkline's width scaled with how many days of recorder history a device actually had — down
+to zero width outright on a failed/empty query — so every element after it in the row's flex
+layout shifted left on a less-established device's row. `sparklineHtml()` now always renders
+a fixed 14-bar-wide block, padding missing (older) days with invisible placeholder bars;
+`estimatorToggleHtml()` gets the same same-size-invisible-placeholder treatment when a device
+has no LoadEstimator, since that icon's presence/absence was a smaller second source of the
+same shift (it sits between the Greedy icons and the segmented control in the row).
+
+**Unverified.** This container has no browser. `node --check` and grep-based method/field
+name collision checks (see §9b's own precedent for this class of check) both pass, and the
+port from the standalone card's methods to shared functions preserves behaviour with no
+signature changes to what any card renders — but the row alignment, the merged panel's
+wrapping at real card widths, the ported tooltip positioning inside `grid-lens-advisory-
+card.js`'s (previously tooltip-less) shadow root, and the new delegated event listeners have
+not been exercised against live `hass` state. `getCardSize()`'s new formula for the expanded
+compact header is a rough heuristic pending visual tuning. Needs `sync-to-ha.sh`, a dashboard
+reload, and a click-through of both the Settings "Deferrable Loads" card and the new Power
+Flow expander before this is "done" in the sense a curl-tested API change is done.
 
 ---
 
@@ -1942,6 +2009,12 @@ with its 14-day average and computed "≈X kWh at this rate" readout, a "Follow 
 reset button when a device is pinned, and **both today's remaining forecast solar and
 tomorrow's** (with a placeholder weather icon each) for context while dialing.
 
+**That same per-device expander is no longer Daily-Target-only (2026-09-24, see §6b).**
+Each expanded row now ALSO carries the full load-control row — Today Boost, Greedy toggles,
+Off now/On now/Auto, live status, the estimator debug panel — alongside this section's
+slider, so a reader landing here should know the expander is a merged panel, not a
+Daily-Target-exclusive one.
+
 **Named "Daily Target", not "Tomorrow Planning" (its original name — renamed 2026-09-22,
 same day it shipped).** The feature grew out of investigating a "battery charged off grid
 for no reason" report (see the checklist's 2026-09-21 entry): the charge was actually
@@ -2051,7 +2124,9 @@ use of `deferrable_sensor_id`), `services.py`/`services.yaml`
 (`_apply_daily_targets`, called before `_apply_overrides` in `_deferrable_device_params`),
 `www/cards/grid-lens-chart-common.js`'s "Daily Target helpers" section (resolvers,
 `solarSummary`/`weatherFor`, `fetchDailyAverageKwh` — shared by both card files below),
-`www/cards/grid-lens-advisory-card.js` (primary home, compact header — `_dt*` methods),
+`www/cards/grid-lens-advisory-card.js` (primary home, compact header — `_dt*` methods; the
+expanded per-device panel these methods build now also carries the merged load-control row,
+§6b, via that same file's "Load control helpers" section),
 `www/cards/grid-lens-daily-target-card.js` (standalone card, unseeded but still available).
 
 **Unverified** — added 2026-09-21, renamed + today/tomorrow forecast header added
@@ -2108,8 +2183,8 @@ Callers passing no `rightAxis` are byte-for-byte unchanged (verified against the
 | `grid-lens-soc-chart-card` | Battery SOC curve, planned vs measured, full height. Kept alongside the Power Flow chart's SOC overlay on purpose: the overlay is at-a-glance context next to dispatch, this is the divergence diagnostic for whether control is actually tracking the plan. |
 | `grid-lens-cash-chart-card` | Cumulative cost/credit. |
 | `grid-lens-dispatch-chart-card` | Planned EMS mode timeline. |
-| `grid-lens-advisory-card` | Plan status header (plan name/solver/last-run time, status badge), control-mode timeline, deferrable-load recommendations, **plus Daily Target (§9b, relocated 2026-09-22): today/tomorrow solar forecast + master slider in the header, per-device sliders behind a chevron expander** — same header content in both compact and full layouts. `compact: true` config renders just the header (incl. the Daily Target block) — used as a slim "optimiser & plan" status bar at the top of the Power Flow view; `title` config overrides the header text in that mode. `show_current_rates: true` adds a one-line buy/sell readout ("Buy 22c/kWh · Sell 3c/kWh") under the plan-status line — the rate for the slot covering now, from the same `trajectory` attribute. Just the numbers; the rate *graph* is `grid-lens-price-chart-card`. Off by default and **not** used by the seed anymore — the Power Flow view shows the current rate on the `grid-lens-powerflow-card` Grid node instead (2026-09-11). Still available for a dashboard that has no Power Flow card. Works in the full card too. |
-| `grid-lens-load-control-card` | One row per deferrable load: Today Boost, greedy toggles, Off now / On now / Auto, and live greedy status. |
+| `grid-lens-advisory-card` | Plan status header (plan name/solver/last-run time, status badge), control-mode timeline, deferrable-load recommendations, **plus Daily Target (§9b, relocated 2026-09-22): today/tomorrow solar forecast + master slider in the header, per-device sliders behind a chevron expander** — same header content in both compact and full layouts. **The expanded per-device panel also carries the full load-control row (§6b, merged 2026-09-24): sparkline, Today Boost, Greedy toggles, Off now/On now/Auto, live status, the estimator debug panel — alongside that row's slider.** `compact: true` config renders just the header (incl. the Daily Target/load-control block) — used as a slim "optimiser & plan" status bar at the top of the Power Flow view; `title` config overrides the header text in that mode. `show_current_rates: true` adds a one-line buy/sell readout ("Buy 22c/kWh · Sell 3c/kWh") under the plan-status line — the rate for the slot covering now, from the same `trajectory` attribute. Just the numbers; the rate *graph* is `grid-lens-price-chart-card`. Off by default and **not** used by the seed anymore — the Power Flow view shows the current rate on the `grid-lens-powerflow-card` Grid node instead (2026-09-11). Still available for a dashboard that has no Power Flow card. Works in the full card too. |
+| `grid-lens-load-control-card` | One row per deferrable load: Today Boost, greedy toggles, Off now / On now / Auto, and live greedy status. **No longer seeded onto the default Settings view (2026-09-24)** — its default-visible home is now `grid-lens-advisory-card`'s per-device expander on the Power Flow view (§6b), same relocation Daily Target got in §9b. Still installed/registered for a dashboard that wants it as its own card. |
 | `grid-lens-daily-target-card` | Standalone Daily Target card (§9b) — same content as `grid-lens-advisory-card`'s header block, always expanded, no chevron. No longer seeded onto the default Settings view (2026-09-22) since the advisory-card header is now the default home; still installed/registered for a dashboard that wants it as its own card. |
 | `grid-lens-charge-target-card` | One row per SOC-tracked deferrable load: ad-hoc "charge to X% by a datetime" target (§9a) — a percent tile + a datetime tile, auto-paired via the `charge_target_role`/`deferrable_sensor_id` state attributes, plus a plain-text "Target: 95% by Sat, 2:22 am" / "No target set" status line. Empty state when no device has SOC tracking configured. |
 | `grid-lens-defer-schedule-card` | The 7 × 48 allowed-run-times editor. |
