@@ -100,6 +100,17 @@ class DispatchInterval:
     # decide each device's switch on/off (via its own ≥50%-of-max_kw threshold). The battery
     # executor never reads this; it's a parallel control channel for simple on/off loads.
     deferrable_w: list[float] = field(default_factory=list)
+    # Battery SOC (%) the plan forecasts AT THE START of this slot, or None when the plan
+    # doesn't carry one — every DispatchInterval built directly by a test, or by a caller
+    # that predates this field, leaves it None. Consumed by
+    # LoadControlManager._plan_battery_safe_rate_w so Greedy Consumption's forecast-surplus
+    # condition can size its "safe to lend from the battery" rate against the plan's OWN
+    # forecasted trajectory instead of only ever the CURRENT SOC (found 2026-09-24: a
+    # genuine ~15 kWh afternoon export block sat completely unused because the live SOC
+    # snapshot, taken during the battery's own morning charge, looked too depleted to lend
+    # from — even though the plan's own trajectory showed the battery full and idle for
+    # hours before the export even began). The battery executor never reads this.
+    forecast_soc_percent: Optional[float] = None
 
 
 @dataclass

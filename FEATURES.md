@@ -1361,6 +1361,19 @@ for both the $0 and below-floor cases. **Condition 3's budget uses the same
 `≤ min_export_price` bar** — so the forward-looking trigger and the live one agree on what
 counts as wasted.
 
+**Condition 2's two evaluations could disagree for a modulating load (fixed 2026-09-24).**
+`LoadControlManager._modulation_target_w` (the 30s loop that actually writes a modulating
+device's setpoint) nets the device's own already-flowing draw back into the grid reading
+before judging surplus — once the device draws off real surplus, its own draw shrinks the
+visible export, so without netting the loop would wrongly conclude "no more surplus" the
+instant it started drawing. But `_greedy_wants_on` (the 5-minute tick that's the ONLY place
+writing `greedy_reason`/`greedy_blocked` — everything the dashboard reads) compared the raw
+grid reading with no such netting, so a device that was genuinely running on surplus could
+show `greedy_blocked: "no_battery_headroom"` / `greedy_reason: null` right next to
+`modulation_source: "surplus"` on the same card. Fix: `_greedy_wants_on` now nets `device_w`
+and live battery discharge the same way `_modulation_target_w` does, both sourced from the
+manager and threaded through `apply()`. See `docs/GRIDLENS_CHECKLIST.md`, 2026-09-24.
+
 **Condition 3 is proportional, not all-or-nothing (2026-09-11 rewrite).** It used to fire
 binary against a "could this device run flat out for the *whole* look-ahead and the plan
 still spill more" bar — deliberately conservative, but it meant widening the look-ahead
@@ -1416,6 +1429,23 @@ one device would actually draw — which a modest battery can never clear on a b
 regardless of SOC or time of day (a 24 kWh battery, 10% min SOC, tops out at 21.6 kWh of
 headroom, so it permanently failed against any spill bigger than that) and left condition #3
 silently dead on exactly the days it exists for. See `docs/GRIDLENS_CHECKLIST.md`, 2026-09-20.
+
+**The gate only ever saw the LIVE SOC snapshot, never the plan's own forecast (fixed
+2026-09-24).** A battery mid-morning-charge (say 49% SOC) computed a small `battery_headroom_kwh`
+against the fixed look-ahead denominator, capping the safe rate below even a modulating
+device's floor and blocking condition #3 outright — even when the SAME plan's own trajectory
+showed SOC climbing to 100% and holding there for hours before the day's next real discharge,
+i.e. the live snapshot, taken mid-climb, understated the plan's own guarantee by more than
+double. A naive per-slot "headroom/elapsed-time" rate was considered and rejected before
+shipping — hand-traced against the 2026-09-21 regression incident's own numbers, it would have
+computed ~2525 W and incorrectly unblocked the exact flat/non-recovering trajectory that fix
+protects. Shipped fix: `LoadControlManager._plan_battery_headroom_kwh(now, window_end)` scans
+the plan for its PEAK forecasted SOC anywhere in the window (new `DispatchInterval.forecast_soc_percent`
+field, populated in `advisory/planner.py`) and widens `battery_headroom_kwh = max(live_snapshot,
+plan_peak)` before the gate runs — never narrows it. Only the NUMERATOR changes; the existing
+`battery_safe_window_h` denominator is untouched, so a flat trajectory's outcome is bit-for-bit
+unchanged and only a genuine forecasted climb raises the rate. See `docs/GRIDLENS_CHECKLIST.md`,
+2026-09-24.
 
 Only when both gates clear does running the device draw the battery down instead of the grid,
 with that hole refilled by the very spill being bet on. **No battery configured, no capacity
@@ -1935,6 +1965,23 @@ a device that hasn't run yet today (hot water heating in the afternoon), the mor
 adjustment fully applies. This is why the card shows **both** today's remaining forecast
 and tomorrow's, not just tomorrow's — a tomorrow-only header would be the wrong number to
 look at on a rainy morning, actively misleading someone using the feature for today.
+
+**Already-drawn accounting fix (2026-09-24).** "Caps further draw for the rest of today"
+above was the *intent* from day one but wasn't actually true until this fix: today's day-0
+target (both the flat per-device equality and the EV/SOC floor's no-active-charge-target
+branch in `battery_optimizer.py`) was computed as `daily_kwh × (remaining slots today /
+slots_per_day)` — a pure time-fraction proration with **no knowledge of energy already
+metered today**. Found live: a Wattpilot's target was dialled down to 20% (~2.1 kWh)
+mid-afternoon, well after Greedy Consumption had already charged ~8.9 kWh off real solar
+surplus that day — the plan still demanded a further ~0.7 kWh that evening, off grid power,
+because the proration re-derives a fresh fractional slice of the total regardless of what
+already happened. Fixed with a new optional `consumed_today_kwh` field (per-device dict,
+populated by `advisory/coordinator.py._consumed_today_kwh` from live statistics since local
+midnight): when present, today's target becomes `max(0, daily_kwh - consumed_today_kwh)` —
+the real remaining balance — via the new `battery_optimizer._day0_target_kwh` helper.
+Absent (the default — `plan_calculator.py`'s plan-comparison backtest never sets it, same
+reasoning as `soc_initial_percent`) reproduces the old proration byte-for-byte. See
+`tests/test_day0_target_kwh.py` and the checklist's 2026-09-24 entry.
 
 **Why 0% can't mean "clear" here (unlike Today Boost's 0 kWh).** Today Boost's 0 kWh is
 meaningless as a boost, so it doubles as the "unset" sentinel. Daily Target's 0% is a

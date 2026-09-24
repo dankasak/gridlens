@@ -61,6 +61,8 @@ def _install_stubs() -> None:
     dt = _mod("homeassistant.util.dt")
     dt.utcnow = lambda: None
     dt.as_local = lambda x: x
+    dt.as_utc = lambda x: x
+    dt.start_of_local_day = lambda: "midnight"
     util.dt = dt
     ha.util = util
 
@@ -233,6 +235,91 @@ def test_deferrable_for_horizon_never_shortens_the_list():
     # The device after the inert one must keep its OWN values, unshifted.
     assert out[2]["sensor_id"] == "sensor.c"
     assert out[2]["daily_kwh"] == 3.0 and out[2]["max_kw"] == 7.0
+
+
+def test_deferrable_for_horizon_carries_consumed_today_kwh_through():
+    """consumed_today_kwh (set by _deferrable_device_params, see
+    _consumed_today_kwh) must reach battery_optimizer.py's per-device dict
+    unchanged — that's the only path the day-0 ground-truth substitution
+    (battery_optimizer._day0_target_kwh, GRIDLENS_CHECKLIST.md 2026-09-24) has
+    to know how much a device has already drawn today. A device with no value
+    computed (e.g. no sensor_id) must come through as None, not a missing key
+    (battery_optimizer.py's dev.get('consumed_today_kwh') relies on the key
+    round-tripping to explicit None, same convention as the other optional
+    soc_* fields)."""
+    deferrable_for_horizon = AdvisoryCoordinator.__dict__["_deferrable_for_horizon"]
+
+    class _Bundle:
+        start = None
+        slot_minutes = 30
+        slots = 4
+
+    class _Coord:
+        hass = types.SimpleNamespace(data={}, states={})
+        entry = types.SimpleNamespace(entry_id="test_entry")
+        _deferrable_params = [
+            {"sensor_id": "sensor.a", "daily_kwh": 2.1, "max_kw": 7.7, "name": "A",
+             "consumed_today_kwh": 8.9},
+            {"sensor_id": "sensor.b", "daily_kwh": 3.0, "max_kw": 1.0, "name": "B"},
+        ]
+
+        def _device_override(self, sensor_id):
+            return None
+
+        async def _charge_target(self, sensor_id, live_soc_percent):
+            return None
+
+    out = asyncio.run(deferrable_for_horizon(_Coord(), _Bundle()))
+    assert out[0]["consumed_today_kwh"] == 8.9, out[0]
+    assert out[1]["consumed_today_kwh"] is None, out[1]
+
+
+def test_consumed_today_kwh_sums_usage_and_handles_wh_unit():
+    """_consumed_today_kwh (advisory/coordinator.py) sums calc._get_usage_data's
+    raw 'change' values since local midnight, applying the same Wh->kWh divisor
+    _get_deferrable_data uses for a device whose sensor reports in Wh (e.g. the
+    Wattpilot's native totally_charged sensor) — see GRIDLENS_CHECKLIST.md
+    2026-09-24."""
+    consumed_today_kwh = AdvisoryCoordinator.__dict__["_consumed_today_kwh"]
+
+    class _Calc:
+        async def _get_usage_data(self, start, end, sensor_id):
+            return [{"timestamp": 1, "value": 3931.0}, {"timestamp": 2, "value": 4090.0}]
+
+    class _State:
+        attributes = {"unit_of_measurement": "Wh"}
+
+    class _Coord:
+        hass = types.SimpleNamespace(states=types.SimpleNamespace(get=lambda sid: _State()))
+
+    result = asyncio.run(consumed_today_kwh(_Coord(), _Calc(), "sensor.wattpilot"))
+    assert abs(result - 8.021) < 1e-6, result  # (3931 + 4090) Wh / 1000
+
+
+def test_consumed_today_kwh_no_sensor_id_returns_zero():
+    consumed_today_kwh = AdvisoryCoordinator.__dict__["_consumed_today_kwh"]
+
+    class _Coord:
+        hass = types.SimpleNamespace(states=types.SimpleNamespace(get=lambda sid: None))
+
+    result = asyncio.run(consumed_today_kwh(_Coord(), object(), ""))
+    assert result == 0.0, result
+
+
+def test_consumed_today_kwh_fetch_failure_returns_zero_not_raise():
+    """A broken statistics call must never block planning — same 'every failure
+    caught' rule the rest of advisory/coordinator.py follows."""
+    consumed_today_kwh = AdvisoryCoordinator.__dict__["_consumed_today_kwh"]
+
+    class _Calc:
+        async def _get_usage_data(self, start, end, sensor_id):
+            raise RuntimeError("recorder unavailable")
+
+    class _Coord:
+        hass = types.SimpleNamespace(states=types.SimpleNamespace(get=lambda sid: None))
+
+    result = asyncio.run(consumed_today_kwh(_Coord(), _Calc(), "sensor.x"))
+    assert result == 0.0, result
 
 
 # --------------------------------------------------------------------------- runner

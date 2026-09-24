@@ -251,6 +251,34 @@ def _day_groups(
     return groups
 
 
+def _day0_target_kwh(
+    daily_kwh: float, time_fraction: float, consumed_today_kwh: float | None,
+) -> float:
+    """Today's per-device energy target for the flat daily-total equality and the
+    EV/SOC day-0 floor's no-active-charge-target branch.
+
+    consumed_today_kwh known (advisory/coordinator.py's rolling control path,
+    from live statistics since local midnight): the ground-truth remaining
+    balance, daily_kwh minus what's already been drawn today, floored at 0 — a
+    device that already blew past a same-day-reduced Daily Target gets a
+    target of 0 for the rest of today, not a fresh fractional slice of the
+    total it already exceeded.
+
+    consumed_today_kwh is None (the default — plan_calculator.py's
+    plan-comparison backtest never sets it, same reasoning as
+    soc_initial_percent elsewhere in this module; there is no "already drawn
+    today" for a hypothetical past period): the legacy time-fraction proration,
+    daily_kwh scaled by how much of today's slots remain — byte-identical to
+    this function's behaviour before consumed_today_kwh existed.
+
+    See optimize_hourly_schedule's docstring and GRIDLENS_CHECKLIST.md
+    2026-09-24.
+    """
+    if consumed_today_kwh is not None:
+        return max(0.0, daily_kwh - consumed_today_kwh)
+    return daily_kwh * time_fraction
+
+
 def consolidate_deferrable_schedule(
     schedule: List[Dict],
     deferrable_loads: List[Dict],
@@ -458,6 +486,19 @@ class BatteryOptimizer:
           'soc_charge_efficiency_percent': float, default 90.0 — one-way charger
           efficiency, converting def_i[t] (grid/solar-side kWh) into kWh actually
           stored in the device's own battery.
+          'consumed_today_kwh': float, optional — real energy this device has
+          already drawn since local midnight (advisory/coordinator.py's
+          _consumed_today_kwh, from live statistics). When present, TODAY's
+          day-0 target (both the flat per-day equality and the EV/SOC floor's
+          no-active-target branch) becomes max(0, daily_kwh - consumed_today_kwh)
+          instead of daily_kwh prorated by the fraction of today's slots
+          remaining — the old proration has no way to know a device already blew
+          past a same-day-reduced Daily Target, and kept demanding a fresh
+          fractional slice of the (already-exceeded) total for whatever hours
+          were left. Absent/None (the default — plan_calculator.py's
+          plan-comparison backtest never sets it, same reasoning as
+          soc_initial_percent above) reproduces the exact old proration,
+          byte-for-byte. See GRIDLENS_CHECKLIST.md 2026-09-24.
 
         Each device gets its own LP variable with its own power cap, so a
         1.8 kW EV charger and a 4.7 kW hot water system are scheduled
@@ -1115,6 +1156,7 @@ class BatteryOptimizer:
         ev_day0_target: dict[int, float] = {}  # device idx -> floor kWh (SOC path; see floor_slot)
         ev_day0_requested: dict[int, float] = {}  # device idx -> UN-clamped floor target (SOC path)
         eq_row = 2 * T
+        today_day_key = day_groups[0][0] if day_groups else None
         for i, dev in enumerate(deferrable_loads):
             mask = dev.get('hour_mask')
             for day_key, slots in day_groups:
@@ -1130,7 +1172,13 @@ class BatteryOptimizer:
                 avail_slots = (
                     sum(float(mask[t]) for t in slots) if mask else float(len(slots))
                 )
-                requested = dev['daily_kwh'] * len(slots) / slots_per_day
+                if day_key == today_day_key:
+                    requested = _day0_target_kwh(
+                        dev['daily_kwh'], len(slots) / slots_per_day,
+                        dev.get('consumed_today_kwh'),
+                    )
+                else:
+                    requested = dev['daily_kwh'] * len(slots) / slots_per_day
                 deliverable = avail_slots * dev['max_kw'] * dt
                 target = min(requested, deliverable)
                 # Truncated chunks are a ≤ cap, not an equality (see above), so falling
@@ -1176,7 +1224,11 @@ class BatteryOptimizer:
                 )
                 requested = gap_kwh / spec['eta']
             else:
-                requested = dev['daily_kwh'] * fslot / slots_per_day
+                # fslot here IS today's remaining slots (floor_slot's own
+                # docstring), so this is always the day-0 case.
+                requested = _day0_target_kwh(
+                    dev['daily_kwh'], fslot / slots_per_day, dev.get('consumed_today_kwh'),
+                )
             headroom = max(0.0, spec['max_kwh'] - spec['initial_kwh']) / spec['eta']
             ev_target = min(requested, deliverable, headroom)
             ev_day0_target[i] = ev_target
@@ -1399,7 +1451,18 @@ class BatteryOptimizer:
                 i, e = (net, 0.0) if net >= 0 else (0.0, -net)
             ch = max(0.0, x[C+t])
             di = max(0.0, x[D+t])
-            so = max(self.min_soc_kwh, min(self.max_soc_kwh, soc_vals[t]))
+            # soc_vals[t] is the SOC AFTER this slot's charge/discharge (see the SOC-update
+            # equality row above: S[t] = S[t-1] + eta*C[t] - D[t]/eta, i.e. S[t] is an
+            # end-of-slot state). Every consumer of this schedule (DispatchInterval,
+            # AdvisoryPlanner's trajectory row, the SOC/Power chart cards) treats
+            # 'soc_percent' as the SOC AT THE START of slot t — using soc_vals[t] directly
+            # made slot 0 report the battery's state ~30min in the future instead of "now",
+            # producing a large, spurious jump against the live SOC reading at t=0 (found
+            # 2026-09-24: initial_soc_percent 65.4% vs trajectory[0].soc_percent 80.3% in the
+            # SAME plan). The prior slot's end-state is this slot's start-state; for t=0
+            # that's E0, the live SOC the LP was actually seeded with.
+            so_start = E0 if t == 0 else soc_vals[t-1]
+            so = max(self.min_soc_kwh, min(self.max_soc_kwh, so_start))
 
             # Capped hours: cost/rate come from the tranche split (pre-netting values —
             # more accurate than post-net flat-rate multiplication, and the only way to
@@ -1467,12 +1530,15 @@ class BatteryOptimizer:
             tslots = track_slots.get(i, day0_slots)
             for t in range(min(tslots, len(schedule))):
                 row = schedule[t]
-                per_dev = row.get('deferrable_per_device') or []
-                e = per_dev[i] if i < len(per_dev) else 0.0
-                soc_kwh = min(spec['max_kwh'], soc_kwh + spec['eta'] * e)
+                # Report START-of-slot SOC (soc_kwh before this slot's charge is applied),
+                # same fix as so_start above — the previous version stored the post-charge
+                # value under slot t, one slot ahead of what it actually represents.
                 row.setdefault('deferrable_soc_percent', {})[i] = round(
                     soc_kwh / spec['capacity_kwh'] * 100.0, 2
                 )
+                per_dev = row.get('deferrable_per_device') or []
+                e = per_dev[i] if i < len(per_dev) else 0.0
+                soc_kwh = min(spec['max_kwh'], soc_kwh + spec['eta'] * e)
 
         # Show the EFFECTIVE (post-clamp) target, not just the requested one — the
         # unqualified requested figure made a window-clamped boost look like it had
@@ -1680,17 +1746,23 @@ class BatteryOptimizer:
             cha=[v(P_cha[t]) for t in range(T)],
             dis=[v(P_dis[t]) for t in range(T)],
             soc=[v(E_bat[t]) for t in range(T)],
+            E0=E0,
             solver="milp/cbc",
         )
 
     def _build_result_from_arrays(self, T, solar, load, r_imp, r_exp,
-                                   imp, exp, cha, dis, soc, solver):
+                                   imp, exp, cha, dis, soc, E0, solver):
         schedule = []
         total_import_kwh = total_export_kwh = 0.0
         total_import_cost = total_export_credit = 0.0
 
         for t in range(T):
-            i, e, c, d, s = (max(0.0, x) for x in (imp[t], exp[t], cha[t], dis[t], soc[t]))
+            i, e, c, d = (max(0.0, x) for x in (imp[t], exp[t], cha[t], dis[t]))
+            # soc[t] is the SOC AFTER slot t (see E_bat's constraint in _lp_pulp above) —
+            # the schedule row for slot t needs its START-of-slot SOC instead, same fix as
+            # _lp_scipy's so_start (see that docstring for why). soc[t-1] is slot t's start;
+            # for t=0 that's E0, the live SOC the LP was seeded with.
+            s = max(0.0, E0 if t == 0 else soc[t-1])
             ic = i * r_imp[t]
             ec = e * r_exp[t]
             total_import_kwh   += i;  total_export_kwh    += e
@@ -1733,6 +1805,11 @@ class BatteryOptimizer:
         total_import_cost = total_export_credit = 0.0
 
         for t in range(T):
+            # Captured before this slot's charge/discharge updates soc_kwh below — the
+            # schedule row for slot t reports SOC at the START of the slot (same fix as
+            # _lp_scipy's so_start / _build_result_from_arrays' s — see so_start's
+            # docstring), not the state after this slot's action already happened.
+            soc_start = soc_kwh
             net = solar[t] - load[t]
             cha = dis = imp = exp = 0.0
 
@@ -1781,7 +1858,7 @@ class BatteryOptimizer:
                 'hour': t, 'solar_kwh': solar[t], 'load_kwh': load[t],
                 'charge_kwh': cha, 'discharge_kwh': dis,
                 'import_kwh': imp, 'export_kwh': exp,
-                'soc_percent': soc_kwh / self.capacity_kwh * 100.0,
+                'soc_percent': soc_start / self.capacity_kwh * 100.0,
                 'import_rate': r_imp[t], 'export_rate': r_exp[t],
                 'import_cost': imp_cost, 'export_credit': exp_credit,
             })

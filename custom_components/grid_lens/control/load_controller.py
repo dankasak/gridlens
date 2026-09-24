@@ -105,6 +105,16 @@ _LOGGER = logging.getLogger(__name__)
 _CLIMATE_FEATURE_TURN_ON = 256
 _CLIMATE_FEATURE_TURN_OFF = 128
 
+# Canonical home for this constant — LoadControlManager._modulation_target_w's live
+# export-surplus term imports it from here rather than keeping its own copy, so the two
+# independent evaluations of "is the export surplus big enough" can't drift apart on the
+# margin alone. See _greedy_wants_on's export_surplus condition below for why this module
+# needs it too (fixed 2026-09-24: that condition used to compare raw grid export against
+# nothing, so a device already drawing its own already-flowing power off real surplus made
+# its own draw look, to this check, like the surplus had disappeared — see the condition's
+# docstring for the full incident).
+_EXPORT_BIAS_W = 150.0
+
 
 class DeferrableLoadController:
     def __init__(
@@ -237,6 +247,8 @@ class DeferrableLoadController:
         ac_output_headroom_w: Optional[float] = None,
         min_export_price: float = 0.0,
         battery_safe_window_h: Optional[float] = None,
+        device_w: float = 0.0,
+        discharge_w: float = 0.0,
     ) -> bool:
         """True if Greedy Consumption says "on" right now, independent of the plan.
 
@@ -265,6 +277,17 @@ class DeferrableLoadController:
         (and the forecast figures behind the third one) for ``status()`` to publish. A
         greedy "on" is otherwise indistinguishable from a plan-driven one in the UI —
         "why is my pool pump running?" is the whole observability question here.
+
+        ``device_w`` / ``discharge_w`` (fixed 2026-09-24, both default 0.0 so a caller that
+        doesn't pass them reproduces the exact old behaviour): condition #2 below nets the
+        device's own live draw and any live battery discharge into the export reading it
+        judges surplus against — see that condition for why. The manager
+        (``LoadControlManager._tick_device``) sources both the same way its own
+        ``_modulation_target_w`` does, from ``_read_device_power_w`` /
+        ``_read_battery_net_power_w``, so this method's verdict and the manager's live
+        setpoint decision are evaluating the same physical quantity (just on the 5-minute
+        tick's snapshot rather than the 30-second one) instead of two different ones that
+        can disagree about whether surplus exists at all.
         """
         self._greedy_free_kwh = forecast_spill_kwh
         self._greedy_needed_kwh = (
@@ -304,8 +327,19 @@ class DeferrableLoadController:
                 self._greedy_blocked = "no_grid_power"
             else:
                 # Sign convention: positive = importing, negative = exporting (see
-                # CONF_GRID_POWER_SENSOR). exporting_w is the magnitude of current export.
-                exporting_w = max(0.0, -grid_power_w)
+                # CONF_GRID_POWER_SENSOR). Net out THIS device's own already-flowing draw
+                # (fixed 2026-09-24) — without it, a device already charging off genuine
+                # surplus makes its own draw shrink the visible export, so a re-evaluation
+                # while it's running concludes "no surplus" and this condition stops
+                # matching the very draw it's judging, i.e. the exact self-referential
+                # blind spot LoadControlManager._modulation_target_w's live surplus term
+                # was already written to avoid (see that method's docstring) — this mirrors
+                # it so the two verdicts agree instead of one seeing surplus and the other
+                # not. Battery *discharge* is netted back in the same asymmetric way as
+                # there (propping up a near-zero grid reading with stored charge isn't real
+                # solar surplus); *charging* is never credited, same reasoning. The bias
+                # matches the manager's for the same undershoot-over-chatter reason.
+                exporting_w = max(0.0, device_w - (grid_power_w + discharge_w) - _EXPORT_BIAS_W)
                 if self.max_w > 0.0 and exporting_w >= self._export_surplus_threshold_w():
                     self._greedy_reason = "export_surplus"
                     self._greedy_blocked = None
@@ -412,6 +446,23 @@ class DeferrableLoadController:
           scaling normally — see ``LoadControlManager._tick_device``). Falls back to
           ``forecast_hours`` if not supplied, for any caller that doesn't pass it.
 
+          ``battery_headroom_kwh`` itself may already be plan-aware by the time it reaches
+          here (fixed 2026-09-24, see ``LoadControlManager._plan_battery_headroom_kwh``):
+          the manager widens the live snapshot to the plan's own PEAK forecasted headroom
+          within the same window, when the plan carries one, on the theory that a battery
+          the plan shows climbing to (and holding) a high SOC well before the reservation
+          has genuinely more room than whatever the live reading happens to be while that
+          climb is still in progress. This method doesn't need to know which kind of
+          number it received — it still divides by the SAME ``safe_window_h`` as always,
+          which is what keeps this safe against the 2026-09-21 incident: a plan that never
+          actually recovers (flat SOC, no real climb) reports the same peak as its current
+          value, so the arithmetic is untouched and exactly as conservative as before.
+          Deliberately NOT "peak headroom / time-to-reach-that-peak" — dividing by a
+          shorter elapsed time as the peak sits closer to a near reservation would
+          reproduce the exact "safe rate rises as the reservation approaches" bug the
+          fixed ``safe_window_h`` denominator exists to prevent, just moved into the
+          numerator's derivation instead of the denominator's.
+
         A third, optional gate — ``ac_output_headroom_w``
         (``LoadControlManager._ac_output_headroom_w``) — clamps the draw again when the
         household has configured an inverter AC output ceiling (``CONF_MAX_AC_OUTPUT_KW``):
@@ -488,6 +539,8 @@ class DeferrableLoadController:
         min_export_price: float = 0.0,
         soc_cutoff: bool = False,
         battery_safe_window_h: Optional[float] = None,
+        device_w: float = 0.0,
+        discharge_w: float = 0.0,
     ) -> None:
         """Reconcile the switch toward the plan (plus Greedy Consumption, if enabled)
         for this tick.
@@ -546,7 +599,7 @@ class DeferrableLoadController:
             import_rate, export_rate, grid_power_w, schedule_allows,
             forecast_spill_kwh, forecast_hours, battery_headroom_w,
             battery_headroom_kwh, ac_output_headroom_w, min_export_price,
-            battery_safe_window_h,
+            battery_safe_window_h, device_w, discharge_w,
         )
         plan_on = self.desired_on(planned_w)
         if plan_on and self._greedy_reason is not None:

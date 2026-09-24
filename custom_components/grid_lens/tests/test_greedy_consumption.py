@@ -1117,6 +1117,83 @@ async def _run_manager_end_to_end_reservation_does_not_inflate_safe_rate():
     assert m.controllers[0].status()["greedy_blocked"] == "no_battery_headroom"
 
 
+async def _run_manager_end_to_end_plan_aware_headroom_unblocks_recovered_battery():
+    """Real incident, 2026-09-24 (GRIDLENS_CHECKLIST.md): the live-snapshot safe-rate gate
+    blocked a genuine ~15 kWh afternoon export spill because SOC was only 49% mid
+    morning-charge, even though the plan's own trajectory showed it reaching 100% within
+    the hour and holding there for hours before the day's only real discharge reservation.
+    Same shape as the incident test above (a genuine spill inside a reservation-clipped
+    window), but this time the plan carries a forecasted SOC that genuinely recovers well
+    before the reservation — ``_plan_battery_headroom_kwh``'s widening must let this
+    through where the live snapshot alone would still block it.
+
+    49% SOC / 10% min SOC / 24 kWh capacity -> 9.36 kWh live headroom; against the fixed 9h
+    look-ahead that's ~1040 W, below the 2 kW this on/off device needs (the OLD behaviour
+    blocks). The plan forecasts SOC reaching 100% (21.6 kWh headroom) by the second waste
+    slot and holding there through a reservation 4h out -> plan-aware safe rate 2400 W,
+    clearing the 2 kW floor."""
+    m, hass = _mgr(grid_power_sensor="sensor.grid_power",
+                   extra_data=_forecast_battery_data(battery_capacity=24.0,
+                                                      battery_min_soc=10.0))
+    hass.states.set("sensor.grid_power", "500")    # importing right now — nothing live-free
+    hass.states.set("sensor.battery_soc", "49.0")  # mid morning-charge, matching the incident
+    hass.states.set("sensor.battery_power", "0")
+    _NOW[0] = _T0
+    # 8 slots (4h) of genuine $0 export waste (6 kW spilling), then a real 5 kW discharge
+    # reservation. import_rate stays priced throughout so this can only be condition #3,
+    # same as the paired incident test above.
+    plan = _slots([(0.3, 0.0, 6000.0)] * 8, start=_T0 - timedelta(minutes=1))
+    plan += _slots([(0.3, 0.28, 0.0, 0.0, BatteryAction.DISCHARGE, 5000.0)] * 4,
+                    start=_T0 + timedelta(hours=4) - timedelta(minutes=1))
+    # The plan's own forecast: SOC climbs from ~49% to 100% by the second waste slot and
+    # holds there right up to the reservation — the fact the live snapshot alone can't see.
+    plan[0].forecast_soc_percent = 62.0
+    for iv in plan[1:8]:
+        iv.forecast_soc_percent = 100.0
+    m.set_plan(plan, updated_at=_T0)
+    await m.set_entitled(True)
+    await m.enable(0)  # first tick establishes "off" (plan wants off, no greedy yet)
+    assert len(_turn_ons(hass)) == 0
+    await m.set_greedy(0, True)
+    await m.set_greedy_forecast_surplus(0, True)
+    later = _T0 + timedelta(minutes=16)  # past the 15-min min-off debounce
+    await m._tick_device(0, later)
+    assert len(_turn_ons(hass)) == 1
+    assert m.controllers[0].status()["greedy_reason"] == "forecast_surplus"
+
+
+async def _run_manager_end_to_end_plan_aware_headroom_no_help_when_flat():
+    """Companion to the fix above: a plan that forecasts SOC FLAT (no real recovery) must
+    stay exactly as conservative as the live snapshot alone — proving the widening in
+    ``_plan_battery_headroom_kwh`` is a genuine ``max()`` with the live reading, not a
+    rubber stamp. Same numbers as the 2026-09-21 incident test, but this time every slot in
+    the window explicitly carries a forecasted SOC (all at the live 22.8% reading) instead
+    of leaving the field unset — proving the new code path, not just its absence, still
+    blocks correctly."""
+    m, hass = _mgr(grid_power_sensor="sensor.grid_power",
+                   extra_data=_forecast_battery_data(battery_capacity=24.0,
+                                                      battery_min_soc=10.0))
+    hass.states.set("sensor.grid_power", "500")
+    hass.states.set("sensor.battery_soc", "22.8")
+    hass.states.set("sensor.battery_power", "0")
+    _NOW[0] = _T0
+    plan = (_slots([(0.3, 0.0, 6000.0)] * 3, start=_T0 - timedelta(minutes=1))
+            + _slots([(0.3, 0.28, 0.0, 0.0, BatteryAction.DISCHARGE, 5000.0)] * 4,
+                     start=_T0 + timedelta(hours=1.5) - timedelta(minutes=1)))
+    for iv in plan:
+        iv.forecast_soc_percent = 22.8  # the plan never shows recovery
+    m.set_plan(plan, updated_at=_T0)
+    await m.set_entitled(True)
+    await m.enable(0)
+    assert len(_turn_ons(hass)) == 0
+    await m.set_greedy(0, True)
+    await m.set_greedy_forecast_surplus(0, True)
+    later = _T0 + timedelta(minutes=16)
+    await m._tick_device(0, later)
+    assert len(_turn_ons(hass)) == 0
+    assert m.controllers[0].status()["greedy_blocked"] == "no_battery_headroom"
+
+
 def test_manager_notify_on_every_tick():
     """The control switch entity's state listener fires on every tick, not just on user
     actions (2026-09-11) — so the Load Control card shows live greedy state instead of
@@ -1248,6 +1325,8 @@ if __name__ == "__main__":
         ("manager_end_to_end_surplus_tick", lambda: _run_async(_run_manager_end_to_end_surplus_tick)),
         ("manager_end_to_end_forecast_below_floor_tick", lambda: _run_async(_run_manager_end_to_end_forecast_below_floor_tick)),
         ("manager_end_to_end_reservation_does_not_inflate_safe_rate", lambda: _run_async(_run_manager_end_to_end_reservation_does_not_inflate_safe_rate)),
+        ("manager_end_to_end_plan_aware_headroom_unblocks_recovered_battery", lambda: _run_async(_run_manager_end_to_end_plan_aware_headroom_unblocks_recovered_battery)),
+        ("manager_end_to_end_plan_aware_headroom_no_help_when_flat", lambda: _run_async(_run_manager_end_to_end_plan_aware_headroom_no_help_when_flat)),
     ]
     passed = 0
     for name, fn in tests:

@@ -69,7 +69,7 @@ from ..const import (
 from ..inverters.base import BatteryAction
 from ..reoptimize import request_reoptimize
 from .executor import DispatchInterval
-from .load_controller import DeferrableLoadController
+from .load_controller import DeferrableLoadController, _EXPORT_BIAS_W
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -107,7 +107,11 @@ _MIN_BUDGET_WINDOW_H = 0.5
 # than chatter" — just applied to money instead of write frequency. Small relative to a
 # modulating load's usual step (a 1 A quantisation step is ~230 W), so it nudges rather than
 # meaningfully throttles.
-_EXPORT_BIAS_W = 150.0
+#
+# Defined in load_controller.py (imported below) since 2026-09-24: _greedy_wants_on's own
+# export_surplus condition now nets the same live device/discharge readings the same way,
+# and needs the same margin — importing one constant keeps the two verdicts from drifting
+# apart on the bias alone.
 
 # The battery-priority correction (see _modulation_target_w) deliberately over-corrects by
 # this much, for the same asymmetry reason as _EXPORT_BIAS_W above — added 2026-09-12 on the
@@ -581,10 +585,18 @@ class LoadControlManager:
             # A window that's merely short because the plan itself doesn't extend
             # further (no reservation involved) is a genuine, honestly-measured
             # opportunity and keeps using its own span, same as before this fix.
-            _, reservation_hit = self._reservation_window_end(index, now)
+            window_end, reservation_hit = self._reservation_window_end(index, now)
             battery_safe_window_h = (
                 GREEDY_SURPLUS_LOOKAHEAD_HOURS if reservation_hit else spill_hours
             )
+            # Widen the live snapshot to the plan's own peak forecasted headroom in this
+            # same window, when the plan has one (fixed 2026-09-24, see
+            # _plan_battery_headroom_kwh) — never narrows it: a plan with no per-slot SOC
+            # forecast, or one whose peak doesn't exceed the live reading, leaves
+            # battery_headroom_kwh exactly as the live snapshot already had it.
+            plan_headroom_kwh = self._plan_battery_headroom_kwh(now, window_end)
+            if plan_headroom_kwh is not None:
+                battery_headroom_kwh = max(battery_headroom_kwh or 0.0, plan_headroom_kwh)
         if controller.greedy and not self._grid_power_sensor and not self._warned_no_grid_power:
             # Greedy's export-surplus condition is the one that catches a house spilling
             # kilowatts at a $0 export price, and it is silently unavailable without this
@@ -616,6 +628,13 @@ class LoadControlManager:
                 min_export_price=self._min_export_price(),
                 soc_cutoff=self._soc_cutoff_active(index),
                 battery_safe_window_h=battery_safe_window_h,
+                # Same readings, same netting as _modulation_target_w's live surplus term
+                # (fixed 2026-09-24) — so this 5-minute verdict (which owns greedy_reason /
+                # greedy_blocked, i.e. everything the dashboard and GreedyEnergyTracker
+                # show) agrees with the 30-second loop that actually holds a modulating
+                # device's setpoint, instead of judging the same surplus two different ways.
+                device_w=self._read_device_power_w(index) or 0.0,
+                discharge_w=max(0.0, -(self._read_battery_net_power_w() or 0.0)),
             )
         except Exception as err:  # noqa: BLE001 — a bad device tick must not kill the timer
             _LOGGER.error("Load control tick failed for %s: %s", self.controllers[index].name, err)
@@ -1164,6 +1183,54 @@ class LoadControlManager:
         if soc is None:
             return None
         return max(0.0, (soc - self._battery_min_soc) / 100.0 * self._battery_capacity_kwh)
+
+    def _plan_battery_headroom_kwh(
+        self, now: datetime, window_end: datetime
+    ) -> Optional[float]:
+        """Plan-aware widening of ``_battery_headroom_kwh()`` (fixed 2026-09-24) — the most
+        headroom (kWh to the configured minimum SOC) the plan's OWN forecast shows the
+        battery reaching anywhere between ``now`` and ``window_end``.
+
+        The live snapshot answers "how much could the battery give up right now" — correct
+        on its own terms, but blind to a battery the plan is about to fill: on a day the
+        plan shows SOC climbing to (and sitting at) a high level well before
+        ``window_end``, that later headroom is real and safe to lend against, not just
+        whatever the CURRENT SOC happens to be. Found live 2026-09-24: SOC was 49% (still
+        mid morning-charge) while the plan already showed it reaching 100% within the hour
+        and staying there for 6+ hours before the day's only real discharge reservation —
+        the live snapshot's ~9 kWh of headroom (a third of the pack) understated what the
+        plan's own trajectory guaranteed by a wide margin, and the caller's existing
+        ``battery_safe_window_h`` denominator (fixed at the 2026-09-21 incident's nominal
+        look-ahead) then pinned the resulting rate below every modulating device's floor.
+
+        Deliberately the PEAK, not "peak headroom / time to reach it": the caller still
+        divides whatever this returns by the SAME ``battery_safe_window_h`` it always has
+        (see ``_tick_device`` and ``DeferrableLoadController._forecast_surplus_target_w``'s
+        docstring) — dividing by a shorter elapsed time here instead would reproduce the
+        exact "safe rate rises as a reservation approaches" bug that fix exists to prevent,
+        just relocated from the denominator into this number. A plan that never actually
+        recovers (flat SOC, no real climb — the 2026-09-21 incident's shape) has a peak
+        equal to its current value, so the widened figure equals the live one and nothing
+        about that incident's outcome changes; see
+        ``_run_manager_end_to_end_reservation_does_not_inflate_safe_rate``.
+
+        Returns ``None`` — the caller then uses the live snapshot alone, exactly as before
+        this fix — when there's no plan, no battery configured, or not a single slot in the
+        window carries a forecasted SOC (every ``DispatchInterval`` built directly by a
+        test, or by a caller that predates ``forecast_soc_percent``).
+        """
+        plan = self._plan
+        if not plan or not self._battery_capacity_kwh or not self._battery_soc_sensor:
+            return None
+        peak_soc: Optional[float] = None
+        for iv in plan:
+            if iv.start < now or iv.start > window_end or iv.forecast_soc_percent is None:
+                continue
+            if peak_soc is None or iv.forecast_soc_percent > peak_soc:
+                peak_soc = iv.forecast_soc_percent
+        if peak_soc is None:
+            return None
+        return max(0.0, (peak_soc - self._battery_min_soc) / 100.0 * self._battery_capacity_kwh)
 
     def _ac_output_headroom_w(self) -> Optional[float]:
         """Headroom (W) below the configured inverter/plant AC output ceiling, or None if

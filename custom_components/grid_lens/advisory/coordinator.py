@@ -322,12 +322,50 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             if combined:
                 hod = calc._aggregate_kwh_by_hod(combined)
                 self._deferrable_load_hod = [float(hod.get(h, 0.0)) for h in range(24)]
+            for dev in defs or []:
+                dev["consumed_today_kwh"] = await self._consumed_today_kwh(
+                    calc, dev.get("sensor_id", "")
+                )
             scaled = await self._apply_daily_targets(defs or [])
             return await self._apply_overrides(scaled)
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Advisory: deferrable device params unavailable: %s", err)
             self._deferrable_load_hod = [0.0] * 24
             return []
+
+    async def _consumed_today_kwh(self, calc, sensor_id: str) -> float:
+        """Real energy sensor_id has recorded since local midnight, in kWh — the
+        ground truth battery_optimizer.py's day-0 target needs so it can ask for
+        what's actually left of today's (possibly Daily-Target-scaled) daily_kwh
+        instead of blindly re-prorating the full figure by how much of today's
+        clock remains, with no idea a device already blew past a same-day-reduced
+        target hours ago. See 'consumed_today_kwh' in
+        battery_optimizer.optimize_hourly_schedule's docstring, and
+        GRIDLENS_CHECKLIST.md 2026-09-24.
+
+        Reuses calc._get_usage_data (same "change"-per-hour statistics call
+        _get_deferrable_data already makes for the 14-day average) rather than a
+        fresh statistics query, so a reset/unit quirk only needs handling once.
+        Returns 0.0 (never blocks planning) on any failure or missing sensor —
+        callers must treat 0.0 as "no data", same as an absent key would be
+        treated by the optimizer's own None-check.
+        """
+        if not sensor_id:
+            return 0.0
+        try:
+            raw = await calc._get_usage_data(
+                dt_util.as_utc(dt_util.start_of_local_day()), dt_util.utcnow(), sensor_id
+            )
+        except Exception as err:  # noqa: BLE001 — must never block planning
+            _LOGGER.debug("Advisory: consumed-today lookup failed for %s: %s", sensor_id, err)
+            return 0.0
+        if not raw:
+            return 0.0
+        divisor = 1.0
+        state_obj = self.hass.states.get(sensor_id)
+        if state_obj and state_obj.attributes.get("unit_of_measurement") == "Wh":
+            divisor = 1000.0
+        return sum(d["value"] for d in raw) / divisor
 
     async def _apply_daily_targets(self, defs: list) -> list:
         """Scale each device's historical daily_kwh by its Daily Target percent
@@ -604,6 +642,7 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
                         # enforced in the controller instead.
                         "min_kw": dev.get("min_kw", 0.0),
                         "name": dev.get("name"), "sensor_id": dev.get("sensor_id"),
+                        "consumed_today_kwh": dev.get("consumed_today_kwh"),
                         **soc_kwargs})
         return out
 

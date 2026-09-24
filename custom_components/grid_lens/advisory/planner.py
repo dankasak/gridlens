@@ -142,6 +142,15 @@ class AdvisoryPlanner:
                     # condition needs the total the plan expects to push out the meter.
                     total_export_w=max(0.0, float(step.get("export_kwh", 0.0))) / dt_h * 1000.0,
                     deferrable_w=deferrable_w,
+                    # Same source as the trajectory row's own "soc_percent" below — the
+                    # LP's own forecasted SOC at this slot's start, for Greedy Consumption's
+                    # plan-aware battery-safe-rate calculation (see DispatchInterval's
+                    # docstring). float(...) rather than the row's rounded copy: this one
+                    # feeds a calculation, not a display.
+                    forecast_soc_percent=(
+                        float(step["soc_percent"]) if step.get("soc_percent") is not None
+                        else None
+                    ),
                 )
             )
             row = {
