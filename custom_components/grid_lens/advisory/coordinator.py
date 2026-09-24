@@ -199,6 +199,25 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             self.hass, main.async_request_refresh(), name="grid_lens_advisory_kick_main"
         )
 
+    def invalidate_meta(self) -> None:
+        """Force the next ``_run()`` to call ``_refresh_meta()`` regardless of
+        META_REFRESH's normal ~2 min throttle — called by ``reoptimize.py`` before an
+        immediate re-run.
+
+        Daily Target and Today Boost are only re-read from their stores inside
+        ``_deferrable_device_params()``, which itself only runs from ``_refresh_meta()``.
+        Under the old periodic-only tick, that ~2 min throttle was invisible: the tick
+        cadence and the throttle window were the same length, so metadata refreshed on
+        nearly every tick anyway. The immediate-reoptimize feature broke that coincidence
+        — a Daily Target change re-triggered ``_run()`` right away, but without this,
+        ``_run()`` would silently keep solving against the deferrable params from up to
+        2 minutes ago, producing an identical plan and no visible chart update even
+        though the sensor's ``generated_at`` (and the optimizing dot) both looked fresh.
+        Found live 2026-09-24: a Daily Target flip 20%→100%→back produced a byte-identical
+        trajectory across the "immediate" re-run.
+        """
+        self._meta_refreshed = None
+
     async def _refresh_meta(self) -> None:
         """Refresh the current plan + load history (infrequent)."""
         self._plan = self._current_plan()

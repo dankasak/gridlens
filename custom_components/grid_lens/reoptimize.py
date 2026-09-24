@@ -25,6 +25,15 @@ def request_reoptimize(hass: HomeAssistant, entry_id: str) -> None:
     advisory = getattr(hass, "data", {}).get(DOMAIN, {}).get(f"{entry_id}_advisory")
     if advisory is None or not hasattr(advisory, "async_request_refresh"):
         return
+    # Daily Target / Today Boost are only re-read from their stores inside the
+    # coordinator's own _refresh_meta(), which is normally throttled to once per
+    # META_REFRESH (~2 min) — invisible under the old periodic-only tick (same cadence
+    # as the throttle), but without this an immediate re-run right after one of those
+    # changes would solve against stale deferrable params and look like nothing
+    # happened. See AdvisoryCoordinator.invalidate_meta()'s docstring.
+    invalidate_meta = getattr(advisory, "invalidate_meta", None)
+    if invalidate_meta is not None:
+        invalidate_meta()
     entry = getattr(advisory, "entry", None)
     coro = advisory.async_request_refresh()
     if entry is not None and hasattr(entry, "async_create_background_task"):
