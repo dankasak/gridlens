@@ -45,8 +45,11 @@ import {
   STYLE, esc, fmtTime, fmtDayHour, modeLabel, MODE_COLORS, execMode, reasonFor, deferColorFor,
   fmtC, resolveDeferrableLoads, resolveDailyTargetMasterEid, resolveDailyTargetEidFor,
   resolveBoostEidFor, resolveChargeTargetPercentEidFor, resolveSolarForecastEid, solarSummary,
-  fmtKwh, clampTargetPct, fetchDailyAverageKwh,
-} from './grid-lens-chart-common.js?v=20260923c';
+  fmtKwh, clampTargetPct, fetchDailyAverageKwh, resolveLoadControlRows, fetchDailyHistory,
+  estimatorFor, boostCeiling, socCapFor, friendlyNote, greedyLine, modulationLine, socCapHtml,
+  sparklineHtml, estimatorToggleHtml, estimatorPanelHtml, controlHtml, greedyButtonsHtml,
+  boostInputHtml, currentReadoutHtml, maxCurrentHtml, attachTooltip,
+} from './grid-lens-chart-common.js?v=20260924d';
 
 const DAILY_TARGET_HISTORY_REFRESH_MS = 15 * 60000;
 // Minimum time the optimizing dot stays visible once triggered, regardless of how
@@ -86,6 +89,18 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._dtSolarEid = null;
     this._dtHistoryCache = {};
     this._dtHistoryPending = new Set();
+    // Load control (FEATURES.md §6/§6a) — merged into this same per-device expander
+    // 2026-09-24 from the formerly Settings-only grid-lens-load-control-card.js, so a
+    // device's Today Boost/Greedy/On-Off controls don't have to live on two different
+    // pages. Separate cache from _dtHistoryCache above (that one stores a single average
+    // number for the %-slider readout; this one stores the day-by-day series the
+    // sparkline needs — different shape, kept in its own object rather than one cache
+    // guessing which shape a given entry is). _dtExpandedEstimator mirrors
+    // grid-lens-load-control-card.js's own `_expandedEstimator` — local-only UI state,
+    // never part of `dtSig`, never reset on repaint.
+    this._dtSparkCache = {};
+    this._dtSparkPending = new Set();
+    this._dtExpandedEstimator = new Set();
   }
 
   setConfig(config) {
@@ -100,7 +115,14 @@ class GridLensAdvisoryCard extends HTMLElement {
 
   getCardSize() {
     if (!this._config.compact) return 3;
-    return this._dtExpanded ? 3 : 2;
+    if (!this._dtExpanded) return 2;
+    // The expanded panel now carries the merged load-control row content too (sparkline,
+    // boost, greedy, control segment, and an estimator debug panel per open row) —
+    // Home Assistant's masonry/sections layout only takes this as an approximate hint,
+    // and the exact constants here may need visual tuning once seen in a browser.
+    const rows = (this._dtRows || []).length;
+    const openEstimators = this._dtExpandedEstimator ? this._dtExpandedEstimator.size : 0;
+    return Math.max(3, rows + 2 + openEstimators);
   }
 
   set hass(hass) {
@@ -112,27 +134,62 @@ class GridLensAdvisoryCard extends HTMLElement {
     // works even in the (unlikely) case that sensor is unavailable.
     this._dtDevices = resolveDeferrableLoads(hass);
     this._dtPollHistory(this._dtDevices);
+    this._dtPollSparkline(this._dtDevices);
     this._dtMasterEid = resolveDailyTargetMasterEid(hass);
     this._dtSolarEid = resolveSolarForecastEid(hass, this._config.solar_forecast_entity);
-    const dtRows = this._dtDevices.map((d) => ({
+    const loadControlRows = resolveLoadControlRows(hass, this._dtDevices);
+    const dtRows = this._dtDevices.map((d, i) => ({
       device: d,
       targetEid: resolveDailyTargetEidFor(hass, d.energy_entity),
       boostEid: resolveBoostEidFor(hass, d.energy_entity),
       ctEid: resolveChargeTargetPercentEidFor(hass, d.energy_entity),
+      ...loadControlRows[i],
     }));
     this._dtRows = dtRows;
     const dtSolarSt = this._dtSolarEid && hass.states[this._dtSolarEid];
     const dtSig = [
       this._dtMasterEid && hass.states[this._dtMasterEid] ? hass.states[this._dtMasterEid].state : '',
       dtRows.map((r) => {
+        const d = r.device;
         const t = r.targetEid && hass.states[r.targetEid];
         const b = r.boostEid && hass.states[r.boostEid];
         const c = r.ctEid && hass.states[r.ctEid];
+        // Load control fields — same set grid-lens-load-control-card.js's own `hass`
+        // setter signature includes, ported verbatim so its merged row here repaints on
+        // exactly the same state changes as the standalone card does.
+        const ctl = r.controlEid && hass.states[r.controlEid];
+        const sel = r.selEid && hass.states[r.selEid];
+        const g = r.gEid && hass.states[r.gEid];
+        const gs = r.gsEid && hass.states[r.gsEid];
+        const gf = r.gfEid && hass.states[r.gfEid];
+        const ceiling = boostCeiling(d);
+        const isMod = d.control_type === 'modulating';
+        const mc = isMod && r.maxCurEid ? hass.states[r.maxCurEid] : null;
+        const sp = isMod && d.setpoint_entity ? hass.states[d.setpoint_entity] : null;
+        const pw = isMod && d.power_entity ? hass.states[d.power_entity] : null;
+        const est = estimatorFor(hass, d);
+        const estA = est && est.attrs;
+        const sc = socCapFor(hass, d.energy_entity);
         return [
           r.device.energy_entity,
           t ? `${t.state}|${(t.attributes || {}).is_override}` : '',
           b ? b.state : '',
           c ? c.state : '',
+          sc ? `${sc.day0_charge_kwh}|${sc.target_kwh}|${sc.max_percent}|${sc.initial_percent}` : '',
+          ctl ? [ctl.state, (ctl.attributes || {}).note, (ctl.attributes || {}).greedy_reason,
+                 (ctl.attributes || {}).greedy_blocked,
+                 (ctl.attributes || {}).forecast_free_kwh,
+                 (ctl.attributes || {}).modulation_source,
+                 (ctl.attributes || {}).plugged_in].join('|') : '',
+          sel ? sel.state : '',
+          g ? g.state : '',
+          gs ? gs.state : '',
+          gf ? gf.state : '',
+          ceiling == null ? '' : ceiling.toFixed(1),
+          mc ? mc.state : '',
+          sp ? sp.state : '',
+          pw ? pw.state : '',
+          estA ? `${estA.sample_count}|${estA.last_sample_at}|${estA.estimated_kw}|${est.state.state}` : '',
         ].join('~');
       }).join(','),
       // Minute-granularity tick so "today remaining" keeps drifting through the day even
@@ -215,6 +272,24 @@ class GridLensAdvisoryCard extends HTMLElement {
       fetchDailyAverageKwh(this._hass, eid).then((avgKwh) => {
         this._dtHistoryPending.delete(eid);
         this._dtHistoryCache[eid] = { ts: Date.now(), avgKwh };
+        this._paint();
+      });
+    }
+  }
+
+  // Same pattern as _dtPollHistory above, but for the merged Today Boost sparkline's
+  // day-by-day series (fetchDailyHistory) rather than a single average — a separate cache
+  // because the two entries have different shapes ({avgKwh} vs {days}).
+  _dtPollSparkline(devices) {
+    for (const d of devices) {
+      const eid = d.energy_entity;
+      if (!eid || this._dtSparkPending.has(eid)) continue;
+      const cached = this._dtSparkCache[eid];
+      if (cached && Date.now() - cached.ts < DAILY_TARGET_HISTORY_REFRESH_MS) continue;
+      this._dtSparkPending.add(eid);
+      fetchDailyHistory(this._hass, eid).then((days) => {
+        this._dtSparkPending.delete(eid);
+        this._dtSparkCache[eid] = { ts: Date.now(), days };
         this._paint();
       });
     }
@@ -393,14 +468,40 @@ class GridLensAdvisoryCard extends HTMLElement {
       const resetBtn = isOverride
         ? `<button class="dt-reset-btn" data-dt-reset-for="${d.energy_entity}">Follow master</button>` : '';
 
+      // Load control (FEATURES.md §6/§6a) — merged into this same per-device row
+      // 2026-09-24, same content as grid-lens-load-control-card.js's own row, built from
+      // the same shared chart-common.js functions with { prefix: 'dt-' } so their class
+      // names don't collide with this card's own bare `.row` (used elsewhere for the
+      // mode-transition timeline — see chart-common.js's "Load control helpers" header
+      // comment for why the prefix matters here specifically).
+      const controlSt = r.controlEid ? hass.states[r.controlEid] : null;
+      const a = controlSt ? (controlSt.attributes || {}) : {};
+      const controlMeta = friendlyNote(a.note);
+      const isErr = (a.note || '').startsWith('command_error');
+      const est = estimatorFor(hass, d);
+      const estOpen = !!(est && this._dtExpandedEstimator.has(est.eid));
+      const lcOpts = { prefix: 'dt-' };
+
       return `
         <div class="dt-row">
           <div class="dt-info">
             <div class="dt-name">${esc(d.name)}</div>
             ${note ? `<div class="dt-meta dt-note">${esc(note)}</div>` : ''}
+            ${controlMeta ? `<div class="dt-meta${isErr ? ' dt-note' : ''}">${esc(controlMeta)}</div>` : ''}
+            ${greedyLine(a, lcOpts)}
+            ${modulationLine(a, d, lcOpts)}
+            ${socCapHtml(hass, d, lcOpts)}
           </div>
           ${this._dtSliderRowHtml(r.targetEid, pct, kwhReadout, isOverride ? 'is-override' : '')}
           ${resetBtn}
+          ${sparklineHtml(this._dtSparkCache[d.energy_entity], d.energy_entity, lcOpts)}
+          ${boostInputHtml(hass, r, d, lcOpts)}
+          ${currentReadoutHtml(hass, d, lcOpts)}
+          ${maxCurrentHtml(hass, r, d, lcOpts)}
+          ${greedyButtonsHtml(hass, r, d, lcOpts)}
+          ${estimatorToggleHtml(est, estOpen, lcOpts)}
+          ${controlHtml(hass, r, d, lcOpts)}
+          ${est && estOpen ? estimatorPanelHtml(d, est, lcOpts) : ''}
         </div>`;
     }).join('') + `</div>`;
   }
@@ -434,6 +535,87 @@ class GridLensAdvisoryCard extends HTMLElement {
     if (!el || !el.matches || !el.matches('input[type=range][data-dt-eid]') || !this._hass) return;
     const eid = el.getAttribute('data-dt-eid');
     this._hass.callService('number', 'set_value', { entity_id: eid, value: clampTargetPct(el.value) });
+  }
+
+  // ---------------------------------------------- Load control (merged 2026-09-24)
+  //
+  // All delegated on `.body` (bound once in _renderShell, below), unlike
+  // grid-lens-load-control-card.js's own per-element querySelectorAll(...).forEach(...)
+  // wiring — that pattern only works there because it re-attaches after every _paint()
+  // call; this card's _paint() only ever replaces `.body`'s innerHTML, and every other
+  // handler on this card is already delegated for exactly that reason.
+
+  _onDtEstToggleClick(ev) {
+    const btn = ev.target && ev.target.closest && ev.target.closest('.dt-est-toggle[data-est-eid]');
+    if (!btn) return;
+    ev.stopPropagation();
+    const eid = btn.getAttribute('data-est-eid');
+    if (this._dtExpandedEstimator.has(eid)) this._dtExpandedEstimator.delete(eid);
+    else this._dtExpandedEstimator.add(eid);
+    this._paint();
+  }
+
+  _onDtGreedyClick(ev) {
+    const btn = ev.target && ev.target.closest && ev.target.closest('.dt-gbtn[data-eid]');
+    if (!btn || !this._hass) return;
+    ev.stopPropagation();
+    this._hass.callService('switch', 'toggle', { entity_id: btn.getAttribute('data-eid') });
+  }
+
+  _onDtOverrideClick(ev) {
+    const btn = ev.target && ev.target.closest && ev.target.closest('.dt-ovr button:not([disabled])');
+    if (!btn || !this._hass) return;
+    ev.stopPropagation();
+    const grp = btn.closest('.dt-ovr');
+    const sel = grp.getAttribute('data-sel');
+    const opt = btn.getAttribute('data-opt');
+    this._hass.callService('select', 'select_option', { entity_id: sel, option: opt });
+    if (opt === 'Auto') {
+      // Auto means "GridLens controls it" — also engage the per-device enable switch,
+      // same as grid-lens-load-control-card.js's own override-button handler.
+      this._hass.callService('switch', 'turn_on', { entity_id: grp.getAttribute('data-ctl') });
+    }
+  }
+
+  // Plain-toggle fallback (an older integration build with no override select yet).
+  _onDtSwitchClick(ev) {
+    const el = ev.target && ev.target.closest && ev.target.closest('.dt-sw[data-eid]');
+    if (!el || !this._hass) return;
+    ev.stopPropagation();
+    this._hass.callService('switch', 'toggle', { entity_id: el.getAttribute('data-eid') });
+  }
+
+  _onDtBoostInputChange(ev) {
+    const el = ev.target;
+    if (!el || !el.matches || !el.matches('.dt-boost-input') || !this._hass) return;
+    const eid = el.getAttribute('data-eid');
+    let v = parseFloat(el.value);
+    if (!Number.isFinite(v) || v < 0) v = 0;
+    this._hass.callService('number', 'set_value', { entity_id: eid, value: v });
+  }
+
+  _onDtBoostInputKeydown(ev) {
+    if (ev.key === 'Enter' && ev.target && ev.target.matches && ev.target.matches('.dt-boost-input')) {
+      ev.target.blur();
+    }
+  }
+
+  _onDtMaxCurInputChange(ev) {
+    const el = ev.target;
+    if (!el || !el.matches || !el.matches('.dt-maxcur-input') || !this._hass) return;
+    const eid = el.getAttribute('data-eid');
+    let v = parseFloat(el.value);
+    const lo = parseFloat(el.min), hi = parseFloat(el.max);
+    if (!Number.isFinite(v)) return;
+    if (Number.isFinite(lo)) v = Math.max(lo, v);
+    if (Number.isFinite(hi)) v = Math.min(hi, v);
+    this._hass.callService('number', 'set_value', { entity_id: eid, value: v });
+  }
+
+  _onDtMaxCurInputKeydown(ev) {
+    if (ev.key === 'Enter' && ev.target && ev.target.matches && ev.target.matches('.dt-maxcur-input')) {
+      ev.target.blur();
+    }
   }
 
   _renderShell() {
@@ -506,8 +688,113 @@ class GridLensAdvisoryCard extends HTMLElement {
                         cursor:pointer; font-family:inherit; flex:0 0 auto; }
         .dt-reset-btn:hover { border-color:var(--good); color:var(--good); }
         .dt-empty { padding:8px 2px; font-size:11.5px; color:var(--ink2); }
+
+        /* Load control (FEATURES.md §6/§6a) — merged into the per-device panel 2026-09-24
+           from grid-lens-load-control-card.js's own row. Ported verbatim from that card's
+           CSS with every class `dt-`-prefixed: this card's OWN `.row` already means
+           something else (`.modeline .row`, the mode-transition timeline below), so bare
+           class names here would leak through that compound selector and corrupt it — see
+           chart-common.js's "Load control helpers" section header for the full story.
+           `.card { position: relative }` is needed for the tooltip's own position math
+           (attachTooltip below) — this card had no tooltip before this merge. */
+        .card { position: relative; }
+        .dt-row .gbar { flex: 0 0 auto; width: 42px; height: 4px; border-radius: 2px;
+                background: var(--border); overflow: hidden; }
+        .dt-row .gbar > span { display: block; height: 100%; background: var(--good); }
+        .dt-row .greedy-line { font-size: 11px; color: var(--ink2); opacity: .8; margin-top: 1px;
+                            display: flex; align-items: center; gap: 6px; }
+        .dt-row .greedy-line.active { color: var(--good); opacity: 1; }
+        .dt-row .soc-cap { font-size: 11px; color: var(--buy); opacity: .9; margin-top: 1px;
+                        display: flex; align-items: center; gap: 5px; }
+        .dt-row .soc-cap ha-icon { --mdc-icon-size: 14px; }
+        .dt-sw { position: relative; flex: 0 0 auto; width: 40px; height: 22px; border-radius: 12px;
+              background: var(--border); cursor: pointer; transition: background .15s ease; }
+        .dt-sw::after { content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+              border-radius: 50%; background: var(--surface); box-shadow: 0 1px 3px rgba(0,0,0,.3);
+              transition: transform .15s ease; }
+        .dt-sw.on { background: var(--good); }
+        .dt-sw.on::after { transform: translateX(18px); }
+        .dt-sw.unavail { opacity: .45; cursor: default; }
+        .dt-ovr { display: flex; gap: 0; flex: 0 0 auto; border: 1px solid var(--border);
+               border-radius: 9px; overflow: hidden; }
+        .dt-ovr button { font-size: 10.5px; font-weight: 600; padding: 4px 9px; border: none;
+               background: transparent; color: var(--ink2); cursor: pointer;
+               font-family: inherit; border-left: 1px solid var(--border); }
+        .dt-ovr button:first-child { border-left: none; }
+        .dt-ovr button.active { background: var(--good); color: #fff; }
+        .dt-ovr button.active.off { background: var(--buy); }
+        .dt-ovr.disabled { cursor: not-allowed; }
+        .dt-ovr.disabled button { opacity: .4; cursor: not-allowed; }
+        .dt-greedy { display: flex; gap: 4px; flex: 0 0 auto; }
+        .dt-greedy .dt-gbtn { display: flex; align-items: center; justify-content: center;
+               width: 26px; height: 26px; border-radius: 7px; border: 1px solid var(--border);
+               background: transparent; color: var(--ink2); cursor: pointer; }
+        .dt-gbtn.on { background: var(--good); color: #fff; border-color: var(--good); }
+        .dt-gbtn ha-icon { --mdc-icon-size: 15px; }
+        .dt-gbtn.disabled { opacity: .35; cursor: not-allowed; }
+        .dt-boost { display: flex; align-items: center; gap: 3px; flex: 0 0 auto;
+               border: 1px solid var(--border); border-radius: 7px; padding: 3px 7px; }
+        .dt-boost.active { border-color: var(--good); }
+        .dt-boost.over { border-color: var(--buy); }
+        .dt-boost-cap { font-size: 10px; font-weight: 600; color: var(--buy); white-space: nowrap; }
+        .dt-boost-input { width: 42px; border: none; background: transparent; color: var(--ink);
+               font-size: 12px; font-family: inherit; text-align: right; }
+        .dt-boost-input::-webkit-outer-spin-button, .dt-boost-input::-webkit-inner-spin-button { margin: 0; }
+        .dt-boost-unit { font-size: 10px; color: var(--ink2); }
+        .dt-modcur { font-size: 11px; font-weight: 600; color: var(--ink); white-space: nowrap;
+               border: 1px solid var(--border); border-radius: 7px; padding: 3px 8px;
+               flex: 0 0 auto; font-variant-numeric: tabular-nums;
+               min-width: 100px; box-sizing: border-box; text-align: center; }
+        .dt-maxcur { display: flex; align-items: center; gap: 3px; flex: 0 0 auto;
+               border: 1px solid var(--border); border-radius: 7px; padding: 3px 7px;
+               min-width: 84px; box-sizing: border-box; }
+        .dt-maxcur-label { font-size: 10px; color: var(--ink2); }
+        .dt-maxcur-input { width: 32px; border: none; background: transparent; color: var(--ink);
+               font-size: 12px; font-family: inherit; text-align: right; }
+        .dt-maxcur-input::-webkit-outer-spin-button, .dt-maxcur-input::-webkit-inner-spin-button { margin: 0; }
+        .dt-maxcur-unit { font-size: 10px; color: var(--ink2); }
+        .dt-modcur.ph, .dt-maxcur.ph, .dt-gbtn.ph { visibility: hidden; border-color: transparent; }
+        /* Sparkline — fixed width (14 bars * 4px + 13 gaps * 1.5px = 75.5px) regardless of
+           how many real days came back, matching the fix applied to
+           grid-lens-load-control-card.js's own copy for the same reason (2026-09-24
+           misalignment bug) — sparklineHtml() pads with invisible `.dt-sbar.ph` bars. */
+        .dt-spark { display: flex; flex-direction: column; align-items: center; gap: 2px;
+                 flex: 0 0 auto; padding: 0 2px; }
+        .dt-sbars { display: flex; align-items: flex-end; gap: 1.5px; height: 22px; min-width: 75.5px; }
+        .dt-sbar { width: 4px; min-height: 1.5px; background: var(--ink2); opacity: .5;
+                border-radius: 1px 1px 0 0; }
+        .dt-sbar.today { background: var(--ink); opacity: .85; }
+        .dt-sbar.ph { visibility: hidden; }
+        .dt-spark-avg { font-size: 9.5px; color: var(--ink2); white-space: nowrap; }
+        .dt-spark-ph { width: 75.5px; height: 22px; }
+        .dt-est-toggle.on { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+        .dt-est-panel { flex: 1 1 100%; margin: 2px 0 6px 34px; padding: 10px 12px;
+               border: 1px solid var(--border); border-radius: 9px; background: var(--panel-bg, rgba(127,127,127,.06)); }
+        .dt-est-stats { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-bottom: 8px; }
+        .dt-est-stat { display: flex; flex-direction: column; gap: 1px; }
+        .dt-est-stat .v { font-size: 13px; font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
+        .dt-est-stat .l { font-size: 9.5px; color: var(--ink2); text-transform: uppercase; letter-spacing: .02em; }
+        .dt-est-chart { margin: 4px 0 8px; }
+        .dt-est-chart .chart-svg { width: 100%; height: 90px; display: block; }
+        .dt-est-empty { font-size: 11.5px; color: var(--ink2); font-style: italic; padding: 4px 0; }
+        .dt-est-samples { display: flex; flex-direction: column; gap: 3px; }
+        .dt-est-sample-hd { font-size: 9.5px; color: var(--ink2); text-transform: uppercase; letter-spacing: .02em; margin-bottom: 2px; }
+        .dt-est-sample { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--ink); padding: 2px 0; }
+        .dt-est-sample .t { color: var(--ink2); flex: 0 0 64px; }
+        .dt-est-sample .d { flex: 0 0 64px; font-variant-numeric: tabular-nums; }
+        .dt-est-sample .r { flex: 1 1 auto; font-size: 10.5px; }
+        .dt-est-sample.ok .r { color: var(--good); }
+        .dt-est-sample.rej .r { color: var(--buy); }
+        [data-tip] { outline: none; }
+        [data-tip]:focus-visible { box-shadow: 0 0 0 2px var(--good); border-radius: 4px; }
+        .dt-tt-pop { position: absolute; left: 0; top: 0; transform: translate(-50%, calc(-100% - 8px));
+               background: var(--ink); color: var(--surface); font-size: 11px; font-weight: 500;
+               line-height: 1.4; padding: 6px 9px; border-radius: 7px; max-width: 230px;
+               white-space: normal; pointer-events: none; opacity: 0; visibility: hidden;
+               box-shadow: 0 4px 14px rgba(0,0,0,.28); z-index: 30; transition: opacity .08s ease; }
+        .dt-tt-pop.show { opacity: 1; visibility: visible; }
       </style>
-      <div class="card"><div class="body"></div></div>
+      <div class="card"><div class="body"></div><div class="dt-tt-pop"></div></div>
     `;
     // Delegated: _paint() replaces .body's innerHTML on every repaint, so per-element
     // listeners would be torn off. The listeners live on .body, which survives.
@@ -518,7 +805,16 @@ class GridLensAdvisoryCard extends HTMLElement {
       body.addEventListener('click', (ev) => this._onDtResetClick(ev));
       body.addEventListener('input', (ev) => this._onDtSliderInput(ev));
       body.addEventListener('change', (ev) => this._onDtSliderChange(ev));
+      body.addEventListener('click', (ev) => this._onDtEstToggleClick(ev));
+      body.addEventListener('click', (ev) => this._onDtGreedyClick(ev));
+      body.addEventListener('click', (ev) => this._onDtOverrideClick(ev));
+      body.addEventListener('click', (ev) => this._onDtSwitchClick(ev));
+      body.addEventListener('change', (ev) => this._onDtBoostInputChange(ev));
+      body.addEventListener('keydown', (ev) => this._onDtBoostInputKeydown(ev));
+      body.addEventListener('change', (ev) => this._onDtMaxCurInputChange(ev));
+      body.addEventListener('keydown', (ev) => this._onDtMaxCurInputKeydown(ev));
     }
+    attachTooltip(this.shadowRoot, { popupClass: 'dt-tt-pop' });
   }
 
   _paint() {
@@ -582,7 +878,7 @@ class GridLensAdvisoryCard extends HTMLElement {
             </div>`).join('')}
         </div>
       </div>` : ''}
-      <div class="note">Advisory only — the battery follows its native EMS, so actual SOC won't track the plan until control is enabled. See the SOC/Power chart cards for the solar/load/price forecast validation. All series are the forecast for the current plan (${s.plan_name ? esc(s.plan_name) : '—'}).</div>`;
+      <div class="note">See the SOC/Power chart cards for the solar/load/price forecast validation. All series are the forecast for the current plan (${s.plan_name ? esc(s.plan_name) : '—'}).</div>`;
   }
 
   _modeTransitions() {

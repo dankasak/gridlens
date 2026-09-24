@@ -780,11 +780,203 @@ export function localMidnightDaysAgo(n) {
   return d;
 }
 
-// Same recorder query Today Boost's own sparkline uses (originally
-// grid-lens-load-control-card.js's _fetchHistory) — a plain N-day average, since
-// Daily Target only needs "what's typical" for the kWh readout next to a slider,
-// not the day-by-day series.
-export async function fetchDailyAverageKwh(hass, eid, historyDays = 14) {
+// Daily Target's kWh readout only needs "what's typical" as one number. The day-by-day
+// series it's built from (fetchDailyHistory, in the Load control helpers section below)
+// is the same recorder query the Today Boost sparkline needs anyway — this just averages
+// that series rather than running a second, near-identical recorder query.
+export async function fetchDailyAverageKwh(hass, eid, historyDays = HISTORY_DAYS) {
+  const days = await fetchDailyHistory(hass, eid, historyDays);
+  if (days == null) return null;
+  if (!days.length) return 0;
+  return days.reduce((s, d) => s + d.kwh, 0) / days.length;
+}
+
+// ----------------------------------------------------- Load control helpers
+//
+// Shared by grid-lens-load-control-card.js (the standalone "Deferrable Loads" card —
+// no longer seeded by default since 2026-09-24, still installed/registered for anyone
+// using it on its own dashboard) and grid-lens-advisory-card.js (whose per-device
+// Daily Target expander, on the Power Flow page, now ALSO carries this same row content
+// — Today Boost, Greedy toggles, Off now/On now/Auto, live status, the estimator debug
+// panel — merged in 2026-09-24 so a device's controls don't have to live on two
+// different pages). Centralised here rather than duplicated per-card, for the same
+// reason as the Daily Target helpers above (this exact drift already happened once).
+//
+// Every HTML-producing function below takes an `opts.prefix` string (default '') and
+// builds its own class names through a local `p()` closure — grid-lens-advisory-card.js
+// already has bare classes named `.row` for something unrelated (`_modeTimelineHtml`'s
+// mode-transition list), so every class ported here is `dt`-prefixed at that call site
+// to avoid leaking through the shared `.modeline .row` selector. Load-control-card's own
+// call sites pass no prefix, so its class names are unchanged from before this refactor.
+//
+// See FEATURES.md §6/§6a/§9/§9b for what this UI is; §6's "every row the same shape"
+// invariant (a device with no control switch/estimator gets the same disabled/placeholder
+// markup, never omitted) applies to every function below, not just load-control-card.
+
+export const HISTORY_DAYS = 14;
+
+export function controlSwitchFor(hass, phys) {
+  if (!hass || !phys) return null;
+  for (const eid of Object.keys(hass.states)) {
+    if (!eid.startsWith('switch.')) continue;
+    const a = hass.states[eid].attributes || {};
+    if (a.switch === phys && 'on_threshold_w' in a) return eid;
+  }
+  return null;
+}
+
+// The manual-override selector paired with a control switch — see select.py's
+// GridLensLoadOverrideSelect. The shared `switch` value is the deliberate join key.
+export function overrideSelectFor(hass, phys) {
+  if (!hass || !phys) return null;
+  for (const eid of Object.keys(hass.states)) {
+    if (!eid.startsWith('select.')) continue;
+    const a = hass.states[eid].attributes || {};
+    if (a.switch === phys && 'override' in a) return eid;
+  }
+  return null;
+}
+
+// Greedy Consumption's three per-device toggles (switch.py) — same `switch` join key as
+// the override select, disambiguated by `role`.
+export function greedySwitchFor(hass, phys, role) {
+  if (!hass || !phys) return null;
+  for (const eid of Object.keys(hass.states)) {
+    if (!eid.startsWith('switch.')) continue;
+    const a = hass.states[eid].attributes || {};
+    if (a.switch === phys && a.role === role) return eid;
+  }
+  return null;
+}
+
+// Max-current ceiling number (modulating devices only) — MODULATING_CONTRACT.md §6.
+export function maxCurrentFor(hass, d) {
+  if (!hass || !d || d.control_type !== 'modulating' || !d.energy_entity) return null;
+  for (const eid of Object.keys(hass.states)) {
+    if (!eid.startsWith('number.')) continue;
+    const a = hass.states[eid].attributes || {};
+    if (a.deferrable_sensor_id === d.energy_entity && a.role === 'max_current') return eid;
+  }
+  return null;
+}
+
+// The LoadEstimator-backed entity for a device, if any (load_estimation.py). Checks
+// energy_entity first (a fully synthetic "estimated load"), falling back to power_entity
+// (a device with a real energy sensor but only an inferred power reading).
+export function estimatorFor(hass, d) {
+  const tryEid = (eid) => {
+    if (!eid) return null;
+    const st = hass.states[eid];
+    const a = st && st.attributes;
+    return a && 'sample_count' in a ? { eid, state: st, attrs: a } : null;
+  };
+  return tryEid(d.energy_entity) || tryEid(d.power_entity);
+}
+
+// Day-0 SOC-ceiling status for a device, from whichever sensor publishes `ev_soc_status`
+// (the planned_dispatch sensor). Only returned when the ceiling is actually holding the
+// charge back (`soc_limited`).
+export function socCapFor(hass, energyEntity) {
+  if (!hass || !energyEntity) return null;
+  for (const eid of Object.keys(hass.states)) {
+    if (!eid.startsWith('sensor.')) continue;
+    const a = hass.states[eid].attributes;
+    if (!a || !Array.isArray(a.ev_soc_status)) continue;
+    const st = a.ev_soc_status.find((e) => e && e.sensor_id === energyEntity);
+    if (st && st.soc_limited) return st;
+  }
+  return null;
+}
+
+// Allowed HOURS in the 24 hours starting now, from a device's 7x48 half-hour weekly grid
+// (Monday first) — mirrors schedule_grid.rolling_window_hours on the Python side.
+export function windowHours(week) {
+  if (!Array.isArray(week) || week.length !== 7) return 24;
+  const now = new Date();
+  const wd = (now.getDay() + 6) % 7;   // JS Sunday=0 → Python Monday=0
+  const start = wd * 48 + now.getHours() * 2 + (now.getMinutes() >= 30 ? 1 : 0);
+  let n = 0;
+  for (let k = 0; k < 48; k++) {
+    const idx = (start + k) % (7 * 48);
+    const row = week[Math.floor(idx / 48)];
+    const slot = row ? row[idx % 48] : undefined;
+    if (slot === undefined || slot) n++;
+  }
+  return n / 2;
+}
+
+// Most kWh a device can physically take in the next 24h — a boost above this is silently
+// clamped by the LP, so the UI can show the ceiling rather than a number that quietly does
+// nothing.
+export function boostCeiling(d) {
+  const kw = parseFloat(d.max_kw);
+  if (!Number.isFinite(kw) || kw <= 0) return null;
+  return windowHours(d.schedule || d.default_schedule) * kw;
+}
+
+// Per-device row resolution — every configured deferrable load joined to its control
+// switch/override select/greedy switches/boost number/max-current number, all on the
+// device's `switch_entity`/`setpoint_entity` (never a naming convention). `resolveBoostEidFor`
+// (Daily Target helpers, above) is used rather than a load-control-specific boost
+// resolver — an earlier private `_boostFor` in grid-lens-load-control-card.js joined on
+// `deferrable_sensor_id` alone, without the `daily_target_scope`/`charge_target_role`
+// exclusions `resolveBoostEidFor` already has, so it could resolve to the wrong number
+// entity in iteration-order-dependent cases. Fixed by using the one correct resolver here.
+export function resolveLoadControlRows(hass, devices) {
+  return (devices || []).map((d) => {
+    // Falls back to the setpoint entity when there's no separate on/off switch — the
+    // common case for a modulating device with no switch at all (an OCPP/Zaptec/Wallbox
+    // charger, say).
+    const phys = d.switch_entity || d.setpoint_entity || null;
+    return {
+      device: d,
+      controlEid: controlSwitchFor(hass, phys),
+      selEid: overrideSelectFor(hass, phys),
+      gEid: greedySwitchFor(hass, phys, 'greedy'),
+      gsEid: greedySwitchFor(hass, phys, 'greedy_schedule'),
+      gfEid: greedySwitchFor(hass, phys, 'greedy_surplus'),
+      boostEid: resolveBoostEidFor(hass, d.energy_entity),
+      maxCurEid: maxCurrentFor(hass, d),
+    };
+  });
+}
+
+export function friendlyNote(note) {
+  if (!note) return '';
+  if (note.startsWith('command_error')) return 'Command error';
+  return note.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase());
+}
+
+// Friendly labels for LoadEstimator's sample_history rejection reasons (load_estimation.py).
+export const EST_REASON_LABELS = {
+  implausible: 'Outside plausible range',
+  contaminated: 'Another device changed state mid-sample',
+  too_short: 'On-period too short to trust',
+  counter_reset: 'Energy counter went backwards',
+};
+export function estReasonLabel(reason) {
+  return EST_REASON_LABELS[reason] || (reason ? reason.replace(/_/g, ' ') : '');
+}
+
+// Coarse "how long ago" for a sample_history timestamp — a debug-panel entry, not a live
+// countdown, so a coarse bucket reads better than exact HH:MM.
+export function relTime(iso) {
+  if (!iso) return '–';
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return '–';
+  if (ms < 90000) return 'just now';
+  const m = Math.round(ms / 60000);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
+// Daily kWh for the last `historyDays` days (today's bucket included, partial), from the
+// recorder's own long-term "change" statistic for a total_increasing energy sensor.
+// Returns null (not []) on failure so the caller can tell "no data yet" apart from
+// "queried, nothing came back".
+export async function fetchDailyHistory(hass, eid, historyDays = HISTORY_DAYS) {
   try {
     const res = await hass.callWS({
       type: 'recorder/statistics_during_period',
@@ -795,16 +987,473 @@ export async function fetchDailyAverageKwh(hass, eid, historyDays = 14) {
       types: ['change'],
     });
     const rows = (res && res[eid]) || [];
+    // `change` comes back in the sensor's own recorded unit — a Wh energy sensor reports
+    // change in Wh, not kWh, and the recorder API doesn't convert it.
     const st = hass.states && hass.states[eid];
     const divisor = (st && st.attributes && st.attributes.unit_of_measurement) === 'Wh' ? 1000.0 : 1.0;
-    const kwhs = rows
-      .map((r) => (r.change == null ? null : Math.max(0, +r.change) / divisor))
-      .filter((v) => v != null && !isNaN(v));
-    if (!kwhs.length) return 0;
-    return kwhs.reduce((s, v) => s + v, 0) / kwhs.length;
+    return rows
+      .map((r) => ({ start: new Date(r.start), kwh: r.change == null ? null : Math.max(0, +r.change) / divisor }))
+      .filter((d) => d.kwh != null && !isNaN(d.start.getTime()));
   } catch (e) {
     return null;
   }
+}
+
+// Shared explanation for the forecast-surplus trigger bar, wherever it's shown.
+function forecastSurplusTip(have, need) {
+  return `Forecast surplus: energy the plan expects to waste over the look-ahead `
+    + `(export at or below your Minimum Export Price, or an unused free-import window), `
+    + `up to the point the plan itself starts drawing the battery down. Greedy runs this `
+    + `device at that average rate now, off the battery, and the spill refills it. The `
+    + `bar is that surplus versus what the device would use running flat out for the `
+    + `same window — at 100% a plain on/off load runs fully; a modulating load ramps in `
+    + `proportionally below that. Currently ${have.toFixed(1)} of ${need.toFixed(1)} kWh.`;
+}
+
+// One-line live greedy status from the control switch's attributes (DeferrableLoadController
+// .status()). Priority order: hard SOC cutoff; greedy holding the device on (and why); greedy
+// armed but blocked; forecast-surplus armed and tracking. Empty when greedy is off entirely.
+export function greedyLine(a, opts = {}) {
+  const p = (n) => `${opts.prefix || ''}${n}`;
+  if (!a) return '';
+  if (a.soc_cutoff) {
+    return `<div class="${p('greedy-line')}" data-tip="${esc('This device reached its configured '
+      + 'SOC cutoff and is being stopped, regardless of the plan or Greedy Consumption. '
+      + 'Adjust Max SOC % in Grid Lens > Reconfigure if this is lower than intended.')}" tabindex="0">`
+      + `Stopped: SOC cutoff reached</div>`;
+  }
+  if (!a.greedy) return '';
+  const reason = a.greedy_reason;
+  if (reason) {
+    let fcRate = '';
+    if (reason === 'forecast_surplus' && a.forecast_target_w) {
+      fcRate = ` at ~${Math.round(+a.forecast_target_w)} W`;
+    }
+    const label = {
+      import_free: 'On — import is free right now',
+      export_surplus: 'On — running on surplus export',
+      forecast_surplus: `On — soaking forecast surplus${fcRate}`,
+    }[reason] || `On — ${esc(reason)}`;
+    let nums = '';
+    let bar = '';
+    if (reason === 'forecast_surplus' && a.forecast_free_kwh != null && a.forecast_needed_kwh) {
+      const have = +a.forecast_free_kwh, need = +a.forecast_needed_kwh;
+      const pct = Math.max(0, Math.min(100, need > 0 ? (have / need) * 100 : 100));
+      const tip = forecastSurplusTip(have, need);
+      nums = ` (${have.toFixed(1)} of ${need.toFixed(1)} kWh)`;
+      bar = `<span class="${p('gbar')}" tabindex="0" data-tip="${esc(tip)}">`
+        + `<span style="width:${pct.toFixed(0)}%"></span></span>`;
+    }
+    return `<div class="${p('greedy-line')} active">Greedy: ${label}${nums}${bar}</div>`;
+  }
+  if (a.greedy_blocked === 'no_battery_headroom') {
+    const have = a.forecast_free_kwh != null ? +a.forecast_free_kwh : null;
+    const need = a.forecast_needed_kwh != null ? +a.forecast_needed_kwh : null;
+    const nums = have != null && need ? ` (${have.toFixed(1)} of ${need.toFixed(1)} kWh)` : '';
+    return `<div class="${p('greedy-line')}" data-tip="${esc('The forecast-surplus bar has cleared, but '
+      + 'this condition also needs the battery to have enough SOC and free discharge rate to '
+      + 'cover this device right now — otherwise turning it on would draw straight from the '
+      + 'grid. Configure a Battery SOC sensor and a signed Battery charge power sensor in '
+      + 'Grid Lens > Reconfigure > Battery, or wait for the battery to have headroom.')}" tabindex="0">`
+      + `Greedy: forecast surplus reached, but no battery headroom${nums}</div>`;
+  }
+  if (a.greedy_blocked === 'no_grid_power') {
+    return `<div class="${p('greedy-line')}" data-tip="${esc('Greedy\'s export-surplus condition needs a live '
+      + 'grid power sensor (positive = importing, negative = exporting). Set the optional Grid Power '
+      + 'sensor in Grid Lens > Reconfigure > Energy sensors.')}" tabindex="0">`
+      + `Greedy: export is being wasted, but no grid power sensor is set</div>`;
+  }
+  if (a.greedy_blocked) {
+    const why = a.greedy_blocked === 'override'
+      ? 'suppressed by a manual override'
+      : 'outside this load\'s availability window';
+    return `<div class="${p('greedy-line')}">Greedy: armed, ${why}</div>`;
+  }
+  if (a.greedy_forecast_surplus && a.forecast_free_kwh != null && a.forecast_needed_kwh) {
+    const have = +a.forecast_free_kwh, need = +a.forecast_needed_kwh;
+    const pct = Math.max(0, Math.min(100, (have / need) * 100));
+    const tip = forecastSurplusTip(have, need);
+    return `<div class="${p('greedy-line')}">Greedy: armed · forecast surplus `
+      + `${have.toFixed(1)} / ${need.toFixed(1)} kWh`
+      + `<span class="${p('gbar')}" tabindex="0" data-tip="${esc(tip)}">`
+      + `<span style="width:${pct.toFixed(0)}%"></span></span></div>`;
+  }
+  return `<div class="${p('greedy-line')}">Greedy: armed, waiting for free energy</div>`;
+}
+
+// Modulating-only "why" line — reuses greedyLine's `.greedy-line`/`.greedy-line.active`
+// styling since it's the same class of message.
+export function modulationLine(a, d, opts = {}) {
+  const p = (n) => `${opts.prefix || ''}${n}`;
+  if (!a || d.control_type !== 'modulating') return '';
+  if (a.plugged_in === false) {
+    return `<div class="${p('greedy-line')}">Unplugged — charging stopped</div>`;
+  }
+  const label = {
+    plan: 'Following the plan',
+    surplus: 'Charging on surplus solar/export',
+    battery_priority: 'Reduced — home battery has priority',
+    override: 'Manual override',
+    off: 'Not charging',
+  }[a.modulation_source];
+  if (!label) return '';
+  return `<div class="${p('greedy-line')}${a.modulation_source === 'surplus' ? ' active' : ''}">${esc(label)}</div>`;
+}
+
+// Live current/power readout chip for a modulating device. Always renders a same-sized
+// box, populated or not, so a modulating device's extra column doesn't shift every other
+// field sideways relative to a plain on/off row.
+export function currentReadoutHtml(hass, d, opts = {}) {
+  const p = (n) => `${opts.prefix || ''}${n}`;
+  if (d.control_type !== 'modulating') return `<div class="${p('modcur')} ph"></div>`;
+  const spSt = d.setpoint_entity ? hass.states[d.setpoint_entity] : null;
+  const spVal = spSt ? parseFloat(spSt.state) : NaN;
+  const spOk = spSt && Number.isFinite(spVal) && !['unavailable', 'unknown'].includes(spSt.state);
+  const spUnit = (spSt && spSt.attributes && spSt.attributes.unit_of_measurement) || 'A';
+  const pwSt = d.power_entity ? hass.states[d.power_entity] : null;
+  const pwVal = pwSt ? parseFloat(pwSt.state) : NaN;
+  const pwOk = pwSt && Number.isFinite(pwVal) && !['unavailable', 'unknown'].includes(pwSt.state);
+  const pwUnit = (pwSt && pwSt.attributes && pwSt.attributes.unit_of_measurement) || 'W';
+  const pwKw = pwOk ? (pwUnit.toLowerCase() === 'kw' ? pwVal : pwVal / 1000) : null;
+  const parts = [];
+  if (spOk) parts.push(`${spVal.toFixed(1)} ${esc(spUnit)}`);
+  if (pwKw != null) parts.push(`${pwKw.toFixed(2)} kW`);
+  const text = parts.length ? parts.join(' · ') : '–';
+  const tip = 'Live charging current'
+    + (d.power_entity ? ' and measured power draw' : '')
+    + '. Shows "–" when the setpoint entity is unavailable.';
+  return `<div class="${p('modcur')}" tabindex="0" data-tip="${esc(tip)}">${text}</div>`;
+}
+
+// Max-current ceiling input (modulating devices only). Omitted (placeholder) when the
+// entity hasn't resolved yet — reads as "not configured", same as any other missing
+// auxiliary entity on this row.
+export function maxCurrentHtml(hass, r, d, opts = {}) {
+  const p = (n) => `${opts.prefix || ''}${n}`;
+  const ph = `<div class="${p('maxcur')} ph"></div>`;
+  if (d.control_type !== 'modulating' || !r.maxCurEid) return ph;
+  const st = hass.states[r.maxCurEid];
+  if (!st) return ph;
+  const ba = st.attributes || {};
+  const val = parseFloat(st.state);
+  const shown = Number.isFinite(val) ? val : (ba.max ?? 0);
+  const unit = ba.unit_of_measurement || 'A';
+  const tip = `Ceiling on the current Grid Lens may command this charger to — turn down `
+    + `to reserve capacity for something else sharing the circuit. `
+    + `Native max: ${ba.max ?? '–'} ${esc(unit)}.`;
+  return `
+    <div class="${p('maxcur')}" tabindex="0" data-tip="${esc(tip)}">
+      <span class="${p('maxcur-label')}">Max</span>
+      <input type="number" class="${p('maxcur-input')}" data-eid="${esc(r.maxCurEid)}"
+        min="${ba.min ?? 0}" max="${ba.max ?? 32}" step="${ba.step ?? 1}" value="${shown}">
+      <span class="${p('maxcur-unit')}">${esc(unit)}</span>
+    </div>`;
+}
+
+// "SOC-limited" chip — shown next to the sparkline when the plan's SOC ceiling is why
+// today's scheduled charge is short. Absent for a device charging freely below its cap,
+// and for a device with no SOC model at all.
+export function socCapHtml(hass, d, opts = {}) {
+  const p = (n) => `${opts.prefix || ''}${n}`;
+  const st = socCapFor(hass, d.energy_entity);
+  if (!st) return '';
+  const got = Number(st.day0_charge_kwh);
+  const want = Number(st.target_kwh);
+  const unmet = Number(st.unmet_kwh);
+  const cap = Number(st.max_percent);
+  const soc = Number(st.initial_percent);
+  const nums = [got, want, cap].every(Number.isFinite);
+  const body = nums ? `${got.toFixed(1)} of ~${want.toFixed(1)} kWh` : 'charge capped';
+  const tip = nums
+    ? `This load's battery is at ${soc.toFixed(0)}% and Grid Lens charges it only to ${cap.toFixed(0)}%. `
+      + `That leaves ~${got.toFixed(1)} kWh of room today — below the ~${want.toFixed(1)} kWh a typical `
+      + `day adds, so about ${unmet.toFixed(1)} kWh isn't being scheduled. Raise this load's `
+      + `Max SOC % in the Grid Lens integration's Reconfigure flow to schedule more.`
+    : `Grid Lens's SOC ceiling for this load is limiting today's scheduled charge.`;
+  return `<div class="${p('soc-cap')}" tabindex="0" data-tip="${esc(tip)}">
+    <ha-icon icon="mdi:battery-lock"></ha-icon><span>SOC-limited · ${body}</span>
+  </div>`;
+}
+
+// 14-day daily-kWh bar sparkline for a device's energy sensor. `historyEntry` is the
+// card's own cache entry (`{ ts, days }`) — undefined means "still loading" (a single
+// placeholder box), `days == null`/empty means the query failed or the sensor is too new
+// for long-term stats.
+//
+// Always renders exactly `historyDays` bar slots regardless of how many real days came
+// back — a device with less than a full history used to render a narrower `.sbars` block
+// (or, on a failed/empty query, nothing at all), which shifted every element after the
+// sparkline in the row's flex layout, row to row. Missing (older) days are padded with
+// invisible placeholder bars at the front, matching the same "always reserve the column"
+// convention this file's `.modcur.ph`/`.maxcur.ph` already use for the modulating-only
+// columns — found from a screenshot showing the Today Boost box, Greedy icons, and
+// segmented control at inconsistent x-positions row to row (2026-09-24).
+export function sparklineHtml(historyEntry, eid, opts = {}) {
+  const p = (n) => `${opts.prefix || ''}${n}`;
+  const historyDays = opts.historyDays || HISTORY_DAYS;
+  if (!historyEntry) return `<div class="${p('spark-ph')}"></div>`;
+  const real = historyEntry.days || [];
+  const todayKey = new Date().toDateString();
+  const full = real.filter((d) => d.start.toDateString() !== todayKey);
+  const avg = full.length ? full.reduce((s, d) => s + d.kwh, 0) / full.length : null;
+  const max = Math.max(0.1, ...real.map((d) => d.kwh));
+  const padCount = Math.max(0, historyDays - real.length);
+  const padBars = Array.from({ length: padCount }, () => `<div class="${p('sbar')} ph"></div>`).join('');
+  const realBars = real.map((d) => {
+    const isToday = d.start.toDateString() === todayKey;
+    const h = Math.max(1.5, (d.kwh / max) * 22).toFixed(1);
+    const when = d.start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+    const label = `${when}: ${d.kwh.toFixed(1)} kWh${isToday ? ' (so far today)' : ''}`;
+    return `<div class="${p('sbar')}${isToday ? ' today' : ''}" style="height:${h}px" tabindex="0" data-tip="${esc(label)}"></div>`;
+  }).join('');
+  const tip = real.length ? `Daily energy use, last ${real.length} of ${historyDays} days` : 'Daily energy use — no history yet';
+  return `
+    <div class="${p('spark')}" tabindex="0" data-tip="${esc(tip)}">
+      <div class="${p('sbars')}">${padBars}${realBars}</div>
+      ${avg != null ? `<div class="${p('spark-avg')}">avg ${avg.toFixed(1)} kWh/d</div>` : ''}
+    </div>`;
+}
+
+// Icon toggle that opens/closes the LoadEstimator debug panel for a row. `isOpen` is
+// passed explicitly (the caller's own expanded-Set membership) rather than read off any
+// particular card instance. Placeholder (same size, invisible) when the row has no
+// estimator at all, so the segmented control after it doesn't shift row to row depending
+// on whether the previous row happened to have one — same bug family as the sparkline fix
+// above, same fix pattern.
+export function estimatorToggleHtml(est, isOpen, opts = {}) {
+  const p = (n) => `${opts.prefix || ''}${n}`;
+  if (!est) return `<div class="${p('gbtn')} ph"></div>`;
+  return `<div class="${p('gbtn')} ${p('est-toggle')}${isOpen ? ' on' : ''}" data-est-eid="${esc(est.eid)}" tabindex="0"
+    data-tip="${isOpen ? 'Hide' : 'Show'} how this device's usage is being estimated">
+    <ha-icon icon="mdi:chart-bell-curve-cumulative"></ha-icon>
+  </div>`;
+}
+
+// The expanded LoadEstimator debug panel: current numbers, a convergence chart of
+// accepted samples over time, and the most recent accept/reject decisions with why.
+export function estimatorPanelHtml(d, est, opts = {}) {
+  const p = (n) => `${opts.prefix || ''}${n}`;
+  const a = est.attrs;
+  const history = Array.isArray(a.sample_history) ? a.sample_history : [];
+  const kind = a.energy_sensor ? 'own meter' : (a.load_power_sensor ? 'house load' : 'not sampled yet');
+
+  // Prefer the last *accepted* sample_history entry over last_sample_delta_w/_at — those
+  // two attributes are only ever updated in-memory and go stale to null right after HA
+  // restarts even when sample_count shows samples already happened; history is persisted.
+  const lastAccepted = [...history].reverse().find((h) => h.accepted);
+  const lastSampleStr = lastAccepted
+    ? `${lastAccepted.delta_w != null ? lastAccepted.delta_w.toFixed(0) + ' W' : '–'} · ${relTime(lastAccepted.at)}`
+    : (a.last_sample_delta_w != null ? `${a.last_sample_delta_w.toFixed(0)} W · ${relTime(a.last_sample_at)}` : '–');
+
+  const stats = [
+    ['Estimate', `${(a.estimated_kw * 1000).toFixed(0)} W`],
+    ['Seed', `${a.manual_kw.toFixed(2)} kW`],
+    ['Samples', `${a.sample_count}`],
+    ['Last sample', lastSampleStr],
+    ['Calibrates from', kind],
+    ['Auto-refine', a.auto_refine ? 'On' : 'Off'],
+  ];
+  if (a.track_energy) stats.push(['Running today', `${(parseFloat(est.state.state) || 0).toFixed(2)} kWh`]);
+  const statsHtml = stats.map(([l, v]) => `
+    <div class="${p('est-stat')}"><span class="v">${esc(v)}</span><span class="l">${esc(l)}</span></div>`).join('');
+
+  const withTime = history.map((h) => ({ ...h, t: new Date(h.at) })).filter((h) => !isNaN(h.t.getTime()));
+  let chartHtml;
+  if (withTime.length >= 2) {
+    const t0 = withTime[0].t.getTime(), t1 = Date.now();
+    chartHtml = multiLineChart(withTime, { t0, t1 }, [{
+      points: withTime.map((h) => ({ t: h.t, v: h.resulting_w })),
+      color: 'var(--ink)',
+    }], { height: 90, fmt: (v) => `${v.toFixed(0)}W` });
+  } else {
+    chartHtml = `<div class="${p('est-empty')}">Not enough samples yet to chart a trend — needs at least 2 observations (accepted or rejected).</div>`;
+  }
+
+  const rows = history.slice(-8).reverse().map((h) => {
+    const magnitude = h.delta_w != null ? `${h.delta_w.toFixed(0)} W` : '–';
+    const why = h.accepted ? 'Accepted' : `Rejected · ${esc(estReasonLabel(h.reason))}`;
+    return `<div class="${p('est-sample')} ${h.accepted ? 'ok' : 'rej'}">
+      <span class="t">${relTime(h.at)}</span><span class="d">${magnitude}</span><span class="r">${why}</span>
+    </div>`;
+  }).join('');
+  const samplesHtml = history.length
+    ? `<div class="${p('est-samples')}"><div class="${p('est-sample-hd')}">Recent observations</div>${rows}</div>`
+    : '';
+
+  return `
+    <div class="${p('est-panel')}">
+      <div class="${p('est-stats')}">${statsHtml}</div>
+      <div class="${p('est-chart')}">${chartHtml}</div>
+      ${samplesHtml}
+    </div>`;
+}
+
+// Segmented Off now/On now/Auto control — or its disabled/loading placeholder, or the
+// plain-toggle fallback for an older integration build with no override select yet. Every
+// device gets one of these four, same shape, per FEATURES.md §6's "every row the same
+// shape" invariant.
+export function controlHtml(hass, r, d, opts = {}) {
+  const p = (n) => `${opts.prefix || ''}${n}`;
+  const controlSt = r.controlEid ? hass.states[r.controlEid] : null;
+  const on = controlSt ? controlSt.state === 'on' : false;
+  if (!d.controllable) {
+    return `
+      <div class="${p('ovr')} disabled" tabindex="0" data-tip="Full control has not yet been configured — assign a switch via the Grid Lens integration's Reconfigure flow to enable Off now / On now / Auto.">
+        <button disabled>Off now</button>
+        <button disabled>On now</button>
+        <button disabled>Auto</button>
+      </div>`;
+  }
+  if (r.selEid) {
+    const cur = hass.states[r.selEid] ? hass.states[r.selEid].state : null;
+    return `
+      <div class="${p('ovr')}" data-sel="${esc(r.selEid)}" data-ctl="${esc(r.controlEid)}" data-tip="Manual override">
+        <button data-opt="Force Off" class="${cur === 'Force Off' ? 'active off' : ''}">Off now</button>
+        <button data-opt="Force On" class="${cur === 'Force On' ? 'active' : ''}">On now</button>
+        <button data-opt="Auto" class="${cur === 'Auto' && on ? 'active' : ''}"
+          data-tip="Grid Lens schedules this load">Auto</button>
+      </div>`;
+  }
+  if (r.controlEid) {
+    return `<div class="${p('sw')} ${on ? 'on' : ''}" data-eid="${esc(r.controlEid)}" tabindex="0" data-tip="${on ? 'Turn off' : 'Turn on'}"></div>`;
+  }
+  // controllable per config, but the control entities haven't appeared yet (a startup
+  // race) — same disabled placeholder, self-heals on the next repaint.
+  return `
+    <div class="${p('ovr')} disabled" tabindex="0" data-tip="Control entities are still loading…">
+      <button disabled>Off now</button><button disabled>On now</button><button disabled>Auto</button>
+    </div>`;
+}
+
+// Greedy Consumption's three per-device toggle icons — always all three, disabled/dimmed
+// with an explanatory tooltip when the device isn't controllable, so every row keeps the
+// same shape regardless of what's actually configured.
+export function greedyButtonsHtml(hass, r, d, opts = {}) {
+  const p = (n) => `${opts.prefix || ''}${n}`;
+  const greedyWhy = !d.controllable
+    ? "Only available once this load has a control switch — assign one via the Grid Lens integration's Reconfigure flow."
+    : 'Loading…';
+  const gBtn = (icon, eid, on2, label) => eid
+    ? `<div class="${p('gbtn')}${on2 ? ' on' : ''}" data-eid="${esc(eid)}" tabindex="0" data-tip="${esc(label)}">
+         <ha-icon icon="${icon}"></ha-icon>
+       </div>`
+    : `<div class="${p('gbtn')} disabled" tabindex="0" data-tip="${esc(greedyWhy)}">
+         <ha-icon icon="${icon}"></ha-icon>
+       </div>`;
+  const gOn = r.gEid && hass.states[r.gEid] && hass.states[r.gEid].state === 'on';
+  const gsOn = r.gsEid && hass.states[r.gsEid] && hass.states[r.gsEid].state === 'on';
+  const gfOn = r.gfEid && hass.states[r.gfEid] && hass.states[r.gfEid].state === 'on';
+  return `
+    <div class="${p('greedy')}">
+      ${gBtn('mdi:leaf', r.gEid, gOn,
+        'Greedy Consumption: turn on whenever import is free or export is being wasted')}
+      ${gBtn('mdi:calendar-clock', r.gsEid, gsOn,
+        "Greedy Respects Schedule: only greedy-fire inside this load's own availability window")}
+      ${gBtn('mdi:weather-sunny-alert', r.gfEid, gfOn,
+        'Greedy Forecast Surplus: also start early when the plan forecasts more free energy going to waste than this load could use (needs Greedy Consumption on; may import briefly)')}
+    </div>`;
+}
+
+// Today Boost override input — shown for every device that has one, controllable or not.
+export function boostInputHtml(hass, r, d, opts = {}) {
+  const p = (n) => `${opts.prefix || ''}${n}`;
+  if (!r.boostEid || !hass.states[r.boostEid]) return '';
+  const bst = hass.states[r.boostEid];
+  const ba = bst.attributes || {};
+  const val = parseFloat(bst.state);
+  const shown = Number.isFinite(val) ? val : 0;
+  const active = shown > 0;
+  const ceiling = boostCeiling(d);
+  const over = ceiling != null && shown > ceiling + 1e-6;
+  const tip = ceiling == null
+    ? "Today's kWh target override — 0 uses the 14-day historical average"
+    : `Today's kWh target override — 0 uses the 14-day historical average. `
+      + `At ${d.max_kw} kW, this load's schedule allows at most `
+      + `${ceiling.toFixed(1)} kWh over the next 24 h; anything above that `
+      + `cannot be scheduled.`;
+  return `
+    <div class="${p('boost')}${active ? ' active' : ''}${over ? ' over' : ''}" tabindex="0" data-tip="${esc(tip)}">
+      <input type="number" class="${p('boost-input')}" data-eid="${esc(r.boostEid)}"
+        min="${ba.min ?? 0}" max="${ba.max ?? 999}" step="${ba.step ?? 0.5}"
+        value="${shown}">
+      <span class="${p('boost-unit')}">kWh</span>
+      ${over ? `<span class="${p('boost-cap')}">max ${ceiling.toFixed(1)}</span>` : ''}
+    </div>`;
+}
+
+// Delegated tooltip system, standing in for the native title="" attribute everywhere on a
+// card (native tooltips have a long browser-controlled delay and are unreliable on touch).
+// Bound once per shadow root via a WeakSet guard, rather than an instance flag the caller
+// has to manage, so either card can call this unconditionally from its own _renderShell().
+const _tooltipBoundRoots = new WeakSet();
+export function attachTooltip(shadowRoot, opts = {}) {
+  if (!shadowRoot || _tooltipBoundRoots.has(shadowRoot)) return;
+  _tooltipBoundRoots.add(shadowRoot);
+  const popupClass = opts.popupClass || 'tt-pop';
+  const triggerAttr = opts.triggerAttr || 'data-tip';
+  const cardSelector = opts.cardSelector || '.card';
+  const delayMs = opts.delayMs ?? 150;
+  const root = shadowRoot;
+  let timer = null;
+  let shownFor = null;
+
+  const place = (el) => {
+    const card = root.querySelector(cardSelector);
+    const pop = root.querySelector(`.${popupClass}`);
+    if (!card || !pop) return;
+    const er = el.getBoundingClientRect();
+    const cr = card.getBoundingClientRect();
+    const anchorX = er.left - cr.left + er.width / 2;
+    pop.style.left = `${anchorX}px`;
+    pop.style.top = `${er.top - cr.top}px`;
+    pop.classList.add('show');
+    requestAnimationFrame(() => {
+      const pw = pop.offsetWidth;
+      const half = pw / 2;
+      let left = anchorX;
+      if (left - half < 4) left = 4 + half;
+      if (left + half > cr.width - 4) left = cr.width - 4 - half;
+      pop.style.left = `${left}px`;
+    });
+  };
+  const show = (el) => {
+    const text = el.getAttribute(triggerAttr);
+    const pop = root.querySelector(`.${popupClass}`);
+    if (!text || !pop) return;
+    pop.textContent = text;
+    shownFor = el;
+    place(el);
+  };
+  const hide = (el) => {
+    if (el && shownFor !== el) return;
+    shownFor = null;
+    const pop = root.querySelector(`.${popupClass}`);
+    if (pop) pop.classList.remove('show');
+  };
+  root.addEventListener('mouseover', (e) => {
+    const el = e.target.closest(`[${triggerAttr}]`);
+    if (!el || el === shownFor) return;
+    clearTimeout(timer);
+    timer = setTimeout(() => show(el), delayMs);
+  });
+  root.addEventListener('mouseout', (e) => {
+    const el = e.target.closest(`[${triggerAttr}]`);
+    if (!el) return;
+    clearTimeout(timer);
+    hide(el);
+  });
+  // Keyboard tab-focus and touch (many mobile browsers focus a tapped control before
+  // firing its click) — shown immediately, no delay.
+  root.addEventListener('focusin', (e) => {
+    const el = e.target.closest(`[${triggerAttr}]`);
+    if (!el) return;
+    clearTimeout(timer);
+    show(el);
+  });
+  root.addEventListener('focusout', (e) => {
+    const el = e.target.closest(`[${triggerAttr}]`);
+    if (el) hide(el);
+  });
 }
 
 // Shared inner CSS (no <style> wrapper) — imported by both the chart-card base class

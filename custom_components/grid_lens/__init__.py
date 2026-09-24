@@ -435,15 +435,15 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
             "grid_options": {"columns": "full"},
         })
     if deferrable_sensors:
-        if not battery_control:
-            settings_cards.append({
-                "type": "heading", "heading": "Control", "heading_style": "title",
-                "icon": "mdi:toggle-switch-outline", "grid_options": {"columns": "full"},
-            })
-        settings_cards.append({
-            "type": "custom:grid-lens-load-control-card", "title": "Deferrable Loads",
-            "grid_options": {"columns": "full"},
-        })
+        # "Deferrable Loads" (grid-lens-load-control-card) is NOT seeded here (was, until
+        # 2026-09-24) — its per-device controls (Today Boost, Greedy toggles, Off now/On
+        # now/Auto, live status, the estimator debug panel) are now ALSO rendered on
+        # grid-lens-advisory-card's compact header on the Power Flow view, behind the same
+        # chevron expander Daily Target already uses there, so a second copy on Settings
+        # would just be a redundant, easy-to-forget-to-keep-in-sync UI — same reasoning as
+        # Daily Target's own relocation below. grid-lens-load-control-card.js still exists
+        # and is still registered as a Lovelace resource for anyone who wants it as its own
+        # card on a different dashboard.
         # Daily Target (percent-of-average master + per-device targets, FEATURES.md §9b)
         # is NOT seeded here (was, 2026-09-21 to 2026-09-22) — its default-visible home
         # is now grid-lens-advisory-card's compact header on the Power Flow view (solar
@@ -456,10 +456,22 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
         # for a device with SOC tracking configured (same condition as show_ev above —
         # the card itself auto-discovers per device, but the heading/card are only worth
         # seeding at all when at least one device could ever populate a row).
-        if any(
+        # The "Control" heading is gated on this SOC-tracking condition too (not just
+        # `not battery_control`) now that grid-lens-load-control-card is no longer seeded
+        # unconditionally above — without this, a deferrable-load-only install with no
+        # SOC-tracked device and no battery would get a "Control" heading with zero cards
+        # under it before the unconditional "Schedules" heading further down (caught while
+        # removing the load-control seed entry, 2026-09-24).
+        has_soc_tracking = any(
             (s or "").strip()
             for s in (entry.data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, []) or [])
-        ):
+        )
+        if has_soc_tracking and not battery_control:
+            settings_cards.append({
+                "type": "heading", "heading": "Control", "heading_style": "title",
+                "icon": "mdi:toggle-switch-outline", "grid_options": {"columns": "full"},
+            })
+        if has_soc_tracking:
             settings_cards.append({
                 "type": "custom:grid-lens-charge-target-card", "title": "Charge Targets",
                 "grid_options": {"columns": "full"},
@@ -622,7 +634,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260923e"
+    _CARD_VERSION = "20260924c"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
