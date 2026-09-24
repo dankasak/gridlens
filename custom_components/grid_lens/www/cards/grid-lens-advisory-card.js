@@ -691,12 +691,16 @@ class GridLensAdvisoryCard extends HTMLElement {
 
         /* Load control (FEATURES.md §6/§6a) — merged into the per-device panel 2026-09-24
            from grid-lens-load-control-card.js's own row. Ported verbatim from that card's
-           CSS with every class `dt-`-prefixed: this card's OWN `.row` already means
-           something else (`.modeline .row`, the mode-transition timeline below), so bare
+           CSS with every class 'dt-'-prefixed: this card's OWN '.row' already means
+           something else ('.modeline .row', the mode-transition timeline below), so bare
            class names here would leak through that compound selector and corrupt it — see
            chart-common.js's "Load control helpers" section header for the full story.
-           `.card { position: relative }` is needed for the tooltip's own position math
-           (attachTooltip below) — this card had no tooltip before this merge. */
+           NOTE: no backtick characters anywhere in this comment block — it lives inside
+           this method's own shadowRoot.innerHTML template literal, so a literal backtick
+           here closes that string early and corrupts everything after it (found live
+           2026-09-24, a Firefox "SyntaxError: unexpected token: identifier" thrown loading
+           this exact file). '.card { position: relative }' is needed for the tooltip's own
+           position math (attachTooltip below) — this card had no tooltip before this merge. */
         .card { position: relative; }
         .dt-row .gbar { flex: 0 0 auto; width: 42px; height: 4px; border-radius: 2px;
                 background: var(--border); overflow: hidden; }
@@ -757,7 +761,7 @@ class GridLensAdvisoryCard extends HTMLElement {
         /* Sparkline — fixed width (14 bars * 4px + 13 gaps * 1.5px = 75.5px) regardless of
            how many real days came back, matching the fix applied to
            grid-lens-load-control-card.js's own copy for the same reason (2026-09-24
-           misalignment bug) — sparklineHtml() pads with invisible `.dt-sbar.ph` bars. */
+           misalignment bug) — sparklineHtml() pads with invisible '.dt-sbar.ph' bars. */
         .dt-spark { display: flex; flex-direction: column; align-items: center; gap: 2px;
                  flex: 0 0 auto; padding: 0 2px; }
         .dt-sbars { display: flex; align-items: flex-end; gap: 1.5px; height: 22px; min-width: 75.5px; }

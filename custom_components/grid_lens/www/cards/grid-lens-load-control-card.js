@@ -294,11 +294,14 @@ class GridLensLoadControlCard extends HTMLElement {
            identity to keep consistent across cards.
            Fixed width (14 bars * 4px + 13 gaps * 1.5px = 75.5px), NOT sized to however many
            real days came back — a device with less than a full 14-day history used to
-           render a narrower `.sbars` (or nothing at all on a failed/empty query), which
+           render a narrower '.sbars' (or nothing at all on a failed/empty query), which
            shifted the Today Boost box/Greedy icons/segmented control leftward on that row
            relative to a full-history row. sparklineHtml() (chart-common.js) now always pads
-           to a full 14 slots with invisible `.sbar.ph` bars — found from a screenshot
-           showing exactly this misalignment (2026-09-24). */
+           to a full 14 slots with invisible '.sbar.ph' bars — found from a screenshot
+           showing exactly this misalignment (2026-09-24). No backtick characters in this
+           comment — it lives inside this method's own shadowRoot.innerHTML template
+           literal, and one here would close that string early (see grid-lens-advisory-
+           card.js's own copy of this same fix, and the SyntaxError it caused live). */
         .spark { display: flex; flex-direction: column; align-items: center; gap: 2px;
                  flex: 0 0 auto; padding: 0 2px; }
         .sbars { display: flex; align-items: flex-end; gap: 1.5px; height: 22px; min-width: 75.5px; }
