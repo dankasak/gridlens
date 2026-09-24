@@ -1229,7 +1229,23 @@ cheapest slots.
 OCPP `SetChargingProfile` calls or cloud API writes to Easee/Wallbox/Zaptec. A 30-second loop
 with no throttle is a write storm against someone's charger. Hence a `write_deadband_a`
 (0.5 A, converted to the setpoint's own unit) and a `min_write_interval_s` (20 s) — both
-bypassed when the target is 0 or crosses the on/off boundary, which always writes immediately.
+bypassed when the target is 0 or crosses the on/off boundary, which writes immediately for a
+hard interlock (SOC cutoff, unplugged) or a genuine reconnect.
+
+**⚠ A plan/surplus-driven crossing is instead held to a minimum dwell — found live
+2026-09-25.** With no time-based hold on an on/off *crossing* (only the deadband/rate-limit
+above, both of which a crossing always bypassed), a live target oscillating across the
+device's floor produced a real start/stop button press on the household's Wattpilot every
+~30 s fast tick for 17 minutes straight — the battery was at 16-17% SOC against a 10%
+configured minimum, exactly the marginal-headroom regime where the live surplus/battery-
+priority figure (see `_BATTERY_PRIORITY_BIAS_W` below) sits right at the boundary. Fixed with
+`MODULATION_CROSSING_DWELL_SECONDS` (5 minutes, household-set): a plan/surplus crossing must
+hold the current state at least this long since the last real transition before it's allowed
+to flip again (`ModulatingLoadController._write`'s `debounce` parameter). `soc_cutoff`,
+`unplugged`, and a just-connected reassert never pass `debounce=True` and so remain instant —
+this dwell only throttles the *ordinary* control decision, never a safety interlock. See
+also the new SOC-margin gate on Greedy Forecast Surplus itself, described where that feature
+is documented above.
 
 **Unit handling.** `watts = amps × voltage × phases`. The unit is inferred from the setpoint
 entity's own `unit_of_measurement` (resolved lazily — at construction the charger integration
@@ -1540,6 +1556,21 @@ never fires**, same discipline as conditions #1 and #2's missing-sensor handling
 `greedy_blocked = "no_battery_headroom"` whenever the spill rate alone would have driven a
 draw (see below) — distinguishing "the spill hasn't cleared the bar yet" from "it cleared,
 but the battery can't safely supply it right now".
+
+**⚠ A safety margin above `battery_min_soc` gates the condition entirely — added
+2026-09-25 after a live incident.** Both gates above used to switch on at `soc <=
+battery_min_soc` exactly — no margin. At 16-17% SOC against a 10% configured minimum
+(~6-7 points of real margin), that returned a small-but-positive headroom, and the
+household's Wattpilot (a modulating/button-actuated load — no stateful switch) flapped its
+start/stop buttons every ~30 s fast tick for 17 minutes straight before it was noticed and
+forced off by hand. `GREEDY_FORECAST_SURPLUS_MIN_SOC_MARGIN_PCT` (10 percentage points,
+household-set) widens the gate: both `_battery_headroom_w()` and `_battery_headroom_kwh()`
+now return `0.0` whenever `soc <= battery_min_soc + margin`, not just at/below the true
+minimum — condition #3 doesn't engage at all below that line, on *any* device, not just a
+modulating one. Once the margin is cleared, the energy figures are still measured against
+the true `battery_min_soc`, unchanged — the margin decides *whether* to run, not how much
+energy is actually available once running is allowed. See also the companion fix on the
+modulating-load write path itself, documented in this file's "Write economy" section above.
 
 **⚠ `battery_charge_power_sensor` isn't signed on every inverter (fixed 2026-09-11).** The
 original assumption — positive = charging, negative = discharging, one sensor — holds for

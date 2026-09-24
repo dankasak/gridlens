@@ -298,6 +298,20 @@ DEFAULT_MIN_CHARGE_CURRENT_A = 6.0
 # and slow enough that a cloud-edge oscillation doesn't turn into a write storm (the
 # controller's own deadband + min-write-interval carry the rest of that load).
 MODULATION_INTERVAL_SECONDS = 30
+# Minimum time a modulating load must hold its current on/off state before a plan/surplus-
+# driven crossing is allowed to flip it again — the modulating-load equivalent of the on/off
+# controller's min_on_seconds/min_off_seconds debounce (load_controller.py), which
+# ModulatingLoadController does not otherwise apply to its button/setpoint crossings. Set to
+# 5 minutes per household direction after the 2026-09-25 Wattpilot flapping incident (see
+# GRIDLENS_CHECKLIST.md) — short enough to still react to a real multi-minute solar/cloud
+# transition, long enough to kill a tick-to-tick oscillation across the on/off boundary.
+MODULATION_CROSSING_DWELL_SECONDS = 300
+# Percentage points the battery's live SOC must sit above its configured minimum before
+# Greedy Forecast Surplus is allowed to draw it down at all. Below this, the headroom
+# calculation is too marginal to size a stable draw from — found 2026-09-25: the Wattpilot's
+# start/stop buttons flapped every ~30s for 17 minutes with the battery at 16-17% against a
+# 10% configured minimum (only ~6-7 points of real margin). See GRIDLENS_CHECKLIST.md.
+GREEDY_FORECAST_SURPLUS_MIN_SOC_MARGIN_PCT = 10.0
 # Charger status strings that mean "nothing is connected / can't deliver". Matched
 # case-insensitively against a CONF_DEFERRABLE_LOAD_PLUG_SENSOR state. Everything else —
 # including any state we don't recognise — counts as plugged, per the fail-open rule above.

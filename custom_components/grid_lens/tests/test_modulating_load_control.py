@@ -157,6 +157,7 @@ def _bootstrap():
 from gl.inverters.base import BatteryAction  # noqa: E402  (loaded above)
 
 MODULATION_INTERVAL_SECONDS = CONST.MODULATION_INTERVAL_SECONDS
+MODULATION_CROSSING_DWELL_SECONDS = CONST.MODULATION_CROSSING_DWELL_SECONDS
 DEFAULT_SUPPLY_VOLTAGE = CONST.DEFAULT_SUPPLY_VOLTAGE
 DEFAULT_MIN_CHARGE_CURRENT_A = CONST.DEFAULT_MIN_CHARGE_CURRENT_A
 
@@ -425,7 +426,10 @@ async def _run_floor_hysteresis_holds_then_drops():
     assert _values(hass) == [13.0, 6.0]             # same setpoint -> nothing written
     assert c._commanded is True
 
-    t += timedelta(seconds=30)
+    # The on->off drop below is itself a crossing, so it must clear the crossing dwell
+    # (MODULATION_CROSSING_DWELL_SECONDS) since the on-crossing at _T0, not just the
+    # amplitude hysteresis bar this test is actually about.
+    t = _T0 + timedelta(seconds=MODULATION_CROSSING_DWELL_SECONDS + 30)
     await c.modulate(800.0, t)                      # below 0.6 * floor -> genuinely stop
     assert _values(hass) == [13.0, 6.0, 0.0]
     assert c._commanded is False
@@ -445,7 +449,9 @@ async def _run_floor_hysteresis_upward_boundary():
     t += timedelta(seconds=30)
     await c.modulate(1379.0, t)                     # a whisker under the floor -> still off
     assert _values(hass) == [0.0]
-    t += timedelta(seconds=30)
+    # The off->on start below is itself a crossing, so it must clear the crossing dwell
+    # since the off-crossing established at _T0, not just the floor comparison under test.
+    t = _T0 + timedelta(seconds=MODULATION_CROSSING_DWELL_SECONDS + 30)
     await c.modulate(1380.0, t)                     # at the floor -> start
     assert _values(hass) == [0.0, 6.0]
     assert c._commanded is True
@@ -493,17 +499,88 @@ async def _run_write_min_interval_skip():
 
 
 async def _run_boundary_crossing_always_writes():
-    """An on/off transition is safety-relevant, not a trim: neither the deadband nor the
-    rate limit may delay it."""
+    """The very first command establishes state regardless of debounce. After that, a
+    plan/surplus-driven on/off transition is held to the crossing dwell
+    (MODULATION_CROSSING_DWELL_SECONDS) rather than writing immediately — found 2026-09-25:
+    with no such dwell, a live target oscillating across the floor produced a real start/stop
+    button press every ~30s fast tick for 17 minutes straight."""
     hass = FakeHass()
     _evse(hass, mx=32)
     c = _mk(hass)
-    await c.modulate(3000.0, _T0)
+    await c.modulate(3000.0, _T0)                           # first-ever write -> establishes on
     assert _values(hass) == [13.0]
-    await c.modulate(0.0, _T0 + timedelta(seconds=1))       # 1 s later -> still writes
+    await c.modulate(0.0, _T0 + timedelta(seconds=1))       # 1 s later -> held, dwell not met
+    assert _values(hass) == [13.0]
+    assert "hold_crossing_dwell" in c._note
+    assert c._commanded is True
+    t = _T0 + timedelta(seconds=MODULATION_CROSSING_DWELL_SECONDS + 1)
+    await c.modulate(0.0, t)                                # dwell cleared -> now writes
     assert _values(hass) == [13.0, 0.0]
-    await c.modulate(3000.0, _T0 + timedelta(seconds=2))    # and back on
+    assert c._commanded is False
+    t += timedelta(seconds=1)                                # immediately back on -> held again
+    await c.modulate(3000.0, t)
+    assert _values(hass) == [13.0, 0.0]
+    assert "hold_crossing_dwell" in c._note
+    t += timedelta(seconds=MODULATION_CROSSING_DWELL_SECONDS)
+    await c.modulate(3000.0, t)                              # dwell cleared -> and back on
     assert _values(hass) == [13.0, 0.0, 13.0]
+
+
+async def _run_crossing_dwell_bounds_oscillation_flap():
+    """Direct regression for the 2026-09-25 incident's shape: a live target alternating
+    across the on/off boundary every fast tick for several minutes (the real household
+    Wattpilot's ``relieved_w`` battery-priority term oscillating near the floor) must not
+    produce a real crossing on every tick — the crossing dwell caps how often the household's
+    charger can actually start/stop, regardless of how noisy the live target is."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    c = _mk(hass)
+    t = _T0
+    crossings = 0
+    prev_commanded = None
+    num_ticks = 34  # 34 * 30s fast ticks == 17 minutes, matching the incident's real duration
+    for i in range(num_ticks):
+        target = 3000.0 if i % 2 == 0 else 500.0  # alternates above floor / below 0.6*floor
+        await c.modulate(target, t)
+        if c._commanded != prev_commanded:
+            crossings += 1
+            prev_commanded = c._commanded
+        t += timedelta(seconds=MODULATION_INTERVAL_SECONDS)
+    # Without the dwell this would be one crossing per tick (up to num_ticks). With a 5-minute
+    # dwell over a 17-minute window there is room for only a handful of real transitions.
+    assert crossings < num_ticks, crossings
+    assert crossings <= 1 + (num_ticks * MODULATION_INTERVAL_SECONDS) // MODULATION_CROSSING_DWELL_SECONDS + 1
+
+
+async def _run_hard_interlocks_bypass_crossing_dwell():
+    """soc_cutoff and unplugged must still act instantly even immediately after a
+    plan-driven crossing that would itself be dwell-blocked if attempted again — the dwell
+    in _write() is opt-in per call site (``debounce=True`` only on the plan/surplus branch),
+    so a hard interlock is never at the mercy of the household's chosen dwell window."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    hass.states.set("sensor.evse_status", "charging")
+    c = _mk(hass, plug_entity_id="sensor.evse_status")
+    await c.modulate(3000.0, _T0)                       # on, 13 A
+    assert c._commanded is True
+
+    # soc_cutoff forces off 1 s later -- would be blocked by the dwell on the plan/surplus
+    # branch, but soc_cutoff's _write() call never passes debounce=True.
+    await c.apply(5000.0, _T0 + timedelta(seconds=1), soc_cutoff=True)
+    await c.modulate(5000.0, _T0 + timedelta(seconds=1))
+    assert c._commanded is False
+    assert _values(hass)[-1] == 0.0
+
+    # Clear the cutoff and resume (past the dwell, so this crossing is the plan/surplus
+    # branch's own legitimate one), then simulate an unplug immediately after -- that must
+    # also act instantly regardless of how recently the on-crossing happened.
+    t = _T0 + timedelta(seconds=MODULATION_CROSSING_DWELL_SECONDS + 5)
+    await c.apply(5000.0, t, soc_cutoff=False)
+    await c.modulate(5000.0, t)
+    assert c._commanded is True
+    hass.states.set("sensor.evse_status", "available")  # car unplugged
+    await c.modulate(5000.0, t + timedelta(seconds=1))
+    assert c._commanded is False
 
 
 # ================================================================= plug detection
@@ -687,7 +764,11 @@ async def _run_button_pair_stop_skips_the_zero_write():
     _evse(hass, mx=32)
     c = _mk(hass, start_button_entity_id="button.start", stop_button_entity_id="button.stop")
     await c.modulate(3000.0, _T0)                                    # on, 13 A
-    await c.modulate(0.0, _T0 + timedelta(seconds=30))               # on -> off: crossing
+    # The off-crossing must itself clear the crossing dwell since the on-crossing at _T0 —
+    # push it out past MODULATION_CROSSING_DWELL_SECONDS so the dwell gate (Part B of the
+    # 2026-09-25 flap fix) doesn't confound the stop-button behavior under test here.
+    off_t = _T0 + timedelta(seconds=MODULATION_CROSSING_DWELL_SECONDS + 30)
+    await c.modulate(0.0, off_t)                                     # on -> off: crossing
     assert len(_presses(hass, "button.stop")) == 1
     assert 0.0 not in _values(hass), "wrote 0 to a setpoint that would reject it"
     assert c._commanded is False
@@ -698,9 +779,10 @@ async def _run_button_pair_repeated_off_does_not_repress_stop():
     _evse(hass, mx=32)
     c = _mk(hass, start_button_entity_id="button.start", stop_button_entity_id="button.stop")
     await c.modulate(3000.0, _T0)
-    await c.modulate(0.0, _T0 + timedelta(seconds=30))
-    await c.modulate(0.0, _T0 + timedelta(seconds=60))               # still off
-    await c.modulate(1000.0, _T0 + timedelta(seconds=90))            # below floor -> stays off
+    off_t = _T0 + timedelta(seconds=MODULATION_CROSSING_DWELL_SECONDS + 30)
+    await c.modulate(0.0, off_t)
+    await c.modulate(0.0, off_t + timedelta(seconds=30))               # still off
+    await c.modulate(1000.0, off_t + timedelta(seconds=60))            # below floor -> stays off
     assert len(_presses(hass, "button.stop")) == 1
 
 
@@ -783,8 +865,12 @@ async def _run_soc_cutoff_clears_when_soc_drops_back():
     await c.apply(5000.0, _T0, soc_cutoff=True)
     await c.modulate(5000.0, _T0)
     assert c._commanded is False
-    await c.apply(5000.0, _T0 + timedelta(seconds=30), soc_cutoff=False)
-    await c.modulate(5000.0, _T0 + timedelta(seconds=30))
+    # Resuming after a cleared interlock is an ordinary plan-driven crossing (not exempt like
+    # the interlock's own stop, which never passes debounce=True) — it must itself clear the
+    # crossing dwell since the soc_cutoff-driven off at _T0.
+    t = _T0 + timedelta(seconds=MODULATION_CROSSING_DWELL_SECONDS + 30)
+    await c.apply(5000.0, t, soc_cutoff=False)
+    await c.modulate(5000.0, t)
     assert c._commanded is True
     assert c.status()["soc_cutoff"] is False
 
@@ -1892,6 +1978,8 @@ if __name__ == "__main__":
         ("write_deadband_skip", lambda: _run_async(_run_write_deadband_skip)),
         ("write_min_interval_skip", lambda: _run_async(_run_write_min_interval_skip)),
         ("boundary_crossing_always_writes", lambda: _run_async(_run_boundary_crossing_always_writes)),
+        ("crossing_dwell_bounds_oscillation_flap", lambda: _run_async(_run_crossing_dwell_bounds_oscillation_flap)),
+        ("hard_interlocks_bypass_crossing_dwell", lambda: _run_async(_run_hard_interlocks_bypass_crossing_dwell)),
         # plug
         ("plug_states", test_plug_states),
         ("unplugged_commands_zero", lambda: _run_async(_run_unplugged_commands_zero)),

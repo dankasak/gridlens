@@ -54,7 +54,13 @@ Behaviours this file is careful about, in rough order of how expensive getting t
   ``SetChargingProfile``, or a cloud round-trip for Easee/Wallbox/Zaptec, some of which are
   rate-limited. So a change smaller than the deadband, or sooner than the minimum write
   interval, is skipped. Crossing the on/off boundary (or commanding 0) always writes
-  immediately: that is a safety-relevant transition, not a trim.
+  immediately for a hard interlock (SOC cutoff, unplugged) or a genuine reconnect — those
+  are safety-relevant transitions, not a trim. A plan/surplus-driven crossing is instead held
+  to a minimum dwell (``MODULATION_CROSSING_DWELL_SECONDS``, see ``_write``'s ``debounce``
+  parameter) — found 2026-09-25: with no such dwell, a live target oscillating across the
+  floor produced a real start/stop button press every ~30s fast tick for 17 minutes straight
+  (the household's Wattpilot). Unlike the deadband/rate-limit above, which exist purely to
+  spare the hardware, this one also protects the household from real relay/session churn.
 * **Never raise, never force off.** Same two rules as the on/off controller. A failed write
   logs and returns; nothing in this file forces a load off on shutdown or a stale plan (the
   "leave as-is" deadman — see ``load_control_manager.py``).
@@ -90,6 +96,7 @@ from ..const import (
     DEFAULT_MIN_CHARGE_CURRENT_A,
     DEFAULT_SUPPLY_VOLTAGE,
     MODULATING_UNPLUGGED_STATES,
+    MODULATION_CROSSING_DWELL_SECONDS,
 )
 from .load_controller import DeferrableLoadController
 
@@ -134,6 +141,7 @@ class ModulatingLoadController(DeferrableLoadController):
         plug_entity_id: str = "",
         write_deadband_a: float = 0.5,
         min_write_interval_s: float = 20.0,
+        min_crossing_dwell_s: float = MODULATION_CROSSING_DWELL_SECONDS,
         start_button_entity_id: str = "",
         stop_button_entity_id: str = "",
         **kwargs,
@@ -174,6 +182,12 @@ class ModulatingLoadController(DeferrableLoadController):
         self.voltage = float(voltage) if float(voltage or 0.0) > 0.0 else DEFAULT_SUPPLY_VOLTAGE
         self.write_deadband_a = max(0.0, float(write_deadband_a))
         self.min_write_interval_s = max(0.0, float(min_write_interval_s))
+        # See _write's `debounce` gate — a plan/surplus-driven crossing must hold this long
+        # since the last one before it's allowed to flip again. Deliberately a new field
+        # rather than reusing the inherited min_on_seconds/min_off_seconds (those exist for
+        # a different controller's different problem — physical switch wear, asymmetric per
+        # direction — and this class's flapping was symmetric, not direction-biased).
+        self.min_crossing_dwell_s = max(0.0, float(min_crossing_dwell_s))
 
         # "" = infer from the entity's own unit_of_measurement the first time we can read it.
         # Resolution is deferred (not done here) because at construction time the charger
@@ -592,6 +606,7 @@ class ModulatingLoadController(DeferrableLoadController):
         await self._write(
             commanded, now, source=resolved,
             force=just_connected, reason="reconnected" if just_connected else "",
+            debounce=True,
         )
 
     def _quantised_setpoint(self, commanded_w: float) -> float:
@@ -627,24 +642,38 @@ class ModulatingLoadController(DeferrableLoadController):
 
     async def _write(
         self, commanded_w: float, now: datetime, *, source: str, reason: str = "",
-        force: bool = False,
+        force: bool = False, debounce: bool = False,
     ) -> None:
         """Apply write economy, then actuate. Never raises.
 
         A trim (same on/off state, small delta, or too soon since the last write) is skipped
         entirely. Crossing the on/off boundary — including the very first command, where
-        ``_commanded`` is still None — always writes: those are the transitions that actually
-        start or stop energy flowing, and delaying one to satisfy a rate limit is the wrong
-        trade.
+        ``_commanded`` is still None — always writes immediately, UNLESS ``debounce=True``
+        and the minimum crossing dwell (``min_crossing_dwell_s``) hasn't elapsed since the
+        last real transition (see the block just below) — those are still the transitions
+        that actually start or stop energy flowing, but a plan/surplus-driven one can be a
+        noisy live signal repeatedly re-crossing the boundary, not always a genuine change
+        (found 2026-09-25: 17 minutes of a real start/stop button press every ~30s fast tick).
 
         ``force`` (set only for a just-connected edge — see the module docstring's "Reassert
         on connect" bullet) makes this tick behave as a crossing even when ``want_on`` matches
         what we already believe is commanded: the whole point is that the hardware may have
         moved on its own, so "nothing changed on our side" cannot be trusted to mean "nothing
-        needs writing" here the way it normally does."""
+        needs writing" here the way it normally does. It also always bypasses the crossing
+        dwell below, whether or not the caller also passed ``debounce=True``.
+
+        ``debounce`` is opt-in per call site (see ``modulate()``): a hard interlock
+        (``soc_cutoff``, ``unplugged``) must never be delayed, so those call sites simply
+        never pass it — only the ordinary plan/surplus branch does."""
         setpoint = self._quantised_setpoint(commanded_w)
         want_on = setpoint > 0.0
         crossing = force or self._commanded is None or want_on != bool(self._commanded)
+
+        if crossing and debounce and not force and self._commanded is not None:
+            held = (now - self._changed_at).total_seconds() if self._changed_at else 1e9
+            if held < self.min_crossing_dwell_s:
+                self._note = f"hold_crossing_dwell{'_' + reason if reason else ''}"
+                return
 
         if not crossing:
             if (
@@ -823,5 +852,6 @@ class ModulatingLoadController(DeferrableLoadController):
             "last_write": self._last_write_at.isoformat() if self._last_write_at else None,
             "modulation_source": self._modulation_source,
             "planned_w": round(self._planned_w, 1),
+            "crossing_dwell_s": self.min_crossing_dwell_s,
         })
         return st

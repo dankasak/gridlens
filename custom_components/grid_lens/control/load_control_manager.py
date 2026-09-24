@@ -64,6 +64,7 @@ from ..const import (
     CONF_MIN_EXPORT_PRICE,
     DEFAULT_MIN_CHARGE_CURRENT_A,
     DOMAIN,
+    GREEDY_FORECAST_SURPLUS_MIN_SOC_MARGIN_PCT,
     MODULATION_INTERVAL_SECONDS,
 )
 from ..inverters.base import BatteryAction
@@ -1137,8 +1138,13 @@ class LoadControlManager:
         None (never 0) whenever the SOC sensor or the net battery-power reading is missing
         or unreadable — same fail-closed discipline as every other Greedy Consumption input;
         a household with no battery configured must never have this silently read as
-        "unlimited headroom". 0.0 (a real, measured answer) once SOC is at or below the
-        configured minimum: there is a battery, it just has nothing spare to give.
+        "unlimited headroom". 0.0 (a real, measured answer) once SOC is at or below
+        ``GREEDY_FORECAST_SURPLUS_MIN_SOC_MARGIN_PCT`` above the configured minimum — not
+        just at/below the minimum itself. Found 2026-09-25: at 16-17% SOC against a 10%
+        minimum (~6-7 points of real margin), this returned a small but positive headroom,
+        letting the Wattpilot's forecast-surplus target sit right at its floor and flap
+        every ~30s for 17 minutes. Below the margin there is a battery, but not enough
+        spare, measured conservatively, to size a stable draw from.
 
         Net battery power (``_read_battery_net_power_w()``, +charging/-discharging) —
         the discharging magnitude is netted off the rated max discharge rate to get what's
@@ -1154,7 +1160,7 @@ class LoadControlManager:
         soc = self._read_percent(self._battery_soc_sensor)
         if soc is None:
             return None
-        if soc <= self._battery_min_soc:
+        if soc <= self._battery_min_soc + GREEDY_FORECAST_SURPLUS_MIN_SOC_MARGIN_PCT:
             return 0.0
         charge_w = self._read_battery_net_power_w()
         if charge_w is None:
@@ -1176,12 +1182,21 @@ class LoadControlManager:
         reading is missing — same fail-closed discipline as ``_battery_headroom_w``. An
         install with ``has_battery`` but no capacity configured therefore can't use the
         proportional forecast-surplus draw at all, which is the safe default.
+
+        Gated by the same ``GREEDY_FORECAST_SURPLUS_MIN_SOC_MARGIN_PCT`` margin as
+        ``_battery_headroom_w`` — a matched pair, per ``_forecast_surplus_target_w``'s
+        docstring — so a marginal SOC can't get through via this path once the other is
+        gated. Once the margin is cleared, the energy figure itself is still measured
+        against the true configured minimum, not the margin: the margin decides *whether*
+        to run, not how much energy is actually available once running is allowed.
         """
         if not self._battery_capacity_kwh or not self._battery_soc_sensor:
             return None
         soc = self._read_percent(self._battery_soc_sensor)
         if soc is None:
             return None
+        if soc <= self._battery_min_soc + GREEDY_FORECAST_SURPLUS_MIN_SOC_MARGIN_PCT:
+            return 0.0
         return max(0.0, (soc - self._battery_min_soc) / 100.0 * self._battery_capacity_kwh)
 
     def _plan_battery_headroom_kwh(

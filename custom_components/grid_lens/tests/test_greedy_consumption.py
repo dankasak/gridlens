@@ -756,10 +756,41 @@ def test_manager_battery_headroom_reads_soc_and_charge_sensors():
     assert m._battery_headroom_w() == 0.0
     hass.states.set("sensor.battery_soc", "5")
     assert m._battery_headroom_w() == 0.0
+    # SOC above the true minimum but still inside the 10-point safety margin (found
+    # 2026-09-25: this is exactly the zone that let the Wattpilot flap — 16-17% SOC against
+    # a 10% minimum used to read as a small-but-real headroom instead of "not enough margin
+    # to run from") -> still a hard zero, same as at/below the true minimum.
+    hass.states.set("sensor.battery_power", "0")
+    hass.states.set("sensor.battery_soc", "15")
+    assert m._battery_headroom_w() == 0.0
+    hass.states.set("sensor.battery_soc", "19.9")
+    assert m._battery_headroom_w() == 0.0
+    # Just clear of the margin (min_soc + 10) -> headroom resumes.
+    hass.states.set("sensor.battery_soc", "20.1")
+    assert m._battery_headroom_w() == 5000.0
     # SOC healthy again but the charge-power sensor is unavailable -> unknown, fails closed.
     hass.states.set("sensor.battery_soc", "60")
     hass.states.set("sensor.battery_power", "unavailable")
     assert m._battery_headroom_w() is None
+
+
+def test_manager_battery_headroom_kwh_respects_soc_margin():
+    # The energy-headroom gate mirrors _battery_headroom_w's margin exactly (see
+    # _forecast_surplus_target_w's docstring: a matched pair) so a marginal SOC can't slip
+    # through this path once the other is gated.
+    m, hass = _mgr(extra_data={
+        "battery_soc_sensor": "sensor.battery_soc",
+        "battery_capacity": 20.0,  # kWh
+        "battery_min_soc": 10.0,
+    })
+    hass.states.set("sensor.battery_soc", "10")
+    assert m._battery_headroom_kwh() == 0.0
+    hass.states.set("sensor.battery_soc", "18")
+    assert m._battery_headroom_kwh() == 0.0  # inside the margin -> still gated
+    hass.states.set("sensor.battery_soc", "20.1")
+    assert abs(m._battery_headroom_kwh() - (20.1 - 10.0) / 100.0 * 20.0) < 1e-6
+    hass.states.set("sensor.battery_soc", "60")
+    assert abs(m._battery_headroom_kwh() - (60.0 - 10.0) / 100.0 * 20.0) < 1e-6
 
 
 def test_manager_ac_output_headroom_unconfigured():
@@ -1303,6 +1334,7 @@ if __name__ == "__main__":
         ("manager_min_export_price", test_manager_min_export_price),
         ("manager_battery_headroom_no_battery_configured", test_manager_battery_headroom_no_battery_configured),
         ("manager_battery_headroom_reads_soc_and_charge_sensors", test_manager_battery_headroom_reads_soc_and_charge_sensors),
+        ("manager_battery_headroom_kwh_respects_soc_margin", test_manager_battery_headroom_kwh_respects_soc_margin),
         ("manager_ac_output_headroom_unconfigured", test_manager_ac_output_headroom_unconfigured),
         ("manager_ac_output_headroom_reads_load_and_grid_sensors", test_manager_ac_output_headroom_reads_load_and_grid_sensors),
         ("manager_ac_output_headroom_no_sensors_configured", test_manager_ac_output_headroom_no_sensors_configured),
