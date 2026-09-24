@@ -647,6 +647,39 @@ export function resolveShadeCorrectionEid(hass, configOverride) {
   return null;
 }
 
+// The forecast provider's own "power right now" entity — the same class of sensor the
+// shade correction feature already compares against actual production hour-by-hour (see
+// shade_correction.py's module docstring) — but here for a different purpose: "how
+// closely did the forecast track reality, historically?" needs the forecast HA actually
+// saw at each PAST moment, which only this entity's own recorder history captures. A
+// chart's `trajectory` (the dispatch plan) only ever carries slots from "now" forward
+// (see grid-lens-power-chart-card.js's _timeScale()/_energySeries()), so it has nothing
+// to draw for the past no matter how its line is clipped.
+//
+// `configOverride` (a card's own solar_forecast_power_entity option) always wins.
+// Otherwise prefers the shade-corrected sensor (resolveShadeCorrectionEid) when shade
+// correction is enabled — that IS the "adjusted forecast" a user means by "how close did
+// the forecast get" on an install with known shading, and its history already has the
+// correction baked in. Falls back to shape-based discovery of the raw provider's own
+// power-now entity (device_class power, state_class measurement, a Solcast-shaped
+// estimate10/estimate90 pair — mirrors Python's entity_lookup.resolve_forecast_power_sensor),
+// then the documented Solcast default (const.py's DEFAULT_SOLCAST_POWER_NOW_ENTITY).
+export function resolveForecastPowerSensor(hass, configOverride) {
+  if (configOverride) return configOverride;
+  if (!hass) return null;
+  const shadeEid = resolveShadeCorrectionEid(hass);
+  if (shadeEid) return shadeEid;
+  const matches = [];
+  for (const eid of Object.keys(hass.states)) {
+    if (!eid.startsWith('sensor.')) continue;
+    const a = hass.states[eid].attributes || {};
+    if (a.device_class !== 'power' || a.state_class !== 'measurement') continue;
+    if ('estimate10' in a && 'estimate90' in a) matches.push(eid);
+  }
+  if (matches.length === 1) return matches[0];
+  return hass.states['sensor.solcast_pv_forecast_power_now'] ? 'sensor.solcast_pv_forecast_power_now' : null;
+}
+
 // Multiplies each slot's pv_estimate (and its P10/P90 bounds, so they stay consistent
 // with the corrected central estimate) by the shade-correction factor for that slot's
 // LOCAL hour. `arr` is returned unchanged — not mutated — when no shade-correction
@@ -1175,42 +1208,110 @@ export function socCapHtml(hass, d, opts = {}) {
   </div>`;
 }
 
-// 14-day daily-kWh bar sparkline for a device's energy sensor. `historyEntry` is the
-// card's own cache entry (`{ ts, days }`) — undefined means "still loading" (a single
-// placeholder box), `days == null`/empty means the query failed or the sensor is too new
-// for long-term stats.
+// Average of every FULL day in `days` (excludes today's own partial bucket) — shared by
+// sparklineHtml's own readout below and by both cards' "order by average daily
+// consumption" row sort, so the two never disagree about what "average" means for a
+// device. Returns null when there's nothing to average (no data, or only today so far).
+export function averageFromDays(days) {
+  if (!days || !days.length) return null;
+  const todayKey = new Date().toDateString();
+  const full = days.filter((d) => d.start.toDateString() !== todayKey);
+  if (!full.length) return null;
+  return full.reduce((s, d) => s + d.kwh, 0) / full.length;
+}
+
+// A smooth gradient area/line chart of a device's daily kWh over its last `historyDays`
+// days. Replaced the original discrete-bar sparkline (2026-09-24) once this row had a
+// full line of its own to sit on in both cards' layouts, with plenty of room for something
+// more legible than a strip of narrow bars — a per-day hover dot (same tooltip mechanism),
+// weekday initials along the bottom, and a dashed average reference line. Deliberately
+// still monochrome (var(--ink)/var(--ink2)), not colour-coded per device, matching the
+// original bar version's own reasoning: a single-series magnitude read, not an identity
+// to keep consistent with other cards' per-device colours.
 //
-// Always renders exactly `historyDays` bar slots regardless of how many real days came
-// back — a device with less than a full history used to render a narrower `.sbars` block
-// (or, on a failed/empty query, nothing at all), which shifted every element after the
-// sparkline in the row's flex layout, row to row. Missing (older) days are padded with
-// invisible placeholder bars at the front, matching the same "always reserve the column"
-// convention this file's `.modcur.ph`/`.maxcur.ph` already use for the modulating-only
-// columns — found from a screenshot showing the Today Boost box, Greedy icons, and
-// segmented control at inconsistent x-positions row to row (2026-09-24).
+// `historyEntry` is the card's own cache entry (`{ ts, days }`) — undefined means "still
+// loading", `days` empty/too short means the query failed or the sensor is too new for
+// long-term stats; both render a fixed-size placeholder rather than nothing. Unlike the
+// old bar version, this chart's rendered SIZE comes entirely from the wrapping elements'
+// CSS (the `<svg>`'s viewBox + preserveAspectRatio="none" always stretches to fill
+// whatever box it's given) — a device with fewer real days of history no longer changes
+// this element's own footprint at all, which is what actually caused the 2026-09-24
+// row-misalignment bug the padding-bar workaround (see FEATURES.md §6b) was built to fix.
+// This rewrite removes the need for that workaround rather than refining it further.
 export function sparklineHtml(historyEntry, eid, opts = {}) {
   const p = (n) => `${opts.prefix || ''}${n}`;
   const historyDays = opts.historyDays || HISTORY_DAYS;
-  if (!historyEntry) return `<div class="${p('spark-ph')}"></div>`;
-  const real = historyEntry.days || [];
+  const height = opts.height || 72;
+  if (!historyEntry) {
+    return `<div class="${p('spark')} ${p('spark-loading')}" style="height:${height}px"></div>`;
+  }
+  const days = historyEntry.days || [];
+  if (days.length < 2) {
+    return `<div class="${p('spark')} ${p('spark-empty')}" style="height:${height}px">Not enough history yet</div>`;
+  }
   const todayKey = new Date().toDateString();
-  const full = real.filter((d) => d.start.toDateString() !== todayKey);
-  const avg = full.length ? full.reduce((s, d) => s + d.kwh, 0) / full.length : null;
-  const max = Math.max(0.1, ...real.map((d) => d.kwh));
-  const padCount = Math.max(0, historyDays - real.length);
-  const padBars = Array.from({ length: padCount }, () => `<div class="${p('sbar')} ph"></div>`).join('');
-  const realBars = real.map((d) => {
+  const avg = averageFromDays(days);
+  const maxV = Math.max(0.1, ...days.map((d) => d.kwh));
+  const W = 300, ml = 3, mr = 3, mt = 10, mb = 15;
+  const t0 = days[0].start.getTime(), t1 = days[days.length - 1].start.getTime();
+  const span = Math.max(1, t1 - t0);
+  const X = (ms) => ml + (ms - t0) / span * (W - ml - mr);
+  const Y = (v) => mt + (1 - v / maxV) * (height - mt - mb);
+  const pts = days.map((d) => [X(d.start.getTime()), Y(d.kwh)]);
+  const linePath = smoothPath(pts);
+  const base = Y(0);
+  const areaPath = `${linePath} L${pts[pts.length - 1][0].toFixed(1)},${base.toFixed(1)} L${pts[0][0].toFixed(1)},${base.toFixed(1)} Z`;
+  // Gradient id keyed by eid so multiple devices' charts in the same shadow root never
+  // collide on a duplicate `id` (all identical-looking, but a duplicate id is still
+  // invalid markup and risks the wrong gradient winning the reference).
+  const gid = p(`sparkgrad-${String(eid || 'x').replace(/[^a-zA-Z0-9]/g, '_')}`);
+
+  const dots = days.map((d, i) => {
     const isToday = d.start.toDateString() === todayKey;
-    const h = Math.max(1.5, (d.kwh / max) * 22).toFixed(1);
+    const [x, y] = pts[i];
     const when = d.start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
     const label = `${when}: ${d.kwh.toFixed(1)} kWh${isToday ? ' (so far today)' : ''}`;
-    return `<div class="${p('sbar')}${isToday ? ' today' : ''}" style="height:${h}px" tabindex="0" data-tip="${esc(label)}"></div>`;
+    const r = isToday ? 3.5 : 2;
+    const fill = isToday ? 'var(--ink)' : 'var(--ink2)';
+    // A larger transparent circle is the real hover/focus target — the visible dot alone
+    // is too small to reliably hit with a mouse or a fingertip.
+    return `<g tabindex="0" data-tip="${esc(label)}">`
+      + `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="9" fill="transparent"/>`
+      + `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}" fill="${fill}"/>`
+      + `</g>`;
   }).join('');
-  const tip = real.length ? `Daily energy use, last ${real.length} of ${historyDays} days` : 'Daily energy use — no history yet';
+
+  const weekdayLabels = days.map((d, i) => {
+    const isToday = d.start.toDateString() === todayKey;
+    const [x] = pts[i];
+    const wd = d.start.toLocaleDateString(undefined, { weekday: 'narrow' });
+    return `<text x="${x.toFixed(1)}" y="${height - 3}" text-anchor="middle" font-size="8.5"
+      fill="${isToday ? 'var(--ink)' : 'var(--ink2)'}" font-weight="${isToday ? '700' : '400'}"
+      opacity="${isToday ? '1' : '0.75'}">${esc(wd)}</text>`;
+  }).join('');
+
+  const avgLine = avg != null
+    ? `<line x1="${ml}" y1="${Y(avg).toFixed(1)}" x2="${W - mr}" y2="${Y(avg).toFixed(1)}"
+         stroke="var(--ink2)" stroke-width="1" stroke-dasharray="3 3" opacity="0.5"/>`
+    : '';
+
+  const svg = `
+    <svg viewBox="0 0 ${W} ${height}" preserveAspectRatio="none" class="${p('spark-svg')} chart-svg" role="img">
+      <defs>${gradDef(gid, 'var(--ink2)', 0.38)}</defs>
+      ${avgLine}
+      <path d="${areaPath}" fill="url(#${gid})"/>
+      <path d="${linePath}" fill="none" stroke="var(--ink2)" stroke-width="1.75" stroke-linejoin="round" stroke-linecap="round"/>
+      ${weekdayLabels}
+      ${dots}
+    </svg>`;
+
   return `
-    <div class="${p('spark')}" tabindex="0" data-tip="${esc(tip)}">
-      <div class="${p('sbars')}">${padBars}${realBars}</div>
-      ${avg != null ? `<div class="${p('spark-avg')}">avg ${avg.toFixed(1)} kWh/d</div>` : ''}
+    <div class="${p('spark')}">
+      <div class="${p('spark-hd')}">
+        <span class="${p('spark-title')}">Daily use — last ${days.length} of ${historyDays} days</span>
+        ${avg != null ? `<span class="${p('spark-avg')}">avg ${avg.toFixed(1)} kWh/d</span>` : ''}
+      </div>
+      ${svg}
     </div>`;
 }
 

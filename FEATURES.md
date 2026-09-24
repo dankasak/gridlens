@@ -1373,9 +1373,9 @@ collide — `grid-lens-advisory-card.js` already uses the bare class `.row` for 
 unrelated (the mode-transition timeline), so its call sites pass `{ prefix: 'dt-' }` and
 `grid-lens-load-control-card.js`'s call sites pass none, keeping its class names unchanged.
 
-**Same fix that touched the sparkline (see below) applies to `grid-lens-load-control-card.js`
-itself too** — since `sparklineHtml()`/`estimatorToggleHtml()` are shared functions, the
-misalignment fix reaches both cards from the one change.
+**Same fix that touched the history chart (see below) applies to `grid-lens-load-control-
+card.js` itself too** — since `sparklineHtml()`/`estimatorToggleHtml()` are shared functions,
+the misalignment fix reaches both cards from the one change.
 
 **Files:** `grid-lens-chart-common.js` ("Load control helpers" section — everything above),
 `grid-lens-load-control-card.js` (thin per-instance wrapper: constructor state, `hass`
@@ -1388,13 +1388,18 @@ and no battery).
 
 **Row-alignment bug fixed in the same change.** A screenshot showed the Today Boost box,
 Greedy icons, and segmented control at inconsistent x-positions row to row. Root cause: the
-sparkline's width scaled with how many days of recorder history a device actually had — down
-to zero width outright on a failed/empty query — so every element after it in the row's flex
-layout shifted left on a less-established device's row. `sparklineHtml()` now always renders
-a fixed 14-bar-wide block, padding missing (older) days with invisible placeholder bars;
-`estimatorToggleHtml()` gets the same same-size-invisible-placeholder treatment when a device
-has no LoadEstimator, since that icon's presence/absence was a smaller second source of the
-same shift (it sits between the Greedy icons and the segmented control in the row).
+original bar-based sparkline's width scaled with how many days of recorder history a device
+actually had — down to zero width outright on a failed/empty query — so every element after
+it in the row's flex layout shifted left on a less-established device's row. Fixed same-day
+in two stages: first (still 2026-09-24) by having the bar sparkline always render a fixed
+14-bar-wide block, padding missing days with invisible placeholder bars; then superseded
+later the same day by the area-chart rewrite (see below), whose `<svg>` sizes from its
+wrapping element's CSS rather than from how many bars it has to draw — removing the need for
+the padding workaround entirely rather than refining it further. `estimatorToggleHtml()`
+separately gets a same-size-invisible-placeholder treatment when a device has no
+LoadEstimator, since that icon's presence/absence was a smaller second source of the same
+shift (it sits between the Greedy icons and the segmented control in the row) and is
+unrelated to the chart.
 
 **Unverified.** This container has no browser. `node --check` and grep-based method/field
 name collision checks (see §9b's own precedent for this class of check) both pass, and the
@@ -1897,15 +1902,32 @@ average.
 
 **Files:** `number.py`, `deferrable_overrides.py`, `override_expiry.py`.
 
-**History sparkline.** The Load Control card shows a 14-day daily-kWh bar sparkline next to
-each device's Today Boost input (including today, partial) plus the average of the completed
-days — the same 14-day window `load_history.py` averages for the optimizer's own default, so
-the number the sparkline centers on is the number Today Boost is overriding. Fetched
-client-side via the recorder's `recorder/statistics_during_period` WS call
-(`period: 'day', types: ['change']`), cached per device for 15 minutes
-(`grid-lens-load-control-card.js::_fetchHistory`/`_pollHistory`) — no new backend entity or
-config. A device with no recorder statistics yet (freshly added sensor) simply shows no
-sparkline rather than an error.
+**History chart.** Each device's row shows a 14-day daily-kWh chart next to its Today Boost
+input (including today, partial) plus the average of the completed days — the same 14-day
+window `load_history.py` averages for the optimizer's own default, so the number the chart
+centers on is the number Today Boost is overriding. A smooth gradient area/line chart
+(`sparklineHtml`, `grid-lens-chart-common.js` — rewritten 2026-09-24 from an original
+discrete-bar version once the row had a full line's width to give it), with a per-day hover
+dot (same custom tooltip as everything else on the row), weekday initials along the bottom,
+and a dashed average reference line. Deliberately still monochrome, not colour-coded per
+device — a single-series magnitude read, not an identity to keep consistent with other
+cards' per-device colours. Fetched client-side via the recorder's
+`recorder/statistics_during_period` WS call (`period: 'day', types: ['change']`), cached per
+device for 15 minutes (`fetchDailyHistory`/each card's own `_pollHistory`/`_dtPollSparkline`)
+— no new backend entity or config. A device with fewer than 2 days of recorder statistics yet
+(freshly added sensor) shows a "Not enough history yet" placeholder at the same fixed size,
+rather than an error or a layout shift.
+
+**Row order — by average daily consumption, descending (2026-09-24, user request).** Both
+places this row renders (the standalone Load Control card and
+`grid-lens-advisory-card.js`'s merged per-device panel, §6b) sort devices by the same
+average the history chart centers on, biggest consumer first — not the `deferrable_loads`
+attribute's raw config order every OTHER card that reads it still uses (the Power Flow
+diagram, the Power Chart's stacking, this card's own recommended-on/off timeline further
+down). A device with no history loaded yet sorts last and can jump up once its own average
+arrives; each card sorts independently off its own history cache, so a device may not sit at
+exactly the same row position on both cards while data is still loading, though it settles
+identically once both caches are warm.
 
 **Behaviour**
 - Carryover is deliberate and bounded: a boost persists across the post-midnight slots the

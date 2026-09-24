@@ -46,10 +46,11 @@ import {
   fmtC, resolveDeferrableLoads, resolveDailyTargetMasterEid, resolveDailyTargetEidFor,
   resolveBoostEidFor, resolveChargeTargetPercentEidFor, resolveSolarForecastEid, solarSummary,
   fmtKwh, clampTargetPct, fetchDailyAverageKwh, resolveLoadControlRows, fetchDailyHistory,
-  estimatorFor, boostCeiling, socCapFor, friendlyNote, greedyLine, modulationLine, socCapHtml,
-  sparklineHtml, estimatorToggleHtml, estimatorPanelHtml, controlHtml, greedyButtonsHtml,
-  boostInputHtml, currentReadoutHtml, maxCurrentHtml, attachTooltip,
-} from './grid-lens-chart-common.js?v=20260924d';
+  averageFromDays, estimatorFor, boostCeiling, socCapFor, friendlyNote, greedyLine,
+  modulationLine, socCapHtml, sparklineHtml, estimatorToggleHtml, estimatorPanelHtml,
+  controlHtml, greedyButtonsHtml, boostInputHtml, currentReadoutHtml, maxCurrentHtml,
+  attachTooltip,
+} from './grid-lens-chart-common.js?v=20260924f';
 
 const DAILY_TARGET_HISTORY_REFRESH_MS = 15 * 60000;
 // Minimum time the optimizing dot stays visible once triggered, regardless of how
@@ -145,6 +146,12 @@ class GridLensAdvisoryCard extends HTMLElement {
       ctEid: resolveChargeTargetPercentEidFor(hass, d.energy_entity),
       ...loadControlRows[i],
     }));
+    // Sorted by average daily consumption, descending (2026-09-24, user request) — see
+    // the identical note in grid-lens-load-control-card.js's own hass setter for why this
+    // diverges from every OTHER card reading `deferrable_loads` (Power Flow diagram, Power
+    // Chart, this card's own `_deferNames`-ordered recommendations further down, etc.),
+    // which all keep raw config order.
+    this._sortByAvgDesc(dtRows, (e) => this._dtSparkCache[e]);
     this._dtRows = dtRows;
     const dtSolarSt = this._dtSolarEid && hass.states[this._dtSolarEid];
     const dtSig = [
@@ -277,6 +284,20 @@ class GridLensAdvisoryCard extends HTMLElement {
     }
   }
 
+  // Shared comparator for both the hass setter's own sort and _dtPollSparkline's re-sort
+  // below — mirrors grid-lens-load-control-card.js's own `_sortByAvgDesc`.
+  // `cacheFor(energyEntity)` returns that device's `{ days }` cache entry (or undefined).
+  _sortByAvgDesc(rows, cacheFor) {
+    rows.sort((a, b) => {
+      const va = averageFromDays((cacheFor(a.device.energy_entity) || {}).days);
+      const vb = averageFromDays((cacheFor(b.device.energy_entity) || {}).days);
+      if (va == null && vb == null) return 0;
+      if (va == null) return 1;
+      if (vb == null) return -1;
+      return vb - va;
+    });
+  }
+
   // Same pattern as _dtPollHistory above, but for the merged Today Boost sparkline's
   // day-by-day series (fetchDailyHistory) rather than a single average — a separate cache
   // because the two entries have different shapes ({avgKwh} vs {days}).
@@ -290,6 +311,9 @@ class GridLensAdvisoryCard extends HTMLElement {
       fetchDailyHistory(this._hass, eid).then((days) => {
         this._dtSparkPending.delete(eid);
         this._dtSparkCache[eid] = { ts: Date.now(), days };
+        // Re-sort in place so a device's row jumps to its correct position the moment its
+        // own average becomes known, rather than waiting for the next unrelated hass tick.
+        if (this._dtRows) this._sortByAvgDesc(this._dtRows, (e) => this._dtSparkCache[e]);
         this._paint();
       });
     }
@@ -758,19 +782,23 @@ class GridLensAdvisoryCard extends HTMLElement {
         .dt-maxcur-input::-webkit-outer-spin-button, .dt-maxcur-input::-webkit-inner-spin-button { margin: 0; }
         .dt-maxcur-unit { font-size: 10px; color: var(--ink2); }
         .dt-modcur.ph, .dt-maxcur.ph, .dt-gbtn.ph { visibility: hidden; border-color: transparent; }
-        /* Sparkline — fixed width (14 bars * 4px + 13 gaps * 1.5px = 75.5px) regardless of
-           how many real days came back, matching the fix applied to
-           grid-lens-load-control-card.js's own copy for the same reason (2026-09-24
-           misalignment bug) — sparklineHtml() pads with invisible '.dt-sbar.ph' bars. */
-        .dt-spark { display: flex; flex-direction: column; align-items: center; gap: 2px;
-                 flex: 0 0 auto; padding: 0 2px; }
-        .dt-sbars { display: flex; align-items: flex-end; gap: 1.5px; height: 22px; min-width: 75.5px; }
-        .dt-sbar { width: 4px; min-height: 1.5px; background: var(--ink2); opacity: .5;
-                border-radius: 1px 1px 0 0; }
-        .dt-sbar.today { background: var(--ink); opacity: .85; }
-        .dt-sbar.ph { visibility: hidden; }
-        .dt-spark-avg { font-size: 9.5px; color: var(--ink2); white-space: nowrap; }
-        .dt-spark-ph { width: 75.5px; height: 22px; }
+        /* Daily-kWh chart — smooth gradient area/line (2026-09-24, replacing the original
+           discrete-bar version), matching the same rewrite in
+           grid-lens-load-control-card.js's own copy for the same reason: rows here are
+           sorted by average daily consumption too (see the hass setter), and each row is
+           the only thing on its own line at normal card widths, so there's a full line's
+           width to give this. Sizing is CSS-driven (flex-grow + explicit SVG height)
+           rather than data-driven — a device with less history than another never changes
+           this element's own footprint, which is what actually caused the 2026-09-24
+           row-misalignment bug this replaces (see FEATURES.md §6b). */
+        .dt-spark { display: flex; flex-direction: column; gap: 4px; flex: 1 1 260px; min-width: 220px; }
+        .dt-spark-hd { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+        .dt-spark-title { font-size: 10px; color: var(--ink2); text-transform: uppercase; letter-spacing: .02em; }
+        .dt-spark-avg { font-size: 11px; font-weight: 600; color: var(--ink); white-space: nowrap; }
+        .dt-spark-svg { width: 100%; height: 72px; display: block; }
+        .dt-spark-loading { opacity: .35; }
+        .dt-spark-empty { display: flex; align-items: center; justify-content: center;
+                       font-size: 11px; color: var(--ink2); font-style: italic; }
         .dt-est-toggle.on { background: var(--ink); color: var(--surface); border-color: var(--ink); }
         .dt-est-panel { flex: 1 1 100%; margin: 2px 0 6px 34px; padding: 10px 12px;
                border: 1px solid var(--border); border-radius: 9px; background: var(--panel-bg, rgba(127,127,127,.06)); }

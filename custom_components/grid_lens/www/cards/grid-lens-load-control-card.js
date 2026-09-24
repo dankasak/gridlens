@@ -82,10 +82,10 @@
  */
 import {
   STYLE, esc, resolveDeferrableLoads, resolveLoadControlRows, socCapFor, boostCeiling,
-  estimatorFor, friendlyNote, fetchDailyHistory, greedyLine, modulationLine,
+  estimatorFor, friendlyNote, fetchDailyHistory, averageFromDays, greedyLine, modulationLine,
   currentReadoutHtml, maxCurrentHtml, socCapHtml, sparklineHtml, estimatorToggleHtml,
   estimatorPanelHtml, controlHtml, greedyButtonsHtml, boostInputHtml, attachTooltip,
-} from './grid-lens-chart-common.js?v=20260924d';
+} from './grid-lens-chart-common.js?v=20260924f';
 
 const HISTORY_REFRESH_MS = 15 * 60000;
 
@@ -130,9 +130,28 @@ class GridLensLoadControlCard extends HTMLElement {
       fetchDailyHistory(this._hass, eid).then((days) => {
         this._historyPending.delete(eid);
         this._historyCache[eid] = { ts: Date.now(), days };
+        // Re-sort in place so a device's row jumps to its correct position the moment
+        // its own average becomes known, rather than waiting for the next unrelated
+        // hass tick to happen to re-run set hass()'s own sort.
+        if (this._rows) this._sortByAvgDesc(this._rows, (e) => this._historyCache[e]);
         this._paint();
       });
     }
+  }
+
+  // Shared comparator for both the hass setter's own sort and _pollHistory's re-sort
+  // above — `cacheFor(energyEntity)` returns that device's `{ days }` cache entry (or
+  // undefined), kept as a parameter rather than reading `this._historyCache` directly so
+  // the same helper could serve a differently-cached row list if this card ever needed one.
+  _sortByAvgDesc(rows, cacheFor) {
+    rows.sort((a, b) => {
+      const va = averageFromDays((cacheFor(a.device.energy_entity) || {}).days);
+      const vb = averageFromDays((cacheFor(b.device.energy_entity) || {}).days);
+      if (va == null && vb == null) return 0;
+      if (va == null) return 1;
+      if (vb == null) return -1;
+      return vb - va;
+    });
   }
 
   set hass(hass) {
@@ -140,12 +159,19 @@ class GridLensLoadControlCard extends HTMLElement {
     const dark = !!(hass.themes && hass.themes.darkMode);
     if (dark !== this._dark) { this._dark = dark; this.classList.toggle('dark', dark); }
 
-    // Deliberately NOT re-sorted (e.g. alphabetically) — devices stay in the same order
-    // as the `deferrable_loads` attribute itself, matching every other card that reads
-    // it (grid-lens-defer-schedule-card.js, the Power Flow card, the Power Chart card).
+    // Sorted by average daily consumption, descending (2026-09-24, user request) — NOT
+    // the `deferrable_loads` attribute's raw config order the way every other card that
+    // reads it still is (grid-lens-defer-schedule-card.js, the Power Flow card, the Power
+    // Chart card all keep config order; only this card and grid-lens-advisory-card.js's
+    // merged panel sort, since those are the two places a user is actually comparing
+    // devices' usage against each other). The average comes from the same per-day history
+    // this row's own chart plots (_historyCache, populated by _pollHistory below), so a
+    // device sorts using whatever's cached so far — null (not yet loaded) sorts last,
+    // and a device's row can jump once its own fetch lands.
     const devices = resolveDeferrableLoads(hass);
     const rows = resolveLoadControlRows(hass, devices);
     this._pollHistory(rows);
+    this._sortByAvgDesc(rows, (e) => this._historyCache[e]);
     const sig = rows.map((r) => {
       const d = r.device;
       const c = r.controlEid && hass.states[r.controlEid];
@@ -287,30 +313,29 @@ class GridLensLoadControlCard extends HTMLElement {
            greedy icons, Today Boost, the control segment) lines up across every row
            regardless of which ones happen to be modulating. */
         .modcur.ph, .maxcur.ph, .gbtn.ph { visibility: hidden; border-color: transparent; }
-        /* Daily-kWh sparkline: how much this device has actually drawn per day over the
-           last two weeks, so a user reaching for Today Boost has a number to react to
-           instead of guessing. Deliberately not colour-coded per device (unlike the
-           schedule/power-flow cards) — this is a single-series magnitude read, not an
-           identity to keep consistent across cards.
-           Fixed width (14 bars * 4px + 13 gaps * 1.5px = 75.5px), NOT sized to however many
-           real days came back — a device with less than a full 14-day history used to
-           render a narrower '.sbars' (or nothing at all on a failed/empty query), which
-           shifted the Today Boost box/Greedy icons/segmented control leftward on that row
-           relative to a full-history row. sparklineHtml() (chart-common.js) now always pads
-           to a full 14 slots with invisible '.sbar.ph' bars — found from a screenshot
-           showing exactly this misalignment (2026-09-24). No backtick characters in this
-           comment — it lives inside this method's own shadowRoot.innerHTML template
-           literal, and one here would close that string early (see grid-lens-advisory-
-           card.js's own copy of this same fix, and the SyntaxError it caused live). */
-        .spark { display: flex; flex-direction: column; align-items: center; gap: 2px;
-                 flex: 0 0 auto; padding: 0 2px; }
-        .sbars { display: flex; align-items: flex-end; gap: 1.5px; height: 22px; min-width: 75.5px; }
-        .sbar { width: 4px; min-height: 1.5px; background: var(--ink2); opacity: .5;
-                border-radius: 1px 1px 0 0; }
-        .sbar.today { background: var(--ink); opacity: .85; }
-        .sbar.ph { visibility: hidden; }
-        .spark-avg { font-size: 9.5px; color: var(--ink2); white-space: nowrap; }
-        .spark-ph { width: 75.5px; height: 22px; }
+        /* Daily-kWh chart: how much this device has actually drawn per day over the last
+           two weeks, so a user reaching for Today Boost has a number to react to instead
+           of guessing. Deliberately not colour-coded per device (unlike the schedule/
+           power-flow cards) — this is a single-series magnitude read, not an identity to
+           keep consistent across cards. A smooth gradient area/line chart (2026-09-24,
+           replacing the original discrete-bar version) — rows are sorted by average daily
+           consumption (see the hass setter) and each device's row is the only thing on its
+           own line at normal card widths, so there's a full line's width to give this. No
+           backtick characters in this comment block — it lives inside this method's own
+           shadowRoot.innerHTML template literal, and one here would close that string
+           early (see grid-lens-advisory-card.js's own copy of this same fix, and the
+           SyntaxError it caused live). Sizing is CSS-driven (flex-grow + explicit SVG
+           height) rather than data-driven, so a device with less history than another
+           never changes this element's own footprint — the actual mechanism behind the
+           2026-09-24 row-misalignment bug this replaces (see FEATURES.md §6b). */
+        .spark { display: flex; flex-direction: column; gap: 4px; flex: 1 1 260px; min-width: 220px; }
+        .spark-hd { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+        .spark-title { font-size: 10px; color: var(--ink2); text-transform: uppercase; letter-spacing: .02em; }
+        .spark-avg { font-size: 11px; font-weight: 600; color: var(--ink); white-space: nowrap; }
+        .spark-svg { width: 100%; height: 72px; display: block; }
+        .spark-loading { opacity: .35; }
+        .spark-empty { display: flex; align-items: center; justify-content: center;
+                       font-size: 11px; color: var(--ink2); font-style: italic; }
         /* LoadEstimator debug panel — toggle button on a row backed by an estimator
            (no real energy sensor), and the expanded detail block underneath it. Reuses
            .gbtn's icon-button look for the toggle so it reads as a sibling of the
