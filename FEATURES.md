@@ -120,17 +120,31 @@ actually detected as being on, which always stays priceable. **Local-only**, sam
 tariff-code filter: the household's own postcode never leaves their HA instance. A plan's
 own `included_postcodes` is public catalogue data, not customer data.
 
-Populating `included_postcodes` is currently manual, via `gridlens-editor`'s plan form — the
-CDR PRD source data carries this natively as `geography.includedPostcodes`
-(`gridlens-api/verification/cdr_prd_plan_data.md`), but `prd_sync.py`'s bulk-authoring
-pipeline doesn't extract it yet (see `OPEN_ITEMS.md`). Existing plans are all `NULL`
-(unrestricted), so this ships with zero behaviour change until a plan is explicitly scoped.
+**Extraction from CDR PRD (2026-09-24).** `prd_sync.py`'s `author`/`restructure` commands now
+extract `geography.includedPostcodes` automatically — but not verbatim. Investigated live
+first: PRD restates the WHOLE distributor footprint on almost every plan (every GloBird
+ZeroHero variant on Energex lists the same ~201 postcodes; every ENGIE plan on a given VIC
+distributor lists the same count for that distributor), so a raw copy would be near-meaningless
+noise on nearly every plan and actively risky — an incomplete PRD enumeration at a network's
+edge would silently hide a genuinely available plan. `_prd_postcode_restriction` instead judges
+a plan's list against its PEERS on the same distributor (`_network_postcode_footprint`, built
+from the brand's already-fetched listing, no extra API calls): only a plan whose list is a
+genuine proper subset of what its peers report gets `included_postcodes` set, with a reviewer
+warning to verify against the fact sheet before publishing. Equal-to-peers (the routine case)
+or no peers to compare against both leave it `NULL` rather than guess. `restructure` never
+clears an existing hand-set restriction just because this run found no peer signal for it —
+it's kept and flagged for manual reconfirmation instead (same "PRD wins, but silence isn't
+evidence of absence" pattern as `monthly_subscription`). Existing plans are still all `NULL`
+until re-authored/restructured, so this ships with zero behaviour change on its own.
 
 **Files:** `plan_calculator.py` (`_plan_included_postcodes`), `retailer_plans.py`,
 `const.py` (`CONF_POSTCODE`), `config_flow.py`, `strings.json`/`translations/en.json`;
 API side: `gridlens-api/app/plan_models.py`, `plan_transform.py`, `plan_serialize.py`,
-`plan_admin.py`, `main.py` (guarded `ALTER TABLE`); editor: `gridlens-editor/main_window.py`
-(`PLAN_COLUMNS`), `main_window.ui`.
+`plan_admin.py`, `main.py` (guarded `ALTER TABLE`); PRD extraction:
+`gridlens-api/verification/prd_sync.py` (`_prd_postcode_restriction`,
+`_network_postcode_footprint`, wired into `_derive_ir_from_prd` and `_merge_prd_structure`),
+tested in `gridlens-api/tests/test_prd_postcode_extraction.py`; editor:
+`gridlens-editor/main_window.py` (`PLAN_COLUMNS`), `main_window.ui`.
 
 **Plan data** comes from the private `gridlens-api` (MySQL, temporally versioned —
 `slug@date` rows). The HA side never sees another user's data and never sends usage data
