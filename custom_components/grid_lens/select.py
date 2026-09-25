@@ -58,7 +58,14 @@ class GridLensLoadOverrideSelect(RestoreEntity, SelectEntity):
         self._index = index
         self._controller = controller
         self._attr_name = f"{controller.name} Override"
-        self._attr_unique_id = f"{entry.entry_id}_deferrable_override_mode_{index}"
+        # Keyed by the device's own sensor_id (its CONF_DEFERRABLE_LOAD_SENSORS entry),
+        # not `index` — `index` is just this device's current position in the config
+        # list and shifts on a reorder/insertion, which would otherwise re-arm a
+        # restored Force On/Off meant for a different device (see
+        # __init__.py._migrate_deferrable_positional_unique_ids).
+        self._attr_unique_id = (
+            f"{entry.entry_id}_deferrable_override_mode_{controller.sensor_id or index}"
+        )
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry.entry_id)},
             "name": "Grid Lens",

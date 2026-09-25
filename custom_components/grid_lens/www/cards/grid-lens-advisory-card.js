@@ -47,15 +47,21 @@ import {
   resolveBoostEidFor, resolveChargeTargetPercentEidFor, resolveSolarForecastEid, solarSummary,
   fmtKwh, clampTargetPct, fetchDailyAverageKwh, resolveLoadControlRows, fetchDailyHistory,
   averageFromDays, estimatorFor, boostCeiling, socCapFor, friendlyNote, greedyLine,
-  modulationLine, socCapHtml, sparklineHtml, estimatorToggleHtml, estimatorPanelHtml,
-  controlHtml, greedyButtonsHtml, boostInputHtml, currentReadoutHtml, maxCurrentHtml,
-  attachTooltip,
-} from './grid-lens-chart-common.js?v=20260924f';
+  modulationLine, socCapHtml, acCeilingHtml, sparklineHtml, estimatorToggleHtml, estimatorPanelHtml,
+  controlHtml, greedyButtonsHtml, boostInputHtml, visibilityToggleHtml, currentReadoutHtml,
+  maxCurrentHtml, attachTooltip,
+} from './grid-lens-chart-common.js?v=20260924h';
 
 const DAILY_TARGET_HISTORY_REFRESH_MS = 15 * 60000;
 // Minimum time the optimizing dot stays visible once triggered, regardless of how
 // quickly the underlying run actually finishes — see the constructor's _optDotUntil.
 const OPT_DOT_MIN_MS = 900;
+// How long a Daily Target slider's locally-set value stays authoritative over
+// whatever hass.states currently holds — see _dtResolvePct(). Just long enough to
+// cover a normal number.set_value round-trip; if the entity still hasn't confirmed
+// after this, something's actually wrong (offline, service failed) and showing the
+// real state again is more honest than a stuck local value.
+const DT_PIN_MAX_AGE_MS = 15000;
 
 class GridLensAdvisoryCard extends HTMLElement {
   constructor() {
@@ -102,6 +108,29 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._dtSparkCache = {};
     this._dtSparkPending = new Set();
     this._dtExpandedEstimator = new Set();
+    // Local-override state for the Daily Target sliders (drag-then-release "snaps
+    // back" bug, found 2026-09-25): _paint() rebuilds .body's innerHTML on almost
+    // any unrelated hass change (a per-minute solar tick, another device's estimator
+    // sample, etc.), which both destroys the <input type=range> mid-drag AND, after
+    // release, can redraw the slider from a not-yet-confirmed stale hass.states value
+    // before the number.set_value round-trip lands. _dtPinned holds the locally-set
+    // value per target entity id until hass confirms it (see _dtResolvePct);
+    // _dtDragEid names whichever slider is currently under a held pointer, so _paint()
+    // can defer a mid-drag repaint instead of yanking the element out from under it.
+    this._dtPinned = {};
+    this._dtDragEid = null;
+    this._dtRepaintPending = false;
+    this._dtPointerUpHandler = () => this._onDtSliderPointerUp();
+  }
+
+  connectedCallback() {
+    window.addEventListener('pointerup', this._dtPointerUpHandler);
+    window.addEventListener('pointercancel', this._dtPointerUpHandler);
+  }
+
+  disconnectedCallback() {
+    window.removeEventListener('pointerup', this._dtPointerUpHandler);
+    window.removeEventListener('pointercancel', this._dtPointerUpHandler);
   }
 
   setConfig(config) {
@@ -186,6 +215,7 @@ class GridLensAdvisoryCard extends HTMLElement {
           ctl ? [ctl.state, (ctl.attributes || {}).note, (ctl.attributes || {}).greedy_reason,
                  (ctl.attributes || {}).greedy_blocked,
                  (ctl.attributes || {}).forecast_free_kwh,
+                 (ctl.attributes || {}).forecast_ac_output_headroom_w,
                  (ctl.attributes || {}).modulation_source,
                  (ctl.attributes || {}).plugged_in].join('|') : '',
           sel ? sel.state : '',
@@ -390,6 +420,24 @@ class GridLensAdvisoryCard extends HTMLElement {
 
   // ------------------------------------------------------------ Daily Target (§9b)
 
+  // Resolves the percent a Daily Target slider should render at: the locally-pinned
+  // value (see _dtPinned's constructor comment) while it's still unconfirmed, or the
+  // live hass.states value once the entity catches up. Clears the pin as a side effect
+  // once confirmed (or once it's too stale to trust) so external changes — another
+  // client, "Follow master", clear_daily_target — aren't fought by a leftover pin.
+  _dtResolvePct(hass, eid, fallback) {
+    if (!eid) return fallback;
+    const st = hass.states[eid];
+    const live = st ? clampTargetPct(st.state) : fallback;
+    const pinned = this._dtPinned[eid];
+    if (!pinned) return live;
+    if (Date.now() - pinned.ts > DT_PIN_MAX_AGE_MS || (st && Math.round(live) === Math.round(pinned.value))) {
+      delete this._dtPinned[eid];
+      return live;
+    }
+    return pinned.value;
+  }
+
   _dtSliderRowHtml(eid, pct, kwhReadout, extraClass = '') {
     return `
       <div class="dt-slider-wrap ${extraClass}">
@@ -423,8 +471,7 @@ class GridLensAdvisoryCard extends HTMLElement {
         <span class="dt-solar-value">${kwh == null ? '–' : fmtKwh(kwh)}</span>
       </div>`;
 
-    const masterSt = this._dtMasterEid && hass.states[this._dtMasterEid];
-    const masterPct = masterSt ? clampTargetPct(masterSt.state) : 100;
+    const masterPct = this._dtResolvePct(hass, this._dtMasterEid, 100);
     const hasDevices = (this._dtDevices || []).length > 0;
 
     const masterInline = this._dtMasterEid ? `
@@ -462,8 +509,7 @@ class GridLensAdvisoryCard extends HTMLElement {
     const hass = this._hass;
     const rows = this._dtRows || [];
     if (!rows.length) return '<div class="dt-empty">No deferrable loads configured yet.</div>';
-    const masterSt = this._dtMasterEid && hass.states[this._dtMasterEid];
-    const masterPct = masterSt ? clampTargetPct(masterSt.state) : 100;
+    const masterPct = this._dtResolvePct(hass, this._dtMasterEid, 100);
 
     return `<div class="dt-panel">` + rows.map((r) => {
       const d = r.device;
@@ -473,7 +519,7 @@ class GridLensAdvisoryCard extends HTMLElement {
       }
       const targetSt = hass.states[r.targetEid];
       const isOverride = !!(targetSt && (targetSt.attributes || {}).is_override);
-      const pct = targetSt ? clampTargetPct(targetSt.state) : masterPct;
+      const pct = this._dtResolvePct(hass, r.targetEid, masterPct);
       const cached = this._dtHistoryCache[d.energy_entity];
       const avgKwh = cached ? cached.avgKwh : null;
       const effectiveKwh = avgKwh == null ? null : avgKwh * pct / 100.0;
@@ -515,6 +561,7 @@ class GridLensAdvisoryCard extends HTMLElement {
             ${greedyLine(a, lcOpts)}
             ${modulationLine(a, d, lcOpts)}
             ${socCapHtml(hass, d, lcOpts)}
+            ${acCeilingHtml(a, lcOpts)}
           </div>
           ${this._dtSliderRowHtml(r.targetEid, pct, kwhReadout, isOverride ? 'is-override' : '')}
           ${resetBtn}
@@ -523,6 +570,7 @@ class GridLensAdvisoryCard extends HTMLElement {
           ${currentReadoutHtml(hass, d, lcOpts)}
           ${maxCurrentHtml(hass, r, d, lcOpts)}
           ${greedyButtonsHtml(hass, r, d, lcOpts)}
+          ${visibilityToggleHtml(hass, r, d, lcOpts)}
           ${estimatorToggleHtml(est, estOpen, lcOpts)}
           ${controlHtml(hass, r, d, lcOpts)}
           ${est && estOpen ? estimatorPanelHtml(d, est, lcOpts) : ''}
@@ -543,6 +591,8 @@ class GridLensAdvisoryCard extends HTMLElement {
     if (!btn || !this._hass) return;
     ev.stopPropagation();
     const sensorId = btn.getAttribute('data-dt-reset-for');
+    const row = (this._dtRows || []).find((r) => r.device.energy_entity === sensorId);
+    if (row && row.targetEid) delete this._dtPinned[row.targetEid];
     this._hass.callService('grid_lens', 'clear_daily_target', { sensor_id: sensorId });
   }
 
@@ -550,15 +600,37 @@ class GridLensAdvisoryCard extends HTMLElement {
     const el = ev.target;
     if (!el || !el.matches || !el.matches('input[type=range][data-dt-eid]')) return;
     const eid = el.getAttribute('data-dt-eid');
+    const value = clampTargetPct(el.value);
+    // Pin while dragging too, not just on release — otherwise a repaint that lands
+    // mid-drag (see the constructor's _dtPinned comment) would redraw this slider
+    // from the pre-drag entity value even before the user lets go.
+    this._dtPinned[eid] = { value, ts: Date.now() };
     const readout = this.shadowRoot.querySelector(`[data-dt-pct-for="${eid}"]`);
-    if (readout) readout.textContent = `${parseFloat(el.value).toFixed(0)}%`;
+    if (readout) readout.textContent = `${value.toFixed(0)}%`;
   }
 
   _onDtSliderChange(ev) {
     const el = ev.target;
     if (!el || !el.matches || !el.matches('input[type=range][data-dt-eid]') || !this._hass) return;
     const eid = el.getAttribute('data-dt-eid');
-    this._hass.callService('number', 'set_value', { entity_id: eid, value: clampTargetPct(el.value) });
+    const value = clampTargetPct(el.value);
+    this._dtPinned[eid] = { value, ts: Date.now() };
+    this._hass.callService('number', 'set_value', { entity_id: eid, value });
+  }
+
+  // Marks which slider (if any) is currently under a held pointer, so _paint() can
+  // defer a mid-drag repaint instead of destroying the <input> the user is dragging
+  // (see the constructor's _dtPinned comment for the bug this and _dtResolvePct fix).
+  _onDtSliderPointerDown(ev) {
+    const el = ev.target;
+    if (!el || !el.matches || !el.matches('input[type=range][data-dt-eid]')) return;
+    this._dtDragEid = el.getAttribute('data-dt-eid');
+  }
+
+  _onDtSliderPointerUp() {
+    if (!this._dtDragEid) return;
+    this._dtDragEid = null;
+    if (this._dtRepaintPending) { this._dtRepaintPending = false; this._paint(); }
   }
 
   // ---------------------------------------------- Load control (merged 2026-09-24)
@@ -735,6 +807,11 @@ class GridLensAdvisoryCard extends HTMLElement {
         .dt-row .soc-cap { font-size: 11px; color: var(--buy); opacity: .9; margin-top: 1px;
                         display: flex; align-items: center; gap: 5px; }
         .dt-row .soc-cap ha-icon { --mdc-icon-size: 14px; }
+        /* AC output ceiling line — same "why is this being limited" shape as .soc-cap
+           above, different cause (inverter/plant AC-side ceiling, not SOC). */
+        .dt-row .ac-cap { font-size: 11px; color: var(--buy); opacity: .9; margin-top: 1px;
+                       display: flex; align-items: center; gap: 5px; }
+        .dt-row .ac-cap ha-icon { --mdc-icon-size: 14px; }
         .dt-sw { position: relative; flex: 0 0 auto; width: 40px; height: 22px; border-radius: 12px;
               background: var(--border); cursor: pointer; transition: background .15s ease; }
         .dt-sw::after { content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
@@ -758,6 +835,9 @@ class GridLensAdvisoryCard extends HTMLElement {
                width: 26px; height: 26px; border-radius: 7px; border: 1px solid var(--border);
                background: transparent; color: var(--ink2); cursor: pointer; }
         .dt-gbtn.on { background: var(--good); color: #fff; border-color: var(--good); }
+        /* Show/Hide-on-Power-Flow toggle (visibilityToggleHtml) — see that function's own
+           comment for why this inverts the Greedy icons' ".on = highlighted" convention. */
+        .dt-gbtn.hidden { background: var(--buy); color: #fff; border-color: var(--buy); }
         .dt-gbtn ha-icon { --mdc-icon-size: 15px; }
         .dt-gbtn.disabled { opacity: .35; cursor: not-allowed; }
         .dt-boost { display: flex; align-items: center; gap: 3px; flex: 0 0 auto;
@@ -835,6 +915,7 @@ class GridLensAdvisoryCard extends HTMLElement {
       body.addEventListener('click', (ev) => this._onChipClick(ev));
       body.addEventListener('click', (ev) => this._onDtExpandClick(ev));
       body.addEventListener('click', (ev) => this._onDtResetClick(ev));
+      body.addEventListener('pointerdown', (ev) => this._onDtSliderPointerDown(ev));
       body.addEventListener('input', (ev) => this._onDtSliderInput(ev));
       body.addEventListener('change', (ev) => this._onDtSliderChange(ev));
       body.addEventListener('click', (ev) => this._onDtEstToggleClick(ev));
@@ -850,6 +931,14 @@ class GridLensAdvisoryCard extends HTMLElement {
   }
 
   _paint() {
+    if (this._dtDragEid) {
+      // A repaint landed mid-drag — rebuilding .body's innerHTML would destroy the
+      // <input type=range> the user is actively holding, which is exactly the drag
+      // the reported "snaps back on release" bug traced to. Defer it; _dtSliderPointerUp
+      // runs the deferred repaint once the drag ends.
+      this._dtRepaintPending = true;
+      return;
+    }
     const body = this.shadowRoot && this.shadowRoot.querySelector('.body');
     if (!body) return;
     const s = this._summary || {};

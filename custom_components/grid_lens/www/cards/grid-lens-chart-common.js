@@ -970,6 +970,11 @@ export function resolveLoadControlRows(hass, devices) {
       gfEid: greedySwitchFor(hass, phys, 'greedy_surplus'),
       boostEid: resolveBoostEidFor(hass, d.energy_entity),
       maxCurEid: maxCurrentFor(hass, d),
+      // Unlike every other *Eid above, not resolved by scanning hass.states for a join-key
+      // match — sensor.py's _build_deferrable_loads() already publishes it directly on the
+      // device attribute (switch.py's GridLensDeferrableVisibleSwitch, one per configured
+      // load regardless of controllability), so this is just carried through.
+      visEid: d.visible_entity || null,
     };
   });
 }
@@ -1096,6 +1101,13 @@ export function greedyLine(a, opts = {}) {
       + 'sensor in Grid Lens > Reconfigure > Energy sensors.')}" tabindex="0">`
       + `Greedy: export is being wasted, but no grid power sensor is set</div>`;
   }
+  if (a.greedy_blocked === 'no_ac_output_headroom') {
+    // The real explanation here is the inverter's AC output ceiling, not a schedule window
+    // — rendered as its own icon+tooltip line by acCeilingHtml (same call site as
+    // socCapHtml). Falling through to the generic branch below would wrongly say "outside
+    // this load's availability window", which has nothing to do with why this is blocked.
+    return '';
+  }
   if (a.greedy_blocked) {
     const why = a.greedy_blocked === 'override'
       ? 'suppressed by a manual override'
@@ -1205,6 +1217,35 @@ export function socCapHtml(hass, d, opts = {}) {
     : `Grid Lens's SOC ceiling for this load is limiting today's scheduled charge.`;
   return `<div class="${p('soc-cap')}" tabindex="0" data-tip="${esc(tip)}">
     <ha-icon icon="mdi:battery-lock"></ha-icon><span>SOC-limited · ${body}</span>
+  </div>`;
+}
+
+// Inverter/plant AC output ceiling notice — same "why is this being limited" class of
+// message as socCapHtml above, and same icon+line treatment, but a different cause: the
+// configured AC-output ceiling (CONF_MAX_AC_OUTPUT_KW — see
+// LoadControlManager._ac_output_headroom_w) is already fully claimed by PV and other loads
+// right now, so this device can't get more current regardless of battery SOC or available
+// solar. Fires on either signal that can produce it: the live 30-second loop actually
+// capping the setpoint (`modulation_source === 'ac_output_cap'`, on/off loads never set
+// this) or the 5-minute Greedy Consumption tick finding no headroom to turn on with
+// (`greedy_blocked === 'no_ac_output_headroom'`, checked in greedyLine, which returns ''
+// for this value rather than duplicating the notice this function already renders).
+export function acCeilingHtml(a, opts = {}) {
+  const p = (n) => `${opts.prefix || ''}${n}`;
+  if (!a) return '';
+  if (a.modulation_source !== 'ac_output_cap' && a.greedy_blocked !== 'no_ac_output_headroom') {
+    return '';
+  }
+  const headroom = a.forecast_ac_output_headroom_w != null ? +a.forecast_ac_output_headroom_w : null;
+  const body = headroom != null ? `~${Math.round(headroom)} W spare` : 'no spare capacity';
+  const tip = `Your inverter/plant's configured AC output ceiling is already almost fully used by `
+    + `solar production and other loads right now, regardless of battery SOC or available solar — `
+    + `the battery/PV could deliver more, but the inverter's AC side can't push it out. This clears `
+    + `on its own as other loads finish or production drops. Raise "Inverter max AC output" in the `
+    + `Grid Lens integration's Reconfigure flow (Battery step) only if your hardware can actually `
+    + `sustain more.`;
+  return `<div class="${p('ac-cap')}" tabindex="0" data-tip="${esc(tip)}">
+    <ha-icon icon="mdi:gauge-full"></ha-icon><span>AC output capped · ${body}</span>
   </div>`;
 }
 
@@ -1479,6 +1520,46 @@ export function boostInputHtml(hass, r, d, opts = {}) {
         value="${shown}">
       <span class="${p('boost-unit')}">kWh</span>
       ${over ? `<span class="${p('boost-cap')}">max ${ceiling.toFixed(1)}</span>` : ''}
+    </div>`;
+}
+
+// Show/Hide on Power Flow toggle (switch.py's GridLensDeferrableVisibleSwitch). Unlike the
+// Greedy/Off-now-On-now-Auto controls, this applies to EVERY device — including a
+// forecast-only load with no control switch at all, since it still draws its own node on
+// the Power Flow diagram. Reuses the Greedy icons' own flex wrapper (`.greedy`/`.gbtn` —
+// see greedyButtonsHtml above) as a single-item group so this reads as a sibling icon
+// rather than a new control language, and needs no dedicated container CSS of its own.
+//
+// Deliberately inverted from Greedy's ".on = highlighted" convention: ON (visible) is the
+// default, unremarkable state for every device, so highlighting it would just make every
+// row's icon coloured all the time. OFF (hidden) is the rare, worth-noticing exception —
+// see the entity's own doubling as the Power Flow node's disable button — so `.hidden` gets
+// the same warning accent (--buy) `.ovr button.active.off` already uses for Force Off.
+export function visibilityToggleHtml(hass, r, d, opts = {}) {
+  const p = (n) => `${opts.prefix || ''}${n}`;
+  const eid = r.visEid || d.visible_entity || null;
+  // Missing entity (mid-setup — the switch platform hasn't finished registering yet) fails
+  // open, same as _isLoadVisible()/plan_calculator.py's own "missing = visible" semantics:
+  // a disabled placeholder rather than a button with nothing to toggle.
+  if (!eid) {
+    return `
+      <div class="${p('greedy')}">
+        <div class="${p('gbtn')} disabled" tabindex="0" data-tip="Loading…">
+          <ha-icon icon="mdi:eye-outline"></ha-icon>
+        </div>
+      </div>`;
+  }
+  const st = hass.states[eid];
+  const hidden = !!st && st.state === 'off';
+  const label = d.name || 'this device';
+  const tip = hidden
+    ? `Hidden from the Power Flow diagram — click to show ${label} again`
+    : `Shown on the Power Flow diagram — click to hide ${label}`;
+  return `
+    <div class="${p('greedy')}">
+      <div class="${p('gbtn')}${hidden ? ' hidden' : ''}" data-eid="${esc(eid)}" tabindex="0" data-tip="${esc(tip)}">
+        <ha-icon icon="${hidden ? 'mdi:eye-off-outline' : 'mdi:eye-outline'}"></ha-icon>
+      </div>
     </div>`;
 }
 

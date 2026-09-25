@@ -346,10 +346,12 @@ class PlanCalculator:
     def _deferrable_visibility(self) -> list[bool]:
         """Per-device "Show In Power Flow" switch state (switch.py's
         GridLensDeferrableVisibleSwitch), indexed exactly like self.deferrable_load_sensors —
-        same {entry_id}_deferrable_visible_{i} unique_id scheme sensor.py's
-        _build_deferrable_loads() resolves, same fail-open semantics as that method's
-        visible_entity field and grid-lens-powerflow-card.js's _isLoadVisible() (a missing
-        entity, e.g. mid-setup, reads as visible rather than hiding everything).
+        same {entry_id}_deferrable_visible_{sensor_id} unique_id scheme sensor.py's
+        _build_deferrable_loads() resolves (keyed by the device's own sensor_id, not its
+        list index — see __init__.py's _migrate_deferrable_positional_unique_ids), same
+        fail-open semantics as that method's visible_entity field and
+        grid-lens-powerflow-card.js's _isLoadVisible() (a missing entity, e.g. mid-setup,
+        reads as visible rather than hiding everything).
 
         True = show this device in the Power chart / Plan Comparison breakdown, False = the
         user's hide button is off. Purely a display filter — see calculate_plan_costs' use
@@ -360,9 +362,9 @@ class PlanCalculator:
         """
         ent_reg = async_get_entity_registry(self.hass)
         out = []
-        for i in range(len(self.deferrable_load_sensors)):
+        for sensor_id in self.deferrable_load_sensors:
             visible_entity = ent_reg.async_get_entity_id(
-                "switch", DOMAIN, f"{self.entry.entry_id}_deferrable_visible_{i}"
+                "switch", DOMAIN, f"{self.entry.entry_id}_deferrable_visible_{sensor_id}"
             )
             st = self.hass.states.get(visible_entity) if visible_entity else None
             out.append(not (st and st.state == "off"))

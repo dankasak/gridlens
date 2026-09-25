@@ -300,6 +300,7 @@ class LoadControlManager:
                     stop_button_entity_id=(
                         stop_buttons[i] if i < len(stop_buttons) else ""
                     ),
+                    sensor_id=sensor_id,
                 )
                 self._modulating.add(i)
                 self._device_power_sensors[i] = self._resolve_device_power(
@@ -312,6 +313,7 @@ class LoadControlManager:
                 switch_entity_id=sw,
                 max_w=max_w,
                 climate_on_mode=climate_on_modes[i] if i < len(climate_on_modes) else "",
+                sensor_id=sensor_id,
             )
 
         # Per-device state. _want_enabled = user/switch intent (persists across an

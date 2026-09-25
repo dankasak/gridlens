@@ -604,7 +604,13 @@ class GridLensModulatingMaxCurrentNumber(RestoreEntity, NumberEntity):
         self._setpoint_entity_id = setpoint_entity_id
         self._sensor_id = sensor_id
         self._attr_name = f"{name} Max Current"
-        self._attr_unique_id = f"{entry.entry_id}_deferrable_max_current_{index}"
+        # Keyed by sensor_id (this device's CONF_DEFERRABLE_LOAD_SENSORS entry), not
+        # `index` — index is just this device's current position in the config list and
+        # shifts on a reorder/insertion (see __init__.py._migrate_deferrable_positional_
+        # unique_ids). Falls back to index only if sensor_id wasn't resolved, which
+        # shouldn't happen for a real config but keeps this from ever emitting a blank
+        # unique_id.
+        self._attr_unique_id = f"{entry.entry_id}_deferrable_max_current_{sensor_id or index}"
         self._attr_native_min_value = min_a
         self._attr_native_max_value = max_a
         self._attr_device_info = {

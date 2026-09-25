@@ -26,9 +26,12 @@ import {
   STYLE, esc, resolveDeferrableLoads, resolveDailyTargetMasterEid, resolveDailyTargetEidFor,
   resolveBoostEidFor, resolveChargeTargetPercentEidFor, resolveSolarForecastEid, solarSummary,
   fmtKwh, clampTargetPct, fetchDailyAverageKwh,
-} from './grid-lens-chart-common.js?v=20260923c';
+} from './grid-lens-chart-common.js?v=20260924a';
 
 const HISTORY_REFRESH_MS = 15 * 60000;
+// See grid-lens-advisory-card.js's own DT_PIN_MAX_AGE_MS comment — same slider,
+// same drag-then-release-snaps-back fix, same rationale for the timeout.
+const PIN_MAX_AGE_MS = 15000;
 
 class GridLensDailyTargetCard extends HTMLElement {
   constructor() {
@@ -43,11 +46,41 @@ class GridLensDailyTargetCard extends HTMLElement {
     // it's a stats query and not part of live hass state.
     this._historyCache = {};
     this._historyPending = new Set();
+    // Local-override state for the sliders — see grid-lens-advisory-card.js's
+    // constructor comment for the "snaps back on release" bug this fixes.
+    this._pinned = {};
+    this._dragEid = null;
+    this._repaintPending = false;
+    this._pointerUpHandler = () => this._onSliderPointerUp();
+  }
+
+  connectedCallback() {
+    window.addEventListener('pointerup', this._pointerUpHandler);
+    window.addEventListener('pointercancel', this._pointerUpHandler);
+  }
+
+  disconnectedCallback() {
+    window.removeEventListener('pointerup', this._pointerUpHandler);
+    window.removeEventListener('pointercancel', this._pointerUpHandler);
   }
 
   setConfig(config) {
     this._config = Object.assign({ title: 'Daily Targets' }, config);
     this._renderShell();
+  }
+
+  // See grid-lens-advisory-card.js's own _dtResolvePct for the full rationale.
+  _resolvePct(hass, eid, fallback) {
+    if (!eid) return fallback;
+    const st = hass.states[eid];
+    const live = st ? clampTargetPct(st.state) : fallback;
+    const pinned = this._pinned[eid];
+    if (!pinned) return live;
+    if (Date.now() - pinned.ts > PIN_MAX_AGE_MS || (st && Math.round(live) === Math.round(pinned.value))) {
+      delete this._pinned[eid];
+      return live;
+    }
+    return pinned.value;
   }
 
   getCardSize() { return Math.max(3, (this._rows || []).length + 2); }
@@ -196,6 +229,13 @@ class GridLensDailyTargetCard extends HTMLElement {
   }
 
   _paint() {
+    if (this._dragEid) {
+      // A repaint landed mid-drag — rebuilding the row/master markup would destroy
+      // the <input type=range> the user is actively holding. Defer it;
+      // _onSliderPointerUp runs the deferred repaint once the drag ends.
+      this._repaintPending = true;
+      return;
+    }
     if (!this.shadowRoot.querySelector('.card')) this._renderShell();
     const solar = solarSummary(this._hass, this._config.solar_forecast_entity);
     this._paintSolarBox('today', solar.todayKwh, solar.todayWeather);
@@ -203,8 +243,7 @@ class GridLensDailyTargetCard extends HTMLElement {
 
     const hass = this._hass;
     const masterEid = this._masterEidCache;
-    const masterSt = masterEid && hass.states[masterEid];
-    const masterPct = masterSt ? clampTargetPct(masterSt.state) : 100;
+    const masterPct = this._resolvePct(hass, masterEid, 100);
     const masterWrap = this.shadowRoot.querySelector('.master-wrap');
     masterWrap.innerHTML = masterEid ? `
       <div class="master-inline">
@@ -225,7 +264,7 @@ class GridLensDailyTargetCard extends HTMLElement {
       const d = r.device;
       const targetSt = r.targetEid && hass.states[r.targetEid];
       const isOverride = !!(targetSt && (targetSt.attributes || {}).is_override);
-      const pct = targetSt ? clampTargetPct(targetSt.state) : masterPct;
+      const pct = this._resolvePct(hass, r.targetEid, masterPct);
       const avgKwh = this._historyCache[d.energy_entity] ? this._historyCache[d.energy_entity].avgKwh : null;
       const effectiveKwh = avgKwh == null ? null : avgKwh * pct / 100.0;
       const kwhReadout = avgKwh == null
@@ -266,21 +305,37 @@ class GridLensDailyTargetCard extends HTMLElement {
     this._attachListeners();
   }
 
+  _onSliderPointerUp() {
+    if (!this._dragEid) return;
+    this._dragEid = null;
+    if (this._repaintPending) { this._repaintPending = false; this._paint(); }
+  }
+
   _attachListeners() {
     const root = this.shadowRoot;
     root.querySelectorAll('input[type=range][data-eid]').forEach((el) => {
       const eid = el.getAttribute('data-eid');
       const readout = root.querySelector(`[data-pct-for="${eid}"]`);
+      el.addEventListener('pointerdown', () => { this._dragEid = eid; });
       el.addEventListener('input', () => {
-        if (readout) readout.textContent = `${parseFloat(el.value).toFixed(0)}%`;
+        const value = clampTargetPct(el.value);
+        // Pin while dragging too, not just on release — see the constructor's
+        // _pinned comment for why an in-flight repaint would otherwise snap this
+        // slider back to the pre-drag entity value.
+        this._pinned[eid] = { value, ts: Date.now() };
+        if (readout) readout.textContent = `${value.toFixed(0)}%`;
       });
       el.addEventListener('change', () => {
-        this._hass.callService('number', 'set_value', { entity_id: eid, value: clampTargetPct(el.value) });
+        const value = clampTargetPct(el.value);
+        this._pinned[eid] = { value, ts: Date.now() };
+        this._hass.callService('number', 'set_value', { entity_id: eid, value });
       });
     });
     root.querySelectorAll('[data-reset-for]').forEach((el) => {
       el.addEventListener('click', () => {
         const sensorId = el.getAttribute('data-reset-for');
+        const row = (this._rows || []).find((r) => r.device.energy_entity === sensorId);
+        if (row && row.targetEid) delete this._pinned[row.targetEid];
         this._hass.callService('grid_lens', 'clear_daily_target', { sensor_id: sensorId });
       });
     });

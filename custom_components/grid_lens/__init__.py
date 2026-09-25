@@ -634,7 +634,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260924f"
+    _CARD_VERSION = "20260925a"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -1820,6 +1820,73 @@ async def _ensure_load_estimators(hass: HomeAssistant, entry: ConfigEntry) -> tu
     return energy_estimators, power_estimators
 
 
+def _migrate_deferrable_positional_unique_ids(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """One-time registry fix-up: switch.py/select.py/number.py used to key every per-load
+    entity's unique_id off the device's plain list INDEX in CONF_DEFERRABLE_LOAD_SENSORS
+    (``f"..._deferrable_visible_{i}"`` and the same shape for control/greedy/greedy_
+    schedule/greedy_surplus/override_mode/max_current). An index is not a stable device
+    identity — it's just this device's current position in the array — so inserting or
+    reordering a deferrable load silently reassigned every one of these entities, and any
+    RestoreEntity state (a Show-In-Power-Flow toggle, a Force On/Off override, a Greedy
+    setting) they'd persisted, to whatever device now sits at that index.
+
+    Found 2026-09-25: adding a Hot Water load ahead of the existing devices left its "Show
+    In Power Flow" switch silently inheriting an old EV Charger's OFF state, under the
+    frozen entity_id ``switch...ev_charger_show_in_power_flow`` — the Power Flow card's
+    hot water node vanished with no error anywhere, because ``_isLoadVisible()`` was
+    reading a switch that display-named itself correctly (name is recomputed fresh every
+    setup — see switch.py's async_setup_entry) but had the wrong *identity* underneath.
+
+    Fix: every one of these entities now keys its unique_id off the device's own
+    ``sensor_id`` (its CONF_DEFERRABLE_LOAD_SENSORS entry) instead of `index` — the same
+    stable join key ``GridLensDeferrableOverrideNumber`` ("Today Boost") already used.
+    This function renames each OLD-scheme unique_id sitting in the entity registry to the
+    NEW scheme, using TODAY's index->sensor_id mapping, which preserves the entity (its
+    entity_id, restored state, and history) for whichever device the registry currently,
+    correctly, displays it as. It does NOT rename the entity_id itself — only the
+    registry's internal unique_id — so an entity_id already mislabeled by a past reorder
+    (e.g. ``..._ev_charger_...`` now correctly showing "Hot Water") stays as-is; the owner
+    can rename it by hand (Settings -> Entities) if they want the slug to match. Must run
+    BEFORE the switch/select/number platforms are forwarded, and after
+    _ensure_load_estimators (whose one-time merge can still be extending
+    CONF_DEFERRABLE_LOAD_SENSORS at that point) so it migrates against the final list.
+    Idempotent: a device with no OLD-style entity registered (a fresh install, or one
+    already migrated) is simply skipped.
+    """
+    from homeassistant.helpers import entity_registry as er
+
+    ent_reg = er.async_get(hass)
+    sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or []
+    # Must stay in lockstep with the unique_id each platform actually sets — switch.py's
+    # 5 classes, select.py's override selector, number.py's max-current ceiling.
+    suffixes = (
+        ("switch", "deferrable_visible"),
+        ("switch", "deferrable_control"),
+        ("switch", "deferrable_greedy_surplus"),
+        ("switch", "deferrable_greedy_schedule"),
+        ("switch", "deferrable_greedy"),
+        ("select", "deferrable_override_mode"),
+        ("number", "deferrable_max_current"),
+    )
+    for i, sensor_id in enumerate(sensors):
+        if not sensor_id:
+            continue
+        for domain, suffix in suffixes:
+            old_uid = f"{entry.entry_id}_{suffix}_{i}"
+            entity_id = ent_reg.async_get_entity_id(domain, DOMAIN, old_uid)
+            if not entity_id:
+                continue
+            new_uid = f"{entry.entry_id}_{suffix}_{sensor_id}"
+            if ent_reg.async_get_entity_id(domain, DOMAIN, new_uid):
+                continue  # new-style entry already exists — already migrated
+            ent_reg.async_update_entity(entity_id, new_unique_id=new_uid)
+            _LOGGER.info(
+                "Grid Lens: migrated %s unique_id from positional index %d to stable "
+                "sensor id on entity %s",
+                suffix, i, entity_id,
+            )
+
+
 async def _ensure_greedy_trackers(hass: HomeAssistant, entry: ConfigEntry) -> dict:
     """One GreedyEnergyTracker per deferrable-load index that LoadControlManager actually
     drives — i.e. every key in its ``controllers`` dict, on/off and modulating alike. A
@@ -1959,6 +2026,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _energy_estimators, _power_estimators = await _ensure_load_estimators(hass, entry)
     hass.data[DOMAIN][f"{entry.entry_id}_load_estimators"] = _energy_estimators
     hass.data[DOMAIN][f"{entry.entry_id}_power_estimators"] = _power_estimators
+
+    # Must run before the switch/select/number platforms are forwarded (below), and after
+    # _ensure_load_estimators so CONF_DEFERRABLE_LOAD_SENSORS is in its final form for this
+    # setup. See the function's own docstring for what this fixes and why.
+    _migrate_deferrable_positional_unique_ids(hass, entry)
 
     coordinator = GridLensCoordinator(hass, entry)
     hass.data[DOMAIN][entry.entry_id] = coordinator

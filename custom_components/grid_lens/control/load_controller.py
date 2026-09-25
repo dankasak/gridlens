@@ -129,10 +129,19 @@ class DeferrableLoadController:
         on_fraction: float = 0.5,
         on_floor_w: float = 50.0,
         climate_on_mode: str = "",
+        sensor_id: str = "",
     ) -> None:
         self.hass = hass
         self.name = name
         self.switch_entity_id = switch_entity_id
+        # The device's own CONF_DEFERRABLE_LOAD_SENSORS entry — stable across a reorder or
+        # insertion elsewhere in the deferrable-loads list, unlike this controller's dict
+        # key in LoadControlManager.controllers (a plain array index, see that class's own
+        # docstring). switch.py/select.py key their per-load entities' unique_id off this
+        # instead of the index, so a config change never silently reassigns a user's
+        # override/greedy/visibility settings to a different physical device (found
+        # 2026-09-25 — see __init__.py's _migrate_deferrable_positional_unique_ids).
+        self.sensor_id = sensor_id
         self.max_w = max(0.0, float(max_w))
         self.min_on = float(min_on_seconds)
         self.min_off = float(min_off_seconds)

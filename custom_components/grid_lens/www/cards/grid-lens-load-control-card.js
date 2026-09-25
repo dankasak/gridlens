@@ -83,9 +83,10 @@
 import {
   STYLE, esc, resolveDeferrableLoads, resolveLoadControlRows, socCapFor, boostCeiling,
   estimatorFor, friendlyNote, fetchDailyHistory, averageFromDays, greedyLine, modulationLine,
-  currentReadoutHtml, maxCurrentHtml, socCapHtml, sparklineHtml, estimatorToggleHtml,
-  estimatorPanelHtml, controlHtml, greedyButtonsHtml, boostInputHtml, attachTooltip,
-} from './grid-lens-chart-common.js?v=20260924f';
+  currentReadoutHtml, maxCurrentHtml, socCapHtml, acCeilingHtml, sparklineHtml, estimatorToggleHtml,
+  estimatorPanelHtml, controlHtml, greedyButtonsHtml, boostInputHtml, visibilityToggleHtml,
+  attachTooltip,
+} from './grid-lens-chart-common.js?v=20260924h';
 
 const HISTORY_REFRESH_MS = 15 * 60000;
 
@@ -208,6 +209,7 @@ class GridLensLoadControlCard extends HTMLElement {
         c ? [c.state, (c.attributes || {}).note, (c.attributes || {}).greedy_reason,
              (c.attributes || {}).greedy_blocked,
              (c.attributes || {}).forecast_free_kwh,
+             (c.attributes || {}).forecast_ac_output_headroom_w,
              (c.attributes || {}).modulation_source,
              (c.attributes || {}).plugged_in].join('|') : '',
         s ? s.state : '',
@@ -251,6 +253,11 @@ class GridLensLoadControlCard extends HTMLElement {
         .row .soc-cap { font-size: 11px; color: var(--buy); opacity: .9; margin-top: 1px;
                         display: flex; align-items: center; gap: 5px; }
         .row .soc-cap ha-icon { --mdc-icon-size: 14px; }
+        /* AC output ceiling line — same "why is this being limited" shape as .soc-cap
+           above, different cause (inverter/plant AC-side ceiling, not SOC). */
+        .row .ac-cap { font-size: 11px; color: var(--buy); opacity: .9; margin-top: 1px;
+                       display: flex; align-items: center; gap: 5px; }
+        .row .ac-cap ha-icon { --mdc-icon-size: 14px; }
         /* Progress toward the forecast-surplus trigger: the bar is the point — a number
            pair alone doesn't convey "nearly there" at a glance. */
         .gbar { flex: 0 0 auto; width: 42px; height: 4px; border-radius: 2px;
@@ -279,6 +286,9 @@ class GridLensLoadControlCard extends HTMLElement {
                width: 26px; height: 26px; border-radius: 7px; border: 1px solid var(--border);
                background: transparent; color: var(--ink2); cursor: pointer; }
         .greedy .gbtn.on { background: var(--good); color: #fff; border-color: var(--good); }
+        /* Show/Hide-on-Power-Flow toggle (visibilityToggleHtml) shares this same .gbtn look
+           but inverts the highlight convention — see that function's own comment for why. */
+        .greedy .gbtn.hidden { background: var(--buy); color: #fff; border-color: var(--buy); }
         .greedy .gbtn ha-icon { --mdc-icon-size: 15px; }
         /* Always rendered, even for a non-controllable device — same disabled treatment as
            .ovr.disabled, so every row keeps the same three-icon width and rows line up. */
@@ -409,11 +419,12 @@ class GridLensLoadControlCard extends HTMLElement {
       // row (e.g. a command_error), so it's worth the one line when non-empty.
       const meta = d.controllable ? note : 'Forecast only — no control switch configured';
       // Second meta line: the live greedy story. Third, modulating-only: why the current
-      // is where it is right now. Fourth: "SOC-limited". All three shared with
-      // grid-lens-advisory-card.js's merged panel via chart-common.js.
+      // is where it is right now. Fourth: "SOC-limited". Fifth: "AC output capped". All
+      // shared with grid-lens-advisory-card.js's merged panel via chart-common.js.
       const greedyLineHtml = greedyLine(a);
       const modLine = modulationLine(a, d);
       const socCapLine = socCapHtml(hass, d);
+      const acCapLine = acCeilingHtml(a);
 
       // 14-day daily-kWh sparkline — shown for every device with an energy sensor, right
       // beside the boost input it's meant to inform.
@@ -438,6 +449,7 @@ class GridLensLoadControlCard extends HTMLElement {
       const controlEl = controlHtml(hass, r, d);
       const greedyHtml = greedyButtonsHtml(hass, r, d);
       const boostHtml = boostInputHtml(hass, r, d);
+      const visHtml = visibilityToggleHtml(hass, r, d);
 
       return `
         <div class="row" data-eid="${esc(r.controlEid || d.energy_entity)}">
@@ -448,12 +460,14 @@ class GridLensLoadControlCard extends HTMLElement {
             ${greedyLineHtml}
             ${modLine}
             ${socCapLine}
+            ${acCapLine}
           </div>
           ${sparkHtml}
           ${boostHtml}
           ${currentHtml}
           ${maxCurHtml}
           ${greedyHtml}
+          ${visHtml}
           ${estToggleHtml}
           ${controlEl}
           ${estPanelHtml}

@@ -442,7 +442,7 @@ class CurrentPlanCostSensor(GridLensSensorBase):
                 # whose switch platform hasn't finished setting up yet (registry not
                 # populated) — the card treats a missing entity as visible.
                 "visible_entity": ent_reg.async_get_entity_id(
-                    "switch", DOMAIN, f"{self._entry.entry_id}_deferrable_visible_{i}"
+                    "switch", DOMAIN, f"{self._entry.entry_id}_deferrable_visible_{sensor_id}"
                 ),
             })
         return out

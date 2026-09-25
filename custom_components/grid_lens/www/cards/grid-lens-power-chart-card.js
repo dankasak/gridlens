@@ -8,15 +8,22 @@
  *   type: custom:grid-lens-power-chart-card
  *   entity: sensor.roof_grid_lens_nsw_planned_dispatch   (required)
  *   solar_power_entity, load_power_entity, grid_power_entity, battery_power_entity   (optional, have defaults)
+ *   solar_forecast_power_entity   (optional override — see resolveForecastPowerSensor()
+ *                                 in chart-common.js for auto-discovery. Its history is
+ *                                 what draws the dashed "forecast" line across the past
+ *                                 when Solar is isolated via the legend — see below.)
  *   max_height: 420   // fixed height (px) for the chart; set 0/null for natural (aspect-ratio) height
  *   max_width: null   // cap (px) on how wide the card grows; set 0/null to fill its container
  *   show_forecast_history: false  // true = draw the forecast line across the past too (for
  *                                 // plan-vs-actual comparison). Default cuts it at "now" so
- *                                 // the past shows measured data only.
+ *                                 // the past shows measured data only. Clicking a legend
+ *                                 // entry to isolate one series (e.g. "Solar") does this
+ *                                 // automatically for just that series — no config needed.
  */
 import {
   GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor, clampPct, fmtPct,
-} from './grid-lens-chart-common.js?v=20260923c';
+  resolveForecastPowerSensor, ds, VIEW_BACK_MS,
+} from './grid-lens-chart-common.js?v=20260924a';
 
 // Free-energy shading (see _freeEnergyBands). CSS custom props rather than literals so
 // both bands follow the viewer's light/dark theme like every other colour on this card;
@@ -199,7 +206,20 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
   // reads as the obvious "on" state rather than everything just looking identical.
   _legendItem(group, swatchHtml, label) {
     const dim = this._isolatedGroup && this._isolatedGroup !== group ? ' dim' : '';
-    const tip = this._isolatedGroup === group ? 'Click to show every series again' : 'Click to show only this series';
+    let tip;
+    if (this._isolatedGroup === group) {
+      tip = 'Click to show every series again';
+    } else if (group === 'solar') {
+      // Solar is the one group with a genuine forecast-vs-actual HISTORY comparison —
+      // see _fetchForecastHistory()/_actualSolarForecast — because it's the only series
+      // with its own real "power now" forecast entity to pull history from. Every other
+      // group's forecast side comes from the dispatch trajectory, which never carries
+      // past slots (see _chartSvg()'s clipForecastPastLine comment), so isolating them
+      // has nothing extra to show.
+      tip = 'Click to isolate Solar, with the forecast history line shown alongside actual (forecast vs. actual)';
+    } else {
+      tip = 'Click to show only this series';
+    }
     return `<span class="legend-item${dim}" data-group="${esc(group)}" tabindex="0" title="${esc(tip)}">${swatchHtml}${esc(label)}</span>`;
   }
 
@@ -230,7 +250,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       ${deferLegend}
       ${this._legendItem('soc', '<i style="border-top:3px dashed var(--soc)"></i>', 'SOC % (right axis)')}
       ${bandLegend}
-      <span style="color:var(--muted)">— thin = measured · SOC dashed = planned, solid = measured${dnames.some((_, i) => (this._traj || []).some((r) => r[`defer_${i}_soc`] != null)) ? ' · faint flat line = device SOC ceiling' : ''}</span>
+      <span style="color:var(--muted)">— thin = measured · SOC dashed = planned, solid = measured${dnames.some((_, i) => (this._traj || []).some((r) => r[`defer_${i}_soc`] != null)) ? ' · faint flat line = device SOC ceiling' : ''}${this._isolatedGroup === 'solar' ? ' · Solar dashed = forecast history (vs. solid measured)' : ''}</span>
     `;
   }
 
@@ -331,6 +351,41 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
   async _fetchActual(hass, curSoc) {
     await super._fetchActual(hass, curSoc);
     await this._fetchGreedyBands(hass).catch(() => {});
+    await this._fetchForecastHistory(hass).catch(() => {});
+  }
+
+  // History of the forecast provider's own "power right now" reading (shade-corrected
+  // when that feature is enabled — see resolveForecastPowerSensor() in chart-common.js),
+  // fetched the same way as the measured flow series above but kept separate: the base
+  // class's shared batch call only knows about solar/load/grid/battery + deferrable
+  // entities, and this is a genuinely different kind of thing (a forecast reading, not a
+  // measurement) that only the Solar isolation view wants to draw (see _energySeries()).
+  // Unlike the trajectory's own solar_kwh (which only ever covers "now" forward — see
+  // _timeScale()), this sensor's recorder history genuinely has a value for every past
+  // moment, because it's continuously recomputed as a nowcast rather than a day-ahead plan.
+  async _fetchForecastHistory(hass) {
+    const eid = resolveForecastPowerSensor(hass, this._config.solar_forecast_power_entity);
+    if (!eid) { this._actualSolarForecast = []; return; }
+    let start;
+    if (this._viewMode === 'today') {
+      const now = new Date();
+      start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    } else {
+      start = new Date(new Date(this._traj[0].start).getTime() - VIEW_BACK_MS);
+    }
+    const end = new Date();
+    const url = `history/period/${start.toISOString()}?filter_entity_id=${eid}`
+      + `&end_time=${encodeURIComponent(end.toISOString())}&minimal_response&significant_changes_only`;
+    const res = await hass.callApi('GET', url);
+    const rows = (res && res[0]) || [];
+    const st = hass.states[eid];
+    const factor = (st && st.attributes && st.attributes.unit_of_measurement === 'W') ? 0.001 : 1;
+    const pts = rows
+      .map((r) => ({ t: new Date(r.last_changed || r.lu), v: parseFloat(r.state) * factor }))
+      .filter((p) => !isNaN(p.v) && p.v >= 0);
+    const liveV = st ? parseFloat(st.state) * factor : NaN;
+    if (!isNaN(liveV) && liveV >= 0) pts.push({ t: end, v: liveV });
+    this._actualSolarForecast = ds(pts, 160, { peak: true });
   }
 
   // Per-device stretches where Greedy Consumption actually drove the device, read from
@@ -481,6 +536,22 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
           ? { key: `defer_${i}`, group: `defer_${i}`, color: this._deferColor(i), area: true, scale: kwScale, step: true }
           : null).filter(Boolean),
         { points: this._actualEnergy.solar, group: 'solar', color: 'var(--solar)', actual: true, area: true },
+        // The forecast provider's own historical "power now" reading (see
+        // _fetchForecastHistory()) — only drawn once Solar is isolated (clicking its
+        // legend entry): a dashed overlay on the solid measured line above, so "how
+        // closely did the (shade-corrected) forecast track actual production" is a direct
+        // visual comparison. `actual: true` keeps it off the clipForecastPastLine path
+        // (it's genuinely historical data, drawn full-width) without needing an area fill
+        // of its own — a second same-colour wash on top of the measured one would just
+        // read as a deeper tint, not a second series.
+        ...(this._isolatedGroup === 'solar' ? [{
+          // `|| []` guards the window before the first _fetchForecastHistory() resolves —
+          // multiLineChart treats a falsy `points` as "not a points series at all" and
+          // falls through to reading `row[s.key]` off the trajectory instead (undefined
+          // key → a flat 0 line), so this must never be left undefined.
+          points: this._actualSolarForecast || [], group: 'solar', color: 'var(--solar)',
+          actual: true, dash: true, width: 2,
+        }] : []),
         { points: this._actualEnergy.load, group: 'load', color: 'var(--load)', actual: true, area: true },
         { points: this._actualEnergy.grid, group: 'grid', color: 'var(--gridflow)', actual: true, area: true },
         { points: this._actualEnergy.battery, group: 'battery', color: 'var(--battery)', actual: true, area: true },
@@ -539,8 +610,17 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       fmt: (v) => v.toFixed(1), height: 480, symmetric: true,
       // Left of "now" shows the measured overlay only — the forecast line is cut at the
       // divider so it can't be mistaken for real-time data. Set show_forecast_history: true
-      // to keep the plan's line drawn across the past for plan-vs-actual comparison.
-      clipForecastPastLine: this._config.show_forecast_history !== true,
+      // to draw it across the past anyway. NOTE this only affects the trajectory-keyed
+      // series (solar_kwh, load_kwh, …) — and in practice does nothing visible for THIS
+      // card, because the dispatch trajectory itself only ever carries slots from "now"
+      // forward (the MPC replans from the present — see advisory/planner.py's
+      // `bundle.start`), so there is no past data to unclip. Left here for the config
+      // option's own sake and for any future trajectory shape that does carry history.
+      // Unset the same way when a group is isolated, for consistency — but the real
+      // "forecast vs. actual, historically" comparison for Solar comes from a genuinely
+      // separate historical fetch (_fetchForecastHistory()/_actualSolarForecast), added
+      // as its own dashed series only while Solar is isolated (see _energySeries()).
+      clipForecastPastLine: this._config.show_forecast_history !== true && !this._isolatedGroup,
       bands: [...this._freeEnergyBands(), ...greedyBands],
       // Ticks and axis line are drawn in --soc, the same colour as the curves, so it is
       // visually unambiguous which scale SOC is read against — the one real hazard of a
@@ -586,6 +666,19 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     return `<div>${parts.join(' · ')}</div>`;
   }
 
+  // The forecast-history reading at a hovered moment, with its delta from actual — only
+  // once Solar is isolated (see _energySeries()): elsewhere the dashed line isn't drawn,
+  // so surfacing a number for it in the tooltip would be more confusing than helpful.
+  _solarForecastRow(bestMs, actualSolar) {
+    if (this._isolatedGroup !== 'solar') return '';
+    const fc = this._nearest(this._actualSolarForecast || [], bestMs);
+    if (fc == null) return '';
+    const delta = actualSolar != null ? actualSolar - fc : null;
+    const deltaHtml = delta != null
+      ? ` <span style="color:var(--muted)">(${delta >= 0 ? '+' : ''}${delta.toFixed(2)} kW vs. actual)</span>` : '';
+    return `<div><span class="k" style="color:var(--solar)">forecast</span> ${fc.toFixed(2)} kW${deltaHtml}</div>`;
+  }
+
   _tooltipHtml(bestMs, best, isHistory) {
     const actualSolar = this._nearest(this._actualEnergy.solar, bestMs);
     const actualLoad = this._nearest(this._actualEnergy.load, bestMs);
@@ -605,6 +698,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       }).join('');
       return `<b>${fmtHour(bestMs)}</b>` +
         `<div><span class="k" style="color:var(--solar)">sun</span> ${(actualSolar || 0).toFixed(2)} · <span class="k" style="color:var(--load)">load</span> ${(actualLoad || 0).toFixed(2)} kW</div>` +
+        this._solarForecastRow(bestMs, actualSolar) +
         `<div>${this._signedRow(actualGrid || 0, 'buy', 'sell', '--gridflow')} · ${this._signedRow(actualBattery || 0, 'charge', 'discharge', '--battery')} kW</div>` +
         deferRows +
         this._socRow(bestMs, null) +
@@ -620,6 +714,7 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
     const battKw = actualBattery != null ? actualBattery : (+best.battery_kwh || 0) * kwScale;
     return `<b>${fmtHour(bestMs)}</b>` +
       `<div><span class="k" style="color:var(--solar)">sun</span> ${((actualSolar != null ? actualSolar : (+best.solar_kwh || 0) * kwScale)).toFixed(2)} · <span class="k" style="color:var(--load)">load</span> ${((actualLoad != null ? actualLoad : (+best.load_kwh || 0) * kwScale)).toFixed(2)} kW</div>` +
+      this._solarForecastRow(bestMs, actualSolar) +
       `<div>${this._signedRow(gridKw, 'buy', 'sell', '--gridflow')} · ${this._signedRow(battKw, 'charge', 'discharge', '--battery')} kW</div>` +
       (this._deferNames || []).map((nm, i) => {
         if (!this._isDeferVisible(i)) return '';

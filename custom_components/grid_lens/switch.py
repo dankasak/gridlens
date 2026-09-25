@@ -43,17 +43,30 @@ async def async_setup_entry(
     load_mgr = hass.data[DOMAIN].get(f"{entry.entry_id}_load_control")
     if load_mgr is not None:
         for index, controller in load_mgr.controllers.items():
+            # sensor_id (controller.sensor_id, the device's CONF_DEFERRABLE_LOAD_SENSORS
+            # entry) is the unique_id's identity key, not `index` — see
+            # DeferrableLoadController.sensor_id's docstring and
+            # __init__.py._migrate_deferrable_positional_unique_ids for why: `index` is
+            # just this device's current position in the config list and shifts whenever
+            # a load is inserted/reordered elsewhere in it. `index` is still passed
+            # separately because every manager call (enable/disable/set_greedy/...) is
+            # keyed by it, same as LoadControlManager.controllers itself.
+            sensor_id = controller.sensor_id
             entities.append(
-                GridLensDeferrableLoadSwitch(load_mgr, entry, index, controller.name)
+                GridLensDeferrableLoadSwitch(load_mgr, entry, index, sensor_id, controller.name)
             )
             entities.append(
-                GridLensDeferrableGreedySwitch(load_mgr, entry, index, controller.name)
+                GridLensDeferrableGreedySwitch(load_mgr, entry, index, sensor_id, controller.name)
             )
             entities.append(
-                GridLensDeferrableGreedyScheduleSwitch(load_mgr, entry, index, controller.name)
+                GridLensDeferrableGreedyScheduleSwitch(
+                    load_mgr, entry, index, sensor_id, controller.name
+                )
             )
             entities.append(
-                GridLensDeferrableGreedySurplusSwitch(load_mgr, entry, index, controller.name)
+                GridLensDeferrableGreedySurplusSwitch(
+                    load_mgr, entry, index, sensor_id, controller.name
+                )
             )
 
     # Power Flow layout visibility toggles — pure dashboard display preferences, so they
@@ -85,11 +98,13 @@ async def async_setup_entry(
         # file's own resolve_device_name() exists to prevent everywhere else.
         dashboard_names = await async_get_energy_dashboard_names(hass)
         for i, sensor_id in enumerate(sensors):
+            if not sensor_id:
+                continue
             sw = switches_cfg[i] if i < len(switches_cfg) else ""
             name = resolve_device_name(
                 hass, sw or None, sensor_id, dashboard_names=dashboard_names
             ) or sensor_id
-            entities.append(GridLensDeferrableVisibleSwitch(entry, i, name))
+            entities.append(GridLensDeferrableVisibleSwitch(entry, sensor_id, name))
 
     if entities:
         async_add_entities(entities)
@@ -169,11 +184,13 @@ class GridLensDeferrableLoadSwitch(RestoreEntity, SwitchEntity):
     _attr_has_entity_name = True
     _attr_icon = "mdi:power-plug"
 
-    def __init__(self, manager, entry: ConfigEntry, index: int, device_name: str) -> None:
+    def __init__(
+        self, manager, entry: ConfigEntry, index: int, sensor_id: str, device_name: str
+    ) -> None:
         self._manager = manager
         self._index = index
         self._attr_name = f"{device_name} Control"
-        self._attr_unique_id = f"{entry.entry_id}_deferrable_control_{index}"
+        self._attr_unique_id = f"{entry.entry_id}_deferrable_control_{sensor_id or index}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry.entry_id)},
             "name": "Grid Lens",
@@ -232,11 +249,13 @@ class GridLensDeferrableGreedySwitch(RestoreEntity, SwitchEntity):
     _attr_has_entity_name = True
     _attr_icon = "mdi:leaf"
 
-    def __init__(self, manager, entry: ConfigEntry, index: int, device_name: str) -> None:
+    def __init__(
+        self, manager, entry: ConfigEntry, index: int, sensor_id: str, device_name: str
+    ) -> None:
         self._manager = manager
         self._index = index
         self._attr_name = f"{device_name} Greedy Consumption"
-        self._attr_unique_id = f"{entry.entry_id}_deferrable_greedy_{index}"
+        self._attr_unique_id = f"{entry.entry_id}_deferrable_greedy_{sensor_id or index}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry.entry_id)},
             "name": "Grid Lens",
@@ -286,11 +305,13 @@ class GridLensDeferrableGreedyScheduleSwitch(RestoreEntity, SwitchEntity):
     _attr_has_entity_name = True
     _attr_icon = "mdi:calendar-clock"
 
-    def __init__(self, manager, entry: ConfigEntry, index: int, device_name: str) -> None:
+    def __init__(
+        self, manager, entry: ConfigEntry, index: int, sensor_id: str, device_name: str
+    ) -> None:
         self._manager = manager
         self._index = index
         self._attr_name = f"{device_name} Greedy Respects Schedule"
-        self._attr_unique_id = f"{entry.entry_id}_deferrable_greedy_schedule_{index}"
+        self._attr_unique_id = f"{entry.entry_id}_deferrable_greedy_schedule_{sensor_id or index}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry.entry_id)},
             "name": "Grid Lens",
@@ -345,11 +366,13 @@ class GridLensDeferrableGreedySurplusSwitch(RestoreEntity, SwitchEntity):
     _attr_has_entity_name = True
     _attr_icon = "mdi:weather-sunny-alert"
 
-    def __init__(self, manager, entry: ConfigEntry, index: int, device_name: str) -> None:
+    def __init__(
+        self, manager, entry: ConfigEntry, index: int, sensor_id: str, device_name: str
+    ) -> None:
         self._manager = manager
         self._index = index
         self._attr_name = f"{device_name} Greedy Forecast Surplus"
-        self._attr_unique_id = f"{entry.entry_id}_deferrable_greedy_surplus_{index}"
+        self._attr_unique_id = f"{entry.entry_id}_deferrable_greedy_surplus_{sensor_id or index}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry.entry_id)},
             "name": "Grid Lens",
@@ -395,20 +418,24 @@ class GridLensDeferrableVisibleSwitch(RestoreEntity, SwitchEntity):
     Unlike switch_entity/soc_entity (a user-configured anchor the card resolves a sibling
     sensor from), there's no separate real-world entity to join against here — this switch
     IS the thing being referenced. So sensor.py's _build_deferrable_loads() resolves it by
-    unique_id through the entity registry (same {entry_id}_deferrable_visible_{index}
-    scheme this class sets) into a `visible_entity` field, rather than a config-flow field
-    or an attribute-based join key. Turning it off only changes what the Power Flow card
-    draws — the Load Control card, schedule card, greedy logic and LP optimizer all keep
-    running exactly as before; they don't consult this at all.
+    unique_id through the entity registry (same {entry_id}_deferrable_visible_{sensor_id}
+    scheme this class sets, keyed by the device's own CONF_DEFERRABLE_LOAD_SENSORS entry
+    rather than its list index — see __init__.py's
+    _migrate_deferrable_positional_unique_ids for why an index-keyed scheme silently
+    reassigned this switch's state to the wrong device on a reorder) into a
+    `visible_entity` field, rather than a config-flow field or an attribute-based join
+    key. Turning it off only changes what the Power Flow card draws — the Load Control
+    card, schedule card, greedy logic and LP optimizer all keep running exactly as
+    before; they don't consult this at all.
     """
 
     _attr_has_entity_name = True
     _attr_icon = "mdi:eye-outline"
     _attr_entity_category = EntityCategory.CONFIG
 
-    def __init__(self, entry: ConfigEntry, index: int, device_name: str) -> None:
+    def __init__(self, entry: ConfigEntry, sensor_id: str, device_name: str) -> None:
         self._attr_name = f"{device_name} Show In Power Flow"
-        self._attr_unique_id = f"{entry.entry_id}_deferrable_visible_{index}"
+        self._attr_unique_id = f"{entry.entry_id}_deferrable_visible_{sensor_id}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry.entry_id)},
             "name": "Grid Lens",

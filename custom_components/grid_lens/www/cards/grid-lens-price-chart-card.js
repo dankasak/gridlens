@@ -9,7 +9,7 @@
  *   type: custom:grid-lens-price-chart-card
  *   entity: sensor.roof_grid_lens_nsw_planned_dispatch   (required)
  */
-import { GridLensChartCardBase, multiLineChart, fmtHour, fmtC } from './grid-lens-chart-common.js?v=20260923c';
+import { GridLensChartCardBase, multiLineChart, fmtHour, fmtC } from './grid-lens-chart-common.js?v=20260924a';
 
 class GridLensPriceChartCard extends GridLensChartCardBase {
   get title() { return 'Price ($/kWh)'; }
