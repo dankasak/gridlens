@@ -64,6 +64,49 @@ from .entity_lookup import resolve_device_name, async_get_energy_dashboard_names
 
 _LOGGER = logging.getLogger(__name__)
 
+_CANONICAL_DEMAND_DAY_SPECS = ("all", "weekdays", "weekends")
+
+
+def _demand_days_predicate(days_spec: str | None, plan_id: str | None = None):
+    """Day-of-week predicate for a legacy network-level demand window.
+
+    A missing key legitimately defaults to 'weekdays' (matches the plan
+    schema's own default). But a *present*, unrecognised value used to fall
+    through to that same 'weekdays' default silently — indistinguishable from
+    an intentional 'weekdays' plan. That's dangerous, not just wrong: the
+    backend (gridlens-api) found a real case where its own window-derivation
+    code produced exactly this shape (a day-set that's neither 'all' /
+    'weekdays' / 'weekends', e.g. "every day but Monday") and this fallback
+    would have silently mispriced it as Monday-Friday only, backwards from
+    the days it actually covered (found 2026-09-26 tracing the
+    import_gap/export_overlap plan_lint cluster; the backend now refuses to
+    author such a plan, but this is defense in depth for any other path that
+    could introduce one — hand-authoring, a future schema change).
+
+    Logs an error (visible by default, not debug) and falls back to
+    matching every day, on the reasoning that a demand charge silently
+    UNDER-counted is worse to leave undetected than one shown as applying
+    more broadly than intended — the loud fallback direction is the one a
+    user or the owner is more likely to notice and report.
+    """
+    if days_spec is None or days_spec in _CANONICAL_DEMAND_DAY_SPECS:
+        days_spec = days_spec or "weekdays"
+    else:
+        _LOGGER.error(
+            "Demand window for plan %s has an unrecognised 'days' value %r "
+            "(expected 'all'/'weekdays'/'weekends') — treating as 'all' "
+            "rather than silently guessing; this plan's data needs fixing",
+            plan_id, days_spec)
+        days_spec = "all"
+
+    def day_ok(weekday: int) -> bool:  # 0=Mon .. 6=Sun
+        if days_spec == "all":
+            return True
+        if days_spec == "weekends":
+            return weekday >= 5
+        return weekday < 5  # 'weekdays'
+
+    return day_ok
 
 
 def power_unit_divisor(hass, entity_id: str) -> float:
@@ -1481,14 +1524,7 @@ class PlanCalculator:
             def hour_ok(h):
                 return h in hset
 
-        days_spec = window.get('days', 'weekdays')
-
-        def day_ok(weekday: int) -> bool:  # 0=Mon .. 6=Sun
-            if days_spec == 'all':
-                return True
-            if days_spec == 'weekends':
-                return weekday >= 5
-            return weekday < 5  # 'weekdays' (default)
+        day_ok = _demand_days_predicate(window.get('days'), getattr(plan, 'plan_id', None))
 
         # Peak kW within the window. For optimised alternatives the LP dispatch
         # already reflects battery peak-shaving; for the current plan we use the
@@ -1525,7 +1561,7 @@ class PlanCalculator:
             'days': actual_days,
             'amount': round(peak_kw * rate * actual_days, 2),
             'window_hours': hours,
-            'time_range': format_window_range({'hours': hours, 'days': days_spec}),
+            'time_range': format_window_range({'hours': hours, 'days': window.get('days', 'weekdays')}),
             'source': source,
             'approximate': True,
         }
@@ -3845,18 +3881,11 @@ class PlanCalculator:
                 demand_rate = plan.demand_charge_per_kw_per_day
                 window = getattr(plan, 'demand_window', None) or {}
                 whours = window.get('hours', DEFAULT_DEMAND_WINDOW_HOURS)
-                days_spec = window.get('days', 'weekdays')
+                day_ok = _demand_days_predicate(window.get('days'), getattr(plan, 'plan_id', None))
 
                 def demand_predicate(local_dt):
                     h_ok = True if whours == 'all' else (local_dt.hour in whours)
-                    wd = local_dt.weekday()
-                    if days_spec == 'all':
-                        d_ok = True
-                    elif days_spec == 'weekends':
-                        d_ok = wd >= 5
-                    else:
-                        d_ok = wd < 5  # weekdays (default)
-                    return h_ok and d_ok
+                    return h_ok and day_ok(local_dt.weekday())
 
         hourly_import_rates = []
         hourly_export_rates = []

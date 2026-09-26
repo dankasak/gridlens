@@ -787,14 +787,14 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             rate = legacy_rate
             window = getattr(plan, "demand_window", None) or {}
             hours = window.get("hours", DEFAULT_DEMAND_WINDOW_HOURS)
-            days_spec = window.get("days", "weekdays")
+            days_spec = window.get("days")
             pred = demand_window_predicate(hours, days_spec)
             mask = [
                 1 if pred(start_local + timedelta(minutes=t * bundle.slot_minutes)) else 0
                 for t in range(bundle.slots)
             ]
             days_remaining = float(billing_days_remaining(now_local))
-            win_desc = f"{hours}/{days_spec}"
+            win_desc = f"{hours}/{days_spec or 'weekdays'}"
 
         mtd_peak = await self._demand_peak_month_to_date(pred, now_local, tz)
 

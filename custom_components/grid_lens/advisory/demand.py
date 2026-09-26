@@ -20,23 +20,47 @@ be a few days out each cycle. Documented approximation, see docs/OPEN_ITEMS.md.
 from __future__ import annotations
 
 import calendar
+import logging
 from datetime import datetime, timedelta
 from typing import Callable, Iterable
+
+_LOGGER = logging.getLogger(__name__)
 
 # Mirrors const.DEFAULT_DEMAND_WINDOW_HOURS — duplicated here only so this module
 # stays import-free; the caller passes the plan's real window in every live path.
 _DEFAULT_WINDOW_HOURS = [15, 16, 17, 18, 19, 20]
 
+_CANONICAL_DEMAND_DAY_SPECS = ("all", "weekdays", "weekends")
 
-def demand_window_predicate(hours, days_spec: str) -> Callable[[datetime], bool]:
+
+def demand_window_predicate(hours, days_spec: str | None) -> Callable[[datetime], bool]:
     """``(hours, days_spec) -> fn(local_dt) -> bool``.
 
     ``hours`` is a list of local hour-of-day ints, or the string ``"all"``.
-    ``days_spec`` is ``"all"`` / ``"weekends"`` / anything else (= weekdays).
-    Same semantics as ``plan_calculator``'s demand-window predicate so the
-    advisory mask and the plan-comparison mask can never disagree.
+    ``days_spec`` is ``"all"`` / ``"weekdays"`` / ``"weekends"``, or ``None``
+    for the legitimate "key absent" default (-> "weekdays"). Same semantics
+    as ``plan_calculator``'s demand-window predicate so the advisory mask and
+    the plan-comparison mask can never disagree — including on an
+    unrecognised value: a *present* value outside those three used to fall
+    through to "weekdays" silently, indistinguishable from an intentional
+    weekdays-only plan. Found 2026-09-26 in the backend's own window-
+    derivation code (a real day-set like "every day but Monday" is neither
+    'all'/'weekdays'/'weekends' and nothing downstream understood it) — the
+    backend now refuses to author such a plan, but this stays defense in
+    depth. Logs loudly and falls back to matching every day, since a demand
+    charge silently UNDER-counted is worse to leave undetected than one shown
+    applying more broadly than intended.
     """
     hset = None if hours == "all" else set(hours or _DEFAULT_WINDOW_HOURS)
+
+    if days_spec is None or days_spec in _CANONICAL_DEMAND_DAY_SPECS:
+        days_spec = days_spec or "weekdays"
+    else:
+        _LOGGER.error(
+            "Demand window has an unrecognised 'days' value %r (expected "
+            "'all'/'weekdays'/'weekends') — treating as 'all' rather than "
+            "silently guessing; this plan's data needs fixing", days_spec)
+        days_spec = "all"
 
     def ok(local_dt: datetime) -> bool:
         h_ok = True if hset is None else (local_dt.hour in hset)

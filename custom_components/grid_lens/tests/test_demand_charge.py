@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import logging
 import os
 import re
 import sys
@@ -273,12 +274,20 @@ def _compute_demand_charge(has_demand_tariff=True):
     src = open(os.path.join(_COMPONENT, "plan_calculator.py")).read()
     i = src.index("    def _compute_demand_charge")
     j = src.index("    # How many of a rate's cap periods", i)
+    # _demand_days_predicate is a module-level helper the sliced method calls
+    # into (shared with the LP-forecast demand predicate) — lift its real
+    # source too, so this test exercises the actual unrecognised-days-value
+    # handling rather than a re-implemented stub.
+    pi = src.index("_CANONICAL_DEMAND_DAY_SPECS")
+    pj = src.index("\ndef power_unit_divisor", pi)
     ns: dict = {
         "DEFAULT_DEMAND_WINDOW_HOURS": [15, 16, 17, 18, 19, 20],
         "format_window_range": lambda w=None, *_a, **_k: (
             "3pm-9pm" if not w or w.get("start") else "3pm-9pm"),
         "timedelta": dt.timedelta,
+        "_LOGGER": logging.getLogger("test_demand_charge"),
     }
+    exec(src[pi:pj], ns)
     exec(f"class C:\n    has_demand_tariff = {has_demand_tariff!r}\n" + src[i:j], ns)
     return ns["C"]()
 
