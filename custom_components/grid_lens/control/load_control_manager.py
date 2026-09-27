@@ -831,11 +831,19 @@ class LoadControlManager:
         plan still drives. With no ``grid_power_sensor`` configured at all, surplus tracking
         never engages and this degrades to pure plan-following.
 
-        **Inverter AC output ceiling, applied last, regardless of source** (found
-        2026-09-12 — see ``_ac_output_headroom_w``). ``plan_w`` and ``fc_target_w`` both
-        reason about PV/battery *capability*; neither knows the plant's own AC-side output
-        can be capped well below that. Only relevant when ``CONF_MAX_AC_OUTPUT_KW`` is
-        configured — unset (the default) leaves this a no-op.
+        **Inverter AC output ceiling, applied to surplus_w only, never to plan_w**
+        (found 2026-09-12, rescoped 2026-09-27 — see ``_ac_output_headroom_w``). The
+        live export-surplus term and ``fc_target_w`` both reason about PV/battery
+        *capability*, never about whether the plant can actually deliver that much AC
+        power at once — greedy's whole promise is "this creates no new grid import",
+        which is only true if the plant can really produce it. ``plan_w`` carries no
+        such promise: it is the LP's own cost-informed allocation, already free to draw
+        straight from the grid on top of whatever the plant produces, so a schedule
+        that calls for more than the plant's AC rating is never capped by it —
+        household instruction, 2026-09-27: only Greedy Consumption's "no new import"
+        promise needs this limit; the LP's own schedule already knows what grid import
+        it's asking for and what it costs. Only relevant when ``CONF_MAX_AC_OUTPUT_KW``
+        is configured — unset (the default) leaves this a no-op.
 
         **Battery priority can pull the target below plan_w — the one exception to "plan is
         a floor"** (household instruction, 2026-09-11). Every term above only ever *adds* to
@@ -910,8 +918,45 @@ class LoadControlManager:
             fc_target_w = getattr(controller, "_greedy_forecast_target_w", 0.0) or 0.0
             if fc_target_w > 0.0:
                 surplus_w = max(surplus_w or 0.0, fc_target_w)
+
+        # Inverter/plant AC output ceiling — GREEDY-only (household instruction,
+        # 2026-09-27). Every term feeding surplus_w reasons about PV/battery
+        # *capability*, never about whether the plant can actually deliver that much AC
+        # power at once — Found 2026-09-12: PV alone was already at the plant's ~10kW
+        # ceiling, so the battery's real ~20kW of discharge headroom was moot, and the
+        # forecast-surplus condition sized the Wattpilot's target off PV+battery
+        # capability that could never reach the car (see _ac_output_headroom_w). That's
+        # a genuine physical limit on greedy's promise of "no new grid import" — it has
+        # nothing to do with plan_w, which is the LP's own cost-informed allocation and
+        # is free to draw straight from the grid on top of whatever the plant produces.
+        # Clamping surplus_w HERE, before the max() with plan_w below, means this can
+        # only ever pull back the opportunistic contribution, never the plan's own
+        # floor — a schedule that calls for more than the plant's AC rating keeps its
+        # full allocation regardless of this cap.
+        ac_capped = False
+        if surplus_w is not None and surplus_w > 0.0:
+            ac_headroom_w = self._ac_output_headroom_w()
+            if ac_headroom_w is not None:
+                device_w = self._read_device_power_w(index) or 0.0
+                allowed_w = max(0.0, device_w + ac_headroom_w)
+                if surplus_w > allowed_w:
+                    _LOGGER.debug(
+                        "%s: ac_output_cap clamps greedy surplus_w %.0f -> %.0f "
+                        "(device_w=%.0f, ac_headroom_w=%.0f, plan_w=%.0f untouched, "
+                        "load_power_sensor=%s, grid_power_sensor=%s, "
+                        "device_power_sensor=%s)",
+                        controller.name, surplus_w, allowed_w, device_w, ac_headroom_w,
+                        plan_w, self._load_power_sensor, self._grid_power_sensor,
+                        self._device_power_sensors.get(index, ""),
+                    )
+                    surplus_w = allowed_w
+                    ac_capped = True
+
         target_w = max(plan_w, surplus_w or 0.0)
-        source = "surplus" if (surplus_w or 0.0) > plan_w else "plan"
+        if (surplus_w or 0.0) > plan_w:
+            source = "ac_output_cap" if ac_capped else "surplus"
+        else:
+            source = "plan"
         _LOGGER.debug(
             "%s: plan_w=%.0f surplus_w=%s discharge_w=%.0f -> target_w=%.0f (%s)",
             controller.name, plan_w, f"{surplus_w:.0f}" if surplus_w is not None else "None",
@@ -935,33 +980,6 @@ class LoadControlManager:
                 )
                 target_w = relieved_w
                 source = "battery_priority"
-
-        # Inverter/plant AC output ceiling — a live, continuously-reevaluated hard cap,
-        # applied regardless of which term above produced target_w. Every term so far
-        # (plan_w, the live export-surplus term, and fc_target_w) reasons about PV and
-        # battery *capability*, never about whether the plant can actually deliver that
-        # much AC power at once; fc_target_w in particular is only refreshed on the
-        # 5-minute apply() tick, so a stale forecast figure can keep winning this loop's
-        # max() for minutes after live conditions no longer support it. Found 2026-09-12:
-        # PV alone was already at the plant's ~10kW ceiling, so the battery's real ~20kW
-        # of discharge headroom was moot, and the forecast-surplus condition — unaware of
-        # any of this — sized the Wattpilot's target off PV+battery capability that could
-        # never reach the car. See LoadControlManager._ac_output_headroom_w.
-        ac_headroom_w = self._ac_output_headroom_w()
-        if ac_headroom_w is not None:
-            device_w = self._read_device_power_w(index) or 0.0
-            allowed_w = max(0.0, device_w + ac_headroom_w)
-            if target_w > allowed_w:
-                _LOGGER.debug(
-                    "%s: ac_output_cap clamps target_w %.0f -> %.0f "
-                    "(device_w=%.0f, ac_headroom_w=%.0f, load_power_sensor=%s, "
-                    "grid_power_sensor=%s, device_power_sensor=%s)",
-                    controller.name, target_w, allowed_w, device_w, ac_headroom_w,
-                    self._load_power_sensor, self._grid_power_sensor,
-                    self._device_power_sensors.get(index, ""),
-                )
-                target_w = allowed_w
-                source = "ac_output_cap"
 
         if target_w <= 0.0:
             _LOGGER.debug("%s: final target_w=0 (off)", controller.name)
