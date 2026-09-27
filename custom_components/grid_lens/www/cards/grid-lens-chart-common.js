@@ -302,7 +302,7 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // Only plot slots inside the current view window — with Today selected, t0/t1 span
   // just 24h while the trajectory itself can run 72h+, so unfiltered points map past
   // the right edge and (since the SVG doesn't clip) visibly overflow the card.
-  const raw = series.map(s => {
+  const mapPoints = (s) => {
     if (s.points) return (s.points || [])
       // `pointsForecast` series carry planned (future) values, so they run to the view's
       // right edge like a `key` series — the default clip at `now` is for measured
@@ -312,12 +312,19 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
     return traj
       .filter(row => { const ms = new Date(row.start).getTime(); return ms >= t0 && ms <= t1; })
       .map(row => ({ ms: new Date(row.start).getTime(), v: (s.calc ? s.calc(row) : (+row[s.key] || 0)) * (s.scale || 1) }));
-  });
-  let yMax = 0, yMin = opts.yMin != null ? opts.yMin : 0;
+  };
+  const raw = series.map(mapPoints);
+  let yMax = opts.yMax != null ? opts.yMax : 0, yMin = opts.yMin != null ? opts.yMin : 0;
+  // opts.scaleSeries lets a caller compute the y-extent from a DIFFERENT (usually larger)
+  // series set than the one actually being drawn — e.g. grid-lens-power-chart-card isolating
+  // one legend group to a single series still wants the axis to reflect the whole day's
+  // range, not just that group's, so the scale doesn't jump around when isolating/restoring.
+  const extentSeries = opts.scaleSeries || series;
+  const extentRaw = opts.scaleSeries ? extentSeries.map(mapPoints) : raw;
   // Right-axis series are excluded from the left axis' extent. Including them would let
   // a 0-100 percentage stretch a kW axis to +100 and flatten every real flow to a line.
-  raw.forEach((pts, i) => {
-    if (series[i] && series[i].axis === 'right') return;
+  extentRaw.forEach((pts, i) => {
+    if (extentSeries[i] && extentSeries[i].axis === 'right') return;
     for (const p of pts) { if (p.v > yMax) yMax = p.v; if (p.v < yMin) yMin = p.v; }
   });
   if (opts.symmetric) { const m = Math.max(Math.abs(yMin), Math.abs(yMax)); yMin = -m; yMax = m; }

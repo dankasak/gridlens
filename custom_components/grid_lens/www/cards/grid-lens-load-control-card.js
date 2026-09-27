@@ -86,7 +86,7 @@ import {
   currentReadoutHtml, maxCurrentHtml, socCapHtml, acCeilingHtml, sparklineHtml, estimatorToggleHtml,
   estimatorPanelHtml, controlHtml, greedyButtonsHtml, boostInputHtml, visibilityToggleHtml,
   attachTooltip,
-} from './grid-lens-chart-common.js?v=20260924h';
+} from './grid-lens-chart-common.js?v=20260928a';
 
 const HISTORY_REFRESH_MS = 15 * 60000;
 

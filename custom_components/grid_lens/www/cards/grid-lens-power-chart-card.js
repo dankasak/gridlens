@@ -23,7 +23,7 @@
 import {
   GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor, clampPct, fmtPct,
   resolveForecastPowerSensor, ds, VIEW_BACK_MS,
-} from './grid-lens-chart-common.js?v=20260924a';
+} from './grid-lens-chart-common.js?v=20260928a';
 
 // Free-energy shading (see _freeEnergyBands). CSS custom props rather than literals so
 // both bands follow the viewer's light/dark theme like every other colour on this card;
@@ -582,12 +582,15 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
   }
 
   _chartSvg() {
-    let { series } = this._energySeries();
-    // Isolated to one legend group (see _wireLegendToggle): drop every other series
-    // rather than just dimming them, so the y-axis also rescales to that series' own
-    // range — a small signal like Battery is otherwise squashed flat next to Solar/Load.
-    // SOC survives isolation of any OTHER group. Isolating exists to rescale the kW axis
-    // to one series; SOC is on a separate axis, so keeping it costs that nothing, and it
+    const { series: allSeries } = this._energySeries();
+    let series = allSeries;
+    // Isolated to one legend group (see _wireLegendToggle): drop every other series from
+    // what's DRAWN, so a small signal like Battery isn't lost among Solar/Load's lines.
+    // The kW axis itself stays keyed to the full day's range (via scaleSeries below,
+    // passed from allSeries) rather than rescaling to just the isolated series — the axis
+    // changing meaning on click was confusing (a value that reads "4kW" pre-isolation
+    // shouldn't read differently post-isolation). SOC survives isolation of any OTHER
+    // group. SOC is on a separate axis, so keeping it costs the left axis nothing, and it
     // is context for whatever you just isolated ("battery charges here — does SOC agree?").
     // Isolating SOC itself still shows SOC alone.
     if (this._isolatedGroup) {
@@ -621,6 +624,9 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
       // separate historical fetch (_fetchForecastHistory()/_actualSolarForecast), added
       // as its own dashed series only while Solar is isolated (see _energySeries()).
       clipForecastPastLine: this._config.show_forecast_history !== true && !this._isolatedGroup,
+      // Always scale against the full (unfiltered) series set, even when isolated to one
+      // legend group — see the isolation comment above.
+      scaleSeries: allSeries,
       bands: [...this._freeEnergyBands(), ...greedyBands],
       // Ticks and axis line are drawn in --soc, the same colour as the curves, so it is
       // visually unambiguous which scale SOC is read against — the one real hazard of a
