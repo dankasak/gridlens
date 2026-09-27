@@ -591,10 +591,15 @@ class ModulatingLoadController(DeferrableLoadController):
             # Below the floor: the feasible set is {0} ∪ [floor, cap], so this must resolve
             # one way or the other. Hold at the floor while already delivering (see the
             # module docstring on re-handshake cost); otherwise stay off.
-            commanded = (
-                floor
-                if (self._commanded and floor > 0.0 and want >= floor * _MIN_HOLD_FRACTION)
-                else 0.0
+            hold_at_floor = (
+                self._commanded and floor > 0.0 and want >= floor * _MIN_HOLD_FRACTION
+            )
+            commanded = floor if hold_at_floor else 0.0
+            _LOGGER.debug(
+                "%s: target_w=%.0f below floor=%.0f (was_commanded=%s, "
+                "hold_threshold=%.0f) -> commanded=%.0f",
+                self.name, want, floor, self._commanded,
+                floor * _MIN_HOLD_FRACTION, commanded,
             )
         else:
             commanded = want
@@ -672,6 +677,12 @@ class ModulatingLoadController(DeferrableLoadController):
         if crossing and debounce and not force and self._commanded is not None:
             held = (now - self._changed_at).total_seconds() if self._changed_at else 1e9
             if held < self.min_crossing_dwell_s:
+                _LOGGER.debug(
+                    "%s: holding %s->%s (commanded_w=%.0f wanted) — only %.0fs of %.0fs "
+                    "crossing dwell elapsed since last change at %s",
+                    self.name, self._commanded, want_on, commanded_w,
+                    held, self.min_crossing_dwell_s, self._changed_at,
+                )
                 self._note = f"hold_crossing_dwell{'_' + reason if reason else ''}"
                 return
 

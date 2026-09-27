@@ -889,12 +889,21 @@ class LoadControlManager:
                 surplus_w = max(surplus_w or 0.0, fc_target_w)
         target_w = max(plan_w, surplus_w or 0.0)
         source = "surplus" if (surplus_w or 0.0) > plan_w else "plan"
+        _LOGGER.debug(
+            "%s: plan_w=%.0f surplus_w=%s discharge_w=%.0f -> target_w=%.0f (%s)",
+            controller.name, plan_w, f"{surplus_w:.0f}" if surplus_w is not None else "None",
+            discharge_w, target_w, source,
+        )
 
         # Battery-priority correction — see the docstring above. The only place in this
         # function the target is allowed to drop below plan_w.
         if discharge_w > 0.0 and target_w > 0.0:
             relieved_w = max(0.0, target_w - discharge_w - _BATTERY_PRIORITY_BIAS_W)
             if relieved_w < target_w:
+                _LOGGER.debug(
+                    "%s: battery_priority pulls target_w %.0f -> %.0f (discharge_w=%.0f)",
+                    controller.name, target_w, relieved_w, discharge_w,
+                )
                 target_w = relieved_w
                 source = "battery_priority"
 
@@ -914,11 +923,21 @@ class LoadControlManager:
             device_w = self._read_device_power_w(index) or 0.0
             allowed_w = max(0.0, device_w + ac_headroom_w)
             if target_w > allowed_w:
+                _LOGGER.debug(
+                    "%s: ac_output_cap clamps target_w %.0f -> %.0f "
+                    "(device_w=%.0f, ac_headroom_w=%.0f, load_power_sensor=%s, "
+                    "grid_power_sensor=%s, device_power_sensor=%s)",
+                    controller.name, target_w, allowed_w, device_w, ac_headroom_w,
+                    self._load_power_sensor, self._grid_power_sensor,
+                    self._device_power_sensors.get(index, ""),
+                )
                 target_w = allowed_w
                 source = "ac_output_cap"
 
         if target_w <= 0.0:
+            _LOGGER.debug("%s: final target_w=0 (off)", controller.name)
             return 0.0, "off"
+        _LOGGER.debug("%s: final target_w=%.0f (%s)", controller.name, target_w, source)
         return target_w, source
 
     def _reservation_window_end(
