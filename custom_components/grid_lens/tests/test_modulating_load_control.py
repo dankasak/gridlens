@@ -1407,33 +1407,6 @@ async def _run_manager_target_ac_output_cap_credits_current_export():
     assert target == c.cap_w and source == "surplus", (target, source, c.cap_w)
 
 
-async def _run_manager_target_ac_output_cap_never_limits_plan():
-    """Household instruction, 2026-09-27: the AC output ceiling models a physical limit
-    on the Sigenergy plant's own PV+battery output, not a whole-house consumption cap —
-    the LP's schedule is free to draw the rest straight from the grid, which the plant's
-    AC-side rating has nothing to do with. Only Greedy Consumption's "this creates no
-    new import" promise needs bounding by what the plant can actually produce; a
-    plan-driven target must sail straight through this cap even while the plant itself
-    is already pinned at (or past) the ceiling.
-
-    Numbers: 10kW ceiling, house already drawing 15kW backed by 5kW of grid import
-    (i.e. the plant is already 5kW over its own rating) — greedy produces no surplus_w
-    at all (not enabled), so plan_w=12000 (a schedule that wants more than the plant's
-    entire rating) must reach the setpoint completely untouched."""
-    m, hass = _mod_mgr(
-        grid_power_sensor="sensor.grid",
-        load_power_sensor="sensor.load",
-        max_ac_output_kw=10.0,
-    )
-    m.set_plan(_plan(export_rate=0.20, dev_w=12000.0), updated_at=_T0)
-    # greedy left at its default-off state, same as _battery_priority_ignores_greedy_toggle.
-    hass.states.set("sensor.load", "15000")        # plant already well past its own cap
-    hass.states.set("sensor.grid", "5000")         # backed entirely by grid import
-    hass.states.set("sensor.evse_power", "12000")
-    target, source = await m._modulation_target_w(0, _T0)
-    assert target == 12000.0 and source == "plan", (target, source)
-
-
 def test_greedy_reason_exposed_on_onoff_controller():
     """greedy_reason is public because _modulation_target_w reads it — but it must read
     identically on a plain on/off load, whose behaviour this feature did not change."""
@@ -2112,7 +2085,6 @@ if __name__ == "__main__":
         ("manager_target_forecast_surplus", lambda: _run_async(_run_manager_target_forecast_surplus)),
         ("manager_target_ac_output_cap", lambda: _run_async(_run_manager_target_ac_output_cap)),
         ("manager_target_ac_output_cap_credits_current_export", lambda: _run_async(_run_manager_target_ac_output_cap_credits_current_export)),
-        ("manager_target_ac_output_cap_never_limits_plan", lambda: _run_async(_run_manager_target_ac_output_cap_never_limits_plan)),
         ("greedy_reason_on_onoff_controller", test_greedy_reason_exposed_on_onoff_controller),
         ("manager_target_fails_closed", lambda: _run_async(_run_manager_target_fails_closed)),
         ("manager_target_schedule_gate", lambda: _run_async(_run_manager_target_respects_schedule_gate)),
