@@ -28,6 +28,7 @@ a real appliance mid-cycle has more consequence than reverting an inverter mode.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timedelta
 from typing import Callable, Optional
 
@@ -128,6 +129,23 @@ _MIN_BUDGET_WINDOW_H = 0.5
 # correction should overshoot toward the safe side rather than track the discharge exactly.
 _BATTERY_PRIORITY_BIAS_W = 150.0
 
+# Low-pass time constant (seconds) for the discharge reading battery_priority corrects
+# against — see _smoothed_discharge_w. Found 2026-09-27: reacting to the RAW 30s-tick
+# discharge reading turned this correction into a self-sustaining oscillator. A
+# modulating device pulled back hard by a discharge spike drops the house's real load by
+# several kW; the battery's own control reacts to that drop within the next tick or two
+# by cutting its discharge toward zero; the following tick reads that near-zero
+# discharge as "all clear" and swings the device straight back to full power, which
+# recreates the original discharge spike — live data showed the Wattpilot and
+# sigen_0_battery_discharging_power riding a ~60s square wave in lockstep (full power /
+# ~1.4kW floor every 30s, 6.3kW / ~0.3kW discharge every 30s) for as long as it was left
+# running. The on/off crossing-dwell guard doesn't cover this: the device stays "on"
+# throughout, only its setpoint magnitude is swinging. 180s is long enough to average
+# across several of those 30s ticks (killing the resonance) while still responding to a
+# genuine sustained discharge — a real evening battery drawdown unfolds over minutes,
+# not one tick.
+_BATTERY_PRIORITY_SMOOTHING_TAU_S = 180.0
+
 # Stuck-setpoint-while-importing watchdog (see _check_stuck_import) — added 2026-09-13
 # after the ac_output_cap headroom bug (GRIDLENS_CHECKLIST.md, same date) let a modulating
 # device's setpoint freeze mid-overshoot with a live, unchanging import for 5+ minutes and
@@ -225,6 +243,11 @@ class LoadControlManager:
         # actually being drained to fund the load).
         self._battery_discharge_power_sensor: str = d.get(CONF_BATTERY_DISCHARGE_POWER_SENSOR) or ""
         self._battery_min_soc: float = float(d.get(CONF_BATTERY_MIN_SOC, 10.0))
+        # Low-pass state for the battery-priority correction (see _smoothed_discharge_w) —
+        # one shared filter, not per-device, since discharge_w is a single plant-level
+        # reading every modulating device's correction reads from the same tick.
+        self._discharge_ema_w: Optional[float] = None
+        self._discharge_ema_at: Optional[datetime] = None
         self._battery_max_discharge_rate_kw: float = float(d.get(CONF_BATTERY_MAX_DISCHARGE_RATE, 5.0))
         # Usable pack size (kWh). Backs the forecast-surplus condition's transient-dip check
         # (_battery_headroom_kwh): greedy may draw the battery down ahead of a forecast spill
@@ -896,13 +919,19 @@ class LoadControlManager:
         )
 
         # Battery-priority correction — see the docstring above. The only place in this
-        # function the target is allowed to drop below plan_w.
-        if discharge_w > 0.0 and target_w > 0.0:
-            relieved_w = max(0.0, target_w - discharge_w - _BATTERY_PRIORITY_BIAS_W)
+        # function the target is allowed to drop below plan_w. Corrects against the
+        # SMOOTHED discharge reading, not this tick's raw one (see
+        # _smoothed_discharge_w/_BATTERY_PRIORITY_SMOOTHING_TAU_S) — reacting to the raw
+        # reading turned this correction into a self-sustaining oscillator with the very
+        # setpoint swings it was causing (found 2026-09-27).
+        smoothed_discharge_w = self._smoothed_discharge_w(discharge_w, now)
+        if smoothed_discharge_w > 0.0 and target_w > 0.0:
+            relieved_w = max(0.0, target_w - smoothed_discharge_w - _BATTERY_PRIORITY_BIAS_W)
             if relieved_w < target_w:
                 _LOGGER.debug(
-                    "%s: battery_priority pulls target_w %.0f -> %.0f (discharge_w=%.0f)",
-                    controller.name, target_w, relieved_w, discharge_w,
+                    "%s: battery_priority pulls target_w %.0f -> %.0f "
+                    "(discharge_w=%.0f raw, %.0f smoothed)",
+                    controller.name, target_w, relieved_w, discharge_w, smoothed_discharge_w,
                 )
                 target_w = relieved_w
                 source = "battery_priority"
@@ -1099,6 +1128,30 @@ class LoadControlManager:
         if discharge_w is None:
             return None
         return charge_w - discharge_w
+
+    def _smoothed_discharge_w(self, discharge_w: float, now: datetime) -> float:
+        """Exponential moving average of live discharge (W), time-constant
+        ``_BATTERY_PRIORITY_SMOOTHING_TAU_S`` — see that constant for why this exists
+        (the battery_priority correction reacting to a raw 30s reading self-oscillates).
+
+        Time-based (not a fixed per-tick alpha) so an irregular tick gap — a missed
+        cycle, the manager just starting up, HA having been restarted — decays correctly
+        instead of either barely moving (if it assumed a shorter gap really elapsed) or
+        snapping instantly (if it assumed a longer one). The first call ever seeds the
+        filter at the live reading rather than 0, so a fresh start doesn't read as "no
+        discharge" and skip a correction that's actually needed from tick one.
+        """
+        if self._discharge_ema_w is None or self._discharge_ema_at is None:
+            self._discharge_ema_w = discharge_w
+            self._discharge_ema_at = now
+            return discharge_w
+        elapsed = max(0.0, (now - self._discharge_ema_at).total_seconds())
+        self._discharge_ema_at = now
+        if elapsed <= 0.0:
+            return self._discharge_ema_w
+        alpha = 1.0 - math.exp(-elapsed / _BATTERY_PRIORITY_SMOOTHING_TAU_S)
+        self._discharge_ema_w += alpha * (discharge_w - self._discharge_ema_w)
+        return self._discharge_ema_w
 
     def _read_percent(self, entity_id: str) -> Optional[float]:
         """A plain 0-100 sensor reading (SOC), or None if unconfigured/unavailable."""

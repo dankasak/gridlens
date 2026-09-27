@@ -1542,6 +1542,52 @@ async def _run_manager_target_battery_priority_bias_floors_at_zero():
     assert target == 0.0 and source == "off", (target, source)
 
 
+async def _run_manager_target_battery_priority_smoothing_damps_oscillation():
+    """Found live 2026-09-27: correcting against the RAW 30s-tick discharge reading made
+    battery_priority a self-sustaining oscillator. Pulling this device back hard drops
+    real house load by kilowatts; the battery's own control reacts within a tick or two
+    by cutting its discharge toward zero; the next tick reads that near-zero discharge as
+    "all clear" and swings the device straight back to full power, recreating the
+    original discharge spike. Live data showed the Wattpilot and the battery's discharge
+    reading riding a ~60s square wave in lockstep for as long as it ran unattended.
+
+    This replays that square wave (alternating 2200 W / 0 W discharge every 30s against
+    a 2100 W plan) through _modulation_target_w and checks the smoothed correction never
+    lets the target swing back anywhere near its un-smoothed value once the filter has
+    seen more than one reading — the raw reading alone would put the "discharge idle"
+    ticks at ~1950 W (2100 - 0 - 150 bias); the smoothed correction must stay well below
+    that on every tick from the second one on."""
+    m, hass = _mod_mgr(
+        grid_power_sensor="sensor.grid",
+        battery_charge_power_sensor="sensor.batt_charge",
+        battery_discharge_power_sensor="sensor.batt_discharge",
+    )
+    m.set_plan(_plan(export_rate=0.20, dev_w=2100.0), updated_at=_T0)
+    hass.states.set("sensor.grid", "0")
+    hass.states.set("sensor.batt_charge", "0")
+    hass.states.set("sensor.evse_power", "0")
+
+    targets = []
+    for i in range(8):
+        discharge = 2200 if i % 2 == 0 else 0
+        hass.states.set("sensor.batt_discharge", str(discharge))
+        t = _T0 + timedelta(seconds=30 * i)
+        target, _source = await m._modulation_target_w(0, t)
+        targets.append(target)
+
+    # The very first tick seeds the filter at the live reading (no history yet to
+    # smooth against) — everything from the second tick on must stay damped: nowhere
+    # near the ~1950 W a raw discharge=0 tick would give (2100 - 0 - 150 bias).
+    unsmoothed_idle_target = 2100.0 - 0.0 - 150.0
+    for i, target in enumerate(targets[1:], start=1):
+        assert target < unsmoothed_idle_target - 500, (i, target)
+    # And the oscillation itself must be damped, not just individually capped — the
+    # peak-to-peak swing across the tail (once the filter has absorbed a few cycles)
+    # should be a small fraction of the ~2100 W the raw reading swings across.
+    tail_swing = max(targets[-4:]) - min(targets[-4:])
+    assert tail_swing < 500, (targets, tail_swing)
+
+
 async def _run_manager_target_no_discharge_no_correction():
     """Battery idle or charging must leave plan_w untouched by this correction — it only
     ever fires on a live discharge, never as a general-purpose plan override."""
@@ -2030,6 +2076,7 @@ if __name__ == "__main__":
         ("battery_priority_ignores_greedy_toggle", lambda: _run_async(_run_manager_target_battery_priority_ignores_greedy_toggle)),
         ("battery_priority_bias_small_discharge", lambda: _run_async(_run_manager_target_battery_priority_bias_applied_even_for_small_discharge)),
         ("battery_priority_bias_floors_at_zero", lambda: _run_async(_run_manager_target_battery_priority_bias_floors_at_zero)),
+        ("battery_priority_smoothing_damps_oscillation", lambda: _run_async(_run_manager_target_battery_priority_smoothing_damps_oscillation)),
         ("no_discharge_no_correction", lambda: _run_async(_run_manager_target_no_discharge_no_correction)),
         ("surplus_battery_charging_not_credited", lambda: _run_async(_run_manager_target_surplus_battery_charging_not_credited)),
         ("surplus_no_battery_unchanged", lambda: _run_async(_run_manager_target_surplus_no_battery_configured_unchanged)),
