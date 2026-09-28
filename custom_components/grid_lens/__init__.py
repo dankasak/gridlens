@@ -634,7 +634,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260928b"
+    _CARD_VERSION = "20260928c"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -1341,9 +1341,20 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     whatif_solar_pct=whatif_solar_pct,
                 )
             if isinstance(result, dict) and isinstance(result.get('plan_details'), dict):
-                result['plan_details'] = {
-                    k: _slim_stream_detail(v) for k, v in result['plan_details'].items()
-                }
+                # Every plan's detail was already streamed once via `on_plan_ready`
+                # (_slim_stream_detail applied there too) — resending the identical
+                # slimmed dict again here duplicates the single largest chunk of the
+                # whole response for no reason. Confirmed live 2026-09-28: a 208-plan
+                # comparison (up from 121 when the original 109 MB fix landed
+                # 2026-09-08) had grown back to ~7.9 MB, ~2.9 MB of which was this
+                # exact resend, and intermittently tripped the same client-side
+                # `src.onerror` "stream failed" abort the original fix was meant to
+                # prevent (one of three consecutive owner-triggered runs stopped dead
+                # at plan 199/211 with zero server-side exception — a transport-side
+                # drop, not a calculation bug). The card merges its own
+                # incrementally-built plan_details back in on 'complete' instead (see
+                # grid-lens-card.js), so the wire payload only needs to carry it once.
+                result = {**result, 'plan_details': {}}
             await send('complete', result)
             return resp
 

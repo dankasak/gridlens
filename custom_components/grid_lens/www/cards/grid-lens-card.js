@@ -179,6 +179,11 @@ class GridLensCard extends HTMLElement {
       this._plansTotal  = 0;
       this._fetching    = false;
       const full = JSON.parse(e.data);
+      // The server omits plan_details here (see PlanStreamView in __init__.py) —
+      // each plan's detail already arrived via its own 'plan' event above and was
+      // merged into this._data.plan_details, so restore it rather than losing it
+      // to the empty dict the 'complete' payload carries in its place.
+      full.plan_details = (this._data && this._data.plan_details) || {};
       this._data = full;
       const cacheKey = `${startDate || ''}|${endDate || ''}|${this._excludeGreedy}|${this._whatifCacheFrag()}`;
       GridLensCard._cache[cacheKey] = full;
