@@ -39,7 +39,10 @@ LP formulation (per hour t):
                      tracking window and the floor's own deadline out to the target's
                      slot, even into day 1+. A one-off dated floor carries none of the
                      recurring case's infeasibility risk — it is a single bounded
-                     constraint that stops applying once its slot passes.
+                     constraint that stops applying once its slot passes. WHICH slot(s)
+                     before the floor actually get charged (as opposed to just how much
+                     by when) is a tie-break, not this constraint's job — see
+                     "charge_timing_preference" in the objective below.
     Capped rates   : for hours inside a capped-rate window w (e.g. GloBird ZEROHERO's
                      50 kWh/day free import window), P_imp[t] splits into a free
                      tranche and an over-cap tranche: P_imp[t] = free_w[t] + over_w[t],
@@ -67,6 +70,19 @@ import math
 from typing import Dict, List
 
 _LOGGER = logging.getLogger(__name__)
+
+# Charge-timing tie-break for SOC-tracked devices (ev_soc_idx below) — mirrors
+# charge_timing_preference.py's own constants/magnitude (that module is the
+# single source of truth for the Store/select.py side; this file stays
+# self-contained with no local-package imports, same reasoning ev_soc_idx's
+# own charge_target_percent/charge_target_slot fields are consumed as plain
+# dev-dict values rather than importing charge_target.py). Keep these two
+# files' string values and TIE_BREAK_MAGNITUDE in sync if either changes.
+_PREFER_EARLY = "prefer_early"
+_NO_PREFERENCE = "no_preference"
+# Anything else (including the default "prefer_just_in_time") ranks the same
+# way: latest-before-the-floor slot cheapest.
+_CHARGE_TIMING_TIE_BREAK_MAGNITUDE = 0.0003
 
 
 def _import_bound(load, solar, deferrable_loads, dt, max_charge_kw, max_discharge_kw):
@@ -152,7 +168,10 @@ def _slot_marginal_tiers(schedule: List[Dict], dev_idx: int, slots: List[int], c
     return tiers
 
 
-def _front_load_device_day(schedule: List[Dict], dev_idx: int, slots: List[int], cap_kwh: float) -> None:
+def _consolidate_device_day(
+    schedule: List[Dict], dev_idx: int, slots: List[int], cap_kwh: float,
+    preference: str = '',
+) -> None:
     """Rearrange device ``dev_idx``'s deferrable energy across ``slots`` (one
     calendar day's eligible slots) into the cheapest possible arrangement of
     the SAME total, only committing if doing so does not increase total cost
@@ -160,8 +179,36 @@ def _front_load_device_day(schedule: List[Dict], dev_idx: int, slots: List[int],
     zero direct objective cost, so the LP is often indifferent to how it's
     split across equally-free hours — this picks the least-fragmented of the
     equally-good options, using chronological order as the tie-break so
-    equally-cheap capacity fills into the earliest slots first (favouring one
-    contiguous block over a scattered one).
+    equally-cheap capacity fills into one contiguous block rather than a
+    scattered one.
+
+    ``preference`` (a charge_timing_preference.py value, or '' — this
+    function runs for EVERY deferrable device, not just SOC-tracked ones,
+    so '' covers both "no preference set" and "this device has no timing-
+    preference concept at all", e.g. a pool pump, or any device on
+    plan_calculator.py's plan-comparison path, which never populates the
+    field) decides WHICH end of a cost-tied stretch that block lands at:
+    '' (unset), "prefer_early", and "no_preference" ALL fill the earliest
+    eligible slots first — the original, byte-identical-to-before-this-
+    feature behaviour, and the safe default for anything this feature
+    doesn't apply to. Only an explicit "prefer_just_in_time" (or any other
+    non-empty, unrecognised value — matching charge_timing_preference.DEFAULT)
+    fills the LATEST eligible slots first instead. Unlike the empty-string
+    case, a real SOC-tracked device's preference field is never actually
+    empty in practice — advisory/coordinator.py always resolves it to a
+    real value, defaulting to "prefer_just_in_time" — so '' here only ever
+    means "not applicable", never "applicable but unset".
+
+    This function is the reason the LP-objective tie-break above is not
+    sufficient on its own: `optimize_hourly_schedule` calls
+    `consolidate_deferrable_schedule` (which calls this) AFTER the LP solve,
+    to collapse a fragmented raw allocation into one block — and until this
+    parameter existed, that post-process always re-sorted cost-tied slots
+    earliest-first regardless of the LP's own (correctly tie-broken)
+    objective, silently undoing it. Found live 2026-09-28: a "prefer
+    just-in-time" EV target still front-loaded, because the LP's raw solve
+    (already correctly late-leaning) got re-flattened back to earliest-first
+    by this pass a few lines later.
     """
     if not slots:
         return
@@ -169,8 +216,9 @@ def _front_load_device_day(schedule: List[Dict], dev_idx: int, slots: List[int],
     if total <= 1e-9:
         return
 
+    prefer_late = bool(preference) and preference not in ('prefer_early', 'no_preference')
     tiers = _slot_marginal_tiers(schedule, dev_idx, slots, cap_kwh)
-    tiers.sort(key=lambda tup: (tup[0], tup[1]))  # cheapest first, then earliest
+    tiers.sort(key=lambda tup: (tup[0], -tup[1] if prefer_late else tup[1]))
 
     target = {t: 0.0 for t in slots}
     remaining = total
@@ -306,6 +354,18 @@ def consolidate_deferrable_schedule(
     on/off/on/off across an afternoon with identical $0 marginal cost either
     way (GRIDLENS_CHECKLIST.md).
 
+    Each SOC-tracked device's own `charge_timing_preference` (see that module,
+    and the objective-level tie-break in `_lp_scipy` right after "def_i has
+    NO direct cost") decides which END of a cost-tied stretch this pass fills
+    first — see `_consolidate_device_day`'s own docstring for the full
+    reasoning. This is NOT optional/cosmetic: the LP objective's own tie-break
+    only sets which raw slots the solver *initially* picks among ties, and this
+    post-process runs AFTER that solve specifically to collapse fragmentation —
+    without passing the preference through here too, this pass would silently
+    re-flatten an already-correctly-tie-broken raw solve back to its own
+    hardcoded default, discarding the objective-level fix entirely (found live
+    2026-09-28, see GRIDLENS_CHECKLIST.md).
+
     This is a mutate-in-place, pure-Python pass over the already-solved
     ``schedule`` (no re-solve, no scipy/numpy dependency — testable without
     the LXC). It re-derives each touched slot's import/export kWh from the
@@ -368,7 +428,10 @@ def consolidate_deferrable_schedule(
                 # full slot's energy into it would overfill; leave those as solved.
                 if (float(mask[t]) >= 1.0 if mask else True) and t not in protected
             ]
-            _front_load_device_day(schedule, i, eligible, cap_kwh)
+            _consolidate_device_day(
+                schedule, i, eligible, cap_kwh,
+                preference=dev.get('charge_timing_preference') or '',
+            )
 
 
 class BatteryOptimizer:
@@ -1017,6 +1080,37 @@ class BatteryOptimizer:
         # when solar is sufficient, def_i reduces exp → opportunity cost = r_exp[t];
         # when solar is insufficient, def_i increases imp → cost = r_imp[t].
         # This lets the LP correctly prefer solar over grid for deferrable loads.
+        #
+        # Charge-timing tie-break (grid_lens's select.*_charge_timing_preference
+        # entity, default "prefer just-in-time"): the SAME floor_slot[i] window
+        # above (whether it's the everyday day-0 ceiling or an active ad-hoc
+        # charge target) only bounds the CUMULATIVE energy charged by the
+        # deadline — nothing above prices WHICH pre-deadline slot is used, so
+        # when several are cost-tied (a flat overnight tariff, most commonly)
+        # the solver's own degenerate-vertex choice decides, and in practice
+        # that front-loads the charge — an EV reaches its target hours before
+        # the deadline and then sits there, which is bad for battery longevity.
+        # This adds a tiny per-slot nudge, spread evenly across each device's
+        # own pre-floor window so a long window gets no bigger a total nudge
+        # than a short one, scaled to the SAME proven-safe magnitude as the
+        # soc_reward degeneracy regularizer above (0.0003 $/kWh total swing —
+        # calibrated there: 0.001 measurably distorts real decisions, this
+        # doesn't) so it can only ever resolve a genuine tie, never outweigh a
+        # real price difference between slots. "No preference" (or a
+        # single-slot window, nothing to break a tie over) adds nothing, so
+        # behaviour is byte-for-byte unchanged from before this feature existed.
+        for i in ev_soc_idx:
+            fslot = floor_slot[i]
+            if fslot <= 1:
+                continue
+            preference = deferrable_loads[i].get('charge_timing_preference') or ''
+            if preference == _NO_PREFERENCE:
+                continue
+            def_col0 = (5 + i) * T
+            step = _CHARGE_TIMING_TIE_BREAK_MAGNITUDE / (fslot - 1)
+            for t in range(fslot):
+                rank = t if preference == _PREFER_EARLY else (fslot - 1 - t)
+                c_obj[def_col0 + t] += step * rank
 
         lb = np.zeros(n)
         ub = np.full(n, np.inf)

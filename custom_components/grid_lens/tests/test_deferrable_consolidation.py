@@ -291,6 +291,113 @@ def test_slot_day_index_confines_consolidation_to_real_calendar_days():
           f"got {with_index[2]['deferrable_per_device'][0]}, {with_index[3]['deferrable_per_device'][0]}")
 
 
+def test_prefer_early_fills_earliest_tied_slots_first():
+    """Explicit 'prefer_early' — same shape as the no-preference default test
+    above, confirming the explicit value doesn't change anything."""
+    dev = [{'max_kw': 1.8, 'daily_kwh': 3.6, 'hour_mask': None,
+            'charge_timing_preference': 'prefer_early'}]
+    schedule = [
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.0]),  # the gap
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+    ]
+    consolidate_deferrable_schedule(schedule, dev, dt=0.5, slots_per_day=48)
+    on_pattern = [r['deferrable_per_device'][0] > 0 for r in schedule]
+    check("prefer_early fills the earliest tied slots — leading block",
+          on_pattern == [True, True, True, True, False], f"pattern={on_pattern}")
+
+
+def test_prefer_just_in_time_fills_latest_tied_slots_first():
+    """The live 2026-09-28 bug this was found from: with charge_timing_preference
+    set to prefer_just_in_time, a fragmented cost-tied allocation must
+    consolidate into a TRAILING block (latest slots), not the leading one
+    _front_load_device_day (now _consolidate_device_day) used to always
+    produce regardless of preference."""
+    dev = [{'max_kw': 1.8, 'daily_kwh': 3.6, 'hour_mask': None,
+            'charge_timing_preference': 'prefer_just_in_time'}]
+    schedule = [
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.0]),  # the gap
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+    ]
+    before_total = sum(r['deferrable_per_device'][0] for r in schedule)
+    consolidate_deferrable_schedule(schedule, dev, dt=0.5, slots_per_day=48)
+    after_total = sum(r['deferrable_per_device'][0] for r in schedule)
+    on_pattern = [r['deferrable_per_device'][0] > 0 for r in schedule]
+    check("total energy is preserved", abs(after_total - before_total) < 1e-6)
+    check("prefer_just_in_time fills the latest tied slots — trailing block",
+          on_pattern == [False, True, True, True, True], f"pattern={on_pattern}")
+
+
+def test_no_preference_behaves_like_the_original_earliest_first_default():
+    """'no_preference' must NOT be treated as a third direction — it means
+    "no special handling", which for this pass's own pre-existing behaviour
+    is earliest-first, same as prefer_early and same as no field at all."""
+    dev = [{'max_kw': 1.8, 'daily_kwh': 3.6, 'hour_mask': None,
+            'charge_timing_preference': 'no_preference'}]
+    schedule = [
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.0]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+    ]
+    consolidate_deferrable_schedule(schedule, dev, dt=0.5, slots_per_day=48)
+    on_pattern = [r['deferrable_per_device'][0] > 0 for r in schedule]
+    check("no_preference fills earliest tied slots first, like the original default",
+          on_pattern == [True, True, True, True, False], f"pattern={on_pattern}")
+
+
+def test_missing_preference_field_is_scoped_to_early_not_late():
+    """A device with NO charge_timing_preference key at all (every non-SOC-
+    tracked device — a pool pump, hot water — and every device on
+    plan_calculator.py's plan-comparison path) must consolidate exactly like
+    before this feature existed. Regression guard against the field's ''
+    fallback accidentally defaulting to "prefer late" and silently changing
+    consolidation direction for devices this feature was never meant to
+    touch — found and fixed during the same 2026-09-28 session that added
+    the preference-awareness in the first place."""
+    dev = [{'max_kw': 1.8, 'daily_kwh': 3.6, 'hour_mask': None}]  # no key at all
+    schedule = [
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.0]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9]),
+    ]
+    consolidate_deferrable_schedule(schedule, dev, dt=0.5, slots_per_day=48)
+    on_pattern = [r['deferrable_per_device'][0] > 0 for r in schedule]
+    check("a device with no preference field consolidates earliest-first, unchanged",
+          on_pattern == [True, True, True, True, False], f"pattern={on_pattern}")
+
+
+def test_prefer_just_in_time_still_respects_its_own_charge_target_deadline():
+    """Combines the 2026-09-18 floor_slot regression guard with the new
+    preference: even preferring late slots, the pass must never move energy
+    to or past the device's own ad-hoc charge-target deadline — floor_slot's
+    day clipping happens before _consolidate_device_day ever sees the
+    eligible slot list, so this should hold regardless of preference."""
+    dev = [{'max_kw': 2.0, 'daily_kwh': 1.0, 'hour_mask': None,
+            'charge_timing_preference': 'prefer_just_in_time'}]
+    schedule = [
+        _row(import_kwh=0.5, import_rate=1.00, defer=[1.0]),  # before the deadline
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.0]),  # at/after the deadline
+    ]
+    consolidate_deferrable_schedule(
+        schedule, dev, dt=0.5, slots_per_day=48, floor_slot={0: 1},
+    )
+    check("pre-deadline energy stays in the pre-deadline slot even under prefer_just_in_time",
+          schedule[0]['deferrable_per_device'][0] == 1.0,
+          f"got {schedule[0]['deferrable_per_device'][0]}")
+    check("nothing leaks past the deadline",
+          schedule[1]['deferrable_per_device'][0] == 0.0,
+          f"got {schedule[1]['deferrable_per_device'][0]}")
+
+
 def test_deferrable_kwh_field_kept_in_sync():
     """The aggregate 'deferrable_kwh' field (used for display) must always
     equal the sum of deferrable_per_device after consolidation."""
@@ -317,6 +424,11 @@ if __name__ == "__main__":
     test_never_moves_energy_past_its_own_charge_target_deadline()
     test_floor_slot_does_not_restrict_days_outside_the_deadline()
     test_slot_day_index_confines_consolidation_to_real_calendar_days()
+    test_prefer_early_fills_earliest_tied_slots_first()
+    test_prefer_just_in_time_fills_latest_tied_slots_first()
+    test_no_preference_behaves_like_the_original_earliest_first_default()
+    test_missing_preference_field_is_scoped_to_early_not_late()
+    test_prefer_just_in_time_still_respects_its_own_charge_target_deadline()
     test_deferrable_kwh_field_kept_in_sync()
     if _FAILURES:
         print(f"\nFAIL — {len(_FAILURES)} failure(s): {_FAILURES}")

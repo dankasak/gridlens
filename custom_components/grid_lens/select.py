@@ -21,10 +21,18 @@ import logging
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
-from .const import DOMAIN
+from . import charge_timing_preference as ctp
+from .const import (
+    DOMAIN,
+    CONF_DEFERRABLE_LOAD_SENSORS,
+    CONF_DEFERRABLE_LOAD_SOC_SENSORS,
+    CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH,
+)
+from .entity_lookup import resolve_device_name
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -37,13 +45,37 @@ _OPTION_TO_MODE = {OPTION_AUTO: None, OPTION_FORCE_ON: "on", OPTION_FORCE_OFF: "
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
+    entities = []
+
     load_mgr = hass.data[DOMAIN].get(f"{entry.entry_id}_load_control")
-    if load_mgr is None:
-        return
-    entities = [
-        GridLensLoadOverrideSelect(load_mgr, entry, index, controller)
-        for index, controller in load_mgr.controllers.items()
-    ]
+    if load_mgr is not None:
+        entities.extend(
+            GridLensLoadOverrideSelect(load_mgr, entry, index, controller)
+            for index, controller in load_mgr.controllers.items()
+        )
+
+    # One "charge timing preference" per SOC-tracked deferrable device — same
+    # gating as number.py's ad-hoc charge-target percent entity (needs a live
+    # SOC reading + capacity for the floor this preference is tie-breaking to
+    # be meaningful at all).
+    sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
+    soc_sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, [])
+    soc_capacities = entry.data.get(CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH, [])
+    if soc_sensors:
+        timing_store = hass.data.get(DOMAIN, {}).get(
+            f"{entry.entry_id}_charge_timing_preferences"
+        )
+        for i, soc_sensor_id in enumerate(soc_sensors):
+            capacity = soc_capacities[i] if i < len(soc_capacities) else 0.0
+            if not soc_sensor_id or not capacity:
+                continue
+            if i >= len(sensors) or not sensors[i]:
+                continue
+            name = resolve_device_name(hass, sensors[i])
+            entities.append(
+                GridLensChargeTimingPreferenceSelect(entry, timing_store, sensors[i], name)
+            )
+
     if entities:
         async_add_entities(entities)
 
@@ -102,4 +134,80 @@ class GridLensLoadOverrideSelect(RestoreEntity, SelectEntity):
             return
         await self._manager.set_override(self._index, _OPTION_TO_MODE[option])
         self._attr_current_option = option
+        self.async_write_ha_state()
+
+
+class GridLensChargeTimingPreferenceSelect(SelectEntity):
+    """Prefer early / No preference / Prefer just-in-time for one SOC-tracked
+    deferrable load's floor-satisfying charge — the everyday day-0 ceiling, or
+    an active ad-hoc charge target (§9a) — see charge_timing_preference.py for
+    the maths and why this exists (in short: without it, the LP is free to
+    front-load the charge across cost-tied slots, leaving the device sitting
+    fully charged for hours before it's actually needed).
+
+    Reads/writes through the shared ChargeTimingPreferenceStore rather than
+    RestoreEntity, same reasoning as GridLensChargeTargetPercentNumber: the
+    store is the single source of truth AdvisoryCoordinator reads from
+    directly, so there is nothing for RestoreEntity to usefully duplicate.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:battery-clock-outline"
+    _attr_options = list(ctp.LABELS.values())
+
+    def __init__(self, entry: ConfigEntry, store, sensor_id: str, name: str) -> None:
+        self._store = store
+        self._entry_id = entry.entry_id
+        self._sensor_id = sensor_id
+        self._attr_name = f"{name} Charge Timing Preference"
+        self._attr_unique_id = f"{entry.entry_id}_charge_timing_preference_{sensor_id}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_current_option = ctp.LABELS[ctp.DEFAULT]
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        await self._refresh_from_store()
+        if self._store is not None:
+            from .charge_timing_preference_store import update_signal
+
+            async def _on_update(sensor_id: str) -> None:
+                if sensor_id == self._sensor_id:
+                    await self._refresh_from_store()
+                    self.async_write_ha_state()
+
+            self.async_on_remove(
+                async_dispatcher_connect(
+                    self.hass, update_signal(self._entry_id), _on_update,
+                )
+            )
+
+    async def _refresh_from_store(self) -> None:
+        if self._store is None:
+            return
+        preference = await self._store.async_get(self._sensor_id)
+        self._attr_current_option = ctp.LABELS.get(preference, ctp.LABELS[ctp.DEFAULT])
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        # Real state attributes so grid-lens-charge-target-card.js can pair this with the
+        # matching percent/time row, the same way number.py's charge_target_role
+        # disambiguates its own deferrable_sensor_id use from Today Boost's. Plain
+        # deferrable_sensor_id alone isn't a safe fingerprint for a select entity — the
+        # Force On/Auto/Off override select (GridLensLoadOverrideSelect) is also a
+        # select.* entity on a deferrable device, so charge_timing_preference_role is
+        # the actual discriminator the card scans for.
+        return {
+            "deferrable_sensor_id": self._sensor_id,
+            "charge_timing_preference_role": "select",
+        }
+
+    async def async_select_option(self, option: str) -> None:
+        preference = ctp.VALUES_BY_LABEL.get(option, ctp.DEFAULT)
+        if self._store is not None:
+            await self._store.async_set(self._sensor_id, preference)
+        self._attr_current_option = ctp.LABELS[preference]
         self.async_write_ha_state()

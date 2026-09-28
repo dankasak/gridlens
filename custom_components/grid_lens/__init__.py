@@ -634,7 +634,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260928a"
+    _CARD_VERSION = "20260928b"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -2060,6 +2060,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, entry.entry_id
     )
 
+    # Charge timing preference (Prefer early / No preference / Prefer
+    # just-in-time) per SOC-tracked device — shared between the select.py
+    # entity (writer) and AdvisoryCoordinator (reader). Same "created before
+    # platforms are forwarded" reasoning as the stores above.
+    from .charge_timing_preference_store import ChargeTimingPreferenceStore
+    hass.data[DOMAIN][f"{entry.entry_id}_charge_timing_preferences"] = ChargeTimingPreferenceStore(
+        hass, entry.entry_id
+    )
+
     # Weekly per-weekday availability schedules for deferrable loads (edited on the
     # dashboard schedule card; replaces the static hours config when set for a device).
     # Preloaded here so sensor.py's sync attribute builder can read the cache.
@@ -2267,6 +2276,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_overrides", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_charge_targets", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_daily_targets", None)
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_charge_timing_preferences", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_schedules", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_load_estimators", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_power_estimators", None)

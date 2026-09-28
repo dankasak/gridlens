@@ -20,6 +20,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .. import charge_target as ct
+from .. import charge_timing_preference as ctp
 from ..battery_optimizer import BatteryOptimizer
 from ..const import (
     CONF_HAS_DEMAND_TARIFF,
@@ -520,6 +521,20 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             return None
         return {"percent": raw["percent"], "target_dt": dt_util.as_utc(target_dt)}
 
+    async def _charge_timing_preference(self, sensor_id: str) -> str:
+        """Prefer early / No preference / Prefer just-in-time for sensor_id's
+        floor-satisfying charge (see charge_timing_preference.py) — the default
+        (Prefer just-in-time) if unset or the store isn't available for some
+        reason, same "never block the solve" rule as the rest of this module."""
+        if not sensor_id:
+            return ctp.DEFAULT
+        store = self.hass.data.get(DOMAIN, {}).get(
+            f"{self.entry.entry_id}_charge_timing_preferences"
+        )
+        if store is None:
+            return ctp.DEFAULT
+        return await store.async_get(sensor_id)
+
     async def _deferrable_for_horizon(self, bundle) -> list:
         """Build the optimizer's per-device deferrable dicts for THIS horizon: device
         daily_kwh/max_kw + a per-slot availability mask.
@@ -590,6 +605,9 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
                             "soc_capacity_kwh": capacity,
                             "soc_initial_percent": live_soc_percent,
                             "soc_max_percent": float(dev.get("soc_max_percent", 100.0) or 100.0),
+                            "charge_timing_preference": await self._charge_timing_preference(
+                                dev.get("sensor_id", "")
+                            ),
                         }
                     except (TypeError, ValueError):
                         live_soc_percent = None

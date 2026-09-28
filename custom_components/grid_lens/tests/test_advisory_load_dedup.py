@@ -128,6 +128,16 @@ def _install_stubs() -> None:
     sys.modules["gl.charge_target"] = ct_mod
     ct_spec.loader.exec_module(ct_mod)
 
+    # charge_timing_preference.py (Prefer early/No preference/Prefer just-in-time
+    # maths) is import-free too — load the real module, same reasoning as
+    # charge_target.py above.
+    ctp_spec = importlib.util.spec_from_file_location(
+        "gl.charge_timing_preference", os.path.join(_COMPONENT, "charge_timing_preference.py")
+    )
+    ctp_mod = importlib.util.module_from_spec(ctp_spec)
+    sys.modules["gl.charge_timing_preference"] = ctp_mod
+    ctp_spec.loader.exec_module(ctp_mod)
+
 
 def _load_coordinator():
     _install_stubs()

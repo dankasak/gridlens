@@ -17,6 +17,13 @@
  * both also carry (same attribute Today Boost's entities use — `charge_target_role` is
  * what distinguishes these from a Today Boost number, which has no such attribute).
  *
+ * A third, OPTIONAL tile — select.py's GridLensChargeTimingPreferenceSelect (Prefer
+ * early / No preference / Prefer just-in-time, see FEATURES.md §9c) — is added to a row
+ * when present, fingerprinted by `charge_timing_preference_role: 'select'` and paired by
+ * the same `deferrable_sensor_id`. Unlike the percent/time pair, a device's row is never
+ * gated on this tile existing — it governs WHICH pre-deadline slot(s) get charged, not
+ * whether a target is active, so it's meaningful (and shown) even with no target set.
+ *
  * Device naming: same `deferrable_loads` sensor attribute lookup as
  * grid-lens-boost-tuning-card.js / grid-lens-powerflow-card.js's _resolveDeferLoads(), so
  * labels never drift between cards.
@@ -66,14 +73,16 @@ class GridLensChargeTargetCard extends HTMLElement {
     const nameMap = this._resolveDeferrableNames();
     const byKey = {};
     for (const eid of Object.keys(hass.states)) {
-      if (!eid.startsWith('number.') && !eid.startsWith('datetime.')) continue;
+      if (!eid.startsWith('number.') && !eid.startsWith('datetime.') && !eid.startsWith('select.')) continue;
       const attrs = hass.states[eid].attributes || {};
       const role = attrs.charge_target_role;
-      if (role !== 'percent' && role !== 'time') continue;
+      const isTiming = attrs.charge_timing_preference_role === 'select';
+      if (role !== 'percent' && role !== 'time' && !isTiming) continue;
       const key = attrs.deferrable_sensor_id || eid;
       const entry = (byKey[key] = byKey[key] || { key, name: nameMap[key] || key });
       if (role === 'percent') entry.percentEntity = eid;
-      else entry.timeEntity = eid;
+      else if (role === 'time') entry.timeEntity = eid;
+      else if (isTiming) entry.timingEntity = eid;
     }
     const devices = Object.values(byKey).filter((d) => d.percentEntity && d.timeEntity);
     devices.sort((a, b) => a.name.localeCompare(b.name));
@@ -83,7 +92,7 @@ class GridLensChargeTargetCard extends HTMLElement {
   set hass(hass) {
     this._hass = hass;
     const devices = this._resolveDevices();
-    const sig = devices.map((d) => `${d.percentEntity}:${d.timeEntity}:${d.name}`).join(',');
+    const sig = devices.map((d) => `${d.percentEntity}:${d.timeEntity}:${d.timingEntity}:${d.name}`).join(',');
     if (sig !== this._sig) {
       this._sig = sig;
       this._buildRows(devices);
@@ -166,6 +175,23 @@ class GridLensChargeTargetCard extends HTMLElement {
       });
       timeTile.hass = this._hass;
 
+      const tiles = [percentTile, timeTile];
+      const tileEntries = [
+        { entity_id: d.percentEntity, el: percentTile },
+        { entity_id: d.timeEntity, el: timeTile },
+      ];
+      // Optional — governs WHICH slot(s) get charged, meaningful whether or not a
+      // target is currently active, so it's rendered whenever the entity exists at
+      // all (not gated on percent/time the way the row itself is).
+      if (d.timingEntity) {
+        const timingTile = helpers.createCardElement({
+          type: 'tile', entity: d.timingEntity, name: 'Timing',
+        });
+        timingTile.hass = this._hass;
+        tiles.push(timingTile);
+        tileEntries.push({ entity_id: d.timingEntity, el: timingTile });
+      }
+
       const wrap = document.createElement('div');
       wrap.className = 'device';
       const label = document.createElement('div');
@@ -173,7 +199,7 @@ class GridLensChargeTargetCard extends HTMLElement {
       label.textContent = d.name;
       const grid = document.createElement('div');
       grid.className = 'grid';
-      for (const el of [percentTile, timeTile]) {
+      for (const el of tiles) {
         const item = document.createElement('div');
         item.className = 'item';
         item.appendChild(el);
@@ -189,7 +215,7 @@ class GridLensChargeTargetCard extends HTMLElement {
       const entry = {
         ...d,
         statusEl: status,
-        tiles: [{ entity_id: d.percentEntity, el: percentTile }, { entity_id: d.timeEntity, el: timeTile }],
+        tiles: tileEntries,
       };
       this._updateStatus(entry);
       return entry;

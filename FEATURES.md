@@ -2203,6 +2203,103 @@ any card change.
 
 ---
 
+## 9c. Charge timing preference
+
+**What it does.** Per SOC-tracked deferrable device, a `select.*_charge_timing_preference`
+entity with three options — **Prefer early**, **No preference**, **Prefer just-in-time**
+(default) — controlling WHICH pre-deadline slot(s) the optimizer uses to satisfy that
+device's floor, not how much or by when (those are unchanged — §9a's ad-hoc charge target,
+or the everyday day-0 ceiling when no ad-hoc target is active).
+
+**Why it exists.** `battery_optimizer.py`'s floor row (`Σ def_i[t]` for `t < floor_slot[i]`
+`>= target`) only bounds the *cumulative* energy charged by the deadline — it prices no
+preference between the pre-deadline slots that satisfy it. When several are cost-tied (a
+flat overnight tariff, most commonly), the LP has no cost reason to prefer one over another,
+and in practice the solver's own degenerate-vertex choice front-loads the charge — an EV
+set to "100% by 6am" reaches it hours early and then sits fully charged the rest of the
+night, which is bad for battery longevity. "Prefer just-in-time" breaks that tie the other
+way (nudges the charge toward the *last* feasible slots before the deadline); "Prefer early"
+breaks it the original way, on purpose, for anyone who'd rather have headroom sooner.
+"No preference" adds nothing — solver behaviour identical to before this feature existed.
+
+**How the tie-break works — two layers, both required.** (1) A tiny per-slot cost is added to
+`def_i[t]`'s objective coefficient for `t` in `[0, floor_slot[i])`, spread evenly across that
+device's own window so a long window (a next-morning deadline) gets no bigger a total nudge
+than a short one (a same-afternoon one). Total swing across the whole window is capped at the
+SAME proven-safe magnitude as the existing `soc_reward` degeneracy regularizer (0.0003 $/kWh —
+calibrated there: 0.001 measurably distorts real decisions, this doesn't; see §2), so it can
+only ever resolve a genuine tie between equally-priced slots, never outweigh an actual price
+difference. (2) `consolidate_deferrable_schedule`'s post-LP pass (`_consolidate_device_day`,
+below) ALSO needs to know the preference — see the 2026-09-28 bug note below for why (1) alone
+isn't sufficient.
+
+**Live bug found and fixed 2026-09-28, same day as the feature's initial ship: the objective
+tie-break alone did nothing.** First live check showed the owner's real "100% by 6am" EV
+target still front-loading (00:00–03:30 of an available 22:00–06:00 flat-rate window) with
+"Prefer just-in-time" selected. Root cause: `optimize_hourly_schedule` calls
+`consolidate_deferrable_schedule` AFTER the raw LP solve, specifically to collapse a
+fragmented per-slot allocation into one contiguous block (§ "why this exists" in that
+function's own docstring — unrelated to this feature, added 2026-07-24). That pass's tie-break
+for cost-tied slots was hardcoded "earliest first," with zero awareness of
+`charge_timing_preference` — so even though objective layer (1) was verified (via temporary
+diagnostic logging) to correctly cost early slots higher and late slots at 0, layer (2) simply
+re-flattened the result back to earliest-first a few lines later, silently discarding the fix.
+Confirmed via full-precision rate logging that the window really was an exact tie (`0.21626`
+$/kWh, bit-for-bit identical, not a rounding artifact) — ruling out "real price difference"
+before looking for a code bug. Fixed by giving `_consolidate_device_day` (renamed from
+`_front_load_device_day`, since it's no longer always front-loading) a `preference` parameter:
+`prefer_early`/`no_preference`/unset all still fill earliest-first (byte-identical to
+before this feature existed, and the correct default for the *entire rest* of the deferrable
+system — pool pumps, hot water, etc. — which never populate this field at all and must never
+be affected by it); `prefer_just_in_time` (or any other non-empty, unrecognised value) now
+fills latest-first instead. Re-verified live after the fix: the same EV target now runs
+02:30–05:30, ending exactly at the 06:00 deadline instead of finishing at 03:30 and sitting
+full for 2.5 hours. See `docs/GRIDLENS_CHECKLIST.md` 2026-09-28 for the full investigation.
+
+**Scope.** Applies to any device with SOC tracking configured (same
+`CONF_DEFERRABLE_LOAD_SOC_SENSORS`/`_CAPACITY_KWH` gating as §9a) — both while an ad-hoc
+charge target is active AND on the everyday day-0 ceiling floor when one isn't, since both
+share the exact same `floor_slot`/`ev_soc_idx` mechanism in `battery_optimizer.py`. Devices
+without SOC tracking (a pool pump, a dishwasher) get no entity — there's no "sitting fully
+charged" concept for them to tie-break.
+
+**Files:** `charge_timing_preference.py` (pure enum + rank maths, no HA imports —
+`tests/test_charge_timing_preference.py`), `charge_timing_preference_store.py` (shared
+`Store`-backed `ChargeTimingPreferenceStore`; `update_signal`), `select.py`
+(`GridLensChargeTimingPreferenceSelect`, one per SOC-tracked device — `deferrable_sensor_id`
++ `charge_timing_preference_role: 'select'` state attributes, the latter the actual
+discriminator the card scans for since a plain deferrable-device select already exists for
+a different purpose, the Force On/Auto/Off load override), `advisory/coordinator.py`
+(`_charge_timing_preference`, folded into `soc_kwargs` inside `_deferrable_for_horizon`),
+`battery_optimizer.py` (the tie-break term added to the objective right after the "`def_i`
+has NO direct cost" comment — deliberately duplicates the three preference strings +
+magnitude as local constants rather than importing `charge_timing_preference.py`, matching
+this file's existing "no local-package imports, stay importable standalone" design — see
+`tests/test_day_groups.py`'s header for why — `_consolidate_device_day`, the post-LP
+consolidation pass, DOES need the preference and gets it via a plain string parameter from
+its caller rather than an import, same reasoning), `www/cards/grid-lens-charge-target-card.js`
+(third, optional "Timing" tile per device row — unlike the percent/time pair, not gated on
+an active target, since the preference also governs the everyday day-0 ceiling).
+
+**Live-verified (2026-09-28), including the actual schedule shift, not just a clean solve**:
+synced + restarted the dev rig multiple times over the course of the investigation above;
+confirmed `select.roof_grid_lens_nsw_totally_charged_charge_timing_preference` registered with
+the right options/default, the objective-level tie-break's coefficients via temporary
+diagnostic logging (removed before the final commit), and — after the consolidation fix — the
+owner's real Wattpilot/XPENG charge target rescheduling from 00:00–03:30 to 02:30–05:30 (same
+total energy, same cost, ending exactly at the 06:00 deadline) by polling the live
+`sensor.*_planned_dispatch` trajectory. `tests/test_deferrable_consolidation.py` gained 5 new
+assertions covering `prefer_early`/`prefer_just_in_time`/`no_preference`/missing-field/
+floor_slot-interaction; full suite re-run clean (one pre-existing, unrelated
+`test_min_export_price.py` failure, confirmed via `git stash` to already exist on `main`).
+**Still unverified**: the card's "Timing" tile has not been clicked through by the owner (no
+browser/display in this dev container — same caveat as `grid-lens-charge-target-card`'s own
+unclicked note above and `gridlens-editor`, docs/CLAUDE.md), and this was only checked
+against ONE real device/plan/tariff shape — worth keeping an eye on over the next few charge
+cycles.
+
+---
+
 ## 10. Cards & the default dashboard
 
 All cards **auto-discover** their entities by attribute fingerprint — never a naming
@@ -2239,7 +2336,7 @@ Callers passing no `rightAxis` are byte-for-byte unchanged (verified against the
 | `grid-lens-advisory-card` | Plan status header (plan name/solver/last-run time, status badge), control-mode timeline, deferrable-load recommendations, **plus Daily Target (§9b, relocated 2026-09-22): today/tomorrow solar forecast + master slider in the header, per-device sliders behind a chevron expander** — same header content in both compact and full layouts. **The expanded per-device panel also carries the full load-control row (§6b, merged 2026-09-24): sparkline, Today Boost, Greedy toggles, Off now/On now/Auto, live status, the estimator debug panel — alongside that row's slider.** `compact: true` config renders just the header (incl. the Daily Target/load-control block) — used as a slim "optimiser & plan" status bar at the top of the Power Flow view; `title` config overrides the header text in that mode. `show_current_rates: true` adds a one-line buy/sell readout ("Buy 22c/kWh · Sell 3c/kWh") under the plan-status line — the rate for the slot covering now, from the same `trajectory` attribute. Just the numbers; the rate *graph* is `grid-lens-price-chart-card`. Off by default and **not** used by the seed anymore — the Power Flow view shows the current rate on the `grid-lens-powerflow-card` Grid node instead (2026-09-11). Still available for a dashboard that has no Power Flow card. Works in the full card too. |
 | `grid-lens-load-control-card` | One row per deferrable load: Today Boost, greedy toggles, Off now / On now / Auto, and live greedy status. **No longer seeded onto the default Settings view (2026-09-24)** — its default-visible home is now `grid-lens-advisory-card`'s per-device expander on the Power Flow view (§6b), same relocation Daily Target got in §9b. Still installed/registered for a dashboard that wants it as its own card. |
 | `grid-lens-daily-target-card` | Standalone Daily Target card (§9b) — same content as `grid-lens-advisory-card`'s header block, always expanded, no chevron. No longer seeded onto the default Settings view (2026-09-22) since the advisory-card header is now the default home; still installed/registered for a dashboard that wants it as its own card. |
-| `grid-lens-charge-target-card` | One row per SOC-tracked deferrable load: ad-hoc "charge to X% by a datetime" target (§9a) — a percent tile + a datetime tile, auto-paired via the `charge_target_role`/`deferrable_sensor_id` state attributes, plus a plain-text "Target: 95% by Sat, 2:22 am" / "No target set" status line. Empty state when no device has SOC tracking configured. |
+| `grid-lens-charge-target-card` | One row per SOC-tracked deferrable load: ad-hoc "charge to X% by a datetime" target (§9a) — a percent tile + a datetime tile, auto-paired via the `charge_target_role`/`deferrable_sensor_id` state attributes, plus a plain-text "Target: 95% by Sat, 2:22 am" / "No target set" status line, plus a third "Timing" tile (§9c's Prefer early/No preference/Prefer just-in-time select, matched via `charge_timing_preference_role: 'select'`) shown whenever the entity exists, independent of whether a target is currently active. Empty state when no device has SOC tracking configured. |
 | `grid-lens-defer-schedule-card` | The 7 × 48 allowed-run-times editor. |
 | `grid-lens-flex-row-card` | Layout helper — per-child `flex` control, stacks below a breakpoint, and collapses children that hide themselves (native `conditional` cards) out of the row. |
 
