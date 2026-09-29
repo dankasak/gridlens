@@ -548,7 +548,11 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
       const minY = Math.min(...ys), maxY = Math.max(...ys);
       const zeroFrac = maxY > minY ? (base - minY) / (maxY - minY) : 1;
       const gid = `g${g2.si}_${ri}`;
-      defs += gradDef(gid, s.color, 0.52, zeroFrac);
+      // Peak near-opaque (not a washed-out ~50% tint) so the fill at Y=0 actually reads
+      // as the series' own color, same as its border — it only needs to fall short of
+      // the stroke's own full opacity so the stroke still reads as the "real" line
+      // sitting on top of its fill, not indistinguishable from it.
+      defs += gradDef(gid, s.color, 0.88, zeroFrac);
       paths += `<path d="${rd} L${rightX.toFixed(1)},${base.toFixed(1)} L${leftX.toFixed(1)},${base.toFixed(1)} Z" fill="url(#${gid})"${clip}/>`;
     });
   }
