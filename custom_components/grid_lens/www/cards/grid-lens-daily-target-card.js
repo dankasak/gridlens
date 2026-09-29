@@ -25,8 +25,8 @@
 import {
   STYLE, esc, resolveDeferrableLoads, resolveDailyTargetMasterEid, resolveDailyTargetEidFor,
   resolveBoostEidFor, resolveChargeTargetPercentEidFor, resolveSolarForecastEid, solarSummary,
-  fmtKwh, clampTargetPct, fetchDailyAverageKwh,
-} from './grid-lens-chart-common.js?v=20260929i';
+  fmtKwh, clampTargetPct, fetchDailyAverageKwh, detectDark,
+} from './grid-lens-chart-common.js?v=20260929j';
 
 const HISTORY_REFRESH_MS = 15 * 60000;
 // See grid-lens-advisory-card.js's own DT_PIN_MAX_AGE_MS comment — same slider,
@@ -102,7 +102,7 @@ class GridLensDailyTargetCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    const dark = !!(hass.themes && hass.themes.darkMode);
+    const dark = detectDark(this, hass);
     if (dark !== this._dark) { this._dark = dark; this.classList.toggle('dark', dark); }
 
     const devices = resolveDeferrableLoads(hass);

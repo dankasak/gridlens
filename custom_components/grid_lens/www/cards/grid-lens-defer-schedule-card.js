@@ -29,7 +29,7 @@
  *   title: Allowed Run Times            (optional)
  *   source_entity: sensor.xyz           (optional — pin the GridLens sensor to read)
  */
-import { STYLE, esc, deferColorFor } from './grid-lens-chart-common.js?v=20260929i';
+import { STYLE, esc, deferColorFor, detectDark } from './grid-lens-chart-common.js?v=20260929j';
 
 const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const SLOTS = 48; // half-hour resolution
@@ -107,7 +107,7 @@ class GridLensDeferScheduleCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    const dark = !!(hass.themes && hass.themes.darkMode);
+    const dark = detectDark(this, hass);
     if (dark !== this._dark) { this._dark = dark; this.classList.toggle('dark', dark); }
 
     const devices = this._resolveDevices();

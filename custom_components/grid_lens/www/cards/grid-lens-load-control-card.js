@@ -85,8 +85,8 @@ import {
   estimatorFor, friendlyNote, fetchDailyHistory, averageFromDays, greedyLine, modulationLine,
   currentReadoutHtml, maxCurrentHtml, socCapHtml, acCeilingHtml, sparklineHtml, estimatorToggleHtml,
   estimatorPanelHtml, controlHtml, greedyButtonsHtml, boostInputHtml, visibilityToggleHtml,
-  attachTooltip,
-} from './grid-lens-chart-common.js?v=20260929i';
+  attachTooltip, detectDark,
+} from './grid-lens-chart-common.js?v=20260929j';
 
 const HISTORY_REFRESH_MS = 15 * 60000;
 
@@ -157,7 +157,7 @@ class GridLensLoadControlCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    const dark = !!(hass.themes && hass.themes.darkMode);
+    const dark = detectDark(this, hass);
     if (dark !== this._dark) { this._dark = dark; this.classList.toggle('dark', dark); }
 
     // Sorted by average daily consumption, descending (2026-09-24, user request) — NOT

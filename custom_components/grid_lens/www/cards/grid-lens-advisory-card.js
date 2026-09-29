@@ -49,8 +49,8 @@ import {
   averageFromDays, estimatorFor, boostCeiling, socCapFor, friendlyNote, greedyLine,
   modulationLine, socCapHtml, acCeilingHtml, sparklineHtml, estimatorToggleHtml, estimatorPanelHtml,
   controlHtml, greedyButtonsHtml, boostInputHtml, visibilityToggleHtml, currentReadoutHtml,
-  maxCurrentHtml, attachTooltip,
-} from './grid-lens-chart-common.js?v=20260929i';
+  maxCurrentHtml, attachTooltip, detectDark,
+} from './grid-lens-chart-common.js?v=20260929j';
 
 const DAILY_TARGET_HISTORY_REFRESH_MS = 15 * 60000;
 // Minimum time the optimizing dot stays visible once triggered, regardless of how
@@ -157,7 +157,7 @@ class GridLensAdvisoryCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    const dark = !!(hass.themes && hass.themes.darkMode);
+    const dark = detectDark(this, hass);
     if (dark !== this._dark) { this._dark = dark; this.classList.toggle('dark', dark); }
 
     // Daily Target resolution — independent of the dispatch sensor below, so it still

@@ -1868,6 +1868,49 @@ export const STYLE = `
   .view-btn.active { background:var(--surface); color:var(--good); }
 `;
 
+// hass.themes.darkMode reflects the user's own light/dark TOGGLE, not necessarily
+// what the active theme actually renders — a theme with no `modes: {light, dark}`
+// declaration (several community theme packages, including some variants shipped
+// as separate flat theme files rather than one theme with a dark sub-mode) has
+// nothing for that toggle to switch, so the flag can read `false` while the theme's
+// own single palette is a dark charcoal/graphite surface regardless. That mismatch
+// showed up concretely 2026-09-29: --load (deliberately a light/dark-flipping
+// neutral ink, #000000 vs #f1f5f9 — see its definition in STYLE above) rendered
+// solid black on a dark dashboard, because the `.dark` host class this file (and
+// every other card below) toggles off hass.themes.darkMode never got set even
+// though the card's own background was clearly dark. Cross-checking the ACTUAL
+// computed text color catches that case: HA always exposes --rgb-primary-text-color
+// (light text on a dark surface, dark text on a light one) regardless of whether
+// the active theme declared itself dark-mode-aware, so it reflects reality even
+// when the flag doesn't. Falls back to the flag only if the computed style can't
+// be read at all (e.g. called before the element is attached to the document).
+export function detectDark(el, hass) {
+  const flag = !!(hass && hass.themes && hass.themes.darkMode);
+  try {
+    const cs = getComputedStyle(el);
+    const raw = (cs.getPropertyValue('--rgb-primary-text-color') || '').trim();
+    let rgb = null;
+    if (raw) {
+      const parts = raw.split(',').map((n) => parseFloat(n));
+      if (parts.length === 3 && parts.every((n) => !isNaN(n))) rgb = parts;
+    }
+    if (!rgb) {
+      const txt = (cs.getPropertyValue('--primary-text-color') || '').trim();
+      const hex = /^#([0-9a-f]{6})$/i.exec(txt);
+      if (hex) rgb = [0, 2, 4].map((i) => parseInt(hex[1].substr(i, 2), 16));
+      else {
+        const fn = /rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i.exec(txt);
+        if (fn) rgb = [+fn[1], +fn[2], +fn[3]];
+      }
+    }
+    if (rgb) {
+      const lum = (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) / 255;
+      return lum > 0.5; // light TEXT implies a dark surface
+    }
+  } catch (e) { /* getComputedStyle unavailable — fall back to the flag below */ }
+  return flag;
+}
+
 // ---------------------------------------------------------------- base class
 
 // Shared plumbing for the 5 standalone chart cards. Subclasses implement:
@@ -1939,7 +1982,7 @@ export class GridLensChartCardBase extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    const dark = !!(hass.themes && hass.themes.darkMode);
+    const dark = detectDark(this, hass);
     if (dark !== this._dark) { this._dark = dark; this.classList.toggle('dark', dark); }
 
     const st = hass.states[this._config.entity];
