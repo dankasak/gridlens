@@ -145,11 +145,18 @@ export function xAxisTicks(X, t0, t1, axisY, fontSize = 10) {
   }
   return s;
 }
-// Vertical fade gradient (color → transparent) for area fills.
+// Vertical fade gradient (color → transparent) for area fills. Three stops rather than
+// two: a flat two-stop linear fade reads as a thin bright sliver hugging the line with a
+// long washed-out tail below it (opacity falls off linearly, but perceived brightness
+// doesn't — the eye is far more sensitive to the top 20% of the ramp). The middle stop
+// holds a mid-tone for longer before the final taper, so the wash reads as a fuller,
+// more saturated blend from baseline up to the line instead of a hairline glow.
 export function gradDef(id, color, topOpacity) {
+  const mid = (topOpacity * 0.62).toFixed(2);
   return `<linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">`
     + `<stop offset="0" style="stop-color:${color};stop-opacity:${topOpacity}"/>`
-    + `<stop offset="1" style="stop-color:${color};stop-opacity:0.02"/></linearGradient>`;
+    + `<stop offset="0.45" style="stop-color:${color};stop-opacity:${mid}"/>`
+    + `<stop offset="1" style="stop-color:${color};stop-opacity:0.03"/></linearGradient>`;
 }
 export function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
@@ -472,7 +479,7 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // that means nothing on its own scale. Right-axis series are line-only by construction.
   for (const g2 of geo.filter((x) => x.s.area && x.s.axis !== 'right').sort((a, b) => b.mag - a.mag)) {
     const gid = 'g' + g2.si;
-    defs += gradDef(gid, g2.s.color, 0.42);
+    defs += gradDef(gid, g2.s.color, 0.52);
     const clip = (hasActual && !g2.s.actual) ? ` clip-path="url(#${futureClipId})"` : '';
     paths += `<path d="${g2.d} L${g2.rightX.toFixed(1)},${base.toFixed(1)} L${g2.pts[0][0].toFixed(1)},${base.toFixed(1)} Z" fill="url(#${gid})"${clip}/>`;
   }
@@ -490,11 +497,20 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // failed, keep drawing the forecast across the past rather than leaving it blank.
   const clipPastLine = opts.clipForecastPastLine && hasActual
     && series.some((s) => s.actual && s.points && s.points.length);
+  // Soft glow behind every stroke: a blurred copy of the same path, same color, merged
+  // under the crisp original — reads as a subtle neon halo rather than a flat CAD-style
+  // outline, and needs no per-series color param since it just blurs whatever the line
+  // already is. One filter def shared by every line in this chart (not one per series).
+  if (byAxis.length) {
+    defs += `<filter id="lineglow" x="-40%" y="-40%" width="180%" height="180%">`
+      + `<feGaussianBlur in="SourceGraphic" stdDeviation="1.4" result="blur"/>`
+      + `<feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>`;
+  }
   for (const { s, d } of byAxis) {
-    const w = s.width || (s.actual ? 1.75 : 2.5);
-    const op = s.opacity != null ? s.opacity : (s.actual ? 0.9 : 1);
+    const w = s.width || (s.actual ? 2 : 3);
+    const op = s.opacity != null ? s.opacity : (s.actual ? 0.95 : 1);
     const clip = (clipPastLine && !s.actual) ? ` clip-path="url(#${futureClipId})"` : '';
-    paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${w}" opacity="${op}" stroke-linejoin="round" stroke-linecap="round"${clip} ${s.dash ? 'stroke-dasharray="5 4"' : ''}/>`;
+    paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${w}" opacity="${op}" stroke-linejoin="round" stroke-linecap="round" filter="url(#lineglow)"${clip} ${s.dash ? 'stroke-dasharray="5 4"' : ''}/>`;
   }
   // preserveAspectRatio="none": a line/area chart has no inherent aspect ratio to
   // protect (x is time, y is an independent unit) — stretching to exactly fill
