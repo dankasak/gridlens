@@ -145,19 +145,31 @@ export function xAxisTicks(X, t0, t1, axisY, fontSize = 10) {
   }
   return s;
 }
-// Vertical fade gradient (color → transparent) for area fills. Three stops rather than
-// two: a flat two-stop linear fade reads as a thin bright sliver with a long washed-out
-// tail (opacity falls off linearly, but perceived brightness doesn't — the eye is far
-// more sensitive to the top 20% of the ramp). The middle stop holds a mid-tone for
-// longer before the final taper. Deepest/most saturated at the BASELINE (bottom, offset
-// 1), fading out toward the line (top, offset 0) — reversed from a plain "glow near the
-// line" fade per explicit request.
-export function gradDef(id, color, baseOpacity) {
+// Vertical fade gradient (color → transparent both ways) for area fills, peaking at
+// `zeroFrac` — the value=0 baseline's own position within THIS series' filled shape,
+// as a fraction of that shape's bounding box (0=shape's top edge, 1=its bottom edge) —
+// rather than always at one fixed edge. That distinction only matters for a SIGNED
+// series (e.g. net grid import/export, battery charge/discharge on a symmetric axis):
+// its zero line sits somewhere in the MIDDLE of its own filled shape, not at an edge,
+// so a fixed-edge fade would put peak color at the series' most extreme excursion
+// instead of at zero. Defaults to 1 (peak at the bottom edge) because for every
+// non-negative series (solar, load, per-device…) the baseline coincides with the
+// shape's own bottom edge by construction — the common case needs no override.
+// Three-plus stops rather than a flat two-stop fade: a linear opacity ramp still reads
+// as a thin bright sliver with a washed-out tail, since the eye is far more sensitive
+// near the peak than the math implies — the mid stops hold a mid-tone longer before
+// the final taper on each side of the peak.
+export function gradDef(id, color, baseOpacity, zeroFrac = 1) {
+  const zf = Math.max(0, Math.min(1, zeroFrac));
   const mid = (baseOpacity * 0.62).toFixed(2);
-  return `<linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">`
-    + `<stop offset="0" style="stop-color:${color};stop-opacity:0.03"/>`
-    + `<stop offset="0.55" style="stop-color:${color};stop-opacity:${mid}"/>`
-    + `<stop offset="1" style="stop-color:${color};stop-opacity:${baseOpacity}"/></linearGradient>`;
+  const lo = (zf * 0.55).toFixed(3);
+  const hi = (zf + 0.45 * (1 - zf)).toFixed(3);
+  let stops = `<stop offset="0" style="stop-color:${color};stop-opacity:0.03"/>`;
+  if (+lo > 0.01) stops += `<stop offset="${lo}" style="stop-color:${color};stop-opacity:${mid}"/>`;
+  stops += `<stop offset="${zf.toFixed(3)}" style="stop-color:${color};stop-opacity:${baseOpacity}"/>`;
+  if (+hi < 0.99) stops += `<stop offset="${hi}" style="stop-color:${color};stop-opacity:${mid}"/>`;
+  stops += `<stop offset="1" style="stop-color:${color};stop-opacity:0.03"/>`;
+  return `<linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">${stops}</linearGradient>`;
 }
 export function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
@@ -480,7 +492,17 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // that means nothing on its own scale. Right-axis series are line-only by construction.
   for (const g2 of geo.filter((x) => x.s.area && x.s.axis !== 'right').sort((a, b) => b.mag - a.mag)) {
     const gid = 'g' + g2.si;
-    defs += gradDef(gid, g2.s.color, 0.52);
+    // This series' own filled shape includes the curve's points AND the two closing
+    // corners down/up at `base` — the same vertices objectBoundingBox uses for the
+    // gradient's 0..1 span, so computing min/max the same way keeps zeroFrac aligned
+    // with where the browser will actually place offset 0 and 1. A signed series
+    // (net grid, battery) swings on both sides of `base`, so it sits mid-shape, not
+    // at an edge — a non-negative series still resolves to 1 (bottom edge), same as
+    // gradDef's default.
+    const ys = g2.pts.map((p) => p[1]).concat([base]);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const zeroFrac = maxY > minY ? (base - minY) / (maxY - minY) : 1;
+    defs += gradDef(gid, g2.s.color, 0.52, zeroFrac);
     const clip = (hasActual && !g2.s.actual) ? ` clip-path="url(#${futureClipId})"` : '';
     paths += `<path d="${g2.d} L${g2.rightX.toFixed(1)},${base.toFixed(1)} L${g2.pts[0][0].toFixed(1)},${base.toFixed(1)} Z" fill="url(#${gid})"${clip}/>`;
   }
