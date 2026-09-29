@@ -94,6 +94,37 @@ export function subtractStepSeries(basePts, subtractorArrays) {
     return { t: p.t, v: Math.max(0, p.v - sub) };
   });
 }
+// Split a series' raw {ms,v} points into contiguous runs of matching sign — crossing
+// zero starts a new run — with the exact interpolated zero-crossing inserted at each
+// boundary (shared by the two adjacent runs), so each run's own fill polygon closes
+// precisely at the baseline instead of tapering from its last off-baseline sample.
+// Used to give each excursion its OWN gradient scaled to its OWN local peak (see the
+// fill pass in multiLineChart): a single gradient sized to the whole series' peak-to-
+// trough range makes a modest excursion (e.g. a small solar-only charge hump next to a
+// big grid-charge one) sample only the narrow, still-near-full-opacity sliver of that
+// gradient closest to zero, so it never visibly tapers — it just reads as a flat wash.
+// A series that never crosses zero (the common case: solar, load, per-device loads…)
+// still returns exactly one run spanning every point, so this is a no-op for every
+// non-negative series.
+function signRuns(rp) {
+  const runs = [];
+  let cur = { pts: [rp[0]] }, pos = rp[0].v >= 0;
+  for (let i = 1; i < rp.length; i++) {
+    const prev = rp[i - 1], row = rp[i], rowPos = row.v >= 0;
+    if (rowPos !== pos) {
+      const t = prev.v / (prev.v - row.v);
+      const crossPt = { ms: prev.ms + (row.ms - prev.ms) * t, v: 0 };
+      cur.pts.push(crossPt);
+      runs.push(cur);
+      cur = { pts: [crossPt, row] };
+      pos = rowPos;
+    } else {
+      cur.pts.push(row);
+    }
+  }
+  runs.push(cur);
+  return runs;
+}
 // Catmull-Rom → cubic-bezier smoothing. pts = [[x,y],…] → SVG path 'd'.
 export function smoothPath(pts) {
   if (!pts || !pts.length) return '';
@@ -491,20 +522,35 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // `base` is the LEFT axis' zero, so a right-axis series' fill would run to a baseline
   // that means nothing on its own scale. Right-axis series are line-only by construction.
   for (const g2 of geo.filter((x) => x.s.area && x.s.axis !== 'right').sort((a, b) => b.mag - a.mag)) {
-    const gid = 'g' + g2.si;
-    // This series' own filled shape includes the curve's points AND the two closing
-    // corners down/up at `base` — the same vertices objectBoundingBox uses for the
-    // gradient's 0..1 span, so computing min/max the same way keeps zeroFrac aligned
-    // with where the browser will actually place offset 0 and 1. A signed series
-    // (net grid, battery) swings on both sides of `base`, so it sits mid-shape, not
-    // at an edge — a non-negative series still resolves to 1 (bottom edge), same as
-    // gradDef's default.
-    const ys = g2.pts.map((p) => p[1]).concat([base]);
-    const minY = Math.min(...ys), maxY = Math.max(...ys);
-    const zeroFrac = maxY > minY ? (base - minY) / (maxY - minY) : 1;
-    defs += gradDef(gid, g2.s.color, 0.52, zeroFrac);
-    const clip = (hasActual && !g2.s.actual) ? ` clip-path="url(#${futureClipId})"` : '';
-    paths += `<path d="${g2.d} L${g2.rightX.toFixed(1)},${base.toFixed(1)} L${g2.pts[0][0].toFixed(1)},${base.toFixed(1)} Z" fill="url(#${gid})"${clip}/>`;
+    const s = g2.s;
+    const clip = (hasActual && !s.actual) ? ` clip-path="url(#${futureClipId})"` : '';
+    // Each same-sign run gets its OWN fill polygon and gradient, scaled to ITS OWN
+    // peak — not one gradient sized to the whole series' day-long range (see
+    // signRuns' comment for why that reads as a flat wash on any excursion smaller
+    // than the series' biggest one). A non-negative series (solar, load…) is always
+    // exactly one run, identical in shape to the un-split fill this replaces.
+    signRuns(raw[g2.si]).forEach((run, ri, runs) => {
+      const pxPts = run.pts.map((p) => [X(p.ms), Y(p.v)]);
+      let rd, rightX = pxPts[pxPts.length - 1][0];
+      const leftX = pxPts[0][0];
+      if (s.step) {
+        rd = stepPath(pxPts);
+        // Same right-edge hold as the main line geometry above, but only the LAST
+        // run's tail actually reaches the chart's right edge.
+        if (ri === runs.length - 1 && !s.actual) {
+          const endX = X(t1);
+          if (endX > rightX) { rd += ` L${endX.toFixed(1)},${pxPts[pxPts.length - 1][1].toFixed(1)}`; rightX = endX; }
+        }
+      } else {
+        rd = smoothPath(pxPts);
+      }
+      const ys = pxPts.map((p) => p[1]).concat([base]);
+      const minY = Math.min(...ys), maxY = Math.max(...ys);
+      const zeroFrac = maxY > minY ? (base - minY) / (maxY - minY) : 1;
+      const gid = `g${g2.si}_${ri}`;
+      defs += gradDef(gid, s.color, 0.52, zeroFrac);
+      paths += `<path d="${rd} L${rightX.toFixed(1)},${base.toFixed(1)} L${leftX.toFixed(1)},${base.toFixed(1)} Z" fill="url(#${gid})"${clip}/>`;
+    });
   }
   // Left-axis lines first, then right-axis ones on top: a secondary-axis series is
   // usually context for everything else, so it must never end up buried under a wash.
