@@ -37,7 +37,7 @@ class GridLensCard extends HTMLElement {
     this._fetchStep = 0;
     this._fetchTotal = 0;
     this._fetchMessage = '';
-    this._activeSource = null;
+    this._pollGeneration = 0;   // bumped on every _streamCalc call to cancel a stale poll loop
   }
 
   setConfig(config) {
@@ -97,8 +97,13 @@ class GridLensCard extends HTMLElement {
   }
 
   _streamCalc(startDate, endDate) {
-    // Close any previous stream
-    if (this._activeSource) { this._activeSource.close(); this._activeSource = null; }
+    // Cancel any in-flight poll loop from a previous call — _pollCalc checks
+    // this generation counter after every await and bails out once it no
+    // longer matches, the same "stop working for a superseded caller"
+    // pattern the old EventSource's src.close() achieved by tearing down the
+    // connection outright.
+    this._pollGeneration += 1;
+    const generation = this._pollGeneration;
 
     this._fetching = true;
     this._streamPhase = 'fetching';
@@ -107,7 +112,7 @@ class GridLensCard extends HTMLElement {
     this._fetchStep = 0;
     this._fetchTotal = 0;
     this._fetchMessage = '';
-    this._data = null;   // clear stale data so we render from stream only
+    this._data = null;   // clear stale data so we render from the poll loop only
     if (startDate) this._startDate = startDate.substring(0, 10);
     if (endDate)   this._endDate   = endDate.substring(0, 10);
     this._showStreamProgress();
@@ -131,73 +136,112 @@ class GridLensCard extends HTMLElement {
       if (this._whatifApplied.batteryKwh !== null) add('battery_kwh', this._whatifApplied.batteryKwh);
       if (this._whatifApplied.solarPct !== null) add('solar_pct', this._whatifApplied.solarPct);
     }
-    const src = new EventSource(`/api/grid_lens/plan_stream${params}`);
-    this._activeSource = src;
+    this._pollCalc(params, startDate, endDate, generation);
+  }
 
-    src.addEventListener('status', (e) => {
-      const d = JSON.parse(e.data);
-      this._streamPhase   = d.phase || 'fetching';
-      this._plansTotal    = d.plans_total || this._plansTotal;
-      this._fetchStep     = d.fetch_step  || this._fetchStep;
-      this._fetchTotal    = d.fetch_total || this._fetchTotal;
-      this._fetchMessage  = d.message || this._fetchMessage;
-      this._showStreamProgress();
-    });
+  // Drives a plan comparison via short-lived polls instead of one long-lived
+  // SSE connection (this replaced grid-lens-card.js's old EventSource-based
+  // _streamCalc on 2026-09-29). A ~80s single streamed response was reliably
+  // getting killed partway through by the browser's own Service Worker
+  // (confirmed live: the failure vanished entirely in a Private Browsing
+  // window, where no Service Worker is registered) — a duration problem, not
+  // a payload-size one (2026-09-28's payload trim alone didn't fix it, since
+  // it didn't shorten the ~80s wall-clock time, which is LP-solve compute,
+  // not data transfer). Every request here (start, and each poll) completes
+  // in well under a second, so there's nothing long-lived left for a Service
+  // Worker — or any other intermediary — to choke on, regardless of the
+  // exact mechanism that was tripping on the old stream. See
+  // __init__.py's PlanCalcStartView/PlanCalcPollView and
+  // GRIDLENS_CHECKLIST.md, 2026-09-29.
+  async _pollCalc(params, startDate, endDate, generation) {
+    try {
+      const startResp = await fetch(`/api/grid_lens/plan_calc/start${params}`);
+      if (!startResp.ok) throw new Error(`start failed: ${startResp.status}`);
+      const { token } = await startResp.json();
+      if (this._pollGeneration !== generation) return;  // superseded while starting
 
-    src.addEventListener('plan', (e) => {
-      const d = JSON.parse(e.data);
-      this._streamPhase = 'optimising';
-      this._plansDone   = d.plans_done;
-      this._plansTotal  = d.plans_total;
-      // Build/update _data with what's arrived so far so render() works unchanged
-      if (!this._data) {
-        this._data = {
-          plan_details: {},
-          current_plan_name: d.current_plan_name,
-          alternative_plans: {},
-          current_plan_total: 0,
-          usage_days: d.usage_days || 0,
-          start_date: d.start_date || '',
-          end_date: d.end_date || '',
-          energy_flows: d.energy_flows || {},
-          deferrable_devices: d.deferrable_devices || [],
-          calculation_date: null,
-        };
-        this._updateDatesFromData(startDate);
+      let since = 0;
+      while (this._pollGeneration === generation) {
+        const pollResp = await fetch(`/api/grid_lens/plan_calc/poll?since=${since}&token=${token}`);
+        if (!pollResp.ok) throw new Error(`poll failed: ${pollResp.status}`);
+        const d = await pollResp.json();
+        if (this._pollGeneration !== generation) return;  // superseded mid-request
+
+        let gotPlan = false, gotStatus = false;
+        for (const ev of d.events) {
+          if (ev.event === 'status') {
+            const s = ev.data;
+            this._streamPhase   = s.phase || 'fetching';
+            this._plansTotal    = s.plans_total || this._plansTotal;
+            this._fetchStep     = s.fetch_step  || this._fetchStep;
+            this._fetchTotal    = s.fetch_total || this._fetchTotal;
+            this._fetchMessage  = s.message || this._fetchMessage;
+            gotStatus = true;
+          } else if (ev.event === 'plan') {
+            const p = ev.data;
+            this._streamPhase = 'optimising';
+            this._plansDone   = p.plans_done;
+            this._plansTotal  = p.plans_total;
+            // Build/update _data with what's arrived so far so render() works unchanged
+            if (!this._data) {
+              this._data = {
+                plan_details: {},
+                current_plan_name: p.current_plan_name,
+                alternative_plans: {},
+                current_plan_total: 0,
+                usage_days: p.usage_days || 0,
+                start_date: p.start_date || '',
+                end_date: p.end_date || '',
+                energy_flows: p.energy_flows || {},
+                deferrable_devices: p.deferrable_devices || [],
+                calculation_date: null,
+              };
+              this._updateDatesFromData(startDate);
+            }
+            this._data.plan_details[p.plan_key] = p.detail;
+            this._data.alternative_plans = p.alternative_plans || {};
+            this._data.current_plan_total = p.current_plan_total || 0;
+            gotPlan = true;
+          }
+        }
+        // One render/progress-update per poll batch (not per event) — cheaper
+        // than the old one-render-per-SSE-event behaviour with no loss of
+        // freshness, since a poll batch is already at most ~1s of events.
+        if (gotPlan) this.render();
+        else if (gotStatus) this._showStreamProgress();
+        since = d.next_since;
+
+        if (d.status === 'complete') {
+          const full = d.result;
+          // The server omits plan_details here (see PlanCalcStartView) — each
+          // plan's detail already arrived via its own 'plan' event above and
+          // was merged into this._data.plan_details, so restore it rather
+          // than losing it to the empty dict the final payload carries in
+          // its place.
+          full.plan_details = (this._data && this._data.plan_details) || {};
+          this._data = full;
+          const cacheKey = `${startDate || ''}|${endDate || ''}|${this._excludeGreedy}|${this._whatifCacheFrag()}`;
+          GridLensCard._cache[cacheKey] = full;
+          this._streamPhase = null;
+          this._fetching = false;
+          this._updateDatesFromData(startDate);
+          this.render();
+          return;
+        }
+        if (d.status === 'error' || d.status === 'not_found' || d.status === 'stale') {
+          this._streamPhase = null;
+          this._fetching = false;
+          this.renderError('Calculation failed — check HA logs.');
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
-      this._data.plan_details[d.plan_key] = d.detail;
-      this._data.alternative_plans = d.alternative_plans || {};
-      this._data.current_plan_total = d.current_plan_total || 0;
-      this.render();
-    });
-
-    src.addEventListener('complete', (e) => {
-      src.close();
-      this._activeSource = null;
-      this._streamPhase = null;
-      this._plansDone   = 0;
-      this._plansTotal  = 0;
-      this._fetching    = false;
-      const full = JSON.parse(e.data);
-      // The server omits plan_details here (see PlanStreamView in __init__.py) —
-      // each plan's detail already arrived via its own 'plan' event above and was
-      // merged into this._data.plan_details, so restore it rather than losing it
-      // to the empty dict the 'complete' payload carries in its place.
-      full.plan_details = (this._data && this._data.plan_details) || {};
-      this._data = full;
-      const cacheKey = `${startDate || ''}|${endDate || ''}|${this._excludeGreedy}|${this._whatifCacheFrag()}`;
-      GridLensCard._cache[cacheKey] = full;
-      this._updateDatesFromData(startDate);
-      this.render();
-    });
-
-    src.onerror = () => {
-      src.close();
-      this._activeSource = null;
+    } catch (err) {
+      if (this._pollGeneration !== generation) return;  // superseded, not a real failure
       this._streamPhase = null;
       this._fetching = false;
-      this.renderError('Calculation stream failed — check HA logs.');
-    };
+      this.renderError('Calculation failed — check HA logs.');
+    }
   }
 
   _showStreamProgress() {

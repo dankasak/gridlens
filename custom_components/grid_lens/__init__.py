@@ -634,7 +634,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20260928c"
+    _CARD_VERSION = "20260929a"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -1176,18 +1176,36 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 headers={'Content-Disposition': f'attachment; filename="{filename}"'},
             )
 
-    class PlanStreamView(HomeAssistantView):
-        """Stream plan results one-by-one via Server-Sent Events as each LP finishes."""
+    class PlanCalcStartView(HomeAssistantView):
+        """Kick off a plan comparison as a background task; PlanCalcPollView below
+        reads its progress via short polls.
 
-        url = "/api/grid_lens/plan_stream"
-        name = "api:grid_lens:plan_stream"
+        Replaces the old PlanStreamView's single long-lived Server-Sent-Events
+        connection (~80s for a full comparison). Found live 2026-09-28/29: a
+        browser Service Worker was reliably intercepting and killing that
+        stream partway through (one of three consecutive owner-triggered runs
+        stopped dead at plan 199/211, with zero server-side exception — a
+        transport-side drop, not a calculation bug), confirmed by the failure
+        vanishing entirely in a Private Browsing window, where no Service
+        Worker is registered. The prior day's fix (2026-09-28, trimming the
+        'complete' event's duplicate payload) only reduced total bytes, not
+        the ~80s wall-clock duration — which is LP-solve compute time, not
+        data transfer — so it didn't touch the actual cause. Nothing here is
+        ever long-lived: `start` returns immediately after kicking off a
+        background task, and each `poll` just reads whatever's accumulated so
+        far — so there's nothing for a Service Worker (or any other
+        intermediary) to choke on, regardless of the exact mechanism that was
+        tripping on the old stream. See GRIDLENS_CHECKLIST.md, 2026-09-29.
+        """
+
+        url = "/api/grid_lens/plan_calc/start"
+        name = "api:grid_lens:plan_calc_start"
         requires_auth = False
 
         def __init__(self, hass_instance):
             self.hass = hass_instance
 
         async def get(self, request):
-            import json
             from datetime import datetime
             try:
                 from zoneinfo import ZoneInfo
@@ -1209,154 +1227,192 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
             entries = self.hass.config_entries.async_entries(DOMAIN)
             if not entries:
-                return web.Response(
-                    text=json.dumps({'error': 'Integration not loaded'}),
-                    content_type='application/json', status=404,
-                )
-
+                return web.json_response({'error': 'Integration not loaded'}, status=404)
             entry_obj = entries[0]
 
-            # Set up SSE stream
-            resp = web.StreamResponse(headers={
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'X-Accel-Buffering': 'no',
-                'Access-Control-Allow-Origin': '*',
-            })
-            await resp.prepare(request)
+            domain_data = self.hass.data.setdefault(DOMAIN, {})
+            state_key = f"{entry_obj.entry_id}_calc_state"
+            existing = domain_data.get(state_key)
+            if existing and existing['status'] == 'running':
+                # Already in flight (a second tab, a fast double-click) — hand
+                # back the token for the run already going rather than starting
+                # a competing one; _calc_lock would only serialise them anyway.
+                return web.json_response({'token': existing['token']})
 
-            async def send(event, data):
+            token = existing['token'] + 1 if existing else 1
+            state = {
+                'token': token,
+                'status': 'running',
+                'events': [],
+                'result': None,
+                'error': None,
+                'plans_total': 1,
+            }
+            domain_data[state_key] = state
+
+            async def _run():
                 try:
-                    payload = f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
-                    await resp.write(payload.encode())
-                except Exception:
-                    pass  # client disconnected
+                    from .plan_cache import async_fetch_plans
+                    from .plan_calculator import PlanCalculator
+                    from homeassistant.helpers.storage import Store
 
-            from .plan_cache import async_fetch_plans
+                    # Resilient fetch (falls back to cached plans on a failed live
+                    # call). Stays silent on 402 — the background coordinator owns
+                    # the "subscription ended" notification so this on-demand view
+                    # doesn't double-notify.
+                    _LOGGER.info("Fetching plans for calc (entry=%s)", entry_obj.entry_id)
+                    _fetch = await async_fetch_plans(self.hass, entry_obj, notify_on_402=False)
+                    plan_data = _fetch.plans
+                    network_operators = _fetch.network_operators
+                    _LOGGER.info(
+                        "Calc using %d plan(s) (source=%s)", len(plan_data), _fetch.source
+                    )
 
-            # Resilient fetch (falls back to cached plans on a failed live call). Stays
-            # silent on 402 — the background coordinator owns the "subscription ended"
-            # notification so this on-demand view doesn't double-notify.
-            _LOGGER.info("Fetching plans for stream (entry=%s)", entry_obj.entry_id)
-            _fetch = await async_fetch_plans(self.hass, entry_obj, notify_on_402=False)
-            plan_data = _fetch.plans
-            network_operators = _fetch.network_operators
-            _LOGGER.info(
-                "Stream using %d plan(s) (source=%s)", len(plan_data), _fetch.source
-            )
+                    plans_total = len(plan_data) or 1
+                    state['plans_total'] = plans_total
+                    plans_done = 0
 
-            plans_total = len(plan_data) or 1
-            plans_done  = 0
+                    state['events'].append({
+                        'event': 'status',
+                        'data': {
+                            'phase': 'fetching', 'message': 'Fetching energy data…',
+                            'plans_total': plans_total,
+                        },
+                    })
 
-            await send('status', {
-                'phase': 'fetching',
-                'message': 'Fetching energy data…',
-                'plans_total': plans_total,
+                    # Apply plan-history — the calculator splits the window per-day at
+                    # any switch inside it (see _plan_history_segments) rather than
+                    # picking one plan for the whole range from a single lookup.
+                    # Loaded unconditionally (not gated on start_date being set):
+                    # calculate_plan_costs resolves its own default window when the
+                    # caller didn't specify one, and that resolved window can still
+                    # span a switch — this view has no "use coordinator cache"
+                    # fallback for a plain request the way PlanDataView does, so
+                    # every call here actually runs calculate_plan_costs and needs
+                    # this to detect a switch regardless of whether dates were picked.
+                    calculator = PlanCalculator(self.hass, entry_obj)
+                    calculator.plan_data = plan_data
+                    calculator.network_operators = network_operators
+
+                    hist_store = Store(self.hass, _HISTORY_STORAGE_VERSION, _HISTORY_STORAGE_KEY)
+                    hist_data  = await hist_store.async_load() or {"entries": []}
+                    calculator.plan_history_entries = hist_data["entries"]
+
+                    async def on_plan_ready(plan_key, detail, meta):
+                        nonlocal plans_done
+                        plans_done += 1
+                        state['events'].append({
+                            'event': 'plan',
+                            'data': {
+                                'plan_key':          plan_key,
+                                'detail':            _slim_stream_detail(detail),
+                                'plans_done':        plans_done,
+                                'plans_total':       plans_total,
+                                'current_plan_name': meta.get('current_plan_name'),
+                                'alternative_plans': meta.get('alternative_plans', {}),
+                                'current_plan_total': meta.get('current_plan_total', 0),
+                                'usage_days':        meta.get('usage_days', 0),
+                                'start_date':        meta.get('start_date', ''),
+                                'end_date':          meta.get('end_date', ''),
+                                'energy_flows':      meta.get('energy_flows', {}),
+                                'deferrable_devices': meta.get('deferrable_devices', []),
+                            },
+                        })
+
+                    async def on_fetch_progress(message, step, total):
+                        state['events'].append({
+                            'event': 'status',
+                            'data': {
+                                'phase': 'fetching', 'message': message,
+                                'fetch_step': step, 'fetch_total': total,
+                                'plans_total': plans_total,
+                            },
+                        })
+
+                    async def on_period_progress(message, step, total):
+                        state['events'].append({
+                            'event': 'status',
+                            'data': {
+                                'phase': 'optimising', 'message': message,
+                                'fetch_step': step, 'fetch_total': total,
+                                'plans_total': plans_total,
+                            },
+                        })
+
+                    # See _calc_lock's docstring — never overlap with the
+                    # background refresh or another request on the same entry.
+                    async with _calc_lock(self.hass, entry_obj.entry_id):
+                        result = await calculator.calculate_plan_costs(
+                            start_date, end_date,
+                            on_plan_ready=on_plan_ready,
+                            on_progress=on_fetch_progress,
+                            on_period_progress=on_period_progress,
+                            exclude_greedy=exclude_greedy,
+                            whatif_battery_kwh=whatif_battery_kwh,
+                            whatif_solar_pct=whatif_solar_pct,
+                        )
+                    if isinstance(result, dict) and isinstance(result.get('plan_details'), dict):
+                        # Every plan's detail was already appended once above
+                        # (_slim_stream_detail applied there too) — resending the
+                        # identical slimmed dict again here would duplicate the
+                        # single largest chunk of the final payload for no reason
+                        # (see this view's own docstring — the 2026-09-28 fix for
+                        # the old SSE endpoint).
+                        result = {**result, 'plan_details': {}}
+                    state['result'] = result
+                    state['status'] = 'complete'
+                except Exception as exc:
+                    _LOGGER.exception("Plan comparison background task failed")
+                    state['status'] = 'error'
+                    state['error'] = str(exc)
+
+            self.hass.async_create_task(_run())
+            return web.json_response({'token': token})
+
+    class PlanCalcPollView(HomeAssistantView):
+        """Short poll for PlanCalcStartView's background progress — see its
+        docstring for why this replaced a single long-lived SSE connection."""
+
+        url = "/api/grid_lens/plan_calc/poll"
+        name = "api:grid_lens:plan_calc_poll"
+        requires_auth = False
+
+        def __init__(self, hass_instance):
+            self.hass = hass_instance
+
+        async def get(self, request):
+            entries = self.hass.config_entries.async_entries(DOMAIN)
+            if not entries:
+                return web.json_response({'error': 'Integration not loaded'}, status=404)
+            entry_obj = entries[0]
+
+            domain_data = self.hass.data.setdefault(DOMAIN, {})
+            state_key = f"{entry_obj.entry_id}_calc_state"
+            state = domain_data.get(state_key)
+            if not state:
+                return web.json_response({'status': 'not_found'}, status=404)
+
+            try:
+                since = int(request.query.get('since', '0'))
+            except ValueError:
+                since = 0
+            token = request.query.get('token')
+            if token is not None and str(state['token']) != token:
+                # A newer run has started since the caller's last 'start' —
+                # tell it to restart from scratch rather than silently mixing
+                # two runs' events under one 'since' counter.
+                return web.json_response({'status': 'stale'}, status=409)
+
+            events = state['events'][since:]
+            return web.json_response({
+                'token':       state['token'],
+                'status':      state['status'],
+                'events':      events,
+                'next_since':  since + len(events),
+                'plans_total': state['plans_total'],
+                'result':      state['result'] if state['status'] == 'complete' else None,
+                'error':       state['error'],
             })
-
-            # Apply plan-history — the calculator splits the window per-day at any
-            # switch inside it (see _plan_history_segments) rather than picking one
-            # plan for the whole range from a single lookup. Loaded unconditionally
-            # (not gated on start_date being set): calculate_plan_costs resolves its
-            # own default window when the caller didn't specify one, and that
-            # resolved window can still span a switch — this view has no "use
-            # coordinator cache" fallback for a plain request the way PlanDataView
-            # does, so every call here actually runs calculate_plan_costs and needs
-            # this to detect a switch regardless of whether dates were picked.
-            from .plan_calculator import PlanCalculator
-            calculator = PlanCalculator(self.hass, entry_obj)
-            calculator.plan_data = plan_data
-            calculator.network_operators = network_operators
-
-            from homeassistant.helpers.storage import Store
-            hist_store = Store(self.hass, _HISTORY_STORAGE_VERSION, _HISTORY_STORAGE_KEY)
-            hist_data  = await hist_store.async_load() or {"entries": []}
-            calculator.plan_history_entries = hist_data["entries"]
-
-            async def on_plan_ready(plan_key, detail, meta):
-                nonlocal plans_done
-                plans_done += 1
-                await send('plan', {
-                    'plan_key':          plan_key,
-                    'detail':            _slim_stream_detail(detail),
-                    'plans_done':        plans_done,
-                    'plans_total':       plans_total,
-                    'current_plan_name': meta.get('current_plan_name'),
-                    'alternative_plans': meta.get('alternative_plans', {}),
-                    'current_plan_total': meta.get('current_plan_total', 0),
-                    'usage_days':        meta.get('usage_days', 0),
-                    'start_date':        meta.get('start_date', ''),
-                    'end_date':          meta.get('end_date', ''),
-                    'energy_flows':      meta.get('energy_flows', {}),
-                    'deferrable_devices': meta.get('deferrable_devices', []),
-                })
-
-            async def on_fetch_progress(message, step, total):
-                await send('status', {
-                    'phase':       'fetching',
-                    'message':     message,
-                    'fetch_step':  step,
-                    'fetch_total': total,
-                    'plans_total': plans_total,
-                })
-
-            # Ranking every candidate plan against each period's own usage slice
-            # (calculate_plan_costs' `periods` construction) is another full LP
-            # pass per period, on top of the whole-window loop above — a genuinely
-            # long stretch with zero 'plan' events to send, which is exactly what
-            # trips the card's `src.onerror` "stream failed" handler: nothing
-            # written to the response for long enough that the connection looks
-            # dead. Reusing the 'optimising' phase (already what the per-plan loop
-            # above reports) keeps the stream writing throughout instead of only
-            # during the whole-window loop before it.
-            async def on_period_progress(message, step, total):
-                await send('status', {
-                    'phase':       'optimising',
-                    'message':     message,
-                    'fetch_step':  step,
-                    'fetch_total': total,
-                    'plans_total': plans_total,
-                })
-
-            # See _calc_lock's docstring — never overlap with the background
-            # refresh or another request on the same entry. If something else is
-            # already running, say so on the stream immediately: waiting for the
-            # lock is itself a silent stretch otherwise, which is exactly what
-            # trips the card's "stream failed" handler.
-            _lock = _calc_lock(self.hass, entry_obj.entry_id)
-            if _lock.locked():
-                await send('status', {
-                    'phase': 'fetching',
-                    'message': 'Waiting for another calculation on this install to finish…',
-                    'plans_total': plans_total,
-                })
-            async with _lock:
-                result = await calculator.calculate_plan_costs(
-                    start_date, end_date,
-                    on_plan_ready=on_plan_ready,
-                    on_progress=on_fetch_progress,
-                    on_period_progress=on_period_progress,
-                    exclude_greedy=exclude_greedy,
-                    whatif_battery_kwh=whatif_battery_kwh,
-                    whatif_solar_pct=whatif_solar_pct,
-                )
-            if isinstance(result, dict) and isinstance(result.get('plan_details'), dict):
-                # Every plan's detail was already streamed once via `on_plan_ready`
-                # (_slim_stream_detail applied there too) — resending the identical
-                # slimmed dict again here duplicates the single largest chunk of the
-                # whole response for no reason. Confirmed live 2026-09-28: a 208-plan
-                # comparison (up from 121 when the original 109 MB fix landed
-                # 2026-09-08) had grown back to ~7.9 MB, ~2.9 MB of which was this
-                # exact resend, and intermittently tripped the same client-side
-                # `src.onerror` "stream failed" abort the original fix was meant to
-                # prevent (one of three consecutive owner-triggered runs stopped dead
-                # at plan 199/211 with zero server-side exception — a transport-side
-                # drop, not a calculation bug). The card merges its own
-                # incrementally-built plan_details back in on 'complete' instead (see
-                # grid-lens-card.js), so the wire payload only needs to carry it once.
-                result = {**result, 'plan_details': {}}
-            await send('complete', result)
-            return resp
 
     class PowerflowCardView(HomeAssistantView):
         """Proxies the Power Flow card's JS from the API — gated on the install's
@@ -1589,7 +1645,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.http.register_view(PlanHistoryView(hass))
     hass.http.register_view(PlanHistoryItemView(hass))
     hass.http.register_view(DiagnosticExportView(hass))
-    hass.http.register_view(PlanStreamView(hass))
+    hass.http.register_view(PlanCalcStartView(hass))
+    hass.http.register_view(PlanCalcPollView(hass))
     hass.http.register_view(PowerflowCardView(hass))
     hass.http.register_view(PowerflowIconView(hass))
     hass.http.register_view(SubscribeCallbackView(hass))
@@ -2293,6 +2350,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(f"{entry.entry_id}_power_estimators", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_greedy_trackers", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_calc_lock", None)
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_calc_state", None)
 
     return unload_ok
 
