@@ -146,17 +146,18 @@ export function xAxisTicks(X, t0, t1, axisY, fontSize = 10) {
   return s;
 }
 // Vertical fade gradient (color → transparent) for area fills. Three stops rather than
-// two: a flat two-stop linear fade reads as a thin bright sliver hugging the line with a
-// long washed-out tail below it (opacity falls off linearly, but perceived brightness
-// doesn't — the eye is far more sensitive to the top 20% of the ramp). The middle stop
-// holds a mid-tone for longer before the final taper, so the wash reads as a fuller,
-// more saturated blend from baseline up to the line instead of a hairline glow.
-export function gradDef(id, color, topOpacity) {
-  const mid = (topOpacity * 0.62).toFixed(2);
+// two: a flat two-stop linear fade reads as a thin bright sliver with a long washed-out
+// tail (opacity falls off linearly, but perceived brightness doesn't — the eye is far
+// more sensitive to the top 20% of the ramp). The middle stop holds a mid-tone for
+// longer before the final taper. Deepest/most saturated at the BASELINE (bottom, offset
+// 1), fading out toward the line (top, offset 0) — reversed from a plain "glow near the
+// line" fade per explicit request.
+export function gradDef(id, color, baseOpacity) {
+  const mid = (baseOpacity * 0.62).toFixed(2);
   return `<linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">`
-    + `<stop offset="0" style="stop-color:${color};stop-opacity:${topOpacity}"/>`
-    + `<stop offset="0.45" style="stop-color:${color};stop-opacity:${mid}"/>`
-    + `<stop offset="1" style="stop-color:${color};stop-opacity:0.03"/></linearGradient>`;
+    + `<stop offset="0" style="stop-color:${color};stop-opacity:0.03"/>`
+    + `<stop offset="0.55" style="stop-color:${color};stop-opacity:${mid}"/>`
+    + `<stop offset="1" style="stop-color:${color};stop-opacity:${baseOpacity}"/></linearGradient>`;
 }
 export function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
