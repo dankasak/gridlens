@@ -523,13 +523,39 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // that means nothing on its own scale. Right-axis series are line-only by construction.
   for (const g2 of geo.filter((x) => x.s.area && x.s.axis !== 'right').sort((a, b) => b.mag - a.mag)) {
     const s = g2.s;
+    const rp = raw[g2.si];
     const clip = (hasActual && !s.actual) ? ` clip-path="url(#${futureClipId})"` : '';
-    // Each same-sign run gets its OWN fill polygon and gradient, scaled to ITS OWN
-    // peak — not one gradient sized to the whole series' day-long range (see
-    // signRuns' comment for why that reads as a flat wash on any excursion smaller
-    // than the series' biggest one). A non-negative series (solar, load…) is always
-    // exactly one run, identical in shape to the un-split fill this replaces.
-    signRuns(raw[g2.si]).forEach((run, ri, runs) => {
+    // ONE gradient per series (not per run), scaled to THAT SERIES' OWN overall peak
+    // magnitude — not each run's own local extent, and not the shared chart axis. A
+    // per-run scale (the previous approach) made every excursion fade fully to near-0
+    // at its own top regardless of size, which fixed small-vs-big-excursion flatness
+    // WITHIN a series but gave no cross-series consistency: comparing two DIFFERENT
+    // series, a small ripple and a big spike both bottomed out identically, so how
+    // "washed out" a series looked said nothing about its actual magnitude. Anchoring
+    // to the series' own peak instead means: a small excursion within an otherwise
+    // large-swinging series legitimately looks less washed-out than that series' true
+    // peak (it's not there yet), while a DIFFERENT series with a much smaller overall
+    // peak (e.g. a 1.8kW device next to a 14kW battery) still fully washes out AT ITS
+    // OWN ceiling instead of needing to reach some unrelated shared-axis maximum it
+    // may never come close to. userSpaceOnUse (not objectBoundingBox) because the
+    // reference points (this series' own ±peak) generally sit OUTSIDE any single
+    // run's own rendered bounding box.
+    const peakV = rp.reduce((m, p) => Math.max(m, Math.abs(p.v)), 0);
+    const peakOp = s.opacity != null ? s.opacity : (s.actual ? 0.95 : 1);
+    const mid = (peakOp * 0.62).toFixed(2);
+    const gid = `g${g2.si}`;
+    // Y is linear in value, and the two ends are ±peakV (symmetric about 0), so v=0
+    // always lands at exactly the midpoint (0.5) — no fractional bookkeeping needed.
+    defs += `<linearGradient id="${gid}" gradientUnits="userSpaceOnUse" x1="0" y1="${Y(peakV).toFixed(1)}" x2="0" y2="${Y(-peakV).toFixed(1)}">`
+      + `<stop offset="0" style="stop-color:${s.color};stop-opacity:0.03"/>`
+      + `<stop offset="0.3" style="stop-color:${s.color};stop-opacity:${mid}"/>`
+      + `<stop offset="0.5" style="stop-color:${s.color};stop-opacity:${peakOp}"/>`
+      + `<stop offset="0.7" style="stop-color:${s.color};stop-opacity:${mid}"/>`
+      + `<stop offset="1" style="stop-color:${s.color};stop-opacity:0.03"/></linearGradient>`;
+    // Still split into same-sign runs for the fill GEOMETRY (each run closes its own
+    // polygon precisely at the zero-crossing — see signRuns) — only the gradient
+    // itself is now shared across every run of this series, not rebuilt per run.
+    signRuns(rp).forEach((run, ri, runs) => {
       const pxPts = run.pts.map((p) => [X(p.ms), Y(p.v)]);
       let rd, rightX = pxPts[pxPts.length - 1][0];
       const leftX = pxPts[0][0];
@@ -544,15 +570,6 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
       } else {
         rd = smoothPath(pxPts);
       }
-      const ys = pxPts.map((p) => p[1]).concat([base]);
-      const minY = Math.min(...ys), maxY = Math.max(...ys);
-      const zeroFrac = maxY > minY ? (base - minY) / (maxY - minY) : 1;
-      const gid = `g${g2.si}_${ri}`;
-      // Peak opacity matches the STROKE's own opacity exactly (same formula as the
-      // line-drawing pass below) — at Y=0 the fill is the series' actual color, full
-      // strength, same as its border, not a tinted-down approximation of it.
-      const peakOp = s.opacity != null ? s.opacity : (s.actual ? 0.95 : 1);
-      defs += gradDef(gid, s.color, peakOp, zeroFrac);
       paths += `<path d="${rd} L${rightX.toFixed(1)},${base.toFixed(1)} L${leftX.toFixed(1)},${base.toFixed(1)} Z" fill="url(#${gid})"${clip}/>`;
     });
   }

@@ -50,7 +50,7 @@ import {
   modulationLine, socCapHtml, acCeilingHtml, sparklineHtml, estimatorToggleHtml, estimatorPanelHtml,
   controlHtml, greedyButtonsHtml, boostInputHtml, visibilityToggleHtml, currentReadoutHtml,
   maxCurrentHtml, attachTooltip,
-} from './grid-lens-chart-common.js?v=20260929g';
+} from './grid-lens-chart-common.js?v=20260929i';
 
 const DAILY_TARGET_HISTORY_REFRESH_MS = 15 * 60000;
 // Minimum time the optimizing dot stays visible once triggered, regardless of how
