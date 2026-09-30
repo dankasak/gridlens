@@ -15,9 +15,13 @@ class GridLensCard extends HTMLElement {
     // Full-screen breakout — click a plan's cost banner to expand just that plan
     // (bigger charts + fonts, dims/hides everything else). Holds the plan's key
     // (same string as planDetails/plansToShow), or null when nothing is expanded.
+    // Rendered as a native <dialog> (see render()'s plansHtml build) — .showModal()
+    // promotes it to the browser's top layer, which is the only thing that reliably
+    // escapes an ANCESTOR establishing a containing block for position:fixed (our own
+    // :host { contain: content }, but also — the actual reason a plain fixed div
+    // wasn't enough here — ha-card's own internal styling). Top-layer rendering
+    // ignores containment/overflow/stacking-context on every ancestor by construction.
     this._fullscreenPlan = null;
-    this._onKeyDownBound = this._onKeyDown.bind(this);
-    this._escListenerAdded = false;
     this._retailerFilter = '';   // live retailer search box, applied as the user types
     this._excludeGreedy = false; // "exclude greedy consumption" checkbox — see setConfig
     this._topN = 5;              // "Show best N" declutter filter — see setConfig
@@ -74,18 +78,6 @@ class GridLensCard extends HTMLElement {
       const s = this._startDate ? `${this._startDate}T00:00:00` : null;
       const e = this._endDate   ? `${this._endDate}T23:59:59`   : null;
       this.fetchData(s, e);
-    }
-  }
-
-  // Escape closes the full-screen plan breakout. Bound once in the constructor and
-  // registered on `document` (not the shadow root) the first time render() runs,
-  // guarded by _escListenerAdded — render() fires very often (every streamed plan
-  // result re-renders this card), so re-adding on every call would pile up duplicate
-  // document-level listeners for the lifetime of the element.
-  _onKeyDown(ev) {
-    if (ev.key === 'Escape' && this._fullscreenPlan) {
-      this._fullscreenPlan = null;
-      this.render();
     }
   }
 
@@ -1009,12 +1001,6 @@ class GridLensCard extends HTMLElement {
     const styles = `
       <style>
         :host { display: block; contain: content; }
-        /* contain:content (layout+paint) makes THIS element the containing block for
-           any position:fixed descendant — which silently clips the full-screen plan
-           breakout to this card's own small box instead of the viewport (only the
-           top sliver, e.g. the plan title + close button, ends up visible). Drop
-           containment for exactly as long as something is expanded. */
-        :host:has(.fullscreen-plan) { contain: none; }
         .plan-grid {
           display: grid;
           grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -1308,24 +1294,39 @@ class GridLensCard extends HTMLElement {
           font-size: 13px; opacity: 0.7;
         }
         .plan-card.fs-hidden { display: none; }
-        .fs-backdrop {
-          position: fixed; inset: 0; z-index: 999;
-          background: rgba(0,0,0,0.62);
-          backdrop-filter: blur(2px);
-        }
-        .plan-card.fullscreen-plan {
+        /* Full-screen plan breakout renders as a native <dialog>, shown via
+           .showModal() (see render()'s post-innerHTML wiring). Top-layer rendering
+           is the only thing that reliably escapes EVERY ancestor's containing-block/
+           overflow/stacking-context quirks (our own :host's contain:content, and
+           ha-card's own internal styling both defeated a plain position:fixed div
+           here) — a <dialog> promoted via showModal() ignores all of that by
+           construction, same mechanism browsers use for <video> fullscreen. Reset
+           the UA's default dialog box model (border/centering/max-size) rather than
+           fight it, and use its own ::backdrop instead of a hand-rolled overlay div.
+        */
+        dialog.fullscreen-plan {
           position: fixed;
-          top: 3vh; left: 3vw; right: 3vw; bottom: 3vh;
-          z-index: 1000;
+          inset: 3vh 3vw;
+          width: auto; height: auto;
+          max-width: none; max-height: none;
+          margin: 0;
+          border: none;
           overflow-y: auto;
           box-shadow: 0 12px 48px rgba(0,0,0,0.55);
           border-radius: 14px;
           padding: 28px 32px 32px;
+          background: var(--card-background-color);
+          color: var(--primary-text-color);
+        }
+        dialog.fullscreen-plan::backdrop {
+          background: rgba(0,0,0,0.62);
+          backdrop-filter: blur(2px);
         }
         .fs-close-btn {
-          position: fixed;
-          top: calc(3vh + 14px); right: calc(3vw + 14px);
-          z-index: 1001;
+          position: sticky;
+          display: block;
+          top: 0; margin: 0 0 12px auto;
+          width: max-content;
           background: var(--secondary-background-color);
           color: var(--primary-text-color);
           border: 1px solid var(--divider-color);
@@ -1334,25 +1335,26 @@ class GridLensCard extends HTMLElement {
           font-size: 14px; font-weight: 500;
           cursor: pointer;
           box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+          z-index: 1;
         }
         .fs-close-btn:hover { filter: brightness(1.1); }
         /* Everything inside an expanded plan reads bigger, not just its charts —
            the point is a whole-card "presentation mode", not just zoomed graphs. */
-        .plan-card.fullscreen-plan .plan-title { font-size: 26px; margin-bottom: 16px; }
-        .plan-card.fullscreen-plan .cost-display { padding: 28px; margin: 18px 0; }
-        .plan-card.fullscreen-plan .cost-display::after { font-size: 20px; top: 14px; right: 16px; }
-        .plan-card.fullscreen-plan .cost-amount { font-size: 56px; }
-        .plan-card.fullscreen-plan .cost-label { font-size: 16px; }
-        .plan-card.fullscreen-plan .chart-section { margin-top: 24px; }
-        .plan-card.fullscreen-plan .chart-label { font-size: 15px; margin-bottom: 6px; }
-        .plan-card.fullscreen-plan .breakdown-title { font-size: 18px; }
-        .plan-card.fullscreen-plan .breakdown-row { font-size: 16px; padding: 9px 0; }
-        .plan-card.fullscreen-plan .bill-total-row { font-size: 19px; }
-        .plan-card.fullscreen-plan .bill-gst-row { font-size: 14px; }
-        .plan-card.fullscreen-plan .bill-section-head { font-size: 12px; }
-        .plan-card.fullscreen-plan .strategy-box { padding: 18px; }
-        .plan-card.fullscreen-plan .strategy-title { font-size: 17px; }
-        .plan-card.fullscreen-plan .strategy-text { font-size: 15px; }
+        .fullscreen-plan .plan-title { font-size: 26px; margin-bottom: 16px; }
+        .fullscreen-plan .cost-display { padding: 28px; margin: 18px 0; }
+        .fullscreen-plan .cost-display::after { font-size: 20px; top: 14px; right: 16px; }
+        .fullscreen-plan .cost-amount { font-size: 56px; }
+        .fullscreen-plan .cost-label { font-size: 16px; }
+        .fullscreen-plan .chart-section { margin-top: 24px; }
+        .fullscreen-plan .chart-label { font-size: 15px; margin-bottom: 6px; }
+        .fullscreen-plan .breakdown-title { font-size: 18px; }
+        .fullscreen-plan .breakdown-row { font-size: 16px; padding: 9px 0; }
+        .fullscreen-plan .bill-total-row { font-size: 19px; }
+        .fullscreen-plan .bill-gst-row { font-size: 14px; }
+        .fullscreen-plan .bill-section-head { font-size: 12px; }
+        .fullscreen-plan .strategy-box { padding: 18px; }
+        .fullscreen-plan .strategy-title { font-size: 17px; }
+        .fullscreen-plan .strategy-text { font-size: 15px; }
       </style>
     `;
 
@@ -1624,9 +1626,15 @@ class GridLensCard extends HTMLElement {
           <div class="strategy-text">${details.strategy}</div>
         </div>` : '';
 
+      // The fullscreen instance renders as a <dialog> (see render()'s post-innerHTML
+      // wiring, which calls .showModal() on it) — top-layer rendering is what actually
+      // escapes ancestor containment/overflow, not the class name. Every other plan
+      // stays a plain <div>, just hidden behind fs-hidden while one is expanded.
+      const tag = isFullscreen ? 'dialog' : 'div';
       const fsClass = isFullscreen ? ' fullscreen-plan' : (this._fullscreenPlan ? ' fs-hidden' : '');
+      const fsId = isFullscreen ? ' id="epc-fs-dialog"' : '';
       return `
-        <div class="plan-card${isCurrentPlan ? ' current-plan' : ''}${fsClass}" data-retailer="${_esc(_retailerOf(planName))}" data-plan="${_esc(planName)}">
+        <${tag} class="plan-card${isCurrentPlan ? ' current-plan' : ''}${fsClass}"${fsId} data-retailer="${_esc(_retailerOf(planName))}" data-plan="${_esc(planName)}">
           ${isFullscreen ? `<button class="fs-close-btn" id="epc-fs-close" title="Close full screen (Esc)">✕ Close</button>` : ''}
           <div class="plan-title">${planName}</div>
           <div class="cost-display" style="background:${bannerColor}" title="Click to view this plan full-screen">
@@ -1636,7 +1644,7 @@ class GridLensCard extends HTMLElement {
           ${chartHtml}
           ${breakdownHtml}
           ${strategyHtml}
-        </div>`;
+        </${tag}>`;
     }).join('');
 
     // Autocomplete over the retailers actually present, so the box suggests
@@ -1749,14 +1757,9 @@ class GridLensCard extends HTMLElement {
     // flat single-grid view above, just with the same "Show best N" filter
     // already applied to `plansToShow`.
     const periodsArr = this._data.periods || [];
-    // Backdrop only makes sense behind the flat grid — a period section has no
-    // hourly charts to expand (see _renderPeriodPlanCard), so nothing there can
-    // set _fullscreenPlan in the first place.
-    const fsBackdropHtml = (this._fullscreenPlan && periodsArr.length <= 1)
-      ? `<div class="fs-backdrop" id="epc-fs-backdrop"></div>` : '';
     const periodsHtml = (periodsArr.length > 1)
       ? periodsArr.map(p => this._renderPeriodSection(p, topN, showBreakdown)).join('')
-      : `${fsBackdropHtml}<div class="plan-grid">${plansHtml}${skeletonsHtml}</div>`;
+      : `<div class="plan-grid">${plansHtml}${skeletonsHtml}</div>`;
 
     const bodyHtml = this._showHistory
       ? this.renderHistoryPanel(planNames)
@@ -1967,27 +1970,44 @@ class GridLensCard extends HTMLElement {
       });
     }
 
-    // Full-screen plan breakout — click a plan's cost banner to expand it, click it
-    // again (or the ✕, or the backdrop, or Escape) to close.
+    // Full-screen plan breakout — click a plan's cost banner to expand it; click it
+    // again (or the ✕, the dialog's own backdrop, or Escape) to close. Rendered as a
+    // native <dialog> (see the plansHtml build above), so its 'close' event — which
+    // fires for every one of those paths, including Escape, since that's native
+    // <dialog> behaviour — is the ONE place _fullscreenPlan ever gets cleared.
     this.shadowRoot.querySelectorAll('.plan-card .cost-display').forEach((el) => {
       el.addEventListener('click', () => {
-        const plan = el.closest('.plan-card')?.dataset.plan;
+        const card = el.closest('.plan-card');
+        const plan = card?.dataset.plan;
         if (!plan) return;
-        this._fullscreenPlan = (this._fullscreenPlan === plan) ? null : plan;
-        this.render();
+        if (this._fullscreenPlan === plan) {
+          card.close();  // already-expanded plan's own banner — triggers 'close' below
+        } else {
+          this._fullscreenPlan = plan;
+          this.render();
+        }
       });
     });
-    this.shadowRoot.getElementById('epc-fs-close')?.addEventListener('click', () => {
-      this._fullscreenPlan = null;
-      this.render();
-    });
-    this.shadowRoot.getElementById('epc-fs-backdrop')?.addEventListener('click', () => {
-      this._fullscreenPlan = null;
-      this.render();
-    });
-    if (!this._escListenerAdded) {
-      document.addEventListener('keydown', this._onKeyDownBound);
-      this._escListenerAdded = true;
+    const fsDialog = this.shadowRoot.getElementById('epc-fs-dialog');
+    if (fsDialog) {
+      fsDialog.addEventListener('close', () => {
+        this._fullscreenPlan = null;
+        this.render();
+      });
+      // <dialog> has no built-in light-dismiss (unlike the Popover API) — a click
+      // that lands on the dialog element itself, rather than a descendant, means it
+      // hit the backdrop area, so treat that as "click outside to close".
+      fsDialog.addEventListener('click', (ev) => {
+        if (ev.target === fsDialog) fsDialog.close();
+      });
+      this.shadowRoot.getElementById('epc-fs-close')?.addEventListener('click', () => fsDialog.close());
+      // render() fully replaces the shadow root every time (including on every
+      // streamed plan-priced event while this is open), so this is always a fresh,
+      // never-yet-shown node — showModal() promotes it to the top layer, which is
+      // what actually escapes ha-card/:host's containment (see the CSS comment above).
+      if (!fsDialog.open) {
+        try { fsDialog.showModal(); } catch (_) {}
+      }
     }
   }
 
