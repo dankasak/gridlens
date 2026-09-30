@@ -961,10 +961,32 @@ class PlanCalculator:
         # request anyway.
         _orig_has_battery = self.has_battery
         _orig_battery_optimizer = self.battery_optimizer
+
+        def _no_op_battery_optimizer() -> "BatteryOptimizer":
+            # Route a hypothetical "no battery" through the SAME per-hour LP
+            # solar/load/grid balance a real battery uses, instead of letting
+            # the pricing loop below fall back to `_calculate_plan_cost_simple`/
+            # `_compute_bill_items`'s raw-historical-usage path — that fallback
+            # prices off the real, unscaled usage/export sensors and silently
+            # ignores `whatif_solar_pct` entirely (see 2026-09-30 GRIDLENS_CHECKLIST
+            # entry). Capacity is a tiny nonzero value, not 0 — battery_optimizer.py
+            # divides by capacity_kwh when reporting soc_percent, and an exact 0
+            # raises ZeroDivisionError. Zero charge/discharge rate bounds pin the
+            # LP's battery variables at 0 every hour, so it can never actually
+            # store energy — capacity is otherwise inert.
+            return BatteryOptimizer(
+                capacity_kwh=0.01,
+                max_charge_rate_kw=0.0,
+                max_discharge_rate_kw=0.0,
+                efficiency_percent=95.0,
+                min_soc_percent=10.0,
+                max_soc_percent=90.0,
+            )
+
         if whatif_active and whatif_battery_kwh is not None:
             if whatif_battery_kwh <= 0:
-                self.has_battery = False
-                self.battery_optimizer = None
+                self.has_battery = True
+                self.battery_optimizer = _no_op_battery_optimizer()
             else:
                 if _orig_has_battery and self.battery_capacity > 0:
                     # Scale rate limits with capacity so a "bigger battery" isn't
@@ -996,6 +1018,16 @@ class PlanCalculator:
                     "What-if battery: %.1f kWh (%.2f/%.2f kW charge/discharge)",
                     whatif_battery_kwh, _max_charge, _max_discharge,
                 )
+        elif whatif_active and not _orig_has_battery:
+            # Solar-only what-if (battery field left at its default) on a
+            # household with no real battery: `whatif_battery_kwh` is None here,
+            # so the branch above never runs, and without this the loop below
+            # would price every plan off real historical usage/export — same
+            # raw-fallback bug as the explicit "no battery" case, just reached
+            # via the other path. A real battery's own optimizer is left
+            # untouched (has a real, non-hypothetical dispatch to price from).
+            self.has_battery = True
+            self.battery_optimizer = _no_op_battery_optimizer()
 
         for plan in all_plans_ordered:
             plan_key = self._plan_key(plan, _dup_keys)
