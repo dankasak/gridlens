@@ -341,7 +341,7 @@ class GridLensCard extends HTMLElement {
     const upGid = this._nextGid(), dnGid = this._nextGid();
     const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot) =>
       `${slot.hour}:00  ${slot[upKey].toFixed(3)} / ${slot[downKey].toFixed(3)}`);
-    return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="display:block;height:${H}px">
+    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
       <defs>
         ${gradDef(upGid, upColor, 0.82, 1)}
         ${gradDef(dnGid, downColor, 0.82, 0)}
@@ -410,7 +410,7 @@ class GridLensCard extends HTMLElement {
     const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot, i) =>
       `${slot.hour}:00\n${hoverLines[i].join('\n')}\nTotal ${totals[i].toFixed(3)} kWh`);
 
-    return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="display:block;height:${H}px">
+    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
       ${bandsSvg}
       ${hovers}
     </svg>`;
@@ -427,7 +427,7 @@ class GridLensCard extends HTMLElement {
     const gid = this._nextGid();
     const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot) =>
       `${slot.hour}:00  Solar ${(slot.solar_kwh || 0).toFixed(3)} kWh`);
-    return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="display:block;height:${H}px">
+    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
       <defs>${gradDef(gid, GridLensCard.SOLAR_COLOR, 0.85, 1)}</defs>
       <path d="${line} L${lastX},${H} L${firstX},${H} Z" fill="url(#${gid})"/>
       <path d="${line}" fill="none" stroke="${GridLensCard.SOLAR_COLOR}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
@@ -467,7 +467,7 @@ class GridLensCard extends HTMLElement {
     const zeroLine = lo < 0
       ? `<line x1="0" y1="${y(0).toFixed(1)}" x2="${W}" y2="${y(0).toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.8"/>`
       : '';
-    return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="display:block;height:${H}px">
+    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
       ${zeroLine}
       ${line(imp, GridLensCard.SPEND_COLOR)}
       ${line(exp, GridLensCard.INCOME_COLOR)}
@@ -543,7 +543,7 @@ class GridLensCard extends HTMLElement {
     const y20 = yOf(20), y80 = yOf(80);
     const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot) =>
       `${slot.hour}:00  SOC ${(slot.soc_percent || 0).toFixed(0)}%`);
-    return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="display:block;height:${H}px">
+    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
       <defs>${gradDef(gid, GridLensCard.SOC_COLOR, 0.75, 1)}</defs>
       <line x1="0" y1="${y80.toFixed(1)}" x2="${W}" y2="${y80.toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.5" stroke-dasharray="3,3"/>
       <line x1="0" y1="${y20.toFixed(1)}" x2="${W}" y2="${y20.toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.5" stroke-dasharray="3,3"/>
@@ -1347,6 +1347,13 @@ class GridLensCard extends HTMLElement {
         .fullscreen-plan .cost-label { font-size: 16px; }
         .fullscreen-plan .chart-section { margin-top: 24px; }
         .fullscreen-plan .chart-label { font-size: 15px; margin-bottom: 6px; }
+        /* Left un-constrained, .breakdown-row's existing flex + space-between (label
+           flex:1, value margin-left) stretches across the dialog's full ~90vw width,
+           spreading each line's description and amount to opposite edges of the
+           screen instead of reading as one bill line. Cap the column at a sane
+           reading width so they stay right next to each other, same as the compact
+           card already does just by virtue of being narrow. */
+        .fullscreen-plan .breakdown-section { max-width: 640px; }
         .fullscreen-plan .breakdown-title { font-size: 18px; }
         .fullscreen-plan .breakdown-row { font-size: 16px; padding: 9px 0; }
         .fullscreen-plan .bill-total-row { font-size: 19px; }
