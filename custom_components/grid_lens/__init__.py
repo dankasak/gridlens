@@ -1299,8 +1299,15 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     calculator.plan_history_entries = hist_data["entries"]
 
                     async def on_plan_ready(plan_key, detail, meta):
-                        nonlocal plans_done
+                        nonlocal plans_done, plans_total
                         plans_done += 1
+                        # calculate_plan_costs reports the post-eligibility-filter
+                        # count once it has it (see its on_plan_ready docstring) —
+                        # always at or below the raw pre-filter count this closure
+                        # started with. Adopt it so plans_done can actually reach
+                        # plans_total instead of stalling a few plans short.
+                        plans_total = meta.get('plans_total') or plans_total
+                        state['plans_total'] = plans_total
                         state['events'].append({
                             'event': 'plan',
                             'data': {

@@ -1220,6 +1220,17 @@ class PlanCalculator:
                 await on_plan_ready(plan_key, plan_optimization_results[plan_key], {
                     'current_plan_name': current_plan_name,
                     'alternative_plans': dict(plan_costs),
+                    # Post-filter count (network-tariff-code/postcode eligibility
+                    # already applied above) — the caller's own "plans_total" is
+                    # captured from the raw, unfiltered catalogue before this
+                    # method runs, so it overcounts by exactly however many plans
+                    # get excluded here. Without this, a progress bar built from
+                    # the caller's total can never reach 100%, looking permanently
+                    # "stuck" a few plans short even after the run has genuinely
+                    # completed (see GRIDLENS_CHECKLIST.md, 2026-09-30 — 3 ENGIE
+                    # VPP Advantage network-tariff variants correctly excluded for
+                    # this household's EA116, denominator still said 211 of 211).
+                    'plans_total': len(all_plans_ordered),
                     'usage_days': actual_days,
                     'start_date': start_date.isoformat(),
                     'end_date': end_date.isoformat(),
