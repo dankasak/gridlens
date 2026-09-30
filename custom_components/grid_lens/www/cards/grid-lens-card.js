@@ -316,23 +316,30 @@ class GridLensCard extends HTMLElement {
 
   // ── Chart helpers ─────────────────────────────────────────────────────────
 
-  // Faint dashed vertical gridlines every 3 hours (0,3,6,9,noon,3pm,6pm,9pm) —
-  // added to EVERY individual chart, not just the single shared "12am 3am 6am…"
-  // caption renderHourLabels() prints once after the whole stack, so an hour
-  // position can be read (and lined up against the same hour on the chart
-  // above/below it) straight off any one graph. Full chart height, same style as
-  // the existing reference lines (MID divider, SOC's 20/80% lines) rather than a
-  // small edge notch — a first attempt at small low-opacity marks turned out too
-  // subtle to actually notice sitting under/against a filled gradient area.
-  // Drawn by the CALLER after its area fills (not here) so the lines paint on
-  // top and stay visible regardless of what's underneath.
-  _hourTicks(H, BAR, GAP) {
-    let s = '';
+  // Faint dashed vertical gridlines every 3 hours (0,3,6,9,noon,3pm,6pm,9pm), each
+  // with its own "12a/3a/…/9p" label — added to EVERY individual chart (there used
+  // to be one shared caption after the whole stack instead; removed as redundant
+  // now every chart carries its own) so an hour position can be read, and lined up
+  // against the same hour on the chart above/below it, straight off any one graph.
+  // Lines span the chart's own plot height H (same visual language as this file's
+  // existing reference lines — the diverging charts' MID divider, the SOC chart's
+  // 20/80% lines); labels sit in a separate strip BELOW H so text never overlaps a
+  // data curve — the caller extends its viewBox/rendered height by the returned
+  // stripH and appends `labels` there. Returns {ticks, labels, stripH} rather than
+  // one string since ticks are drawn by the caller right after its area fills (so
+  // they paint on top and stay visible), while labels are appended last of all.
+  _hourAxis(H, BAR, GAP, scale = 1) {
+    const stripH = Math.max(9, Math.round(10 * scale));
+    const fontSize = Math.max(7, Math.round(8 * scale));
+    const labelY = (H + stripH - 2).toFixed(1);
+    let ticks = '', labels = '';
     for (let h = 0; h < 24; h += 3) {
       const x = (h * (BAR + GAP) + BAR / 2).toFixed(1);
-      s += `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--divider-color)" stroke-width="0.6" stroke-dasharray="2,2" opacity="0.55"/>`;
+      ticks += `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--divider-color)" stroke-width="0.6" stroke-dasharray="2,2" opacity="0.55"/>`;
+      const label = h === 0 ? '12a' : h === 12 ? '12p' : (h < 12 ? `${h}a` : `${h - 12}p`);
+      labels += `<text x="${x}" y="${labelY}" text-anchor="middle" font-size="${fontSize}" fill="var(--secondary-text-color)">${label}</text>`;
     }
-    return s;
+    return { ticks, labels, stripH };
   }
 
   // Invisible per-slot hit targets: a smoothed curve has no discrete bar to hover,
@@ -360,7 +367,9 @@ class GridLensCard extends HTMLElement {
     const upGid = this._nextGid(), dnGid = this._nextGid();
     const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot) =>
       `${slot.hour}:00  ${slot[upKey].toFixed(3)} / ${slot[downKey].toFixed(3)}`);
-    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
+    const { ticks, labels, stripH } = this._hourAxis(H, BAR, GAP, scale);
+    const totalH = H + stripH;
+    return `<svg width="100%" viewBox="0 0 ${W} ${totalH}" preserveAspectRatio="none" style="display:block;height:${totalH}px">
       <defs>
         ${gradDef(upGid, upColor, 0.82, 1)}
         ${gradDef(dnGid, downColor, 0.82, 0)}
@@ -368,10 +377,11 @@ class GridLensCard extends HTMLElement {
       <line x1="0" y1="${MID}" x2="${W}" y2="${MID}" stroke="var(--divider-color)" stroke-width="0.8"/>
       <path d="${upLine} L${upLastX},${MID} L${upFirstX},${MID} Z" fill="url(#${upGid})"/>
       <path d="${dnLine} L${dnLastX},${MID} L${dnFirstX},${MID} Z" fill="url(#${dnGid})"/>
-      ${this._hourTicks(H, BAR, GAP)}
+      ${ticks}
       <path d="${upLine}" fill="none" stroke="${upColor}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
       <path d="${dnLine}" fill="none" stroke="${downColor}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
       ${hovers}
+      ${labels}
     </svg>`;
   }
 
@@ -429,11 +439,14 @@ class GridLensCard extends HTMLElement {
     const totals = cum;
     const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot, i) =>
       `${slot.hour}:00\n${hoverLines[i].join('\n')}\nTotal ${totals[i].toFixed(3)} kWh`);
+    const { ticks, labels, stripH } = this._hourAxis(H, BAR, GAP, scale);
+    const totalH = H + stripH;
 
-    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
+    return `<svg width="100%" viewBox="0 0 ${W} ${totalH}" preserveAspectRatio="none" style="display:block;height:${totalH}px">
       ${bandsSvg}
-      ${this._hourTicks(H, BAR, GAP)}
+      ${ticks}
       ${hovers}
+      ${labels}
     </svg>`;
   }
 
@@ -448,12 +461,15 @@ class GridLensCard extends HTMLElement {
     const gid = this._nextGid();
     const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot) =>
       `${slot.hour}:00  Solar ${(slot.solar_kwh || 0).toFixed(3)} kWh`);
-    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
+    const { ticks, labels, stripH } = this._hourAxis(H, BAR, GAP, scale);
+    const totalH = H + stripH;
+    return `<svg width="100%" viewBox="0 0 ${W} ${totalH}" preserveAspectRatio="none" style="display:block;height:${totalH}px">
       <defs>${gradDef(gid, GridLensCard.SOLAR_COLOR, 0.85, 1)}</defs>
       <path d="${line} L${lastX},${H} L${firstX},${H} Z" fill="url(#${gid})"/>
       <path d="${line}" fill="none" stroke="${GridLensCard.SOLAR_COLOR}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
-      ${this._hourTicks(H, BAR, GAP)}
+      ${ticks}
       ${hovers}
+      ${labels}
     </svg>`;
   }
 
@@ -489,13 +505,16 @@ class GridLensCard extends HTMLElement {
     const zeroLine = lo < 0
       ? `<line x1="0" y1="${y(0).toFixed(1)}" x2="${W}" y2="${y(0).toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.8"/>`
       : '';
-    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
+    const { ticks, labels, stripH } = this._hourAxis(H, BAR, GAP, scale);
+    const totalH = H + stripH;
+    return `<svg width="100%" viewBox="0 0 ${W} ${totalH}" preserveAspectRatio="none" style="display:block;height:${totalH}px">
       ${zeroLine}
-      ${this._hourTicks(H, BAR, GAP)}
+      ${ticks}
       ${line(imp, GridLensCard.SPEND_COLOR)}
       ${line(exp, GridLensCard.INCOME_COLOR)}
       ${dots(imp, GridLensCard.SPEND_COLOR, 'buy')}
       ${dots(exp, GridLensCard.INCOME_COLOR, 'sell')}
+      ${labels}
     </svg>`;
   }
 
@@ -566,14 +585,17 @@ class GridLensCard extends HTMLElement {
     const y20 = yOf(20), y80 = yOf(80);
     const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot) =>
       `${slot.hour}:00  SOC ${(slot.soc_percent || 0).toFixed(0)}%`);
-    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
+    const { ticks, labels, stripH } = this._hourAxis(H, BAR, GAP, scale);
+    const totalH = H + stripH;
+    return `<svg width="100%" viewBox="0 0 ${W} ${totalH}" preserveAspectRatio="none" style="display:block;height:${totalH}px">
       <defs>${gradDef(gid, GridLensCard.SOC_COLOR, 0.75, 1)}</defs>
       <line x1="0" y1="${y80.toFixed(1)}" x2="${W}" y2="${y80.toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.5" stroke-dasharray="3,3"/>
       <line x1="0" y1="${y20.toFixed(1)}" x2="${W}" y2="${y20.toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.5" stroke-dasharray="3,3"/>
       <path d="${line} L${lastX},${H} L${firstX},${H} Z" fill="url(#${gid})"/>
       <path d="${line}" fill="none" stroke="${GridLensCard.SOC_COLOR}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
-      ${this._hourTicks(H, BAR, GAP)}
+      ${ticks}
       ${hovers}
+      ${labels}
     </svg>`;
   }
 
@@ -593,12 +615,6 @@ class GridLensCard extends HTMLElement {
         <span class="greedy-stripe-icon">⚡</span>
         Excludes Greedy Consumption — adjusted estimate
       </div>`;
-  }
-
-  renderHourLabels() {
-    return `<div style="display:flex;justify-content:space-between;font-size:9px;color:var(--secondary-text-color);margin-top:1px">
-      <span>12am</span><span>3am</span><span>6am</span><span>9am</span><span>noon</span><span>3pm</span><span>6pm</span><span>9pm</span><span>11pm</span>
-    </div>`;
   }
 
   // ── Plan history ─────────────────────────────────────────────────────────
@@ -1645,7 +1661,6 @@ class GridLensCard extends HTMLElement {
             ${rateChartHtml}
             ${spikesHtml}
             ${socChartHtml}
-            ${this.renderHourLabels()}
             ${this._greedyStripeHtml(isCurrentPlan)}
           </div>`;
       }
