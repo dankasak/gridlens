@@ -332,22 +332,27 @@ class GridLensCard extends HTMLElement {
     return s;
   }
 
-  // Hour labels ("12a"…"9p") for the ticks above — deliberately plain HTML, not SVG
-  // <text> inside the chart: every mini-chart's viewBox is a fixed 288 units wide but
-  // renders at width:100% with preserveAspectRatio="none" (so it stretches to fill
-  // whatever the card gives it — see the "charts should take up all horizontal
-  // space" full-screen fix). That stretch is only ~1:1 on the compact card (whose
-  // container is close to 288px already) but ~5x on a full-screen dialog — and
-  // because it's non-uniform (only horizontal, matching W:288 → a much wider box),
-  // SVG text sized in the same viewBox units gets stretched sideways by that same
-  // ~5x, rendering wildly oversized in full-screen regardless of what font-size is
-  // picked. Plain HTML text below the chart isn't part of that coordinate system,
-  // so it sizes normally — and picks up the same modest fullscreen bump as every
-  // other caption via the .fullscreen-plan .hour-axis rule.
-  _hourLabelRow() {
-    return `<div class="hour-axis">
-      <span>12a</span><span>3a</span><span>6a</span><span>9a</span><span>12p</span><span>3p</span><span>6p</span><span>9p</span>
-    </div>`;
+  // Hour labels ("12a"…"11p") for the ticks above — every 3 hours normally, every
+  // hour once full-screen (matching _hourTicks' own step) gives them room. Plain
+  // HTML, not SVG <text> inside the chart: every mini-chart's viewBox is a fixed 288
+  // units wide but renders at width:100% with preserveAspectRatio="none" (so it
+  // stretches to fill whatever the card gives it — see the "charts should take up
+  // all horizontal space" full-screen fix). That stretch is only ~1:1 on the compact
+  // card (whose container is close to 288px already) but ~5x on a full-screen
+  // dialog — and because it's non-uniform (only horizontal, matching W:288 → a much
+  // wider box), SVG text sized in the same viewBox units gets stretched sideways by
+  // that same ~5x, rendering wildly oversized in full-screen regardless of what
+  // font-size is picked. Plain HTML text below the chart isn't part of that
+  // coordinate system, so it sizes normally — and picks up the same modest
+  // fullscreen bump as every other caption via the .fullscreen-plan .hour-axis rule.
+  _hourLabelRow(isFullscreen = false) {
+    const everyH = isFullscreen ? 1 : 3;
+    let spans = '';
+    for (let h = 0; h < 24; h += everyH) {
+      const label = h === 0 ? '12a' : h === 12 ? '12p' : (h < 12 ? `${h}a` : `${h - 12}p`);
+      spans += `<span>${label}</span>`;
+    }
+    return `<div class="hour-axis">${spans}</div>`;
   }
 
   // Invisible per-slot hit targets: a smoothed curve has no discrete bar to hover,
@@ -387,7 +392,7 @@ class GridLensCard extends HTMLElement {
       <path d="${upLine}" fill="none" stroke="${upColor}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
       <path d="${dnLine}" fill="none" stroke="${downColor}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
       ${hovers}
-    </svg>${this._hourLabelRow()}`;
+    </svg>${this._hourLabelRow(isFullscreen)}`;
   }
 
   // Stacked SMOOTH area chart: household on the bottom, then one band per deferrable
@@ -449,7 +454,7 @@ class GridLensCard extends HTMLElement {
       ${bandsSvg}
       ${this._hourTicks(H, BAR, GAP, isFullscreen)}
       ${hovers}
-    </svg>${this._hourLabelRow()}`;
+    </svg>${this._hourLabelRow(isFullscreen)}`;
   }
 
   renderSolarChart(profile, maxVal, scale = 1, isFullscreen = false) {
@@ -469,7 +474,7 @@ class GridLensCard extends HTMLElement {
       <path d="${line}" fill="none" stroke="${GridLensCard.SOLAR_COLOR}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
       ${this._hourTicks(H, BAR, GAP, isFullscreen)}
       ${hovers}
-    </svg>${this._hourLabelRow()}`;
+    </svg>${this._hourLabelRow(isFullscreen)}`;
   }
 
   // Average hourly buy/sell PRICE (c/kWh) over the day. Two polylines —
@@ -511,7 +516,7 @@ class GridLensCard extends HTMLElement {
       ${line(exp, GridLensCard.INCOME_COLOR)}
       ${dots(imp, GridLensCard.SPEND_COLOR, 'buy')}
       ${dots(exp, GridLensCard.INCOME_COLOR, 'sell')}
-    </svg>${this._hourLabelRow()}`;
+    </svg>${this._hourLabelRow(isFullscreen)}`;
   }
 
   // "Wed 20 Aug, 10pm" — compact enough for a one-line spike row.
@@ -589,7 +594,7 @@ class GridLensCard extends HTMLElement {
       <path d="${line}" fill="none" stroke="${GridLensCard.SOC_COLOR}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
       ${this._hourTicks(H, BAR, GAP, isFullscreen)}
       ${hovers}
-    </svg>${this._hourLabelRow()}`;
+    </svg>${this._hourLabelRow(isFullscreen)}`;
   }
 
   // Diagonal hazard-stripe flag shown under an alternative plan's charts whenever
