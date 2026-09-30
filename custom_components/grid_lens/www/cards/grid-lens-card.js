@@ -316,6 +316,27 @@ class GridLensCard extends HTMLElement {
 
   // ── Chart helpers ─────────────────────────────────────────────────────────
 
+  // Faint vertical tick marks every 3 hours (0,3,6,9,noon,3pm,6pm,9pm) — added to
+  // EVERY individual chart, not just the single shared "12am 3am 6am…" caption
+  // renderHourLabels() prints once after the whole stack, so an hour position can
+  // be read (and lined up against the same hour on the chart above/below it)
+  // straight off any one graph. `axisY` is where the ticks anchor — the bottom
+  // edge (H) for every non-negative chart, the MID divider for the diverging
+  // buy/sell and spend/income charts. `straddle` draws the tick centred on axisY
+  // (crossing a reference line drawn AT that y, e.g. the diverging chart's MID
+  // line) instead of poking up from it (the bottom-edge case, where anything
+  // below axisY would render outside the viewBox and get clipped).
+  _hourTicks(axisY, BAR, GAP, straddle = false) {
+    let s = '';
+    for (let h = 0; h < 24; h += 3) {
+      const x = (h * (BAR + GAP) + BAR / 2).toFixed(1);
+      const y0 = straddle ? axisY - 3 : axisY - 4;
+      const y1 = straddle ? axisY + 3 : axisY;
+      s += `<line x1="${x}" y1="${y0.toFixed(1)}" x2="${x}" y2="${y1.toFixed(1)}" stroke="var(--secondary-text-color)" stroke-width="1" opacity="0.4"/>`;
+    }
+    return s;
+  }
+
   // Invisible per-slot hit targets: a smoothed curve has no discrete bar to hover,
   // so a native <title> tooltip is carried by a transparent full-height rect per
   // slot instead — same hourly granularity the old per-bar <title> gave.
@@ -347,6 +368,7 @@ class GridLensCard extends HTMLElement {
         ${gradDef(dnGid, downColor, 0.82, 0)}
       </defs>
       <line x1="0" y1="${MID}" x2="${W}" y2="${MID}" stroke="var(--divider-color)" stroke-width="0.8"/>
+      ${this._hourTicks(MID, BAR, GAP, true)}
       <path d="${upLine} L${upLastX},${MID} L${upFirstX},${MID} Z" fill="url(#${upGid})"/>
       <path d="${dnLine} L${dnLastX},${MID} L${dnFirstX},${MID} Z" fill="url(#${dnGid})"/>
       <path d="${upLine}" fill="none" stroke="${upColor}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
@@ -412,6 +434,7 @@ class GridLensCard extends HTMLElement {
 
     return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
       ${bandsSvg}
+      ${this._hourTicks(H, BAR, GAP)}
       ${hovers}
     </svg>`;
   }
@@ -431,6 +454,7 @@ class GridLensCard extends HTMLElement {
       <defs>${gradDef(gid, GridLensCard.SOLAR_COLOR, 0.85, 1)}</defs>
       <path d="${line} L${lastX},${H} L${firstX},${H} Z" fill="url(#${gid})"/>
       <path d="${line}" fill="none" stroke="${GridLensCard.SOLAR_COLOR}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
+      ${this._hourTicks(H, BAR, GAP)}
       ${hovers}
     </svg>`;
   }
@@ -469,6 +493,7 @@ class GridLensCard extends HTMLElement {
       : '';
     return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
       ${zeroLine}
+      ${this._hourTicks(H, BAR, GAP)}
       ${line(imp, GridLensCard.SPEND_COLOR)}
       ${line(exp, GridLensCard.INCOME_COLOR)}
       ${dots(imp, GridLensCard.SPEND_COLOR, 'buy')}
@@ -549,6 +574,7 @@ class GridLensCard extends HTMLElement {
       <line x1="0" y1="${y20.toFixed(1)}" x2="${W}" y2="${y20.toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.5" stroke-dasharray="3,3"/>
       <path d="${line} L${lastX},${H} L${firstX},${H} Z" fill="url(#${gid})"/>
       <path d="${line}" fill="none" stroke="${GridLensCard.SOC_COLOR}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
+      ${this._hourTicks(H, BAR, GAP)}
       ${hovers}
     </svg>`;
   }
