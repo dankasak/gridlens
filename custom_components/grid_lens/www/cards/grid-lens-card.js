@@ -316,14 +316,16 @@ class GridLensCard extends HTMLElement {
 
   // ── Chart helpers ─────────────────────────────────────────────────────────
 
-  // Faint dashed vertical gridlines every 3 hours (0,3,6,9,noon,3pm,6pm,9pm) — added
-  // to EVERY individual chart so an hour position can be read, and lined up against
-  // the same hour on the chart above/below it, straight off any one graph. Same
-  // visual language as this file's existing reference lines (the diverging charts'
-  // MID divider, the SOC chart's 20/80% lines).
-  _hourTicks(H, BAR, GAP) {
+  // Faint dashed vertical gridlines — every 3 hours (0,3,6,9,noon,3pm,6pm,9pm) on the
+  // compact card, every hour once full-screen gives them room to breathe — added to
+  // EVERY individual chart so an hour position can be read, and lined up against the
+  // same hour on the chart above/below it, straight off any one graph. Same visual
+  // language as this file's existing reference lines (the diverging charts' MID
+  // divider, the SOC chart's 20/80% lines).
+  _hourTicks(H, BAR, GAP, isFullscreen = false) {
+    const everyH = isFullscreen ? 1 : 3;
     let s = '';
-    for (let h = 0; h < 24; h += 3) {
+    for (let h = 0; h < 24; h += everyH) {
       const x = (h * (BAR + GAP) + BAR / 2).toFixed(1);
       s += `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--divider-color)" stroke-width="0.6" stroke-dasharray="2,2" opacity="0.55"/>`;
     }
@@ -359,7 +361,7 @@ class GridLensCard extends HTMLElement {
     }).join('');
   }
 
-  renderDivergingChart(profile, upKey, downKey, maxVal, upColor, downColor, scale = 1) {
+  renderDivergingChart(profile, upKey, downKey, maxVal, upColor, downColor, scale = 1, isFullscreen = false) {
     if (!profile || !profile.length) return '';
     const W = 288, H = Math.round(80 * scale), BAR = 11, GAP = 1, MID = Math.round(38 * scale);
     const barScale = (MID - 3) / (maxVal || 1);
@@ -381,7 +383,7 @@ class GridLensCard extends HTMLElement {
       <line x1="0" y1="${MID}" x2="${W}" y2="${MID}" stroke="var(--divider-color)" stroke-width="0.8"/>
       <path d="${upLine} L${upLastX},${MID} L${upFirstX},${MID} Z" fill="url(#${upGid})"/>
       <path d="${dnLine} L${dnLastX},${MID} L${dnFirstX},${MID} Z" fill="url(#${dnGid})"/>
-      ${this._hourTicks(H, BAR, GAP)}
+      ${this._hourTicks(H, BAR, GAP, isFullscreen)}
       <path d="${upLine}" fill="none" stroke="${upColor}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
       <path d="${dnLine}" fill="none" stroke="${downColor}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
       ${hovers}
@@ -392,7 +394,7 @@ class GridLensCard extends HTMLElement {
   // device on top, each band bounded by two smoothed cumulative curves (its own bottom
   // = the previous layer's own top, computed from the SAME point arrays so the two
   // curves are pixel-identical and no seam shows between adjacent bands).
-  renderStackedBarChart(profile, maxVal, scale = 1, deferrable_devices = []) {
+  renderStackedBarChart(profile, maxVal, scale = 1, deferrable_devices = [], isFullscreen = false) {
     if (!profile || !profile.length) return '';
     const DEVICE_COLORS = GridLensCard.DEVICE_COLORS;
     const W = 288, H = Math.round(70 * scale), BAR = 11, GAP = 1;
@@ -445,12 +447,12 @@ class GridLensCard extends HTMLElement {
 
     return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
       ${bandsSvg}
-      ${this._hourTicks(H, BAR, GAP)}
+      ${this._hourTicks(H, BAR, GAP, isFullscreen)}
       ${hovers}
     </svg>${this._hourLabelRow()}`;
   }
 
-  renderSolarChart(profile, maxVal, scale = 1) {
+  renderSolarChart(profile, maxVal, scale = 1, isFullscreen = false) {
     if (!profile || !profile.length) return '';
     const W = 288, H = Math.round(55 * scale), BAR = 11, GAP = 1;
     const barScale = (H - 4) / (maxVal || 1);
@@ -465,7 +467,7 @@ class GridLensCard extends HTMLElement {
       <defs>${gradDef(gid, GridLensCard.SOLAR_COLOR, 0.85, 1)}</defs>
       <path d="${line} L${lastX},${H} L${firstX},${H} Z" fill="url(#${gid})"/>
       <path d="${line}" fill="none" stroke="${GridLensCard.SOLAR_COLOR}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
-      ${this._hourTicks(H, BAR, GAP)}
+      ${this._hourTicks(H, BAR, GAP, isFullscreen)}
       ${hovers}
     </svg>${this._hourLabelRow()}`;
   }
@@ -476,7 +478,7 @@ class GridLensCard extends HTMLElement {
   // Rates come from the profile slots (import_cost/import_kwh etc.), so an
   // hour with no grid flow at all reports 0; those points are dropped and
   // the line bridges the gap rather than diving to zero.
-  renderRateChart(profile, scale = 1) {
+  renderRateChart(profile, scale = 1, isFullscreen = false) {
     if (!profile || !profile.length) return '';
     const W = 288, H = Math.round(58 * scale), BAR = 11, GAP = 1, PAD = 3;
     const imp = profile.map(s => (s.import_rate || 0) * 100);
@@ -504,7 +506,7 @@ class GridLensCard extends HTMLElement {
       : '';
     return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
       ${zeroLine}
-      ${this._hourTicks(H, BAR, GAP)}
+      ${this._hourTicks(H, BAR, GAP, isFullscreen)}
       ${line(imp, GridLensCard.SPEND_COLOR)}
       ${line(exp, GridLensCard.INCOME_COLOR)}
       ${dots(imp, GridLensCard.SPEND_COLOR, 'buy')}
@@ -568,7 +570,7 @@ class GridLensCard extends HTMLElement {
       </div>`;
   }
 
-  renderSocChart(profile, scale = 1) {
+  renderSocChart(profile, scale = 1, isFullscreen = false) {
     if (!profile || !profile.length) return '';
     const W = 288, H = Math.round(50 * scale), BAR = 11, GAP = 1;
     const yOf = (soc) => H - (soc || 0) / 100 * (H - 4) - 2;
@@ -585,7 +587,7 @@ class GridLensCard extends HTMLElement {
       <line x1="0" y1="${y20.toFixed(1)}" x2="${W}" y2="${y20.toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.5" stroke-dasharray="3,3"/>
       <path d="${line} L${lastX},${H} L${firstX},${H} Z" fill="url(#${gid})"/>
       <path d="${line}" fill="none" stroke="${GridLensCard.SOC_COLOR}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
-      ${this._hourTicks(H, BAR, GAP)}
+      ${this._hourTicks(H, BAR, GAP, isFullscreen)}
       ${hovers}
     </svg>${this._hourLabelRow()}`;
   }
@@ -1609,7 +1611,7 @@ class GridLensCard extends HTMLElement {
               ${devLegend}
               &nbsp;(kWh)
             </div>
-            ${this.renderStackedBarChart(profile, loadSolarMax, scale, deferrable_devices)}` : '';
+            ${this.renderStackedBarChart(profile, loadSolarMax, scale, deferrable_devices, isFullscreen)}` : '';
 
         const solarChartHtml = hasSolar ? `
             <div class="chart-label" style="margin-top:10px">
@@ -1618,13 +1620,13 @@ class GridLensCard extends HTMLElement {
               <span style="font-weight:600"> solar</span>
               &nbsp;(kWh)
             </div>
-            ${this.renderSolarChart(profile, loadSolarMax, scale)}` : '';
+            ${this.renderSolarChart(profile, loadSolarMax, scale, isFullscreen)}` : '';
 
         const socChartHtml = hasSoc ? `
             <div class="chart-label" style="margin-top:10px">
               Avg battery SOC &nbsp;(%)
             </div>
-            ${this.renderSocChart(profile, scale)}` : '';
+            ${this.renderSocChart(profile, scale, isFullscreen)}` : '';
 
         // Price chart: only worth showing when the rate actually moves across
         // the day (spot / TOU plans). A flat single-rate plan would just draw a
@@ -1638,7 +1640,7 @@ class GridLensCard extends HTMLElement {
               <span style="color:${GridLensCard.SPEND_COLOR};font-weight:600">■ buy</span> &nbsp;
               <span style="color:${GridLensCard.INCOME_COLOR};font-weight:600">■ sell</span> &nbsp; (c/kWh)
             </div>
-            ${this.renderRateChart(profile, scale)}` : '';
+            ${this.renderRateChart(profile, scale, isFullscreen)}` : '';
 
         const spikesHtml = this.renderSpikes(details.spikes);
 
@@ -1651,13 +1653,13 @@ class GridLensCard extends HTMLElement {
               <span style="color:${GridLensCard.BUYING_COLOR};font-weight:600">■ buying</span> ↑ &nbsp;
               <span style="color:${GridLensCard.SELLING_COLOR};font-weight:600">■ selling</span> ↓ &nbsp; (kWh)
             </div>
-            ${this.renderDivergingChart(profile, 'import_kwh', 'export_kwh', maxKwh, GridLensCard.BUYING_COLOR, GridLensCard.SELLING_COLOR, scale)}
+            ${this.renderDivergingChart(profile, 'import_kwh', 'export_kwh', maxKwh, GridLensCard.BUYING_COLOR, GridLensCard.SELLING_COLOR, scale, isFullscreen)}
             <div class="chart-label" style="margin-top:10px">
               Average hourly cost &nbsp;
               <span style="color:${GridLensCard.SPEND_COLOR};font-weight:600">■ spend</span> ↑ &nbsp;
               <span style="color:${GridLensCard.INCOME_COLOR};font-weight:600">■ income</span> ↓ &nbsp; ($)
             </div>
-            ${this.renderDivergingChart(profile, 'import_cost', 'export_income', maxCost, GridLensCard.SPEND_COLOR, GridLensCard.INCOME_COLOR, scale)}
+            ${this.renderDivergingChart(profile, 'import_cost', 'export_income', maxCost, GridLensCard.SPEND_COLOR, GridLensCard.INCOME_COLOR, scale, isFullscreen)}
             ${rateChartHtml}
             ${spikesHtml}
             ${socChartHtml}
