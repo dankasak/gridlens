@@ -543,23 +543,21 @@ class GridLensCard extends HTMLElement {
   renderSocChart(profile, scale = 1) {
     if (!profile || !profile.length) return '';
     const W = 288, H = Math.round(50 * scale), BAR = 11, GAP = 1;
-    const pts = profile.map((slot, i) => {
-      const x = i * (BAR + GAP) + BAR / 2;
-      const y = H - (slot.soc_percent || 0) / 100 * (H - 4) - 2;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    }).join(' ');
-    const y20 = H - 20 / 100 * (H - 4) - 2;
-    const y80 = H - 80 / 100 * (H - 4) - 2;
+    const yOf = (soc) => H - (soc || 0) / 100 * (H - 4) - 2;
+    const pts = profile.map((slot, i) => [i * (BAR + GAP) + BAR / 2, yOf(slot.soc_percent)]);
+    const line = smoothPath(pts);
+    const firstX = pts[0][0].toFixed(1), lastX = pts[pts.length - 1][0].toFixed(1);
+    const gid = this._nextGid();
+    const y20 = yOf(20), y80 = yOf(80);
+    const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot) =>
+      `${slot.hour}:00  SOC ${(slot.soc_percent || 0).toFixed(0)}%`);
     return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="display:block;height:${H}px">
+      <defs>${gradDef(gid, GridLensCard.SOC_COLOR, 0.75, 1)}</defs>
       <line x1="0" y1="${y80.toFixed(1)}" x2="${W}" y2="${y80.toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.5" stroke-dasharray="3,3"/>
       <line x1="0" y1="${y20.toFixed(1)}" x2="${W}" y2="${y20.toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.5" stroke-dasharray="3,3"/>
-      <polyline points="${pts}" fill="none" stroke="${GridLensCard.SOC_COLOR}" stroke-width="1.5" stroke-linejoin="round"/>
-      ${profile.map((slot, i) => {
-        const x = i * (BAR + GAP) + BAR / 2;
-        const y = H - (slot.soc_percent || 0) / 100 * (H - 4) - 2;
-        return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2" fill="${GridLensCard.SOC_COLOR}">` +
-               `<title>${slot.hour}:00  SOC ${(slot.soc_percent||0).toFixed(0)}%</title></circle>`;
-      }).join('')}
+      <path d="${line} L${lastX},${H} L${firstX},${H} Z" fill="url(#${gid})"/>
+      <path d="${line}" fill="none" stroke="${GridLensCard.SOC_COLOR}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
+      ${hovers}
     </svg>`;
   }
 
@@ -1011,6 +1009,12 @@ class GridLensCard extends HTMLElement {
     const styles = `
       <style>
         :host { display: block; contain: content; }
+        /* contain:content (layout+paint) makes THIS element the containing block for
+           any position:fixed descendant — which silently clips the full-screen plan
+           breakout to this card's own small box instead of the viewport (only the
+           top sliver, e.g. the plan title + close button, ends up visible). Drop
+           containment for exactly as long as something is expanded. */
+        :host:has(.fullscreen-plan) { contain: none; }
         .plan-grid {
           display: grid;
           grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
