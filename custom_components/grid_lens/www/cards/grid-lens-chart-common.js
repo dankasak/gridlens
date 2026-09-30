@@ -1823,7 +1823,19 @@ export const STYLE = `
        accepted, documented gap as light mode (pre-existing/cross-card, mitigated by
        legend text + soc's own right-axis treatment). */
     --defer1:#fb7185; --defer2:#2dd4bf; --defer3:#6d57db; --defer4:#c32285;
-    --hotwater:#cbd5e1;
+    /* Re-picked 2026-09-30: the old #cbd5e1 sat ΔE 10.0 (normal vision, validate_palette.js)
+       from --load's dark-mode #f1f5f9 — both deliberately-desaturated neutrals pulled out
+       of the hue rotation, so nothing here was ever comparing them against EACH OTHER, only
+       against the categorical hues. That pairing only started to matter once a separate bug
+       (--load's dark-mode value never actually applying — see detectDark()) got fixed and
+       --load started rendering its real near-white instead of always-black. Reused the
+       LIGHT-mode value here instead of picking a new dark-specific one: a medium slate reads
+       fine on both a light and a dark surface (unlike solar/battery/etc, which genuinely
+       need brighter dark-mode variants for contrast), so there's no need to maintain a
+       separate value at all. Re-validated against the full dark-mode set (--pairs all):
+       clears every existing pair with room, and the palette's worst-case pairs are
+       unchanged from before this edit (defer2-vs-battery ΔE9.6, pre-existing/accepted). */
+    --hotwater:#94a3b8;
   }
   .card { background:var(--surface); border:1px solid var(--border); border-radius:14px;
           padding:16px 18px; font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
