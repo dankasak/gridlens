@@ -1,3 +1,5 @@
+import { smoothPath, gradDef } from './grid-lens-chart-common.js?v=20260930a';
+
 class GridLensCard extends HTMLElement {
   constructor() {
     super();
@@ -10,6 +12,12 @@ class GridLensCard extends HTMLElement {
     this._endDate = '';
     this._chartScale = 1.0;
     this._showHistory = false;
+    // Full-screen breakout — click a plan's cost banner to expand just that plan
+    // (bigger charts + fonts, dims/hides everything else). Holds the plan's key
+    // (same string as planDetails/plansToShow), or null when nothing is expanded.
+    this._fullscreenPlan = null;
+    this._onKeyDownBound = this._onKeyDown.bind(this);
+    this._escListenerAdded = false;
     this._retailerFilter = '';   // live retailer search box, applied as the user types
     this._excludeGreedy = false; // "exclude greedy consumption" checkbox — see setConfig
     this._topN = 5;              // "Show best N" declutter filter — see setConfig
@@ -67,6 +75,26 @@ class GridLensCard extends HTMLElement {
       const e = this._endDate   ? `${this._endDate}T23:59:59`   : null;
       this.fetchData(s, e);
     }
+  }
+
+  // Escape closes the full-screen plan breakout. Bound once in the constructor and
+  // registered on `document` (not the shadow root) the first time render() runs,
+  // guarded by _escListenerAdded — render() fires very often (every streamed plan
+  // result re-renders this card), so re-adding on every call would pile up duplicate
+  // document-level listeners for the lifetime of the element.
+  _onKeyDown(ev) {
+    if (ev.key === 'Escape' && this._fullscreenPlan) {
+      this._fullscreenPlan = null;
+      this.render();
+    }
+  }
+
+  // Unique id for an inline <svg>'s <linearGradient>, scoped to one render() pass.
+  // Every hourly chart across every plan-card lives in the SAME shadow root, so ids
+  // must be unique across the whole render, not just within one chart's own <svg>.
+  _nextGid() {
+    this._gidCounter = (this._gidCounter || 0) + 1;
+    return `epcgrad${this._gidCounter}`;
   }
 
   // Fragment identifying the currently-applied What-If override, if any — folded
@@ -296,71 +324,103 @@ class GridLensCard extends HTMLElement {
 
   // ── Chart helpers ─────────────────────────────────────────────────────────
 
+  // Invisible per-slot hit targets: a smoothed curve has no discrete bar to hover,
+  // so a native <title> tooltip is carried by a transparent full-height rect per
+  // slot instead — same hourly granularity the old per-bar <title> gave.
+  _chartHovers(profile, W, H, BAR, GAP, titleFor) {
+    return profile.map((slot, i) => {
+      const x = i * (BAR + GAP);
+      return `<rect x="${x}" y="0" width="${(BAR + GAP).toFixed(1)}" height="${H}" fill="transparent">` +
+             `<title>${titleFor(slot, i)}</title></rect>`;
+    }).join('');
+  }
+
   renderDivergingChart(profile, upKey, downKey, maxVal, upColor, downColor, scale = 1) {
     if (!profile || !profile.length) return '';
     const W = 288, H = Math.round(80 * scale), BAR = 11, GAP = 1, MID = Math.round(38 * scale);
     const barScale = (MID - 3) / (maxVal || 1);
-    const bars = profile.map((slot, i) => {
-      const x = i * (BAR + GAP);
-      const upH = Math.min(Math.max(slot[upKey] * barScale, 0), MID - 3);
-      const dnH = Math.min(Math.max(slot[downKey] * barScale, 0), H - MID - 3);
-      const parts = [];
-      if (upH > 0.3) parts.push(
-        `<rect x="${x}" y="${MID - upH}" width="${BAR}" height="${upH}" fill="${upColor}">` +
-        `<title>${slot.hour}:00  ${slot[upKey].toFixed(3)}</title></rect>`
-      );
-      if (dnH > 0.3) parts.push(
-        `<rect x="${x}" y="${MID}" width="${BAR}" height="${dnH}" fill="${downColor}">` +
-        `<title>${slot.hour}:00  ${slot[downKey].toFixed(3)}</title></rect>`
-      );
-      return parts.join('');
-    }).join('');
+    const upPts = profile.map((slot, i) =>
+      [i * (BAR + GAP) + BAR / 2, MID - Math.min(Math.max(slot[upKey] * barScale, 0), MID - 3)]);
+    const dnPts = profile.map((slot, i) =>
+      [i * (BAR + GAP) + BAR / 2, MID + Math.min(Math.max(slot[downKey] * barScale, 0), H - MID - 3)]);
+    const upLine = smoothPath(upPts), dnLine = smoothPath(dnPts);
+    const upFirstX = upPts[0][0].toFixed(1), upLastX = upPts[upPts.length - 1][0].toFixed(1);
+    const dnFirstX = dnPts[0][0].toFixed(1), dnLastX = dnPts[dnPts.length - 1][0].toFixed(1);
+    const upGid = this._nextGid(), dnGid = this._nextGid();
+    const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot) =>
+      `${slot.hour}:00  ${slot[upKey].toFixed(3)} / ${slot[downKey].toFixed(3)}`);
     return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="display:block;height:${H}px">
+      <defs>
+        ${gradDef(upGid, upColor, 0.82, 1)}
+        ${gradDef(dnGid, downColor, 0.82, 0)}
+      </defs>
       <line x1="0" y1="${MID}" x2="${W}" y2="${MID}" stroke="var(--divider-color)" stroke-width="0.8"/>
-      ${bars}
+      <path d="${upLine} L${upLastX},${MID} L${upFirstX},${MID} Z" fill="url(#${upGid})"/>
+      <path d="${dnLine} L${dnLastX},${MID} L${dnFirstX},${MID} Z" fill="url(#${dnGid})"/>
+      <path d="${upLine}" fill="none" stroke="${upColor}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
+      <path d="${dnLine}" fill="none" stroke="${downColor}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
+      ${hovers}
     </svg>`;
   }
 
+  // Stacked SMOOTH area chart: household on the bottom, then one band per deferrable
+  // device on top, each band bounded by two smoothed cumulative curves (its own bottom
+  // = the previous layer's own top, computed from the SAME point arrays so the two
+  // curves are pixel-identical and no seam shows between adjacent bands).
   renderStackedBarChart(profile, maxVal, scale = 1, deferrable_devices = []) {
     if (!profile || !profile.length) return '';
     const DEVICE_COLORS = GridLensCard.DEVICE_COLORS;
     const W = 288, H = Math.round(70 * scale), BAR = 11, GAP = 1;
     const barScale = (H - 4) / (maxVal || 1);
-    const bars = profile.map((slot, i) => {
-      const x = i * (BAR + GAP);
-      const homeH = Math.min(Math.max((slot.home_load_kwh || 0) * barScale, 0), H - 4);
-      const perDev = slot.deferrable_per_device || [];
-      const total = (slot.home_load_kwh||0) + perDev.reduce((s, v) => s + v, 0) || (slot.deferrable_kwh||0);
-      const parts = [];
-      if (homeH > 0.3) parts.push(
-        `<rect x="${x}" y="${H - homeH}" width="${BAR}" height="${homeH}" fill="${GridLensCard.HOUSEHOLD_COLOR}">` +
-        `<title>${slot.hour}:00  Household ${(slot.home_load_kwh||0).toFixed(3)} kWh\nTotal ${total.toFixed(3)} kWh</title></rect>`
-      );
-      let stackTop = homeH;
-      if (perDev.length > 0) {
-        perDev.forEach((kw, ii) => {
-          const devH = Math.min(Math.max(kw * barScale, 0), H - 4 - stackTop);
-          if (devH > 0.3) {
-            const devName = (deferrable_devices[ii] && deferrable_devices[ii].name) || `Device ${ii + 1}`;
-            const col = DEVICE_COLORS[ii % DEVICE_COLORS.length];
-            parts.push(
-              `<rect x="${x}" y="${H - stackTop - devH}" width="${BAR}" height="${devH}" fill="${col}">` +
-              `<title>${slot.hour}:00  ${devName} ${kw.toFixed(3)} kWh\nTotal ${total.toFixed(3)} kWh</title></rect>`
-            );
-            stackTop += devH;
-          }
-        });
-      } else {
-        const defH = Math.min(Math.max((slot.deferrable_kwh || 0) * barScale, 0), H - 4 - stackTop);
-        if (defH > 0.3) parts.push(
-          `<rect x="${x}" y="${H - stackTop - defH}" width="${BAR}" height="${defH}" fill="${DEVICE_COLORS[0]}">` +
-          `<title>${slot.hour}:00  Deferrable ${(slot.deferrable_kwh||0).toFixed(3)} kWh\nTotal ${total.toFixed(3)} kWh</title></rect>`
-        );
-      }
-      return parts.join('');
-    }).join('');
+
+    const usePerDevice = profile.some(s => (s.deferrable_per_device || []).length > 0);
+    const deviceCount = usePerDevice
+      ? Math.max(deferrable_devices.length, ...profile.map(s => (s.deferrable_per_device || []).length))
+      : (profile.some(s => (s.deferrable_kwh || 0) > 0.01) ? 1 : 0);
+
+    const layers = [{
+      color: GridLensCard.HOUSEHOLD_COLOR,
+      name: 'Household',
+      vals: profile.map(s => s.home_load_kwh || 0),
+    }];
+    for (let ii = 0; ii < deviceCount; ii++) {
+      layers.push({
+        color: DEVICE_COLORS[ii % DEVICE_COLORS.length],
+        name: (deferrable_devices[ii] && deferrable_devices[ii].name) || `Device ${ii + 1}`,
+        vals: profile.map(s => usePerDevice
+          ? ((s.deferrable_per_device || [])[ii] || 0)
+          : (ii === 0 ? (s.deferrable_kwh || 0) : 0)),
+      });
+    }
+
+    const xAt = (i) => i * (BAR + GAP) + BAR / 2;
+    const yAt = (v) => H - Math.min(Math.max(v * barScale, 0), H - 4);
+
+    let cum = profile.map(() => 0);
+    let bandsSvg = '';
+    const hoverLines = profile.map(() => []);
+    layers.forEach((layer) => {
+      const top = cum.map((b, i) => b + layer.vals[i]);
+      const topPts = top.map((v, i) => [xAt(i), yAt(v)]);
+      const botPts = cum.map((v, i) => [xAt(i), yAt(v)]);
+      const topLine = smoothPath(topPts);
+      const botLineRev = smoothPath([...botPts].reverse()).replace(/^M/, 'L');
+      const gid = this._nextGid();
+      bandsSvg += `<defs>${gradDef(gid, layer.color, 0.8, 1)}</defs>`;
+      bandsSvg += `<path d="${topLine}${botLineRev} Z" fill="url(#${gid})"/>`;
+      bandsSvg += `<path d="${topLine}" fill="none" stroke="${layer.color}" stroke-width="1.2" stroke-linejoin="round" opacity="0.95"/>`;
+      profile.forEach((slot, i) => {
+        if (layer.vals[i] > 0.0005) hoverLines[i].push(`${layer.name} ${layer.vals[i].toFixed(3)} kWh`);
+      });
+      cum = top;
+    });
+    const totals = cum;
+    const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot, i) =>
+      `${slot.hour}:00\n${hoverLines[i].join('\n')}\nTotal ${totals[i].toFixed(3)} kWh`);
+
     return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="display:block;height:${H}px">
-      ${bars}
+      ${bandsSvg}
+      ${hovers}
     </svg>`;
   }
 
@@ -368,15 +428,18 @@ class GridLensCard extends HTMLElement {
     if (!profile || !profile.length) return '';
     const W = 288, H = Math.round(55 * scale), BAR = 11, GAP = 1;
     const barScale = (H - 4) / (maxVal || 1);
-    const bars = profile.map((slot, i) => {
-      const x = i * (BAR + GAP);
-      const solH = Math.min(Math.max((slot.solar_kwh || 0) * barScale, 0), H - 4);
-      if (solH < 0.3) return '';
-      return `<rect x="${x}" y="${H - solH}" width="${BAR}" height="${solH}" fill="${GridLensCard.SOLAR_COLOR}">` +
-             `<title>${slot.hour}:00  Solar ${(slot.solar_kwh||0).toFixed(3)} kWh</title></rect>`;
-    }).join('');
+    const pts = profile.map((slot, i) =>
+      [i * (BAR + GAP) + BAR / 2, H - Math.min(Math.max((slot.solar_kwh || 0) * barScale, 0), H - 4)]);
+    const line = smoothPath(pts);
+    const firstX = pts[0][0].toFixed(1), lastX = pts[pts.length - 1][0].toFixed(1);
+    const gid = this._nextGid();
+    const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot) =>
+      `${slot.hour}:00  Solar ${(slot.solar_kwh || 0).toFixed(3)} kWh`);
     return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="display:block;height:${H}px">
-      ${bars}
+      <defs>${gradDef(gid, GridLensCard.SOLAR_COLOR, 0.85, 1)}</defs>
+      <path d="${line} L${lastX},${H} L${firstX},${H} Z" fill="url(#${gid})"/>
+      <path d="${line}" fill="none" stroke="${GridLensCard.SOLAR_COLOR}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
+      ${hovers}
     </svg>`;
   }
 
@@ -943,6 +1006,7 @@ class GridLensCard extends HTMLElement {
     const showCharts = this._config.show_charts !== false;
     const chartScale = this._chartScale * (parseFloat(this._config.chart_scale) || 1.0);
     const planFilter = this._config.plan;
+    this._gidCounter = 0;  // every chart's gradient ids must be unique across this whole render pass
 
     const styles = `
       <style>
@@ -1225,6 +1289,66 @@ class GridLensCard extends HTMLElement {
           border: 1px solid var(--divider-color); border-radius: 4px;
           padding: 3px 10px; cursor: pointer; font-size: 12px; white-space: nowrap;
         }
+        /* Full-screen plan breakout — click a plan's cost banner (below) to expand
+           just that one plan-card over the whole viewport, charts and all. */
+        .cost-display {
+          cursor: pointer;
+          position: relative;
+          transition: filter 0.15s ease, transform 0.1s ease;
+        }
+        .cost-display:hover { filter: brightness(1.08); }
+        .cost-display:active { transform: scale(0.99); }
+        .cost-display::after {
+          content: "⛶";
+          position: absolute; top: 8px; right: 10px;
+          font-size: 13px; opacity: 0.7;
+        }
+        .plan-card.fs-hidden { display: none; }
+        .fs-backdrop {
+          position: fixed; inset: 0; z-index: 999;
+          background: rgba(0,0,0,0.62);
+          backdrop-filter: blur(2px);
+        }
+        .plan-card.fullscreen-plan {
+          position: fixed;
+          top: 3vh; left: 3vw; right: 3vw; bottom: 3vh;
+          z-index: 1000;
+          overflow-y: auto;
+          box-shadow: 0 12px 48px rgba(0,0,0,0.55);
+          border-radius: 14px;
+          padding: 28px 32px 32px;
+        }
+        .fs-close-btn {
+          position: fixed;
+          top: calc(3vh + 14px); right: calc(3vw + 14px);
+          z-index: 1001;
+          background: var(--secondary-background-color);
+          color: var(--primary-text-color);
+          border: 1px solid var(--divider-color);
+          border-radius: 6px;
+          padding: 7px 16px;
+          font-size: 14px; font-weight: 500;
+          cursor: pointer;
+          box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+        }
+        .fs-close-btn:hover { filter: brightness(1.1); }
+        /* Everything inside an expanded plan reads bigger, not just its charts —
+           the point is a whole-card "presentation mode", not just zoomed graphs. */
+        .plan-card.fullscreen-plan .plan-title { font-size: 26px; margin-bottom: 16px; }
+        .plan-card.fullscreen-plan .cost-display { padding: 28px; margin: 18px 0; }
+        .plan-card.fullscreen-plan .cost-display::after { font-size: 20px; top: 14px; right: 16px; }
+        .plan-card.fullscreen-plan .cost-amount { font-size: 56px; }
+        .plan-card.fullscreen-plan .cost-label { font-size: 16px; }
+        .plan-card.fullscreen-plan .chart-section { margin-top: 24px; }
+        .plan-card.fullscreen-plan .chart-label { font-size: 15px; margin-bottom: 6px; }
+        .plan-card.fullscreen-plan .breakdown-title { font-size: 18px; }
+        .plan-card.fullscreen-plan .breakdown-row { font-size: 16px; padding: 9px 0; }
+        .plan-card.fullscreen-plan .bill-total-row { font-size: 19px; }
+        .plan-card.fullscreen-plan .bill-gst-row { font-size: 14px; }
+        .plan-card.fullscreen-plan .bill-section-head { font-size: 12px; }
+        .plan-card.fullscreen-plan .strategy-box { padding: 18px; }
+        .plan-card.fullscreen-plan .strategy-title { font-size: 17px; }
+        .plan-card.fullscreen-plan .strategy-text { font-size: 15px; }
       </style>
     `;
 
@@ -1323,6 +1447,12 @@ class GridLensCard extends HTMLElement {
       const total = breakdown.total || 0;
       const savings = total - currentPlanTotal;
       const isCheaper = savings < -0.05;
+      // Full-screen breakout, triggered by clicking this plan's cost banner below.
+      // Only affects this one card's own chart scale/markup — untouched plans in
+      // the grid keep rendering normally, just hidden behind the fs-hidden class
+      // while a plan is expanded.
+      const isFullscreen = planName === this._fullscreenPlan;
+      const scale = isFullscreen ? chartScale * 2.1 : chartScale;
 
       // Banner colour: amber=current, deep-cyan=cheapest, green=cheaper, red=more expensive
       // — same hexes as the household/SOC/selling/spend chart roles below, kept in sync
@@ -1426,7 +1556,7 @@ class GridLensCard extends HTMLElement {
               ${devLegend}
               &nbsp;(kWh)
             </div>
-            ${this.renderStackedBarChart(profile, loadSolarMax, chartScale, deferrable_devices)}` : '';
+            ${this.renderStackedBarChart(profile, loadSolarMax, scale, deferrable_devices)}` : '';
 
         const solarChartHtml = hasSolar ? `
             <div class="chart-label" style="margin-top:10px">
@@ -1435,13 +1565,13 @@ class GridLensCard extends HTMLElement {
               <span style="font-weight:600"> solar</span>
               &nbsp;(kWh)
             </div>
-            ${this.renderSolarChart(profile, loadSolarMax, chartScale)}` : '';
+            ${this.renderSolarChart(profile, loadSolarMax, scale)}` : '';
 
         const socChartHtml = hasSoc ? `
             <div class="chart-label" style="margin-top:10px">
               Avg battery SOC &nbsp;(%)
             </div>
-            ${this.renderSocChart(profile, chartScale)}` : '';
+            ${this.renderSocChart(profile, scale)}` : '';
 
         // Price chart: only worth showing when the rate actually moves across
         // the day (spot / TOU plans). A flat single-rate plan would just draw a
@@ -1455,7 +1585,7 @@ class GridLensCard extends HTMLElement {
               <span style="color:${GridLensCard.SPEND_COLOR};font-weight:600">■ buy</span> &nbsp;
               <span style="color:${GridLensCard.INCOME_COLOR};font-weight:600">■ sell</span> &nbsp; (c/kWh)
             </div>
-            ${this.renderRateChart(profile, chartScale)}` : '';
+            ${this.renderRateChart(profile, scale)}` : '';
 
         const spikesHtml = this.renderSpikes(details.spikes);
 
@@ -1468,13 +1598,13 @@ class GridLensCard extends HTMLElement {
               <span style="color:${GridLensCard.BUYING_COLOR};font-weight:600">■ buying</span> ↑ &nbsp;
               <span style="color:${GridLensCard.SELLING_COLOR};font-weight:600">■ selling</span> ↓ &nbsp; (kWh)
             </div>
-            ${this.renderDivergingChart(profile, 'import_kwh', 'export_kwh', maxKwh, GridLensCard.BUYING_COLOR, GridLensCard.SELLING_COLOR, chartScale)}
+            ${this.renderDivergingChart(profile, 'import_kwh', 'export_kwh', maxKwh, GridLensCard.BUYING_COLOR, GridLensCard.SELLING_COLOR, scale)}
             <div class="chart-label" style="margin-top:10px">
               Average hourly cost &nbsp;
               <span style="color:${GridLensCard.SPEND_COLOR};font-weight:600">■ spend</span> ↑ &nbsp;
               <span style="color:${GridLensCard.INCOME_COLOR};font-weight:600">■ income</span> ↓ &nbsp; ($)
             </div>
-            ${this.renderDivergingChart(profile, 'import_cost', 'export_income', maxCost, GridLensCard.SPEND_COLOR, GridLensCard.INCOME_COLOR, chartScale)}
+            ${this.renderDivergingChart(profile, 'import_cost', 'export_income', maxCost, GridLensCard.SPEND_COLOR, GridLensCard.INCOME_COLOR, scale)}
             ${rateChartHtml}
             ${spikesHtml}
             ${socChartHtml}
@@ -1490,10 +1620,12 @@ class GridLensCard extends HTMLElement {
           <div class="strategy-text">${details.strategy}</div>
         </div>` : '';
 
+      const fsClass = isFullscreen ? ' fullscreen-plan' : (this._fullscreenPlan ? ' fs-hidden' : '');
       return `
-        <div class="plan-card${isCurrentPlan ? ' current-plan' : ''}" data-retailer="${_esc(_retailerOf(planName))}">
+        <div class="plan-card${isCurrentPlan ? ' current-plan' : ''}${fsClass}" data-retailer="${_esc(_retailerOf(planName))}" data-plan="${_esc(planName)}">
+          ${isFullscreen ? `<button class="fs-close-btn" id="epc-fs-close" title="Close full screen (Esc)">✕ Close</button>` : ''}
           <div class="plan-title">${planName}</div>
-          <div class="cost-display" style="background:${bannerColor}">
+          <div class="cost-display" style="background:${bannerColor}" title="Click to view this plan full-screen">
             <div class="cost-amount">$${total.toFixed(2)}</div>
             <div class="cost-label">${savingsLabel}</div>
           </div>
@@ -1613,9 +1745,14 @@ class GridLensCard extends HTMLElement {
     // flat single-grid view above, just with the same "Show best N" filter
     // already applied to `plansToShow`.
     const periodsArr = this._data.periods || [];
+    // Backdrop only makes sense behind the flat grid — a period section has no
+    // hourly charts to expand (see _renderPeriodPlanCard), so nothing there can
+    // set _fullscreenPlan in the first place.
+    const fsBackdropHtml = (this._fullscreenPlan && periodsArr.length <= 1)
+      ? `<div class="fs-backdrop" id="epc-fs-backdrop"></div>` : '';
     const periodsHtml = (periodsArr.length > 1)
       ? periodsArr.map(p => this._renderPeriodSection(p, topN, showBreakdown)).join('')
-      : `<div class="plan-grid">${plansHtml}${skeletonsHtml}</div>`;
+      : `${fsBackdropHtml}<div class="plan-grid">${plansHtml}${skeletonsHtml}</div>`;
 
     const bodyHtml = this._showHistory
       ? this.renderHistoryPanel(planNames)
@@ -1824,6 +1961,29 @@ class GridLensCard extends HTMLElement {
           if (confirm('Delete this plan change entry?')) await this.deleteHistoryEntry(btn.dataset.id);
         });
       });
+    }
+
+    // Full-screen plan breakout — click a plan's cost banner to expand it, click it
+    // again (or the ✕, or the backdrop, or Escape) to close.
+    this.shadowRoot.querySelectorAll('.plan-card .cost-display').forEach((el) => {
+      el.addEventListener('click', () => {
+        const plan = el.closest('.plan-card')?.dataset.plan;
+        if (!plan) return;
+        this._fullscreenPlan = (this._fullscreenPlan === plan) ? null : plan;
+        this.render();
+      });
+    });
+    this.shadowRoot.getElementById('epc-fs-close')?.addEventListener('click', () => {
+      this._fullscreenPlan = null;
+      this.render();
+    });
+    this.shadowRoot.getElementById('epc-fs-backdrop')?.addEventListener('click', () => {
+      this._fullscreenPlan = null;
+      this.render();
+    });
+    if (!this._escListenerAdded) {
+      document.addEventListener('keydown', this._onKeyDownBound);
+      this._escListenerAdded = true;
     }
   }
 
