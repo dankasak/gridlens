@@ -316,30 +316,36 @@ class GridLensCard extends HTMLElement {
 
   // ── Chart helpers ─────────────────────────────────────────────────────────
 
-  // Faint dashed vertical gridlines every 3 hours (0,3,6,9,noon,3pm,6pm,9pm), each
-  // with its own "12a/3a/…/9p" label — added to EVERY individual chart (there used
-  // to be one shared caption after the whole stack instead; removed as redundant
-  // now every chart carries its own) so an hour position can be read, and lined up
-  // against the same hour on the chart above/below it, straight off any one graph.
-  // Lines span the chart's own plot height H (same visual language as this file's
-  // existing reference lines — the diverging charts' MID divider, the SOC chart's
-  // 20/80% lines); labels sit in a separate strip BELOW H so text never overlaps a
-  // data curve — the caller extends its viewBox/rendered height by the returned
-  // stripH and appends `labels` there. Returns {ticks, labels, stripH} rather than
-  // one string since ticks are drawn by the caller right after its area fills (so
-  // they paint on top and stay visible), while labels are appended last of all.
-  _hourAxis(H, BAR, GAP, scale = 1) {
-    const stripH = Math.max(9, Math.round(10 * scale));
-    const fontSize = Math.max(7, Math.round(8 * scale));
-    const labelY = (H + stripH - 2).toFixed(1);
-    let ticks = '', labels = '';
+  // Faint dashed vertical gridlines every 3 hours (0,3,6,9,noon,3pm,6pm,9pm) — added
+  // to EVERY individual chart so an hour position can be read, and lined up against
+  // the same hour on the chart above/below it, straight off any one graph. Same
+  // visual language as this file's existing reference lines (the diverging charts'
+  // MID divider, the SOC chart's 20/80% lines).
+  _hourTicks(H, BAR, GAP) {
+    let s = '';
     for (let h = 0; h < 24; h += 3) {
       const x = (h * (BAR + GAP) + BAR / 2).toFixed(1);
-      ticks += `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--divider-color)" stroke-width="0.6" stroke-dasharray="2,2" opacity="0.55"/>`;
-      const label = h === 0 ? '12a' : h === 12 ? '12p' : (h < 12 ? `${h}a` : `${h - 12}p`);
-      labels += `<text x="${x}" y="${labelY}" text-anchor="middle" font-size="${fontSize}" fill="var(--secondary-text-color)">${label}</text>`;
+      s += `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--divider-color)" stroke-width="0.6" stroke-dasharray="2,2" opacity="0.55"/>`;
     }
-    return { ticks, labels, stripH };
+    return s;
+  }
+
+  // Hour labels ("12a"…"9p") for the ticks above — deliberately plain HTML, not SVG
+  // <text> inside the chart: every mini-chart's viewBox is a fixed 288 units wide but
+  // renders at width:100% with preserveAspectRatio="none" (so it stretches to fill
+  // whatever the card gives it — see the "charts should take up all horizontal
+  // space" full-screen fix). That stretch is only ~1:1 on the compact card (whose
+  // container is close to 288px already) but ~5x on a full-screen dialog — and
+  // because it's non-uniform (only horizontal, matching W:288 → a much wider box),
+  // SVG text sized in the same viewBox units gets stretched sideways by that same
+  // ~5x, rendering wildly oversized in full-screen regardless of what font-size is
+  // picked. Plain HTML text below the chart isn't part of that coordinate system,
+  // so it sizes normally — and picks up the same modest fullscreen bump as every
+  // other caption via the .fullscreen-plan .hour-axis rule.
+  _hourLabelRow() {
+    return `<div class="hour-axis">
+      <span>12a</span><span>3a</span><span>6a</span><span>9a</span><span>12p</span><span>3p</span><span>6p</span><span>9p</span>
+    </div>`;
   }
 
   // Invisible per-slot hit targets: a smoothed curve has no discrete bar to hover,
@@ -367,9 +373,7 @@ class GridLensCard extends HTMLElement {
     const upGid = this._nextGid(), dnGid = this._nextGid();
     const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot) =>
       `${slot.hour}:00  ${slot[upKey].toFixed(3)} / ${slot[downKey].toFixed(3)}`);
-    const { ticks, labels, stripH } = this._hourAxis(H, BAR, GAP, scale);
-    const totalH = H + stripH;
-    return `<svg width="100%" viewBox="0 0 ${W} ${totalH}" preserveAspectRatio="none" style="display:block;height:${totalH}px">
+    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
       <defs>
         ${gradDef(upGid, upColor, 0.82, 1)}
         ${gradDef(dnGid, downColor, 0.82, 0)}
@@ -377,12 +381,11 @@ class GridLensCard extends HTMLElement {
       <line x1="0" y1="${MID}" x2="${W}" y2="${MID}" stroke="var(--divider-color)" stroke-width="0.8"/>
       <path d="${upLine} L${upLastX},${MID} L${upFirstX},${MID} Z" fill="url(#${upGid})"/>
       <path d="${dnLine} L${dnLastX},${MID} L${dnFirstX},${MID} Z" fill="url(#${dnGid})"/>
-      ${ticks}
+      ${this._hourTicks(H, BAR, GAP)}
       <path d="${upLine}" fill="none" stroke="${upColor}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
       <path d="${dnLine}" fill="none" stroke="${downColor}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
       ${hovers}
-      ${labels}
-    </svg>`;
+    </svg>${this._hourLabelRow()}`;
   }
 
   // Stacked SMOOTH area chart: household on the bottom, then one band per deferrable
@@ -439,15 +442,12 @@ class GridLensCard extends HTMLElement {
     const totals = cum;
     const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot, i) =>
       `${slot.hour}:00\n${hoverLines[i].join('\n')}\nTotal ${totals[i].toFixed(3)} kWh`);
-    const { ticks, labels, stripH } = this._hourAxis(H, BAR, GAP, scale);
-    const totalH = H + stripH;
 
-    return `<svg width="100%" viewBox="0 0 ${W} ${totalH}" preserveAspectRatio="none" style="display:block;height:${totalH}px">
+    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
       ${bandsSvg}
-      ${ticks}
+      ${this._hourTicks(H, BAR, GAP)}
       ${hovers}
-      ${labels}
-    </svg>`;
+    </svg>${this._hourLabelRow()}`;
   }
 
   renderSolarChart(profile, maxVal, scale = 1) {
@@ -461,16 +461,13 @@ class GridLensCard extends HTMLElement {
     const gid = this._nextGid();
     const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot) =>
       `${slot.hour}:00  Solar ${(slot.solar_kwh || 0).toFixed(3)} kWh`);
-    const { ticks, labels, stripH } = this._hourAxis(H, BAR, GAP, scale);
-    const totalH = H + stripH;
-    return `<svg width="100%" viewBox="0 0 ${W} ${totalH}" preserveAspectRatio="none" style="display:block;height:${totalH}px">
+    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
       <defs>${gradDef(gid, GridLensCard.SOLAR_COLOR, 0.85, 1)}</defs>
       <path d="${line} L${lastX},${H} L${firstX},${H} Z" fill="url(#${gid})"/>
       <path d="${line}" fill="none" stroke="${GridLensCard.SOLAR_COLOR}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
-      ${ticks}
+      ${this._hourTicks(H, BAR, GAP)}
       ${hovers}
-      ${labels}
-    </svg>`;
+    </svg>${this._hourLabelRow()}`;
   }
 
   // Average hourly buy/sell PRICE (c/kWh) over the day. Two polylines —
@@ -505,17 +502,14 @@ class GridLensCard extends HTMLElement {
     const zeroLine = lo < 0
       ? `<line x1="0" y1="${y(0).toFixed(1)}" x2="${W}" y2="${y(0).toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.8"/>`
       : '';
-    const { ticks, labels, stripH } = this._hourAxis(H, BAR, GAP, scale);
-    const totalH = H + stripH;
-    return `<svg width="100%" viewBox="0 0 ${W} ${totalH}" preserveAspectRatio="none" style="display:block;height:${totalH}px">
+    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
       ${zeroLine}
-      ${ticks}
+      ${this._hourTicks(H, BAR, GAP)}
       ${line(imp, GridLensCard.SPEND_COLOR)}
       ${line(exp, GridLensCard.INCOME_COLOR)}
       ${dots(imp, GridLensCard.SPEND_COLOR, 'buy')}
       ${dots(exp, GridLensCard.INCOME_COLOR, 'sell')}
-      ${labels}
-    </svg>`;
+    </svg>${this._hourLabelRow()}`;
   }
 
   // "Wed 20 Aug, 10pm" — compact enough for a one-line spike row.
@@ -585,18 +579,15 @@ class GridLensCard extends HTMLElement {
     const y20 = yOf(20), y80 = yOf(80);
     const hovers = this._chartHovers(profile, W, H, BAR, GAP, (slot) =>
       `${slot.hour}:00  SOC ${(slot.soc_percent || 0).toFixed(0)}%`);
-    const { ticks, labels, stripH } = this._hourAxis(H, BAR, GAP, scale);
-    const totalH = H + stripH;
-    return `<svg width="100%" viewBox="0 0 ${W} ${totalH}" preserveAspectRatio="none" style="display:block;height:${totalH}px">
+    return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;height:${H}px">
       <defs>${gradDef(gid, GridLensCard.SOC_COLOR, 0.75, 1)}</defs>
       <line x1="0" y1="${y80.toFixed(1)}" x2="${W}" y2="${y80.toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.5" stroke-dasharray="3,3"/>
       <line x1="0" y1="${y20.toFixed(1)}" x2="${W}" y2="${y20.toFixed(1)}" stroke="var(--divider-color)" stroke-width="0.5" stroke-dasharray="3,3"/>
       <path d="${line} L${lastX},${H} L${firstX},${H} Z" fill="url(#${gid})"/>
       <path d="${line}" fill="none" stroke="${GridLensCard.SOC_COLOR}" stroke-width="1.5" stroke-linejoin="round" opacity="0.95"/>
-      ${ticks}
+      ${this._hourTicks(H, BAR, GAP)}
       ${hovers}
-      ${labels}
-    </svg>`;
+    </svg>${this._hourLabelRow()}`;
   }
 
   // Diagonal hazard-stripe flag shown under an alternative plan's charts whenever
@@ -1157,6 +1148,14 @@ class GridLensCard extends HTMLElement {
           color: var(--secondary-text-color);
           margin-bottom: 3px;
         }
+        /* Plain HTML, not SVG text — see _hourLabelRow()'s comment for why. */
+        .hour-axis {
+          display: flex;
+          justify-content: space-between;
+          font-size: 9px;
+          color: var(--secondary-text-color);
+          margin: 1px 0 8px;
+        }
         .strategy-box {
           background: var(--secondary-background-color);
           padding: 12px;
@@ -1387,6 +1386,7 @@ class GridLensCard extends HTMLElement {
         .fullscreen-plan .cost-label { font-size: 16px; }
         .fullscreen-plan .chart-section { margin-top: 24px; }
         .fullscreen-plan .chart-label { font-size: 15px; margin-bottom: 6px; }
+        .fullscreen-plan .hour-axis { font-size: 12px; }
         /* Left un-constrained, .breakdown-row's existing flex + space-between (label
            flex:1, value margin-left) stretches across the dialog's full ~90vw width,
            spreading each line's description and amount to opposite edges of the
