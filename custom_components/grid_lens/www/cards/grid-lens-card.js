@@ -634,6 +634,11 @@ class GridLensCard extends HTMLElement {
     return String(key).split(' - ')[0].trim();
   }
 
+  _planNameOf(key) {
+    const idx = String(key).indexOf(' - ');
+    return idx === -1 ? '' : String(key).slice(idx + 3).trim();
+  }
+
   // "9 Sep" or "9 – 14 Sep" for a bill_items segment's date range. seg_end from
   // the backend is exclusive (half-open, see _plan_history_segments) — the last
   // real day covered is one day earlier, so that's what gets shown as the end.
@@ -840,7 +845,10 @@ class GridLensCard extends HTMLElement {
       </div>` : '';
     return `
       <div class="plan-card period-plan-card${isCurrentPlan ? ' current-plan' : ''}" data-retailer="${this._esc(this._retailerOf(planName))}">
-        <div class="plan-title">${this._esc(planName)}</div>
+        <div class="plan-title">
+          <div class="plan-title-retailer">${this._esc(this._retailerOf(planName))}</div>
+          <div class="plan-title-name">${this._esc(this._planNameOf(planName))}</div>
+        </div>
         <div class="cost-display" style="background:${bannerColor}">
           <div class="cost-amount">$${total.toFixed(2)}</div>
           <div class="cost-label">${savingsLabel}</div>
@@ -1054,11 +1062,31 @@ class GridLensCard extends HTMLElement {
         .plan-card.current-plan {
           border: 2px solid var(--primary-color);
         }
+        /* Fixed two-line title (retailer on line 1, plan name on line 2) so cards
+           with a long plan name don't grow taller than their neighbours and throw
+           the cost banner/chart below out of vertical alignment across the row.
+           Each line is clamped to itself with an ellipsis rather than wrapping, so
+           a long plan name never spills onto a third line. */
         .plan-title {
+          margin-bottom: 8px;
+        }
+        .plan-title-retailer {
+          font-size: 13px;
+          font-weight: 400;
+          line-height: 1.3;
+          color: var(--secondary-text-color);
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .plan-title-name {
           font-size: 16px;
           font-weight: 500;
-          margin-bottom: 8px;
+          line-height: 1.3;
           color: var(--primary-text-color);
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
         }
         .cost-display {
           color: #fff;
@@ -1386,7 +1414,9 @@ class GridLensCard extends HTMLElement {
         .fs-close-btn:hover { filter: brightness(1.1); }
         /* Everything inside an expanded plan reads bigger, not just its charts —
            the point is a whole-card "presentation mode", not just zoomed graphs. */
-        .fullscreen-plan .plan-title { font-size: 26px; margin-bottom: 16px; }
+        .fullscreen-plan .plan-title { margin-bottom: 16px; }
+        .fullscreen-plan .plan-title-retailer { font-size: 18px; }
+        .fullscreen-plan .plan-title-name { font-size: 26px; }
         .fullscreen-plan .cost-display { padding: 28px; margin: 18px 0; }
         .fullscreen-plan .cost-display::after { font-size: 20px; top: 14px; right: 16px; }
         .fullscreen-plan .cost-amount { font-size: 56px; }
@@ -1425,6 +1455,10 @@ class GridLensCard extends HTMLElement {
     // FIRST " - ", because plan names contain the separator too ("Standing Offer -
     // Time of Use", "Origin Go Variable Ongoing - New & Move Customers only").
     const _retailerOf = (key) => String(key).split(' - ')[0].trim();
+    const _planNameOf = (key) => {
+      const idx = String(key).indexOf(' - ');
+      return idx === -1 ? '' : String(key).slice(idx + 3).trim();
+    };
 
     const planDetails = this._data.plan_details || {};
     const currentPlanTotalFallback = this._data.current_plan_total || 0;
@@ -1689,7 +1723,10 @@ class GridLensCard extends HTMLElement {
       return `
         <${tag} class="plan-card${isCurrentPlan ? ' current-plan' : ''}${fsClass}"${fsId} data-retailer="${_esc(_retailerOf(planName))}" data-plan="${_esc(planName)}">
           ${isFullscreen ? `<button class="fs-close-btn" id="epc-fs-close" title="Close full screen (Esc)">✕ Close</button>` : ''}
-          <div class="plan-title">${planName}</div>
+          <div class="plan-title">
+            <div class="plan-title-retailer">${_esc(_retailerOf(planName))}</div>
+            <div class="plan-title-name">${_esc(_planNameOf(planName))}</div>
+          </div>
           <div class="cost-display" style="background:${bannerColor}" title="Click to view this plan full-screen">
             <div class="cost-amount">$${total.toFixed(2)}</div>
             <div class="cost-label">${savingsLabel}</div>
