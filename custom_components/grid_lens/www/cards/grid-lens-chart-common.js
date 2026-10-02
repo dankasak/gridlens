@@ -133,8 +133,22 @@ export function smoothPath(pts) {
   let d = `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
   for (let i = 0; i < pts.length - 1; i++) {
     const p0 = pts[i ? i - 1 : 0], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2;
-    const c1x = p1[0] + (p2[0] - p0[0]) * k, c1y = p1[1] + (p2[1] - p0[1]) * k;
-    const c2x = p2[0] - (p3[0] - p1[0]) * k, c2y = p2[1] - (p3[1] - p1[1]) * k;
+    let c1x = p1[0] + (p2[0] - p0[0]) * k, c1y = p1[1] + (p2[1] - p0[1]) * k;
+    let c2x = p2[0] - (p3[0] - p1[0]) * k, c2y = p2[1] - (p3[1] - p1[1]) * k;
+    // Clamp each control point's x to this segment's own [p1,p2] range. The raw
+    // Catmull-Rom tangent is sized from the x-distance to the OUTER neighbour (p0 for
+    // c1, p3 for c2) — fine when points are evenly spaced, but real HA history isn't:
+    // a point sitting right next to a big time gap (e.g. dense overnight EV-charging
+    // samples butting up against hours of no updates while driving) gets a tangent
+    // scaled by that gap, which can push the control point's x behind p1 (or past p2)
+    // entirely. The curve then has to double back on itself to reach p2, drawing a
+    // visible backward loop in time even though every {t,v} point is itself correctly
+    // ordered — seen on the Wattpilot/Xpeng SOC line, 2026-10-02. x is always monotonic
+    // here (points are time-sorted), so clamping to the segment's own bounds removes the
+    // loop; it only costs a slightly flatter bulge right at that one point.
+    const xLo = Math.min(p1[0], p2[0]), xHi = Math.max(p1[0], p2[0]);
+    c1x = Math.min(Math.max(c1x, xLo), xHi);
+    c2x = Math.min(Math.max(c2x, xLo), xHi);
     d += ` C${c1x.toFixed(1)},${c1y.toFixed(1)} ${c2x.toFixed(1)},${c2y.toFixed(1)} ${p2[0].toFixed(1)},${p2[1].toFixed(1)}`;
   }
   return d;
