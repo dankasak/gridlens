@@ -29,7 +29,7 @@
  *   title: Allowed Run Times            (optional)
  *   source_entity: sensor.xyz           (optional — pin the GridLens sensor to read)
  */
-import { STYLE, esc, deferColorFor, detectDark } from './grid-lens-chart-common.js?v=20260930a';
+import { STYLE, esc, deferColorFor, detectDark } from './grid-lens-chart-common.js?v=20261002a';
 
 const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const SLOTS = 48; // half-hour resolution

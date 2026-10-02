@@ -26,7 +26,7 @@ import {
   STYLE, esc, resolveDeferrableLoads, resolveDailyTargetMasterEid, resolveDailyTargetEidFor,
   resolveBoostEidFor, resolveChargeTargetPercentEidFor, resolveSolarForecastEid, solarSummary,
   fmtKwh, clampTargetPct, fetchDailyAverageKwh, detectDark,
-} from './grid-lens-chart-common.js?v=20260930a';
+} from './grid-lens-chart-common.js?v=20261002a';
 
 const HISTORY_REFRESH_MS = 15 * 60000;
 // See grid-lens-advisory-card.js's own DT_PIN_MAX_AGE_MS comment — same slider,

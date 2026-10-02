@@ -2162,6 +2162,11 @@ export class GridLensChartCardBase extends HTMLElement {
       const v = parseFloat(r.state);
       if (!isNaN(v)) pts.push({ t: new Date(r.last_changed || r.lu), v });
     }
+    // history/period isn't guaranteed strictly ascending (late/backfilled recorder writes,
+    // an entity swap mid-day) — an out-of-order row here draws as a visible backtrack/loop
+    // in the plotted path, since downstream (ds(), smoothPath/stepPath) just walks array
+    // order. _fetchGreedyBands() already sorts its own fetch for the same reason.
+    pts.sort((a, b) => a.t - b.t);
     return pts;
   }
 
