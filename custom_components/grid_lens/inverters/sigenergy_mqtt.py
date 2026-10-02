@@ -30,6 +30,7 @@ All native values are kW; this driver converts to/from canonical watts.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -50,6 +51,12 @@ MODE_DISCHARGE_ESS = "Command Discharging (Output power from the battery first)"
 # Fallback rate caps (kW) if the number entity does not expose a ``max`` attribute.
 _DEFAULT_CHARGE_CAP_KW = 12.6
 _DEFAULT_DISCHARGE_CAP_KW = 14.4
+
+# Retries/delay for reading a write back before declaring it failed. These entities are
+# proxied through the sigenergy2mqtt bridge, which can lag a beat before the new value is
+# reflected in HA state — but a mismatch that survives these retries is real.
+_VERIFY_RETRIES = 3
+_VERIFY_DELAY_S = 1.0
 
 # Expected mode string per abstract action, for verify_mode(). DISCHARGE isn't listed —
 # it depends on ``discharge_mode_pv_first`` (instance config), so it's resolved from
@@ -290,6 +297,11 @@ class SigenergyMqttController(InverterController):
         )
 
     async def _call(self, domain: str, service: str, entity_id: str, data: dict) -> bool:
+        if self._state(entity_id) is None:
+            _LOGGER.error(
+                "Sigenergy %s.%s on %s refused: entity unavailable", domain, service, entity_id
+            )
+            return False
         try:
             await self.hass.services.async_call(
                 domain,
@@ -297,10 +309,50 @@ class SigenergyMqttController(InverterController):
                 {"entity_id": entity_id, **data},
                 blocking=True,
             )
-            return True
         except Exception as err:  # noqa: BLE001 — control write must never crash the loop
             _LOGGER.error("Sigenergy %s.%s on %s failed: %s", domain, service, entity_id, err)
             return False
+
+        for attempt in range(_VERIFY_RETRIES):
+            if self._write_applied(domain, service, entity_id, data):
+                return True
+            if attempt < _VERIFY_RETRIES - 1:
+                await asyncio.sleep(_VERIFY_DELAY_S)
+
+        # A clean services.async_call return is NOT proof the command reached the hardware:
+        # HA's service helper can decline a call silently (e.g. the target entity was briefly
+        # `unavailable` mid-reconnect) and just log a WARNING rather than raise — which is
+        # exactly what let the Sigenergy inverter sit stuck on a stale "Command Discharging"
+        # mode for 24h+ on 2026-10-02, discharging into a price spike, with zero ERROR in the
+        # log and every tick still reporting success up the stack (see
+        # GRIDLENS_CHECKLIST.md). Read the entity back and only trust a write that actually
+        # landed.
+        _LOGGER.error(
+            "Sigenergy %s.%s on %s did not take effect after %d attempt(s) (state now: %s) —"
+            " hardware may be out of sync with the plan",
+            domain,
+            service,
+            entity_id,
+            _VERIFY_RETRIES,
+            getattr(self.hass.states.get(entity_id), "state", "missing"),
+        )
+        return False
+
+    def _write_applied(self, domain: str, service: str, entity_id: str, data: dict) -> bool:
+        """Read ``entity_id`` back and confirm a just-issued write actually landed."""
+        st = self._state(entity_id)
+        if st is None:
+            return False
+        if domain == "select":
+            return st.state == data.get("option")
+        if domain == "number":
+            try:
+                return abs(float(st.state) - float(data["value"])) < 0.05
+            except (TypeError, ValueError):
+                return False
+        if domain == "switch":
+            return st.state == ("on" if service == "turn_on" else "off")
+        return True
 
     # ----------------------------------------------------------------- read utils
     def _state(self, entity_id: str):
