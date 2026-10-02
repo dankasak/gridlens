@@ -36,6 +36,16 @@ from .battery_controller import BatteryController
 
 _LOGGER = logging.getLogger(__name__)
 
+# Consecutive failed-to-apply ticks before raising a persistent notification. 2, not 1: a
+# single missed tick can be a one-off transport blip (see auto-expiry's 2-interval grace
+# above) and shouldn't page anyone — but the same command failing twice in a row means the
+# plan and the hardware have genuinely diverged, which is exactly what sat undetected for
+# 24h+ on 2026-10-02 (battery discharging into a price spike while every tick reported
+# success). See `_call()`/`_write_applied()` in inverters/sigenergy_mqtt.py for the write
+# verification this counts failures of.
+_APPLY_FAILURE_NOTIFY_THRESHOLD = 2
+_APPLY_FAILURE_NOTIFICATION_ID = "grid_lens_battery_control_apply_failure"
+
 
 @dataclass
 class DispatchInterval:
@@ -126,6 +136,7 @@ class _ExecStatus:
     plan_intervals: int = 0
     plan_updated_at: Optional[datetime] = None
     note: str = "not_started"
+    consecutive_apply_failures: int = 0
 
 
 class ScheduleExecutor:
@@ -180,6 +191,9 @@ class ScheduleExecutor:
             self._cancel_timer = None
         self._status.enabled = False
         self._status.note = "stopped"
+        if self._status.consecutive_apply_failures >= _APPLY_FAILURE_NOTIFY_THRESHOLD:
+            await self._dismiss_apply_failure_notice()
+        self._status.consecutive_apply_failures = 0
         if restore_normal:
             await self.bc.restore_normal()  # deadman
             # None, not SELF_USE: native handback isn't the same real-world state as a
@@ -220,14 +234,61 @@ class ScheduleExecutor:
                 )
 
             if await self._apply(action, power_w):
+                if self._status.consecutive_apply_failures >= _APPLY_FAILURE_NOTIFY_THRESHOLD:
+                    await self._dismiss_apply_failure_notice()
+                self._status.consecutive_apply_failures = 0
                 self._status.applied_action = action
                 self._status.applied_power_w = power_w
                 self._status.applied_at = dt_util.now()
                 self._status.degraded = False
                 self._status.note = f"applied_{action.value}"
+            else:
+                self._status.consecutive_apply_failures += 1
+                self._status.note = f"apply_failed_{action.value}"
+                _LOGGER.error(
+                    "Battery command (%s @ %.0fW) failed to apply (%d consecutive failure(s))",
+                    action.value, power_w, self._status.consecutive_apply_failures,
+                )
+                if self._status.consecutive_apply_failures == _APPLY_FAILURE_NOTIFY_THRESHOLD:
+                    await self._raise_apply_failure_notice(action, power_w)
         except Exception as err:  # noqa: BLE001 — a bad tick must not kill the timer
             _LOGGER.error("ScheduleExecutor tick failed: %s", err)
             self._status.note = f"tick_error:{err}"
+
+    async def _raise_apply_failure_notice(self, action: BatteryAction, power_w: float) -> None:
+        """Surface repeated silent apply failures to the user — this is the gap that let
+        the hardware discharge into a price spike for 24h+ on 2026-10-02 while every tick
+        reported success; the plan was right, nothing told anyone the hardware had stopped
+        listening."""
+        try:
+            await self.hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "notification_id": _APPLY_FAILURE_NOTIFICATION_ID,
+                    "title": "Grid Lens: battery control not responding",
+                    "message": (
+                        f"{self._status.consecutive_apply_failures} attempts in a row to "
+                        f"command the battery ({action.value} @ {power_w:.0f}W) did not take "
+                        "effect on the inverter. The hardware may no longer be following the "
+                        "plan. Check `ha core logs | grep sigenergy_mqtt` for details."
+                    ),
+                },
+                blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001 — a failed notification must not break ticking
+            _LOGGER.error("Failed to raise battery-control-failure notification: %s", err)
+
+    async def _dismiss_apply_failure_notice(self) -> None:
+        try:
+            await self.hass.services.async_call(
+                "persistent_notification",
+                "dismiss",
+                {"notification_id": _APPLY_FAILURE_NOTIFICATION_ID},
+                blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001 — a failed dismiss must not break ticking
+            _LOGGER.debug("Could not dismiss battery-control-failure notification: %s", err)
 
     async def _apply(self, action: BatteryAction, power_w: float) -> bool:
         # Auto-expiry set to two intervals so a single missed tick doesn't drop the mode.
@@ -249,6 +310,9 @@ class ScheduleExecutor:
         self._status.applied_action = None  # see stop(): handback isn't a commanded self-use
         self._status.applied_power_w = 0.0
         self._status.note = f"safe_state:{reason}"
+        if self._status.consecutive_apply_failures >= _APPLY_FAILURE_NOTIFY_THRESHOLD:
+            await self._dismiss_apply_failure_notice()
+        self._status.consecutive_apply_failures = 0
 
     # ------------------------------------------------------------------ helpers
     def _plan_is_stale(self, now: datetime) -> bool:
@@ -375,4 +439,5 @@ class ScheduleExecutor:
             "plan_updated_at": s.plan_updated_at.isoformat() if s.plan_updated_at else None,
             "last_tick": s.last_tick.isoformat() if s.last_tick else None,
             "interval_minutes": self.interval_minutes,
+            "consecutive_apply_failures": s.consecutive_apply_failures,
         }
