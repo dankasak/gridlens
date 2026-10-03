@@ -213,6 +213,25 @@ async def _run_greedy_export_surplus_turns_on():
     assert len(_turn_ons(hass)) == 1
 
 
+async def _run_greedy_export_surplus_keeps_forecast_target():
+    """Regression 2026-10-04: a modulating device front-loading on the forecast makes its
+    own draw read as live export surplus on the next tick. Condition #2 then fired and
+    returned before #3 ran, zeroing _greedy_forecast_target_w, which switched the
+    front-load off (and on again the tick after). Both now publish: reason stays
+    export_surplus, but the forecast target survives."""
+    hass = FakeHass()
+    hass.states.set("switch.x", "off")
+    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
+    c.set_greedy(True)
+    c.set_greedy_forecast_surplus(True)
+    await c.apply(0.0, _T0, import_rate=0.5, export_rate=0.0, grid_power_w=-3000.0,
+                  forecast_spill_kwh=20.0, forecast_hours=8.0,
+                  battery_headroom_w=10000.0, battery_headroom_kwh=20.0,
+                  battery_safe_window_h=8.0)
+    assert c.status()["greedy_reason"] == "export_surplus"
+    assert c._greedy_forecast_target_w == 2000.0, c._greedy_forecast_target_w
+
+
 async def _run_greedy_export_insufficient_no_effect():
     hass = FakeHass()
     hass.states.set("switch.x", "off")
@@ -1302,6 +1321,7 @@ if __name__ == "__main__":
     tests = [
         ("greedy_import_free_turns_on", lambda: _run_async(_run_greedy_import_free_turns_on)),
         ("greedy_export_surplus_turns_on", lambda: _run_async(_run_greedy_export_surplus_turns_on)),
+        ("greedy_export_surplus_keeps_forecast_target", lambda: _run_async(_run_greedy_export_surplus_keeps_forecast_target)),
         ("greedy_export_insufficient_no_effect", lambda: _run_async(_run_greedy_export_insufficient_no_effect)),
         ("greedy_export_below_floor_turns_on", lambda: _run_async(_run_greedy_export_below_floor_turns_on)),
         ("greedy_export_below_floor_disabled_by_default", lambda: _run_async(_run_greedy_export_below_floor_disabled_by_default)),

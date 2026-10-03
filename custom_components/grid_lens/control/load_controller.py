@@ -350,6 +350,18 @@ class DeferrableLoadController:
                 # matches the manager's for the same undershoot-over-chatter reason.
                 exporting_w = max(0.0, device_w - (grid_power_w + discharge_w) - _EXPORT_BIAS_W)
                 if self.max_w > 0.0 and exporting_w >= self._export_surplus_threshold_w():
+                    # Still evaluate the forecast condition and keep its target (fixed
+                    # 2026-10-04). A modulating device front-loading on the forecast
+                    # (LoadControlManager._FRONTLOAD_MIN_BUDGET_H) makes its own draw read
+                    # as live export surplus on the next tick. Returning here without the
+                    # forecast target used to zero it, which switched the front-load off
+                    # and dropped the device back to bare live export, and the next tick
+                    # turned it back on: a 5-minute oscillation. Reason precedence is
+                    # unchanged.
+                    self._greedy_forecast_target_w = self._forecast_surplus_target_w(
+                        forecast_spill_kwh, forecast_hours, battery_headroom_w,
+                        battery_headroom_kwh, ac_output_headroom_w, battery_safe_window_h,
+                    )
                     self._greedy_reason = "export_surplus"
                     self._greedy_blocked = None
                     return True
