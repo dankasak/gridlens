@@ -100,6 +100,18 @@ _RESERVED_DISCHARGE_MIN_W = 300.0
 # shortens the window and must still be actionable.
 _MIN_BUDGET_WINDOW_H = 0.5
 
+# Forecast front-loading (added 2026-10-04, household instruction): once the forecast-surplus
+# condition has fired, a modulating device may also take live solar that is currently going
+# INTO the battery — not just what's being exported — because the plan says that battery
+# will reach full and spill anyway, so the battery's charge displaced now is refilled later
+# from energy that would otherwise have been wasted. Found live: plan showed ~22 kWh of
+# afternoon spill at a 3c FiT, but the proportional rate (spill / 8h window ≈ 2.4 kW) left
+# the Wattpilot at its floor while the battery soaked up ~8 kW of morning solar, only to sit
+# at 100% and export from noon. The displaced draw is capped at what the remaining spill
+# budget could sustain for this long, so it tapers as the replanned spill shrinks rather
+# than running flat out on the last few kWh of a stale budget.
+_FRONTLOAD_MIN_BUDGET_H = 1.0
+
 # The live export-surplus term (see _modulation_target_w) deliberately undershoots true
 # breakeven by this much, so ordinary noise lands on the export side more often than the
 # import side — added 2026-09-11 on the household's own explicit instruction: a small
@@ -288,6 +300,10 @@ class LoadControlManager:
         # streak has already been warned about (so it logs once per incident, not once per
         # 30s tick for as long as the incident lasts).
         self._import_stuck: dict[int, dict] = {}
+        # Latest forecast-surplus spill budget (kWh) per device, from _tick_device's
+        # 5-minute evaluation — read by _modulation_target_w's front-load term
+        # (_FRONTLOAD_MIN_BUDGET_H) to cap how much battery charge it may displace.
+        self._forecast_spill_kwh: dict[int, float] = {}
         for i, sensor_id in enumerate(sensors):
             sw = switches[i] if i < len(switches) else ""
             setpoint = setpoints[i] if i < len(setpoints) else ""
@@ -597,6 +613,7 @@ class LoadControlManager:
         battery_safe_window_h: Optional[float] = None
         if controller.greedy and controller.greedy_forecast_surplus:
             spill_kwh, spill_hours = self._forecast_surplus_budget(index, now)
+            self._forecast_spill_kwh[index] = spill_kwh or 0.0
             battery_headroom_w = self._battery_headroom_w()
             battery_headroom_kwh = self._battery_headroom_kwh()
             ac_output_headroom_w = self._ac_output_headroom_w()
@@ -910,6 +927,21 @@ class LoadControlManager:
             fc_target_w = getattr(controller, "_greedy_forecast_target_w", 0.0) or 0.0
             if fc_target_w > 0.0:
                 surplus_w = max(surplus_w or 0.0, fc_target_w)
+                # Front-load (see _FRONTLOAD_MIN_BUDGET_H): the plan has already said the
+                # battery will fill and spill, so the battery's first claim on live solar
+                # (the asymmetry in the live-surplus term above) no longer protects
+                # anything — it just moves the export later. Take everything live solar
+                # is putting into the battery or the grid right now, net of the house.
+                # battery_priority below still pulls back if this ever overshoots into a
+                # real discharge, and the executor's SELF_USE mode means a smaller battery
+                # charge — not grid import — absorbs the difference.
+                frontload_w = self._frontload_available_w(index)
+                if frontload_w is not None:
+                    budget_w = (
+                        self._forecast_spill_kwh.get(index, 0.0) * 1000.0
+                        / _FRONTLOAD_MIN_BUDGET_H
+                    )
+                    surplus_w = max(surplus_w, min(frontload_w, budget_w))
         target_w = max(plan_w, surplus_w or 0.0)
         source = "surplus" if (surplus_w or 0.0) > plan_w else "plan"
         _LOGGER.debug(
@@ -1059,6 +1091,35 @@ class LoadControlManager:
         if covered_h < _MIN_BUDGET_WINDOW_H:
             return None, 0.0
         return spill_kwh, covered_h
+
+    def _frontload_available_w(self, index: int) -> Optional[float]:
+        """Live solar (W) device ``index`` could take right now if it displaced the
+        battery's charge as well as the export — the front-load term in
+        ``_modulation_target_w`` (see ``_FRONTLOAD_MIN_BUDGET_H``).
+
+        ``device_w - grid_w + battery_net_w - _EXPORT_BIAS_W``: adding back this device's
+        own draw and the battery's signed net power (+charging) to the grid reading
+        recovers PV minus every *other* load, which is unchanged by however the device and
+        the battery split it — so the loop has a stable fixed point instead of chasing its
+        own setpoint.
+
+        None (term skipped, proportional forecast rate still applies) when the grid or
+        battery reading is unavailable, or when the house is importing beyond
+        ``_STUCK_IMPORT_THRESHOLD_W``: in a self-use battery mode an overshoot shows up as
+        battery discharge (which battery_priority corrects), never import, so live import
+        means the battery is being charged from the grid on purpose — displacing that
+        charge would just buy the device's energy from the grid.
+        """
+        if not self._grid_power_sensor:
+            return None
+        grid_w = self._read_grid_power_w()
+        battery_net_w = self._read_battery_net_power_w()
+        if grid_w is None or battery_net_w is None:
+            return None
+        if grid_w > _STUCK_IMPORT_THRESHOLD_W:
+            return None
+        device_w = self._read_device_power_w(index) or 0.0
+        return max(0.0, device_w - grid_w + battery_net_w - _EXPORT_BIAS_W)
 
     @staticmethod
     def _slot_end(plan: list[DispatchInterval], pos: int) -> datetime:

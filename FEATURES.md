@@ -1158,7 +1158,9 @@ spare solar contributes nothing to this device's claim, even though the same net
 reading would suggest real headroom exists. The household's stated priority: the battery gets
 first claim on genuine surplus; a modulating load only ever sees what's left over once the
 battery's own charging is satisfied, never a bonus for what the battery is currently
-absorbing. (The LP's own `plan_w` is unaffected by any of this — the live surplus term only
+absorbing. **Exception:** while Greedy condition #3 (forecast surplus) is firing, the device
+*does* take the battery's live charge. The plan says that battery will fill and spill
+anyway (§7, front-load). (The LP's own `plan_w` is unaffected by any of this — the live surplus term only
 ever *adds* to what the plan already allocated, so a plan that deliberately schedules this
 device from battery/grid for an unrelated economic reason, e.g. a cheap TOU window, still
 works exactly as planned.)
@@ -1501,6 +1503,22 @@ always jumped straight to `cap_w` with no proportionality. It now:
    existing `forecast_free_kwh` (the budget) and `forecast_needed_kwh` (what the device would
    use flat-out over the same window — still the progress-bar denominator: the bar hits 100%
    exactly when an on/off device's rate clears its draw).
+4. **Front-loads on a modulating device (2026-10-04, household instruction).** Once #3 has
+   fired, the 30 s loop (`_modulation_target_w`) lifts the target from the average rate to
+   *all* the live solar that is going into the battery or the grid right now —
+   `LoadControlManager._frontload_available_w`: `device_w − grid_w + battery_net_w −
+   _EXPORT_BIAS_W`, i.e. PV minus every other load. That lifts the battery's usual first
+   claim on live surplus (the asymmetry noted in §6a), and only while #3 is firing, because
+   the plan has already said the battery will fill and spill: charge displaced now gets
+   refilled later from energy that would otherwise have been exported. It is capped at
+   `spill_kwh / _FRONTLOAD_MIN_BUDGET_H` (1 h), so it tapers as replans shrink the spill,
+   and never drops below the proportional rate. It is skipped (the proportional rate still
+   applies) if the grid or battery reading is unavailable, or the house is importing more
+   than `_STUCK_IMPORT_THRESHOLD_W`, because live import means the battery is being charged
+   from the grid on purpose. battery_priority still pulls back on any overshoot into
+   discharge. Prompted by a morning where the plan showed ~22 kWh of 3c afternoon spill:
+   the average rate (~2.4 kW over 8 h) left the Wattpilot at its floor while the battery
+   took ~8 kW, then sat at 100% exporting from noon. On/off loads are unchanged.
 
 **Why #3 exists.** #1 and #2 are strictly instantaneous — they only fire once free energy is
 already flowing. On a solar+battery house that fires late: mid-morning the battery soaks up

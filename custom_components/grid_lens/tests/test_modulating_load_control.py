@@ -1634,6 +1634,59 @@ async def _run_manager_target_surplus_battery_charging_not_credited():
     assert target == 1500.0 and source == "plan", (target, source)
 
 
+async def _run_manager_target_forecast_frontload_displaces_battery_charge():
+    """Forecast front-loading (2026-10-04, household instruction). Once the forecast
+    condition has fired, the plan has already said the battery will fill and spill, so
+    the live-surplus asymmetry (battery gets first claim — test above) no longer protects
+    anything: the device takes the solar currently going INTO the battery too. Numbers are
+    the live morning that prompted it: ~22 kWh of afternoon spill forecast, proportional
+    rate 2.4 kW, battery soaking up 8 kW, Wattpilot sat at 2.25 kW."""
+    m, hass = _mod_mgr(
+        grid_power_sensor="sensor.grid",
+        battery_charge_power_sensor="sensor.batt_charge",
+        battery_discharge_power_sensor="sensor.batt_discharge",
+    )
+    m.set_plan(_plan(export_rate=0.03, dev_w=0.0), updated_at=_T0)
+    await m.set_greedy(0, True)
+    await m.set_greedy_forecast_surplus(0, True)
+    c = m.controllers[0]
+    c._greedy_reason = "forecast_surplus"
+    c._greedy_forecast_target_w = 2400.0
+    m._forecast_spill_kwh[0] = 22.24
+    hass.states.set("sensor.grid", "-50")
+    hass.states.set("sensor.batt_charge", "8000")
+    hass.states.set("sensor.batt_discharge", "0")
+    hass.states.set("sensor.evse_power", "2245")
+    target, source = await m._modulation_target_w(0, _T0)
+    # device(2245) - grid(-50) + battery(8000) - _EXPORT_BIAS_W(150) = 10145, well inside
+    # the 22.24 kWh / 1h budget cap; modulate() clamps it into the envelope.
+    assert target == 10145.0 and source == "surplus", (target, source)
+
+    # Budget taper: a nearly-spent spill caps the displaced draw — never below the
+    # proportional rate the 5-minute tick already approved.
+    m._forecast_spill_kwh[0] = 1.5
+    target, _ = await m._modulation_target_w(0, _T0)
+    assert target == 2400.0, target
+    m._forecast_spill_kwh[0] = 4.0
+    target, _ = await m._modulation_target_w(0, _T0)
+    assert target == 4000.0, target
+
+    # Live import means the battery is being grid-charged on purpose — displacing that
+    # charge would buy the device's energy from the grid. Falls back to the proportional rate.
+    m._forecast_spill_kwh[0] = 22.24
+    hass.states.set("sensor.grid", "3000")
+    target, _ = await m._modulation_target_w(0, _T0)
+    assert target == 2400.0, target
+
+    # Not firing (no forecast target) — the battery keeps first claim, exactly as before.
+    hass.states.set("sensor.grid", "-50")
+    c._greedy_forecast_target_w = 0.0
+    target, source = await m._modulation_target_w(0, _T0)
+    # 3c export is above this test's (unset, $0) Minimum Export Price, so the live-surplus
+    # term doesn't apply either — the battery's 8 kW stays the battery's.
+    assert target == 0.0 and source == "off", (target, source)
+
+
 async def _run_manager_target_surplus_no_battery_configured_unchanged():
     """No battery sensors configured must skip only the discharge correction — the
     export-bias margin still applies, it isn't battery-specific."""
@@ -2079,6 +2132,7 @@ if __name__ == "__main__":
         ("battery_priority_smoothing_damps_oscillation", lambda: _run_async(_run_manager_target_battery_priority_smoothing_damps_oscillation)),
         ("no_discharge_no_correction", lambda: _run_async(_run_manager_target_no_discharge_no_correction)),
         ("surplus_battery_charging_not_credited", lambda: _run_async(_run_manager_target_surplus_battery_charging_not_credited)),
+        ("forecast_frontload_displaces_battery_charge", lambda: _run_async(_run_manager_target_forecast_frontload_displaces_battery_charge)),
         ("surplus_no_battery_unchanged", lambda: _run_async(_run_manager_target_surplus_no_battery_configured_unchanged)),
         ("battery_headroom_unipolar_discharge", lambda: _run_async(_run_battery_headroom_unipolar_discharge_sensor)),
         ("battery_headroom_signed_unchanged", lambda: _run_async(_run_battery_headroom_signed_single_sensor_unchanged)),
