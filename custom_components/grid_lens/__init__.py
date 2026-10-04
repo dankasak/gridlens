@@ -634,7 +634,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20261002d"
+    _CARD_VERSION = "20261004a"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -1648,6 +1648,58 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 </html>"""
             return web.Response(text=html, content_type="text/html")
 
+    class ChangelogView(HomeAssistantView):
+        """Proxies the API's GET /changelog for the "What's new" ticker on the
+        advisory card's header (grid-lens-advisory-card.js). Server-to-server for
+        the same reason as PowerflowCardView — browsers calling api.gridlens.au
+        directly would hit Cloudflare's bot protection and CORS. Sends no API key
+        and no install data; the endpoint is public. Cached for an hour (the feed
+        only changes on an API deploy), and on failure re-serves the last good
+        copy, or an empty list so the ticker simply hides itself.
+        """
+
+        url = "/api/grid_lens/changelog"
+        name = "api:grid_lens:changelog"
+        requires_auth = True
+
+        _TTL = 3600
+
+        def __init__(self, hass_instance):
+            self.hass = hass_instance
+            self._cache: tuple[float, dict] | None = None
+
+        async def get(self, request):
+            import time
+            from .const import CONF_GRIDLENS_API_URL
+
+            now = time.monotonic()
+            if self._cache and now - self._cache[0] < self._TTL:
+                return self.json(self._cache[1])
+
+            entries = self.hass.config_entries.async_entries(DOMAIN)
+            api_url = (entries[0].data.get(CONF_GRIDLENS_API_URL) if entries else None) \
+                or "https://api.gridlens.au"
+            try:
+                session = async_get_clientsession(self.hass)
+                async with session.get(
+                    f"{api_url}/changelog",
+                    params={"limit": "30"},
+                    headers={"User-Agent": "GridLens-HA-Integration/1.0"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        self._cache = (now, data)
+                        return self.json(data)
+                    _LOGGER.debug("Changelog: unexpected status %s from API", resp.status)
+            except Exception as err:  # noqa: BLE001 — best-effort, purely cosmetic
+                _LOGGER.debug("Changelog: could not reach API (%s)", err)
+            if self._cache:
+                # Re-arm the TTL so an outage doesn't mean a retry on every page load.
+                self._cache = (now, self._cache[1])
+                return self.json(self._cache[1])
+            return self.json({"generated_at": None, "entries": []})
+
     hass.http.register_view(PlanDataView(hass))
     hass.http.register_view(PlanHistoryView(hass))
     hass.http.register_view(PlanHistoryItemView(hass))
@@ -1657,6 +1709,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.http.register_view(PowerflowCardView(hass))
     hass.http.register_view(PowerflowIconView(hass))
     hass.http.register_view(SubscribeCallbackView(hass))
+    hass.http.register_view(ChangelogView(hass))
 
     return True
 

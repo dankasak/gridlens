@@ -62,6 +62,10 @@ const OPT_DOT_MIN_MS = 900;
 // after this, something's actually wrong (offline, service failed) and showing the
 // real state again is more honest than a stuck local value.
 const DT_PIN_MAX_AGE_MS = 15000;
+// "What's new" ticker (second header row): how long each changelog entry stays up, and
+// how often the list is re-requested from the integration's proxy.
+const CL_ROTATE_MS = 7000;
+const CL_REFRESH_MS = 60 * 60000;
 
 class GridLensAdvisoryCard extends HTMLElement {
   constructor() {
@@ -121,16 +125,28 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._dtDragEid = null;
     this._dtRepaintPending = false;
     this._dtPointerUpHandler = () => this._onDtSliderPointerUp();
+    // Second header row (see _hd2Html). _statusSig lets the hass setter refresh just the
+    // status pills in place when nothing else in the header changed (device power moves
+    // every few seconds; rebuilding the whole header that often would fight the sliders).
+    this._statusSig = '';
+    this._clEntries = [];
+    this._clIdx = 0;
+    this._clOpen = false;
+    this._clFetchedAt = 0;
+    this._clPending = false;
+    this._clTimer = null;
   }
 
   connectedCallback() {
     window.addEventListener('pointerup', this._dtPointerUpHandler);
     window.addEventListener('pointercancel', this._dtPointerUpHandler);
+    if (!this._clTimer) this._clTimer = setInterval(() => this._clTick(), CL_ROTATE_MS);
   }
 
   disconnectedCallback() {
     window.removeEventListener('pointerup', this._dtPointerUpHandler);
     window.removeEventListener('pointercancel', this._dtPointerUpHandler);
+    if (this._clTimer) { clearInterval(this._clTimer); this._clTimer = null; }
   }
 
   setConfig(config) {
@@ -159,6 +175,7 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._hass = hass;
     const dark = detectDark(this, hass);
     if (dark !== this._dark) { this._dark = dark; this.classList.toggle('dark', dark); }
+    this._clFetch();
 
     // Daily Target resolution — independent of the dispatch sensor below, so it still
     // works even in the (unlikely) case that sensor is unavailable.
@@ -240,7 +257,7 @@ class GridLensAdvisoryCard extends HTMLElement {
       this._summary = { status: 'unknown' };
       this._traj = null;
       const sig = `unknown|${dtSig}`;
-      if (sig !== this._sig) { this._sig = sig; this._paint(); }
+      if (sig !== this._sig) { this._sig = sig; this._paint(); } else this._refreshStatus();
       return;
     }
 
@@ -292,7 +309,17 @@ class GridLensAdvisoryCard extends HTMLElement {
       .join(',');
 
     const sig = `${st.last_updated}|${switchSt ? switchSt.last_updated : ''}|${toggleSig}|${dtSig}`;
-    if (sig !== this._sig) { this._sig = sig; this._paint(); }
+    if (sig !== this._sig) { this._sig = sig; this._paint(); return; }
+    this._refreshStatus();
+  }
+
+  // In-place refresh of the status pills only (see _statusSig in the constructor). Falls
+  // back to a full repaint when the row has to appear or disappear.
+  _refreshStatus() {
+    const html = this._statusHtml();
+    if (html === this._statusSig) return;
+    const st = this.shadowRoot && this.shadowRoot.querySelector('.hd2 .st');
+    if (st) { st.innerHTML = html; this._statusSig = html; } else this._paint();
   }
 
   // Same lazy-fetch-and-cache pattern as grid-lens-load-control-card.js's own
@@ -416,6 +443,224 @@ class GridLensAdvisoryCard extends HTMLElement {
       `<span><span class="rk" style="color:var(--buy)">Buy</span> <b>${buy}</b></span>` +
       `<span><span class="rk" style="color:var(--sell)">Sell</span> <b>${sell}</b></span>` +
       `</div>`;
+  }
+
+  // ------------------------------------------------- Second header row (status + news)
+  //
+  // A slim row under the header (user request 2026-10-04): live status pills on the
+  // left, a rotating "What's new" ticker on the right. Both are summaries of state that
+  // already exists elsewhere — the battery control switch's applied action, each
+  // deferrable load's control switch (DeferrableLoadController.status()) and its power
+  // sensor — so nothing here is install-specific: devices come from the same
+  // `deferrable_loads` auto-discovery the per-device panel uses, and an install with no
+  // battery control / no deferrable loads just shows fewer (or no) pills.
+
+  // Whether a deferrable load is actually drawing power right now. Prefers the measured
+  // power sensor (an AC that is "commanded on" but idling at setpoint shouldn't read as
+  // running); falls back to the controller's own commanded state when there's no sensor.
+  _deviceDrawKw(d, ctlAttrs) {
+    const st = d.power_entity && this._hass.states[d.power_entity];
+    const v = st ? parseFloat(st.state) : NaN;
+    if (Number.isFinite(v)) {
+      const unit = String((st.attributes || {}).unit_of_measurement || 'W').toLowerCase();
+      const kw = unit === 'kw' ? v : v / 1000;
+      const floor = Math.max(0.05, 0.02 * (+d.max_kw || 0));
+      return kw >= floor ? kw : 0;
+    }
+    return ctlAttrs && ctlAttrs.commanded === 'on' ? null : 0;  // null = on, power unknown
+  }
+
+  _statusPills() {
+    const hass = this._hass;
+    if (!hass) return [];
+    const pills = [];
+
+    // Battery — what the executor is commanding right now, or a warning when control is
+    // off/failing (it can sit off for a day with no other visible trace).
+    const bsw = hass.states[this._config.control_switch_entity];
+    if (bsw) {
+      const a = bsw.attributes || {};
+      if (bsw.state !== 'on') {
+        pills.push({ cls: 'warn', icon: 'mdi:battery-off-outline', text: 'Battery control off',
+          tip: 'Grid Lens is not controlling the battery — the inverter is running on its own settings.' });
+      } else if (+a.consecutive_apply_failures > 0 || a.degraded === true) {
+        pills.push({ cls: 'warn', icon: 'mdi:battery-alert-variant-outline', text: 'Battery commands failing',
+          tip: `The inverter has not accepted the last ${a.consecutive_apply_failures || ''} battery command(s).` });
+      } else {
+        const act = a.current_action || a.applied_action;
+        const kw = (+a.current_power_w || +a.applied_power_w || 0) / 1000;
+        const icon = { charge: 'mdi:battery-arrow-up', discharge: 'mdi:battery-arrow-down' }[act] || 'mdi:battery-sync';
+        if (act) {
+          pills.push({ cls: act === 'charge' || act === 'discharge' ? `mode-${act}` : '', icon,
+            text: `${modeLabel(act)}${kw >= 0.05 ? ` ${kw.toFixed(1)} kW` : ''}`,
+            tip: `Battery: the command currently applied by Grid Lens${a.applied_at ? ` (since ${fmtTime(a.applied_at)})` : ''}.` });
+        }
+      }
+    }
+
+    const greedyRunning = [];
+    let greedyArmed = 0;
+    const overrides = [];
+    for (const r of this._dtRows || []) {
+      const d = r.device;
+      const ctl = r.controlEid && hass.states[r.controlEid];
+      const a = ctl ? (ctl.attributes || {}) : null;
+      const name = d.name || d.energy_entity;
+      if (a && (a.override === 'on' || a.override === 'off')) overrides.push(`${name}: forced ${a.override}`);
+      if (a && a.soc_cutoff) {
+        pills.push({ cls: 'dim', icon: 'mdi:battery-check', text: `${name} at SOC limit`,
+          tip: `${name} reached its configured SOC cutoff and has been stopped.` });
+        continue;
+      }
+      if (a && d.control_type === 'modulating' && a.plugged_in === false) {
+        pills.push({ cls: 'dim', icon: 'mdi:power-plug-off-outline', text: `${name} unplugged` });
+        continue;
+      }
+      const kw = this._deviceDrawKw(d, a);
+      if (kw === 0) {
+        if (a && a.greedy && !a.greedy_reason) greedyArmed += 1;
+        continue;
+      }
+      const soc = d.soc_entity && hass.states[d.soc_entity];
+      const socV = soc ? parseFloat(soc.state) : NaN;
+      const greedy = !!(a && a.greedy && a.greedy_reason);
+      if (greedy) greedyRunning.push(name);
+      const why = greedy ? {
+        import_free: 'Greedy Consumption — import is free right now',
+        export_surplus: 'Greedy Consumption — running on solar that would otherwise be exported',
+        forecast_surplus: 'Greedy Consumption — soaking forecast solar surplus',
+      }[a.greedy_reason] || `Greedy Consumption (${a.greedy_reason})` : (a ? friendlyNote(a.note) : '');
+      pills.push({
+        cls: greedy ? 'greedy' : 'run',
+        icon: greedy ? 'mdi:leaf' : (d.soc_entity ? 'mdi:ev-station' : 'mdi:flash'),
+        text: `${name}${kw ? ` ${kw.toFixed(1)} kW` : ' on'}${Number.isFinite(socV) ? ` · ${Math.round(socV)}%` : ''}`,
+        tip: `${name} is running${why ? ` — ${why}` : ''}.`,
+      });
+    }
+    // Greedy summary — only when greedy is armed somewhere but nothing is soaking yet;
+    // when it IS running, the leaf-marked device pills above already say so.
+    if (!greedyRunning.length && greedyArmed) {
+      pills.push({ cls: 'dim', icon: 'mdi:leaf', text: `Greedy armed · ${greedyArmed}`,
+        tip: `Greedy Consumption is enabled on ${greedyArmed} device(s), waiting for free or surplus energy.` });
+    }
+    if (overrides.length) {
+      pills.push({ cls: 'dim', icon: 'mdi:hand-back-right-outline',
+        text: `${overrides.length} override${overrides.length > 1 ? 's' : ''}`,
+        tip: `Manual overrides: ${overrides.join('; ')}.` });
+    }
+    return pills;
+  }
+
+  _statusHtml() {
+    return this._statusPills().map((p) => `
+      <span class="sp ${p.cls || ''}"${p.tip ? ` data-tip="${esc(p.tip)}" tabindex="0"` : ''}>
+        <ha-icon icon="${p.icon}"></ha-icon>${esc(p.text)}</span>`).join('');
+  }
+
+  // Changelog is fetched through the integration's own proxy (ChangelogView in
+  // __init__.py), which caches the API's GET /changelog for an hour — re-asking it
+  // hourly from here is therefore cheap, and picks up a deploy without a page reload.
+  async _clFetch() {
+    if (!this._hass || this._clPending || Date.now() - this._clFetchedAt < CL_REFRESH_MS) return;
+    this._clPending = true;
+    try {
+      const res = await this._hass.callApi('GET', 'grid_lens/changelog');
+      const entries = Array.isArray(res && res.entries) ? res.entries : [];
+      const changed = JSON.stringify(entries) !== JSON.stringify(this._clEntries);
+      this._clEntries = entries;
+      if (this._clIdx >= entries.length) this._clIdx = 0;
+      if (changed) this._paint();
+    } catch (e) {
+      // Older integration without the view, or offline — the ticker just stays hidden.
+    } finally {
+      this._clFetchedAt = Date.now();
+      this._clPending = false;
+    }
+  }
+
+  _clItemHtml(e, extraCls = '') {
+    const src = e.source === 'cloud' ? 'Cloud' : 'Integration';
+    const d = e.date ? new Date(`${e.date}T00:00:00`) : null;
+    const date = d && !isNaN(d) ? d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '';
+    return `<span class="cl-item ${extraCls}">
+      <span class="cl-src ${e.source === 'cloud' ? 'cloud' : 'integ'}">${src}</span>
+      <span class="cl-date">${esc(date)}</span>
+      <span class="cl-title">${esc(e.title)}</span></span>`;
+  }
+
+  _changelogHtml() {
+    const list = this._clEntries || [];
+    if (!list.length) return '';
+    const e = list[this._clIdx % list.length];
+    return `<button class="cl" type="button" data-cl-toggle aria-expanded="${this._clOpen}"
+        title="Recent Grid Lens changes — click for the full list">
+      <span class="cl-hd"><ha-icon icon="mdi:creation"></ha-icon>What's new</span>
+      <span class="cl-viewport">${this._clItemHtml(e)}</span>
+      <span class="cl-count">${(this._clIdx % list.length) + 1}/${list.length}</span>
+    </button>`;
+  }
+
+  _hd2Html() {
+    const status = this._statusHtml();
+    this._statusSig = status;
+    const cl = this._changelogHtml();
+    if (!status && !cl) return '';
+    return `<div class="hd2"><div class="st">${status}</div>${cl}</div>`;
+  }
+
+  // Ticker advance: swaps the visible item with a slide-up transition in place, rather
+  // than through _paint(), so it doesn't rebuild the header (and any open slider) every
+  // few seconds. Paused while hovered/focused or while the full list is open.
+  _clTick() {
+    const list = this._clEntries || [];
+    if (list.length < 2 || this._clOpen) return;
+    const root = this.shadowRoot;
+    if (!root || root.querySelector('.cl:hover, .cl:focus-visible')) return;
+    const vp = root.querySelector('.cl-viewport');
+    this._clIdx = (this._clIdx + 1) % list.length;
+    if (!vp) return;
+    const old = vp.querySelector('.cl-item');
+    vp.insertAdjacentHTML('beforeend', this._clItemHtml(list[this._clIdx], 'enter'));
+    if (old) {
+      old.classList.add('leave');
+      setTimeout(() => old.remove(), 500);
+    }
+    const cnt = root.querySelector('.cl-count');
+    if (cnt) cnt.textContent = `${this._clIdx + 1}/${list.length}`;
+  }
+
+  _clPopHtml() {
+    const list = this._clEntries || [];
+    return `<div class="cl-pop-hd">What's new in Grid Lens</div>` + list.map((e) => {
+      const inner = this._clItemHtml(e);
+      return e.url
+        ? `<a class="cl-row" href="${esc(e.url)}" target="_blank" rel="noopener">${inner}</a>`
+        : `<div class="cl-row">${inner}</div>`;
+    }).join('');
+  }
+
+  _onClToggleClick(ev) {
+    const btn = ev.target && ev.target.closest && ev.target.closest('[data-cl-toggle]');
+    if (!btn) return;
+    ev.stopPropagation();
+    this._clOpen = !this._clOpen;
+    this._syncClPop();
+    btn.setAttribute('aria-expanded', String(this._clOpen));
+  }
+
+  // The full list lives OUTSIDE .body (a sibling, like the tooltip popup) so the
+  // per-minute header repaint doesn't reset its scroll position while it's being read.
+  _syncClPop() {
+    const pop = this.shadowRoot && this.shadowRoot.querySelector('.cl-pop');
+    if (!pop) return;
+    if (!this._clOpen || !(this._clEntries || []).length) {
+      pop.classList.remove('show');
+      return;
+    }
+    if (!pop.classList.contains('show')) pop.innerHTML = this._clPopHtml();
+    const row = this.shadowRoot.querySelector('.hd2');
+    pop.style.top = row ? `${row.offsetTop + row.offsetHeight + 4}px` : '0px';
+    pop.classList.add('show');
   }
 
   // ------------------------------------------------------------ Daily Target (§9b)
@@ -743,6 +988,74 @@ class GridLensAdvisoryCard extends HTMLElement {
                    border-color:color-mix(in srgb,var(--good) 40%,transparent); }
         .chip.on .chip-dot { background:var(--good); }
 
+        /* Second header row: status pills (left, wrap) + What's new ticker (right).
+           No backtick characters in this comment: it sits inside a template literal. */
+        .hd2 { display:flex; align-items:center; gap:10px; margin-top:8px; padding-top:8px;
+               border-top:1px solid var(--border); flex-wrap:wrap; }
+        .hd2 .st { display:flex; gap:6px; flex-wrap:wrap; flex:1 1 260px; min-width:0; }
+        .sp { display:inline-flex; align-items:center; gap:5px; font-size:11.5px; font-weight:600;
+              line-height:1; padding:4px 9px 4px 7px; border-radius:20px; white-space:nowrap;
+              color:var(--ink); background:color-mix(in srgb,var(--ink) 6%,transparent);
+              font-variant-numeric:tabular-nums; }
+        .sp ha-icon { --mdc-icon-size:14px; color:var(--ink2); }
+        .sp.dim { color:var(--ink2); background:transparent; border:1px dashed var(--border); }
+        .sp.run ha-icon { color:var(--solar); }
+        .sp.greedy { color:var(--good); background:color-mix(in srgb,var(--good) 12%,transparent); }
+        .sp.greedy ha-icon { color:var(--good); animation:sp-breathe 2.4s ease-in-out infinite; }
+        .sp.mode-charge ha-icon { color:var(--charge); }
+        .sp.mode-discharge ha-icon { color:var(--discharge); }
+        .sp.warn { color:var(--buy); background:color-mix(in srgb,var(--buy) 12%,transparent); }
+        .sp.warn ha-icon { color:var(--buy); }
+        @keyframes sp-breathe { 50% { opacity:.45; } }
+
+        .cl { display:flex; align-items:center; gap:8px; flex:1 1 320px; min-width:0; max-width:560px;
+              margin-left:auto; padding:3px 4px 3px 3px; border-radius:20px; cursor:pointer;
+              font:inherit; color:var(--ink); text-align:left;
+              border:1px solid var(--border);
+              background:linear-gradient(90deg,
+                color-mix(in srgb,var(--good) 10%,transparent), transparent 60%); }
+        .cl:hover { border-color:color-mix(in srgb,var(--good) 45%,transparent); }
+        .cl:focus-visible { outline:2px solid var(--good); outline-offset:2px; }
+        .cl-hd { flex:0 0 auto; display:inline-flex; align-items:center; gap:4px; font-size:10.5px;
+                 font-weight:700; letter-spacing:.03em; text-transform:uppercase; color:var(--good);
+                 padding:3px 8px; border-radius:20px;
+                 background:color-mix(in srgb,var(--good) 14%,transparent); }
+        .cl-hd ha-icon { --mdc-icon-size:13px; }
+        .cl-viewport { position:relative; flex:1 1 auto; min-width:0; height:20px; overflow:hidden;
+                       -webkit-mask-image:linear-gradient(90deg,#000 88%,transparent);
+                       mask-image:linear-gradient(90deg,#000 88%,transparent); }
+        .cl-viewport .cl-item { position:absolute; inset:0; }
+        .cl-item { display:flex; align-items:center; gap:7px; min-width:0; white-space:nowrap; }
+        .cl-item.enter { animation:cl-in .45s cubic-bezier(.2,.7,.2,1) both; }
+        .cl-item.leave { animation:cl-out .45s cubic-bezier(.4,0,.6,1) both; }
+        @keyframes cl-in { from { transform:translateY(100%); opacity:0; } to { transform:none; opacity:1; } }
+        @keyframes cl-out { to { transform:translateY(-100%); opacity:0; } }
+        .cl-src { flex:0 0 auto; font-size:9.5px; font-weight:700; letter-spacing:.03em;
+                  text-transform:uppercase; padding:2px 6px; border-radius:5px; }
+        .cl-src.integ { color:var(--charge); background:color-mix(in srgb,var(--charge) 13%,transparent); }
+        .cl-src.cloud { color:var(--solar); background:color-mix(in srgb,var(--solar) 16%,transparent); }
+        .cl-date { flex:0 0 auto; font-size:11px; color:var(--ink2); font-variant-numeric:tabular-nums; }
+        .cl-title { font-size:12px; font-weight:550; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+        .cl-count { flex:0 0 auto; font-size:10px; color:var(--ink2); font-variant-numeric:tabular-nums;
+                    padding-right:6px; }
+        .cl-pop { position:absolute; right:16px; width:min(520px, calc(100% - 32px)); max-height:320px;
+                  overflow-y:auto; z-index:20; padding:6px; border-radius:12px;
+                  background:var(--surface); border:1px solid var(--border);
+                  box-shadow:0 10px 30px rgba(0,0,0,.25); display:none; }
+        .cl-pop.show { display:block; animation:cl-pop-in .18s ease-out; }
+        @keyframes cl-pop-in { from { opacity:0; transform:translateY(-4px); } }
+        .cl-pop-hd { font-size:11px; font-weight:700; color:var(--ink2); text-transform:uppercase;
+                     letter-spacing:.03em; padding:4px 8px 6px; }
+        .cl-row { display:block; padding:6px 8px; border-radius:8px; color:var(--ink);
+                  text-decoration:none; }
+        .cl-row .cl-title { white-space:normal; }
+        .cl-row .cl-item { white-space:normal; align-items:baseline; }
+        a.cl-row:hover { background:color-mix(in srgb,var(--ink) 6%,transparent); }
+        @media (prefers-reduced-motion: reduce) {
+          .cl-item.enter, .cl-item.leave, .sp.greedy ha-icon, .cl-pop.show { animation:none; }
+          .cl-item.leave { display:none; }
+        }
+
         /* Daily Target (§9b) — relocated here 2026-09-22. Header content (solar chips,
            master slider, expand button) is spliced directly into .hd above as its own
            direct children — see _dtInlineHtml() — so it's part of the SAME row as the
@@ -906,13 +1219,14 @@ class GridLensAdvisoryCard extends HTMLElement {
                box-shadow: 0 4px 14px rgba(0,0,0,.28); z-index: 30; transition: opacity .08s ease; }
         .dt-tt-pop.show { opacity: 1; visibility: visible; }
       </style>
-      <div class="card"><div class="body"></div><div class="dt-tt-pop"></div></div>
+      <div class="card"><div class="body"></div><div class="cl-pop"></div><div class="dt-tt-pop"></div></div>
     `;
     // Delegated: _paint() replaces .body's innerHTML on every repaint, so per-element
     // listeners would be torn off. The listeners live on .body, which survives.
     const body = this.shadowRoot.querySelector('.body');
     if (body) {
       body.addEventListener('click', (ev) => this._onChipClick(ev));
+      body.addEventListener('click', (ev) => this._onClToggleClick(ev));
       body.addEventListener('click', (ev) => this._onDtExpandClick(ev));
       body.addEventListener('click', (ev) => this._onDtResetClick(ev));
       body.addEventListener('pointerdown', (ev) => this._onDtSliderPointerDown(ev));
@@ -958,16 +1272,19 @@ class GridLensAdvisoryCard extends HTMLElement {
           <div class="badge ${s.restored ? 'stale' : (s.status === 'ok' ? 'ok' : '')}">${s.restored ? 'LAST PLAN' : esc((s.status || 'unknown').toUpperCase())}</div>
         </div>
       </div>
+      ${this._hd2Html()}
       ${this._dtExpandedHtml()}`;
 
     if (this._config.compact) {
       body.innerHTML = header;
+      this._syncClPop();
       return;
     }
 
     if (!this._traj || s.status !== 'ok') {
       body.innerHTML = header +
         `<div class="waiting">Advisory plan not available yet${s.reason ? '<br><span class="sub">' + esc(s.reason) + '</span>' : ''}</div>`;
+      this._syncClPop();
       return;
     }
 
@@ -1000,6 +1317,7 @@ class GridLensAdvisoryCard extends HTMLElement {
         </div>
       </div>` : ''}
       <div class="note">See the SOC/Power chart cards for the solar/load/price forecast validation. All series are the forecast for the current plan (${s.plan_name ? esc(s.plan_name) : '—'}).</div>`;
+    this._syncClPop();
   }
 
   _modeTransitions() {

@@ -1432,6 +1432,52 @@ Flow expander before this is "done" in the sense a curl-tested API change is don
 
 ---
 
+## 6c. Header status strip + "What's new" ticker (2026-10-04)
+
+A second row under the "Optimiser & Plan" header (`grid-lens-advisory-card.js`, both compact
+and full layouts; no config — it appears whenever it has something to show).
+
+**Left — status pills**, a one-glance summary of state that already exists elsewhere:
+- **Battery**: the executor's current command from the battery control switch
+  (`current_action`/`current_power_w`, e.g. "Charge 3.2 kW"), or a warning pill when that
+  switch is off ("Battery control off") or `consecutive_apply_failures`/`degraded` is set.
+- **Running devices**: every `deferrable_loads` device drawing power — measured
+  `power_entity` above max(50 W, 2% of `max_kw`), else the controller's `commanded == on` —
+  with kW and SOC (if `soc_entity`). Leaf icon + green when it's Greedy-driven
+  (`greedy_reason` set), with the reason in the tooltip.
+- **Dim pills**: modulating device unplugged (`plugged_in == false`), SOC cutoff reached,
+  "Greedy armed · N" (enabled but nothing soaking yet — hidden once something is), and "N
+  overrides" (control switch `override` on/off; names in the tooltip).
+All auto-discovered (same `resolveDeferrableLoads`/`resolveLoadControlRows` the expander
+uses); an install with no battery control and no deferrable loads just shows no pills.
+Pills refresh in place (`_refreshStatus`) rather than through a full header repaint, so
+power changes every few seconds don't fight the Daily Target sliders.
+
+**Right — "What's new" ticker**: rotates one recent change every 7 s (slide-up; pauses on
+hover/focus; respects `prefers-reduced-motion`), tagged **Integration** (`gridlens`, links to
+the GitHub commit) or **Cloud** (`gridlens-api`, no link — private repo). Click opens the
+full list (a popup outside `.body`, so repaints don't reset its scroll).
+Data path: `gridlens-api/tools/build_changelog.py` runs in `deploy.yml` before the docker
+build and bakes `app/changelog.json` (gitignored) into the image from both repos' `git log`
+(60 days, 40 entries) → public `GET /changelog` (`app/changelog.py`) → integration proxy
+`GET /api/grid_lens/changelog` (`ChangelogView`, `__init__.py`, 1 h cache, last-good on
+failure) → card fetches hourly via `hass.callApi`.
+
+**Gotchas.**
+- **Commit subjects ARE the public changelog.** Excluded automatically: merges, commits
+  touching only `*.md`/`docs/`/`tests/`/`tools/`, and any message containing
+  `[no-changelog]` — use that for anything not to be announced (unreleased gated work,
+  security fixes).
+- **Restricted-window gate**: a commit made weekdays 9–17 Sydney is withheld until 17:00
+  that day, and only dates (never times) are published — the feed is public, so it must not
+  reveal what the squash-merge rule hides. Since the file is built at API deploy, a
+  daytime `gridlens-api` commit appears at the first deploy after 17:00.
+- `gridlens` entries only refresh when `gridlens-api` deploys (it clones the public repo at
+  that point) — usually same evening, since a `gridlens` push normally comes with a
+  checklist commit in `gridlens-api`.
+
+---
+
 ## 7. Greedy Consumption
 
 **What it does.** A real-time safety net *on top of* the plan: turn a load on whenever
@@ -2351,7 +2397,7 @@ Callers passing no `rightAxis` are byte-for-byte unchanged (verified against the
 | `grid-lens-soc-chart-card` | Battery SOC curve, planned vs measured, full height. Kept alongside the Power Flow chart's SOC overlay on purpose: the overlay is at-a-glance context next to dispatch, this is the divergence diagnostic for whether control is actually tracking the plan. |
 | `grid-lens-cash-chart-card` | Cumulative cost/credit. |
 | `grid-lens-dispatch-chart-card` | Planned EMS mode timeline. |
-| `grid-lens-advisory-card` | Plan status header (plan name/solver/last-run time, status badge), control-mode timeline, deferrable-load recommendations, **plus Daily Target (§9b, relocated 2026-09-22): today/tomorrow solar forecast + master slider in the header, per-device sliders behind a chevron expander** — same header content in both compact and full layouts. **The expanded per-device panel also carries the full load-control row (§6b, merged 2026-09-24): sparkline, Today Boost, Greedy toggles, Off now/On now/Auto, live status, the estimator debug panel — alongside that row's slider.** `compact: true` config renders just the header (incl. the Daily Target/load-control block) — used as a slim "optimiser & plan" status bar at the top of the Power Flow view; `title` config overrides the header text in that mode. `show_current_rates: true` adds a one-line buy/sell readout ("Buy 22c/kWh · Sell 3c/kWh") under the plan-status line — the rate for the slot covering now, from the same `trajectory` attribute. Just the numbers; the rate *graph* is `grid-lens-price-chart-card`. Off by default and **not** used by the seed anymore — the Power Flow view shows the current rate on the `grid-lens-powerflow-card` Grid node instead (2026-09-11). Still available for a dashboard that has no Power Flow card. Works in the full card too. |
+| `grid-lens-advisory-card` | Plan status header (plan name/solver/last-run time, status badge), control-mode timeline, deferrable-load recommendations, **plus Daily Target (§9b, relocated 2026-09-22): today/tomorrow solar forecast + master slider in the header, per-device sliders behind a chevron expander** — same header content in both compact and full layouts. **The expanded per-device panel also carries the full load-control row (§6b, merged 2026-09-24): sparkline, Today Boost, Greedy toggles, Off now/On now/Auto, live status, the estimator debug panel — alongside that row's slider.** `compact: true` config renders just the header (incl. the Daily Target/load-control block) — used as a slim "optimiser & plan" status bar at the top of the Power Flow view; `title` config overrides the header text in that mode. `show_current_rates: true` adds a one-line buy/sell readout ("Buy 22c/kWh · Sell 3c/kWh") under the plan-status line — the rate for the slot covering now, from the same `trajectory` attribute. Just the numbers; the rate *graph* is `grid-lens-price-chart-card`. Off by default and **not** used by the seed anymore — the Power Flow view shows the current rate on the `grid-lens-powerflow-card` Grid node instead (2026-09-11). Still available for a dashboard that has no Power Flow card. Works in the full card too. **Second header row (§6c, 2026-10-04): live status pills (battery command, running/greedy devices, unplugged, overrides) + a rotating "What's new" changelog ticker.** |
 | `grid-lens-load-control-card` | One row per deferrable load: Today Boost, greedy toggles, Off now / On now / Auto, and live greedy status. **No longer seeded onto the default Settings view (2026-09-24)** — its default-visible home is now `grid-lens-advisory-card`'s per-device expander on the Power Flow view (§6b), same relocation Daily Target got in §9b. Still installed/registered for a dashboard that wants it as its own card. |
 | `grid-lens-daily-target-card` | Standalone Daily Target card (§9b) — same content as `grid-lens-advisory-card`'s header block, always expanded, no chevron. No longer seeded onto the default Settings view (2026-09-22) since the advisory-card header is now the default home; still installed/registered for a dashboard that wants it as its own card. |
 | `grid-lens-charge-target-card` | One row per SOC-tracked deferrable load: ad-hoc "charge to X% by a datetime" target (§9a) — a percent tile + a datetime tile, auto-paired via the `charge_target_role`/`deferrable_sensor_id` state attributes, plus a plain-text "Target: 95% by Sat, 2:22 am" / "No target set" status line, plus a third "Timing" tile (§9c's Prefer early/No preference/Prefer just-in-time select, matched via `charge_timing_preference_role: 'select'`) shown whenever the entity exists, independent of whether a target is currently active. Empty state when no device has SOC tracking configured. |
