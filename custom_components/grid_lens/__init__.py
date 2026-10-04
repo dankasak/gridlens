@@ -634,7 +634,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20261004a"
+    _CARD_VERSION = "20261004b"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -1649,13 +1649,18 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             return web.Response(text=html, content_type="text/html")
 
     class ChangelogView(HomeAssistantView):
-        """Proxies the API's GET /changelog for the "What's new" ticker on the
-        advisory card's header (grid-lens-advisory-card.js). Server-to-server for
-        the same reason as PowerflowCardView — browsers calling api.gridlens.au
-        directly would hit Cloudflare's bot protection and CORS. Sends no API key
-        and no install data; the endpoint is public. Cached for an hour (the feed
-        only changes on an API deploy), and on failure re-serves the last good
-        copy, or an empty list so the ticker simply hides itself.
+        """Feeds the two tickers on the advisory card's second header row
+        (grid-lens-advisory-card.js): "What's new" (the API's public GET /changelog —
+        commits to both Grid Lens repos) and "Plan updates" (GET /plans/updates/digest —
+        rate corrections/verifications/removals for this install's state, grouped by
+        retailer). Server-to-server for the same reason as PowerflowCardView — browsers
+        calling api.gridlens.au directly hit Cloudflare's bot protection and CORS.
+
+        The changelog fetch sends no key and no install data. The plan digest sends the
+        install's API key and state, like every other plan fetch (logged as a normal keyed
+        request — see PRIVACY_DATA_INVENTORY.md); the install's current plan is matched
+        locally (`mine`), never sent. Each half is cached for an hour and falls back to its
+        last good copy (or an empty list, which hides that ticker) independently.
         """
 
         url = "/api/grid_lens/changelog"
@@ -1666,39 +1671,67 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
         def __init__(self, hass_instance):
             self.hass = hass_instance
-            self._cache: tuple[float, dict] | None = None
+            self._cache: dict[str, tuple[float, object]] = {}
+
+        async def _cached(self, key, fetch, empty):
+            import time
+            now = time.monotonic()
+            hit = self._cache.get(key)
+            if hit and now - hit[0] < self._TTL:
+                return hit[1]
+            try:
+                data = await fetch()
+                if data is not None:
+                    self._cache[key] = (now, data)
+                    return data
+            except Exception as err:  # noqa: BLE001 — best-effort, purely cosmetic
+                _LOGGER.debug("Changelog %s: could not reach API (%s)", key, err)
+            if hit:
+                # Re-arm the TTL so an outage doesn't mean a retry on every page load.
+                self._cache[key] = (now, hit[1])
+                return hit[1]
+            return empty
 
         async def get(self, request):
-            import time
-            from .const import CONF_GRIDLENS_API_URL
-
-            now = time.monotonic()
-            if self._cache and now - self._cache[0] < self._TTL:
-                return self.json(self._cache[1])
+            from .const import (CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL,
+                                CONF_STATE, CONF_CURRENT_PLAN)
 
             entries = self.hass.config_entries.async_entries(DOMAIN)
-            api_url = (entries[0].data.get(CONF_GRIDLENS_API_URL) if entries else None) \
-                or "https://api.gridlens.au"
-            try:
-                session = async_get_clientsession(self.hass)
-                async with session.get(
-                    f"{api_url}/changelog",
-                    params={"limit": "30"},
-                    headers={"User-Agent": "GridLens-HA-Integration/1.0"},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
+            cfg = {**entries[0].data, **entries[0].options} if entries else {}
+            api_url = cfg.get(CONF_GRIDLENS_API_URL) or "https://api.gridlens.au"
+            api_key = cfg.get(CONF_GRIDLENS_API_KEY) or ""
+            state = (cfg.get(CONF_STATE) or "").upper()
+            session = async_get_clientsession(self.hass)
+            ua = {"User-Agent": "GridLens-HA-Integration/1.0"}
+
+            async def _get(path, params, headers):
+                async with session.get(f"{api_url}{path}", params=params, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        self._cache = (now, data)
-                        return self.json(data)
-                    _LOGGER.debug("Changelog: unexpected status %s from API", resp.status)
-            except Exception as err:  # noqa: BLE001 — best-effort, purely cosmetic
-                _LOGGER.debug("Changelog: could not reach API (%s)", err)
-            if self._cache:
-                # Re-arm the TTL so an outage doesn't mean a retry on every page load.
-                self._cache = (now, self._cache[1])
-                return self.json(self._cache[1])
-            return self.json({"generated_at": None, "entries": []})
+                        return await resp.json()
+                    _LOGGER.debug("Changelog: %s returned %s", path, resp.status)
+                    return None
+
+            async def _changelog():
+                return await _get("/changelog", {"limit": "30"}, ua)
+
+            async def _plans():
+                if not (api_key and state):
+                    return None
+                data = await _get("/plans/updates/digest", {"state": state, "limit": "20"},
+                                  {**ua, "X-API-Key": api_key})
+                return data.get("updates") if data else None
+
+            cl = await self._cached("changelog", _changelog, {"generated_at": None, "entries": []})
+            plans = await self._cached(f"plans:{state}", _plans, [])
+            mine = cfg.get(CONF_CURRENT_PLAN)
+            return self.json({
+                **cl,
+                "plan_updates": [
+                    {**u, "mine": bool(mine) and mine in (u.get("plan_ids") or [])}
+                    for u in plans
+                ],
+            })
 
     hass.http.register_view(PlanDataView(hass))
     hass.http.register_view(PlanHistoryView(hass))

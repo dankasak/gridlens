@@ -66,6 +66,16 @@ const DT_PIN_MAX_AGE_MS = 15000;
 // how often the list is re-requested from the integration's proxy.
 const CL_ROTATE_MS = 7000;
 const CL_REFRESH_MS = 60 * 60000;
+const CL_FEEDS = {
+  app: { label: "What's new", icon: 'mdi:creation', popTitle: "What's new in Grid Lens",
+         tip: 'Recent Grid Lens changes — click for the full list' },
+  plans: { label: 'Plan updates', icon: 'mdi:file-document-refresh-outline',
+           popTitle: 'Plan data updates for your state',
+           tip: 'Recent changes to the plans Grid Lens compares — click for the full list' },
+};
+const CL_PLAN_TYPE_LABELS = {
+  added: 'New', corrected: 'Rates', verified: 'Verified', flagged: 'Flagged', removed: 'Removed',
+};
 
 class GridLensAdvisoryCard extends HTMLElement {
   constructor() {
@@ -129,9 +139,10 @@ class GridLensAdvisoryCard extends HTMLElement {
     // status pills in place when nothing else in the header changed (device power moves
     // every few seconds; rebuilding the whole header that often would fight the sliders).
     this._statusSig = '';
-    this._clEntries = [];
-    this._clIdx = 0;
-    this._clOpen = false;
+    this._cl = { app: { entries: [], idx: 0 }, plans: { entries: [], idx: 0 } };
+    this._clOpen = null;     // which feed's full list is open, if any
+    this._clPopFeed = null;  // which feed the popup's current innerHTML was built for
+    this._clPhase = 0;
     this._clFetchedAt = 0;
     this._clPending = false;
     this._clTimer = null;
@@ -140,7 +151,7 @@ class GridLensAdvisoryCard extends HTMLElement {
   connectedCallback() {
     window.addEventListener('pointerup', this._dtPointerUpHandler);
     window.addEventListener('pointercancel', this._dtPointerUpHandler);
-    if (!this._clTimer) this._clTimer = setInterval(() => this._clTick(), CL_ROTATE_MS);
+    if (!this._clTimer) this._clTimer = setInterval(() => this._clTick(), CL_ROTATE_MS / 2);
   }
 
   disconnectedCallback() {
@@ -557,85 +568,114 @@ class GridLensAdvisoryCard extends HTMLElement {
         <ha-icon icon="${p.icon}"></ha-icon>${esc(p.text)}</span>`).join('');
   }
 
-  // Changelog is fetched through the integration's own proxy (ChangelogView in
-  // __init__.py), which caches the API's GET /changelog for an hour — re-asking it
-  // hourly from here is therefore cheap, and picks up a deploy without a page reload.
+  // Both tickers are fed by one call to the integration's own proxy (ChangelogView in
+  // __init__.py), which caches each upstream source for an hour — re-asking it hourly
+  // from here is therefore cheap, and picks up new entries without a page reload.
+  //   app   — "What's new": commits to both Grid Lens repos (API GET /changelog)
+  //   plans — "Plan updates": plan-data changes for this install's state, grouped by
+  //           retailer (API GET /plans/updates/digest); `mine` marks the current plan.
   async _clFetch() {
     if (!this._hass || this._clPending || Date.now() - this._clFetchedAt < CL_REFRESH_MS) return;
     this._clPending = true;
     try {
       const res = await this._hass.callApi('GET', 'grid_lens/changelog');
-      const entries = Array.isArray(res && res.entries) ? res.entries : [];
-      const changed = JSON.stringify(entries) !== JSON.stringify(this._clEntries);
-      this._clEntries = entries;
-      if (this._clIdx >= entries.length) this._clIdx = 0;
+      const next = {
+        app: Array.isArray(res && res.entries) ? res.entries : [],
+        plans: Array.isArray(res && res.plan_updates) ? res.plan_updates : [],
+      };
+      let changed = false;
+      for (const k of Object.keys(next)) {
+        const f = this._cl[k];
+        if (JSON.stringify(next[k]) !== JSON.stringify(f.entries)) changed = true;
+        f.entries = next[k];
+        if (f.idx >= f.entries.length) f.idx = 0;
+      }
       if (changed) this._paint();
     } catch (e) {
-      // Older integration without the view, or offline — the ticker just stays hidden.
+      // Older integration without the view, or offline — the tickers just stay hidden.
     } finally {
       this._clFetchedAt = Date.now();
       this._clPending = false;
     }
   }
 
-  _clItemHtml(e, extraCls = '') {
-    const src = e.source === 'cloud' ? 'Cloud' : 'Integration';
+  _clDate(e) {
     const d = e.date ? new Date(`${e.date}T00:00:00`) : null;
-    const date = d && !isNaN(d) ? d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '';
-    return `<span class="cl-item ${extraCls}">
-      <span class="cl-src ${e.source === 'cloud' ? 'cloud' : 'integ'}">${src}</span>
-      <span class="cl-date">${esc(date)}</span>
+    return d && !isNaN(d) ? d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '';
+  }
+
+  _clItemHtml(feed, e, extraCls = '') {
+    let tags;
+    if (feed === 'plans') {
+      const t = String(e.type || '');
+      tags = (e.mine ? '<span class="cl-src mine">Your plan</span>' : '')
+        + `<span class="cl-src pu-${esc(t)}">${esc(CL_PLAN_TYPE_LABELS[t] || t)}</span>`;
+    } else {
+      tags = `<span class="cl-src ${e.source === 'cloud' ? 'cloud' : 'integ'}">${e.source === 'cloud' ? 'Cloud' : 'Integration'}</span>`;
+    }
+    return `<span class="cl-item ${extraCls}">${tags}
+      <span class="cl-date">${esc(this._clDate(e))}</span>
       <span class="cl-title">${esc(e.title)}</span></span>`;
   }
 
-  _changelogHtml() {
-    const list = this._clEntries || [];
+  _tickerHtml(feed) {
+    const meta = CL_FEEDS[feed];
+    const f = this._cl[feed];
+    const list = f.entries;
     if (!list.length) return '';
-    const e = list[this._clIdx % list.length];
-    return `<button class="cl" type="button" data-cl-toggle aria-expanded="${this._clOpen}"
-        title="Recent Grid Lens changes — click for the full list">
-      <span class="cl-hd"><ha-icon icon="mdi:creation"></ha-icon>What's new</span>
-      <span class="cl-viewport">${this._clItemHtml(e)}</span>
-      <span class="cl-count">${(this._clIdx % list.length) + 1}/${list.length}</span>
+    const e = list[f.idx % list.length];
+    return `<button class="cl cl-${feed}" type="button" data-cl-toggle="${feed}"
+        aria-expanded="${this._clOpen === feed}" title="${esc(meta.tip)}">
+      <span class="cl-hd"><ha-icon icon="${meta.icon}"></ha-icon><span class="cl-lbl">${esc(meta.label)}</span></span>
+      <span class="cl-viewport">${this._clItemHtml(feed, e)}</span>
+      <span class="cl-count">${(f.idx % list.length) + 1}/${list.length}</span>
     </button>`;
   }
 
   _hd2Html() {
     const status = this._statusHtml();
     this._statusSig = status;
-    const cl = this._changelogHtml();
-    if (!status && !cl) return '';
-    return `<div class="hd2"><div class="st">${status}</div>${cl}</div>`;
+    const tickers = Object.keys(CL_FEEDS).map((k) => this._tickerHtml(k)).join('');
+    if (!status && !tickers) return '';
+    return `<div class="hd2"><div class="st">${status}</div>`
+      + (tickers ? `<div class="cls">${tickers}</div>` : '') + `</div>`;
   }
 
-  // Ticker advance: swaps the visible item with a slide-up transition in place, rather
-  // than through _paint(), so it doesn't rebuild the header (and any open slider) every
-  // few seconds. Paused while hovered/focused or while the full list is open.
+  // Ticker advance: swaps each bar's visible item with a slide-up transition in place,
+  // rather than through _paint(), so it doesn't rebuild the header (and any open slider)
+  // every few seconds. A bar pauses while hovered/focused or while its list is open. The
+  // second bar advances half a period after the first, so the two never move together.
   _clTick() {
-    const list = this._clEntries || [];
-    if (list.length < 2 || this._clOpen) return;
+    this._clPhase = (this._clPhase + 1) % 2;
+    const feed = Object.keys(CL_FEEDS)[this._clPhase];
+    const f = this._cl[feed];
+    const list = f.entries;
+    if (list.length < 2 || this._clOpen === feed) return;
     const root = this.shadowRoot;
-    if (!root || root.querySelector('.cl:hover, .cl:focus-visible')) return;
-    const vp = root.querySelector('.cl-viewport');
-    this._clIdx = (this._clIdx + 1) % list.length;
+    const btn = root && root.querySelector(`.cl-${feed}`);
+    if (!btn || btn.matches(':hover, :focus-visible')) return;
+    f.idx = (f.idx + 1) % list.length;
+    const vp = btn.querySelector('.cl-viewport');
     if (!vp) return;
     const old = vp.querySelector('.cl-item');
-    vp.insertAdjacentHTML('beforeend', this._clItemHtml(list[this._clIdx], 'enter'));
+    vp.insertAdjacentHTML('beforeend', this._clItemHtml(feed, list[f.idx], 'enter'));
     if (old) {
       old.classList.add('leave');
       setTimeout(() => old.remove(), 500);
     }
-    const cnt = root.querySelector('.cl-count');
-    if (cnt) cnt.textContent = `${this._clIdx + 1}/${list.length}`;
+    const cnt = btn.querySelector('.cl-count');
+    if (cnt) cnt.textContent = `${f.idx + 1}/${list.length}`;
   }
 
-  _clPopHtml() {
-    const list = this._clEntries || [];
-    return `<div class="cl-pop-hd">What's new in Grid Lens</div>` + list.map((e) => {
-      const inner = this._clItemHtml(e);
+  _clPopHtml(feed) {
+    const meta = CL_FEEDS[feed];
+    return `<div class="cl-pop-hd">${esc(meta.popTitle)}</div>` + this._cl[feed].entries.map((e) => {
+      const inner = this._clItemHtml(feed, e);
+      const n = Array.isArray(e.plan_ids) ? e.plan_ids.length : 0;
+      const tip = n > 1 ? ` title="${esc(e.plan_ids.join(', '))}"` : '';
       return e.url
         ? `<a class="cl-row" href="${esc(e.url)}" target="_blank" rel="noopener">${inner}</a>`
-        : `<div class="cl-row">${inner}</div>`;
+        : `<div class="cl-row"${tip}>${inner}</div>`;
     }).join('');
   }
 
@@ -643,23 +683,35 @@ class GridLensAdvisoryCard extends HTMLElement {
     const btn = ev.target && ev.target.closest && ev.target.closest('[data-cl-toggle]');
     if (!btn) return;
     ev.stopPropagation();
-    this._clOpen = !this._clOpen;
+    const feed = btn.getAttribute('data-cl-toggle');
+    this._clOpen = this._clOpen === feed ? null : feed;
+    this._clPopFeed = null;  // force a rebuild for the newly opened list
     this._syncClPop();
-    btn.setAttribute('aria-expanded', String(this._clOpen));
+    this.shadowRoot.querySelectorAll('[data-cl-toggle]').forEach((b) =>
+      b.setAttribute('aria-expanded', String(b.getAttribute('data-cl-toggle') === this._clOpen)));
   }
 
   // The full list lives OUTSIDE .body (a sibling, like the tooltip popup) so the
   // per-minute header repaint doesn't reset its scroll position while it's being read.
+  // Anchored under whichever bar opened it, shifted left if it would overflow the card.
   _syncClPop() {
-    const pop = this.shadowRoot && this.shadowRoot.querySelector('.cl-pop');
+    const root = this.shadowRoot;
+    const pop = root && root.querySelector('.cl-pop');
     if (!pop) return;
-    if (!this._clOpen || !(this._clEntries || []).length) {
+    const feed = this._clOpen;
+    const btn = feed && root.querySelector(`.cl-${feed}`);
+    if (!feed || !btn || !this._cl[feed].entries.length) {
       pop.classList.remove('show');
+      this._clPopFeed = null;
       return;
     }
-    if (!pop.classList.contains('show')) pop.innerHTML = this._clPopHtml();
-    const row = this.shadowRoot.querySelector('.hd2');
-    pop.style.top = row ? `${row.offsetTop + row.offsetHeight + 4}px` : '0px';
+    if (this._clPopFeed !== feed) { pop.innerHTML = this._clPopHtml(feed); this._clPopFeed = feed; }
+    const card = root.querySelector('.card');
+    const cardW = card ? card.clientWidth : 600;
+    const w = Math.min(Math.max(btn.offsetWidth, 380), cardW - 32);
+    pop.style.width = `${w}px`;
+    pop.style.left = `${Math.max(16, Math.min(btn.offsetLeft, cardW - 16 - w))}px`;
+    pop.style.top = `${btn.offsetTop + btn.offsetHeight + 4}px`;
     pop.classList.add('show');
   }
 
@@ -1008,13 +1060,24 @@ class GridLensAdvisoryCard extends HTMLElement {
         .sp.warn ha-icon { color:var(--buy); }
         @keyframes sp-breathe { 50% { opacity:.45; } }
 
-        .cl { display:flex; align-items:center; gap:8px; flex:1 1 320px; min-width:0; max-width:560px;
-              margin-left:auto; padding:3px 4px 3px 3px; border-radius:20px; cursor:pointer;
+        /* Two tickers side by side (What's new, Plan updates); they wrap as a pair below
+           the pills when the card is narrow, and stack when narrower still. */
+        .cls { display:flex; gap:8px; flex:2 1 520px; min-width:0; max-width:900px; margin-left:auto;
+               flex-wrap:wrap; }
+        .cl { display:flex; align-items:center; gap:8px; flex:1 1 250px; min-width:0;
+              padding:3px 4px 3px 3px; border-radius:20px; cursor:pointer;
               font:inherit; color:var(--ink); text-align:left;
               border:1px solid var(--border);
               background:linear-gradient(90deg,
                 color-mix(in srgb,var(--good) 10%,transparent), transparent 60%); }
         .cl:hover { border-color:color-mix(in srgb,var(--good) 45%,transparent); }
+        .cl { container-type:inline-size; }
+        /* A narrow bar keeps its icon (the tooltip names it) and gives the room to the
+           entry itself; the count and label come back once there's space for them. */
+        @container (max-width: 380px) {
+          .cl-lbl, .cl-count { display:none; }
+          .cl-hd { padding:3px 5px; }
+        }
         .cl:focus-visible { outline:2px solid var(--good); outline-offset:2px; }
         .cl-hd { flex:0 0 auto; display:inline-flex; align-items:center; gap:4px; font-size:10.5px;
                  font-weight:700; letter-spacing:.03em; text-transform:uppercase; color:var(--good);
@@ -1034,11 +1097,22 @@ class GridLensAdvisoryCard extends HTMLElement {
                   text-transform:uppercase; padding:2px 6px; border-radius:5px; }
         .cl-src.integ { color:var(--charge); background:color-mix(in srgb,var(--charge) 13%,transparent); }
         .cl-src.cloud { color:var(--solar); background:color-mix(in srgb,var(--solar) 16%,transparent); }
+        /* Plan updates bar: own accent (the grid/import purple) so the two bars read apart. */
+        .cl.cl-plans { background:linear-gradient(90deg,
+                         color-mix(in srgb,var(--gridflow) 12%,transparent), transparent 60%); }
+        .cl.cl-plans:hover { border-color:color-mix(in srgb,var(--gridflow) 50%,transparent); }
+        .cl.cl-plans .cl-hd { color:var(--gridflow);
+                              background:color-mix(in srgb,var(--gridflow) 15%,transparent); }
+        .cl-src.pu-added { color:var(--good); background:color-mix(in srgb,var(--good) 13%,transparent); }
+        .cl-src.pu-corrected { color:var(--gridflow); background:color-mix(in srgb,var(--gridflow) 14%,transparent); }
+        .cl-src.pu-verified { color:var(--ink2); background:color-mix(in srgb,var(--ink) 8%,transparent); }
+        .cl-src.pu-flagged, .cl-src.pu-removed { color:var(--buy); background:color-mix(in srgb,var(--buy) 13%,transparent); }
+        .cl-src.mine { color:#fff; background:var(--good); }
         .cl-date { flex:0 0 auto; font-size:11px; color:var(--ink2); font-variant-numeric:tabular-nums; }
         .cl-title { font-size:12px; font-weight:550; overflow:hidden; text-overflow:ellipsis; min-width:0; }
         .cl-count { flex:0 0 auto; font-size:10px; color:var(--ink2); font-variant-numeric:tabular-nums;
                     padding-right:6px; }
-        .cl-pop { position:absolute; right:16px; width:min(520px, calc(100% - 32px)); max-height:320px;
+        .cl-pop { position:absolute; left:16px; width:min(520px, calc(100% - 32px)); max-height:320px;
                   overflow-y:auto; z-index:20; padding:6px; border-radius:12px;
                   background:var(--surface); border:1px solid var(--border);
                   box-shadow:0 10px 30px rgba(0,0,0,.25); display:none; }
