@@ -158,6 +158,7 @@ from gl.inverters.base import BatteryAction  # noqa: E402  (loaded above)
 
 MODULATION_INTERVAL_SECONDS = CONST.MODULATION_INTERVAL_SECONDS
 MODULATION_CROSSING_DWELL_SECONDS = CONST.MODULATION_CROSSING_DWELL_SECONDS
+MODULATION_OFF_CONFIRM_TICKS = CONST.MODULATION_OFF_CONFIRM_TICKS
 DEFAULT_SUPPLY_VOLTAGE = CONST.DEFAULT_SUPPLY_VOLTAGE
 DEFAULT_MIN_CHARGE_CURRENT_A = CONST.DEFAULT_MIN_CHARGE_CURRENT_A
 
@@ -412,7 +413,9 @@ async def _run_floor_hysteresis_holds_then_drops():
     """Below min while ON: hold at min down to 0.6*min, only then drop to 0."""
     hass = FakeHass()
     _evse(hass, mx=32)
-    c = _mk(hass)                                   # floor 1380 W, hold-down bar 828 W
+    # off_confirm_ticks=1 isolates the amplitude bar under test from the multi-tick off
+    # confirmation (covered by its own tests below).
+    c = _mk(hass, off_confirm_ticks=1)              # floor 1380 W, hold-down bar 828 W
     await c.modulate(3000.0, _T0)                   # 13 A
     assert _values(hass) == [13.0] and c._commanded is True
 
@@ -506,7 +509,7 @@ async def _run_boundary_crossing_always_writes():
     button press every ~30s fast tick for 17 minutes straight."""
     hass = FakeHass()
     _evse(hass, mx=32)
-    c = _mk(hass)
+    c = _mk(hass, off_confirm_ticks=1)          # dwell under test, not off-confirmation
     await c.modulate(3000.0, _T0)                           # first-ever write -> establishes on
     assert _values(hass) == [13.0]
     await c.modulate(0.0, _T0 + timedelta(seconds=1))       # 1 s later -> held, dwell not met
@@ -580,6 +583,91 @@ async def _run_hard_interlocks_bypass_crossing_dwell():
     assert c._commanded is True
     hass.states.set("sensor.evse_status", "available")  # car unplugged
     await c.modulate(5000.0, t + timedelta(seconds=1))
+    assert c._commanded is False
+
+
+async def _run_off_confirm_holds_floor_through_one_tick_dip():
+    """Regression for 2026-10-04: a passing cloud dropped the household Wattpilot's target
+    below the hold bar for exactly one 30s tick (5.8 kW -> 407 W -> 1.4 kW -> 3-5 kW). That
+    single tick stopped the charger and the crossing dwell kept it off for 5 minutes. A
+    running load must now hold at its floor through a dip shorter than
+    MODULATION_OFF_CONFIRM_TICKS ticks, and never press stop."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    c = _mk(hass, start_button_entity_id="button.start", stop_button_entity_id="button.stop")
+    t = _T0
+    await c.modulate(5800.0, t)                                 # on, 25 A
+    t += timedelta(seconds=MODULATION_CROSSING_DWELL_SECONDS + 30)  # long past any dwell
+    await c.modulate(5800.0, t)
+    t += timedelta(seconds=MODULATION_INTERVAL_SECONDS)
+    await c.modulate(407.0, t)                                  # the cloud tick
+    assert c._commanded is True
+    assert _last_value(hass) == 6.0                             # held at the floor
+    assert "off_pending_1of" in c._note
+    t += timedelta(seconds=MODULATION_INTERVAL_SECONDS)
+    await c.modulate(1359.0, t)                                 # inside hold band -> resets
+    assert c._off_pending == 0
+    t += timedelta(seconds=MODULATION_INTERVAL_SECONDS)
+    await c.modulate(2953.0, t)                                 # sun back
+    assert c._commanded is True and _last_value(hass) == 13.0
+    assert _presses(hass, "button.stop") == []
+
+
+async def _run_off_confirm_stops_after_n_consecutive_ticks():
+    """A genuine loss of surplus still stops the load — on the Nth consecutive off tick."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    c = _mk(hass, start_button_entity_id="button.start", stop_button_entity_id="button.stop")
+    t = _T0
+    await c.modulate(3000.0, t)
+    t += timedelta(seconds=MODULATION_CROSSING_DWELL_SECONDS + 30)
+    for i in range(1, MODULATION_OFF_CONFIRM_TICKS):
+        await c.modulate(0.0, t)
+        assert c._commanded is True, i
+        assert _presses(hass, "button.stop") == []
+        t += timedelta(seconds=MODULATION_INTERVAL_SECONDS)
+    await c.modulate(0.0, t)                                    # Nth tick -> stop
+    assert c._commanded is False
+    assert len(_presses(hass, "button.stop")) == 1
+    assert c._off_pending == 0
+
+
+async def _run_off_confirm_count_resets_on_recovery():
+    """Non-consecutive off ticks never add up to a stop."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    c = _mk(hass)
+    t = _T0
+    await c.modulate(3000.0, t)
+    t += timedelta(seconds=MODULATION_CROSSING_DWELL_SECONDS + 30)
+    for _ in range(4 * MODULATION_OFF_CONFIRM_TICKS):
+        for target in [0.0] * (MODULATION_OFF_CONFIRM_TICKS - 1) + [3000.0]:
+            await c.modulate(target, t)
+            assert c._commanded is True
+            t += timedelta(seconds=MODULATION_INTERVAL_SECONDS)
+
+
+async def _run_off_confirm_never_delays_hard_interlocks():
+    """soc_cutoff and unplugged stop on the first tick regardless of off-confirmation."""
+    hass = FakeHass()
+    _evse(hass, mx=32)
+    hass.states.set("sensor.evse_status", "charging")
+    c = _mk(hass, plug_entity_id="sensor.evse_status")
+    t = _T0
+    await c.modulate(3000.0, t)
+    t += timedelta(seconds=MODULATION_INTERVAL_SECONDS)
+    await c.modulate(0.0, t)                                    # one pending off tick
+    assert c._commanded is True and c._off_pending == 1
+    hass.states.set("sensor.evse_status", "available")
+    await c.modulate(3000.0, t + timedelta(seconds=1))
+    assert c._commanded is False and c._off_pending == 0
+
+    hass.states.set("sensor.evse_status", "charging")
+    t += timedelta(seconds=MODULATION_CROSSING_DWELL_SECONDS + 30)
+    await c.modulate(3000.0, t)
+    assert c._commanded is True
+    await c.apply(3000.0, t, soc_cutoff=True)
+    await c.modulate(3000.0, t + timedelta(seconds=1))
     assert c._commanded is False
 
 
@@ -762,7 +850,8 @@ async def _run_button_pair_stop_skips_the_zero_write():
     2026-09-11)."""
     hass = FakeHass()
     _evse(hass, mx=32)
-    c = _mk(hass, start_button_entity_id="button.start", stop_button_entity_id="button.stop")
+    c = _mk(hass, start_button_entity_id="button.start", stop_button_entity_id="button.stop",
+            off_confirm_ticks=1)
     await c.modulate(3000.0, _T0)                                    # on, 13 A
     # The off-crossing must itself clear the crossing dwell since the on-crossing at _T0 —
     # push it out past MODULATION_CROSSING_DWELL_SECONDS so the dwell gate (Part B of the
@@ -777,7 +866,8 @@ async def _run_button_pair_stop_skips_the_zero_write():
 async def _run_button_pair_repeated_off_does_not_repress_stop():
     hass = FakeHass()
     _evse(hass, mx=32)
-    c = _mk(hass, start_button_entity_id="button.start", stop_button_entity_id="button.stop")
+    c = _mk(hass, start_button_entity_id="button.start", stop_button_entity_id="button.stop",
+            off_confirm_ticks=1)
     await c.modulate(3000.0, _T0)
     off_t = _T0 + timedelta(seconds=MODULATION_CROSSING_DWELL_SECONDS + 30)
     await c.modulate(0.0, off_t)
@@ -2079,6 +2169,10 @@ if __name__ == "__main__":
         ("boundary_crossing_always_writes", lambda: _run_async(_run_boundary_crossing_always_writes)),
         ("crossing_dwell_bounds_oscillation_flap", lambda: _run_async(_run_crossing_dwell_bounds_oscillation_flap)),
         ("hard_interlocks_bypass_crossing_dwell", lambda: _run_async(_run_hard_interlocks_bypass_crossing_dwell)),
+        ("off_confirm_holds_floor_through_one_tick_dip", lambda: _run_async(_run_off_confirm_holds_floor_through_one_tick_dip)),
+        ("off_confirm_stops_after_n_consecutive_ticks", lambda: _run_async(_run_off_confirm_stops_after_n_consecutive_ticks)),
+        ("off_confirm_count_resets_on_recovery", lambda: _run_async(_run_off_confirm_count_resets_on_recovery)),
+        ("off_confirm_never_delays_hard_interlocks", lambda: _run_async(_run_off_confirm_never_delays_hard_interlocks)),
         # plug
         ("plug_states", test_plug_states),
         ("unplugged_commands_zero", lambda: _run_async(_run_unplugged_commands_zero)),

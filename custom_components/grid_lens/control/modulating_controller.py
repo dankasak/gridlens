@@ -49,7 +49,10 @@ Behaviours this file is careful about, in rough order of how expensive getting t
   the minimum until the target drops well clear of it (``_MIN_HOLD_FRACTION``), instead of
   dropping straight to 0. An EV that gets cut off can take 30+ seconds to re-handshake and
   some cars sulk far longer, so a session flapping off/on across a cloud edge costs far more
-  charge than the few hundred watts of import that holding at 6 A might draw.
+  charge than the few hundred watts of import that holding at 6 A might draw. Even below that
+  bar, a running load holds at the minimum until the target has resolved to off for
+  ``MODULATION_OFF_CONFIRM_TICKS`` consecutive fast ticks — a single 30 s cloud tick is not a
+  reason to stop (found 2026-10-04 on the household's Wattpilot).
 * **Write economy.** Every write here goes over the wire to real hardware — an OCPP
   ``SetChargingProfile``, or a cloud round-trip for Easee/Wallbox/Zaptec, some of which are
   rate-limited. So a change smaller than the deadband, or sooner than the minimum write
@@ -97,6 +100,7 @@ from ..const import (
     DEFAULT_SUPPLY_VOLTAGE,
     MODULATING_UNPLUGGED_STATES,
     MODULATION_CROSSING_DWELL_SECONDS,
+    MODULATION_OFF_CONFIRM_TICKS,
 )
 from .load_controller import DeferrableLoadController
 
@@ -142,6 +146,7 @@ class ModulatingLoadController(DeferrableLoadController):
         write_deadband_a: float = 0.5,
         min_write_interval_s: float = 20.0,
         min_crossing_dwell_s: float = MODULATION_CROSSING_DWELL_SECONDS,
+        off_confirm_ticks: int = MODULATION_OFF_CONFIRM_TICKS,
         start_button_entity_id: str = "",
         stop_button_entity_id: str = "",
         **kwargs,
@@ -188,6 +193,11 @@ class ModulatingLoadController(DeferrableLoadController):
         # a different controller's different problem — physical switch wear, asymmetric per
         # direction — and this class's flapping was symmetric, not direction-biased).
         self.min_crossing_dwell_s = max(0.0, float(min_crossing_dwell_s))
+        # See modulate()'s off-confirmation block: a running load needs this many consecutive
+        # "off" plan/surplus ticks before it is stopped. 1 = stop on the first one (the old
+        # behaviour). _off_pending counts the ticks seen so far in the current run.
+        self.off_confirm_ticks = max(1, int(off_confirm_ticks))
+        self._off_pending = 0
 
         # "" = infer from the entity's own unit_of_measurement the first time we can read it.
         # Resolution is deferred (not done here) because at construction time the charger
@@ -555,6 +565,7 @@ class ModulatingLoadController(DeferrableLoadController):
             # already issued by set_override(). Re-asserting it every 30 s would fight
             # whatever they do at the charger itself — a fresh connect is no exception, the
             # override stays hands-off until the human clears it.
+            self._off_pending = 0
             return
 
         if self._soc_cutoff:
@@ -565,10 +576,12 @@ class ModulatingLoadController(DeferrableLoadController):
             # not "stopped because unplugged", if a caller ever inspects why. _write's own
             # crossing logic means this only actually presses the stop button once (the
             # genuine on->off transition), not on every 30s tick that follows.
+            self._off_pending = 0
             await self._write(0.0, now, source="off", reason="soc_cutoff")
             return
 
         if plugged is False:
+            self._off_pending = 0
             await self._write(0.0, now, source="off", reason="unplugged")
             return
 
@@ -604,15 +617,40 @@ class ModulatingLoadController(DeferrableLoadController):
         else:
             commanded = want
 
+        # Off-confirmation: a running load is only stopped once the plan/surplus target has
+        # resolved to 0 for off_confirm_ticks consecutive ticks; until then it holds at the
+        # floor (see MODULATION_OFF_CONFIRM_TICKS — found 2026-10-04, one cloud tick stopped
+        # the Wattpilot and the crossing dwell kept it off for 5 minutes). Not applied when
+        # the floor itself is infeasible (cap below floor) — that's structural, not noise.
+        reason = "reconnected" if just_connected else ""
+        if (
+            commanded <= 0.0 and self._commanded and floor > 0.0
+            and not (cap > 0.0 and floor > cap)
+        ):
+            self._off_pending += 1
+            if self._off_pending < self.off_confirm_ticks:
+                _LOGGER.debug(
+                    "%s: target_w=%.0f resolves to off — holding at floor=%.0f, %d of %d "
+                    "confirming ticks",
+                    self.name, want, floor, self._off_pending, self.off_confirm_ticks,
+                )
+                commanded = floor
+                reason = reason or f"off_pending_{self._off_pending}of{self.off_confirm_ticks}"
+        else:
+            self._off_pending = 0
+
         if commanded <= 0.0:
             resolved = "off"
         else:
             resolved = source or "plan"
         await self._write(
             commanded, now, source=resolved,
-            force=just_connected, reason="reconnected" if just_connected else "",
+            force=just_connected, reason=reason,
             debounce=True,
         )
+        if not self._commanded:
+            # Off (or the first command established off) — a later run starts counting fresh.
+            self._off_pending = 0
 
     def _quantised_setpoint(self, commanded_w: float) -> float:
         """``commanded_w`` in setpoint units, snapped to the entity's ``step``.

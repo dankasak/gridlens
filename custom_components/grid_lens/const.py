@@ -306,6 +306,14 @@ MODULATION_INTERVAL_SECONDS = 30
 # GRIDLENS_CHECKLIST.md) — short enough to still react to a real multi-minute solar/cloud
 # transition, long enough to kill a tick-to-tick oscillation across the on/off boundary.
 MODULATION_CROSSING_DWELL_SECONDS = 300
+# Consecutive fast ticks (MODULATION_INTERVAL_SECONDS apart) a running modulating load's
+# plan/surplus target must resolve to "off" before it is actually stopped; until then it holds
+# at its floor. Found 2026-10-04: one 30s tick of a passing cloud (PV 6.8 kW -> ~0.8 kW for
+# ~40 s, battery briefly covering 4.3 kW) stopped the household's Wattpilot, and the crossing
+# dwell above then kept it stopped for 5 minutes after the sun was back. Asymmetric on
+# purpose: the battery absorbs a 30-60 s dip at the floor rate trivially, while a stop costs
+# a re-handshake plus a full dwell. Hard interlocks (soc_cutoff, unplugged) never wait on it.
+MODULATION_OFF_CONFIRM_TICKS = 3
 # Percentage points the battery's live SOC must sit above its configured minimum before
 # Greedy Forecast Surplus is allowed to draw it down at all. Below this, the headroom
 # calculation is too marginal to size a stable draw from — found 2026-09-25: the Wattpilot's

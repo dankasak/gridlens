@@ -1249,6 +1249,17 @@ this dwell only throttles the *ordinary* control decision, never a safety interl
 also the new SOC-margin gate on Greedy Forecast Surplus itself, described where that feature
 is documented above.
 
+**⚠ A stop also needs `MODULATION_OFF_CONFIRM_TICKS` (3) consecutive "off" ticks — found live
+2026-10-04.** The dwell above throttles how *often* the load can flip, but the stop itself still
+fired on a single 30 s tick: a passing cloud took PV from 6.8 kW to ~0.8 kW for ~40 s, the
+battery covered 4.3 kW of the Wattpilot for that one tick, battery priority pulled the target to
+407 W (under the 0.6 × floor hold bar), and the charger was stopped — then the dwell kept it off
+for 5 minutes after the sun came back. Now a running load holds at its floor until the plan/
+surplus target has resolved to 0 on 3 consecutive fast ticks (~60 s); any tick back in the hold
+band or above resets the count. Status `note` reads `…_off_pending_<n>of3` while waiting.
+`soc_cutoff`, `unplugged` and a manual override bypass it and stop immediately, and a cap below
+the floor (no feasible current) is not delayed either.
+
 **Unit handling.** `watts = amps × voltage × phases`. The unit is inferred from the setpoint
 entity's own `unit_of_measurement` (resolved lazily — at construction the charger integration
 may not have published state yet), overridable per device. Phases auto-derive from
