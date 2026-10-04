@@ -8,7 +8,7 @@
  *   type: custom:grid-lens-cash-chart-card
  *   entity: sensor.roof_grid_lens_nsw_planned_dispatch   (required)
  */
-import { GridLensChartCardBase, multiLineChart, fmtHour } from './grid-lens-chart-common.js?v=20261002b';
+import { GridLensChartCardBase, multiLineChart, fmtHour } from './grid-lens-chart-common.js?v=20261002d';
 
 class GridLensCashChartCard extends GridLensChartCardBase {
   get title() { return 'Cumulative cost / profit ($)'; }

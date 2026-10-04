@@ -13,6 +13,12 @@
  */
 
 export const GW = 720, GML = 44, GMR = 12;  // shared plot geometry across every chart
+// Right margin widened to make room for a secondary (right-hand) axis' tick labels — see
+// multiLineChart's own `rax ? RIGHT_AXIS_MR : GMR`. Shared here too because the crosshair's
+// mouse->time math (_xOf()/_wireCrosshair() below) has to use the SAME effective margin as
+// whatever actually got drawn, or the hovered pixel and the reported time/value drift apart
+// the further right you hover — see GridLensChartCardBase.hasRightAxis.
+export const RIGHT_AXIS_MR = 34;
 export const VIEW_BACK_MS = 2 * 3600000;    // show 2h of history to the left of "now"
 
 // ---------------------------------------------------------------- pure helpers
@@ -360,7 +366,7 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // line to reach the edge. Widened here rather than at the constant so every other
   // chart keeps its existing plot width exactly.
   const rax = opts.rightAxis || null;
-  const g = { w: GW, h: opts.height || 160, ml: GML, mr: rax ? 34 : GMR, mt: 10, mb: 22 };
+  const g = { w: GW, h: opts.height || 160, ml: GML, mr: rax ? RIGHT_AXIS_MR : GMR, mt: 10, mb: 22 };
   const { t0, t1 } = timeScale;
   const X = (ms) => g.ml + (ms - t0) / (t1 - t0) * (g.w - g.ml - g.mr);
   const nowMs = Date.now();
@@ -606,9 +612,13 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // outline, and needs no per-series color param since it just blurs whatever the line
   // already is. One filter def shared by every line in this chart (not one per series).
   if (byAxis.length) {
+    // stdDeviation kept small and the blurred copy dimmed below full strength: at 1.4/
+    // full-opacity the halo was wide and bright enough to wash out the crisp stroke on
+    // top of it, reading as "fuzzy" rather than a subtle glow.
     defs += `<filter id="lineglow" x="-40%" y="-40%" width="180%" height="180%">`
-      + `<feGaussianBlur in="SourceGraphic" stdDeviation="1.4" result="blur"/>`
-      + `<feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>`;
+      + `<feGaussianBlur in="SourceGraphic" stdDeviation="0.6" result="blur"/>`
+      + `<feComponentTransfer in="blur" result="dimblur"><feFuncA type="linear" slope="0.55"/></feComponentTransfer>`
+      + `<feMerge><feMergeNode in="dimblur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>`;
   }
   for (const { s, d } of byAxis) {
     const w = s.width || (s.actual ? 2 : 3);
@@ -1978,6 +1988,16 @@ export class GridLensChartCardBase extends HTMLElement {
   // cash / dispatch charts are genuinely per-slot and keep snapping.
   get continuousMeasuredPast() { return false; }
 
+  // True for a chart that passes opts.rightAxis to multiLineChart (currently only the
+  // power chart's SOC axis), which widens the right margin to RIGHT_AXIS_MR instead of
+  // the default GMR. _xOf() and _wireCrosshair()'s move() must use that SAME widened
+  // margin for their mouse-x <-> time conversion, or the hovered pixel and the
+  // crosshair/tooltip's reported time drift apart the further right you hover — found
+  // 2026-10-02: hovering mid-chart on the power chart showed a tooltip time ~20min
+  // earlier than the crosshair's actual x position, which read as a bogus SOC value
+  // when checked against the curve's own (correctly-drawn) height.
+  get hasRightAxis() { return false; }
+
   // Hook for a wantsEnergyHistory subclass to name its deferrable devices' real power
   // sensors: { [sensor_id]: power_entity }, keyed by the device's configured energy
   // entity_id (matches _deferSensorIds, not _deferNames — see that field's comment).
@@ -2211,7 +2231,8 @@ export class GridLensChartCardBase extends HTMLElement {
 
   _xOf(ms) {
     const { t0, t1 } = this._timeScale();
-    return GML + (ms - t0) / (t1 - t0) * (GW - GML - GMR);
+    const mr = this.hasRightAxis ? RIGHT_AXIS_MR : GMR;
+    return GML + (ms - t0) / (t1 - t0) * (GW - GML - mr);
   }
 
   // Hook for a subclass to add card-specific CSS on top of the shared STYLE block
@@ -2293,8 +2314,9 @@ export class GridLensChartCardBase extends HTMLElement {
     const move = (ev) => {
       const { t0, t1 } = this._timeScale();
       const r = ev.currentTarget.getBoundingClientRect();
+      const mr = this.hasRightAxis ? RIGHT_AXIS_MR : GMR;
       const frac = Math.max(0, Math.min(1,
-        ((ev.clientX - r.left) / r.width * GW - GML) / (GW - GML - GMR)));
+        ((ev.clientX - r.left) / r.width * GW - GML) / (GW - GML - mr)));
       const ms = t0 + frac * (t1 - t0);
       const trajStart = new Date(this._traj[0].start).getTime();
       // Snap the crosshair to a 30-min trajectory slot only in the genuine future. Left of

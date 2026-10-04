@@ -23,7 +23,7 @@
 import {
   GridLensChartCardBase, multiLineChart, esc, fmtHour, deferColorFor, clampPct, fmtPct,
   resolveForecastPowerSensor, ds, VIEW_BACK_MS,
-} from './grid-lens-chart-common.js?v=20261002b';
+} from './grid-lens-chart-common.js?v=20261002d';
 
 // Free-energy shading (see _freeEnergyBands). CSS custom props rather than literals so
 // both bands follow the viewer's light/dark theme like every other colour on this card;
@@ -56,6 +56,10 @@ class GridLensPowerChartCard extends GridLensChartCardBase {
   // soc_entity doesn't resolve still gets the planned curve — it just loses the
   // measured one, exactly as the standalone SOC card already degrades.
   get wantsSocHistory() { return true; }
+  // This is the only chart that passes opts.rightAxis to multiLineChart (the SOC axis),
+  // which widens the plot's right margin — the crosshair's mouse->time math needs to know
+  // that to stay aligned with the curve it's hovering. See hasRightAxis's own comment.
+  get hasRightAxis() { return true; }
 
   // Caps how tall this card can grow — paired with Power Flow's own max_height so
   // neither one is happy to fill most of the screen on a wide viewport.

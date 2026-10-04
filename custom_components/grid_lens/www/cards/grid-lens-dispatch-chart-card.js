@@ -13,7 +13,7 @@
  */
 import {
   GW, GML, GMR, GridLensChartCardBase, xAxisTicks, fmtHour, actionLabel, fmtPct, fmtC, execMode,
-} from './grid-lens-chart-common.js?v=20261002b';
+} from './grid-lens-chart-common.js?v=20261002d';
 
 class GridLensDispatchChartCard extends GridLensChartCardBase {
   get title() { return 'Planned dispatch'; }
