@@ -87,6 +87,20 @@ class EstimateStore:
         self._data[key] = value
         await self._store.async_save(self._data)
 
+    async def async_rename_key(self, old_key: str, new_key: str) -> bool:
+        """Move a persisted entry (sample_history, converged estimate, everything)
+        from old_key to new_key, if old exists and new doesn't. Used by __init__.py's
+        one-time index->stable-id migration — found 2026-10-11, a device's whole
+        calibration history silently kept running under whichever device inherited its
+        old positional key after CONF_DEFERRABLE_LOAD_SENSORS was reordered. Returns
+        True if a rename happened."""
+        await self._ensure_loaded()
+        if old_key not in self._data or new_key in self._data:
+            return False
+        self._data[new_key] = self._data.pop(old_key)
+        await self._store.async_save(self._data)
+        return True
+
 
 class LoadEstimator:
     def __init__(

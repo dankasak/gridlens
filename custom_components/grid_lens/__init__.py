@@ -1871,7 +1871,11 @@ async def _ensure_load_estimators(hass: HomeAssistant, entry: ConfigEntry) -> tu
         seed_kw = float(kws[i]) if i < len(kws) and kws[i] not in (None, "") else 1.0
         auto = bool(autos[i]) if i < len(autos) else False
 
-        unique_id = f"{entry.entry_id}_est_{i}"
+        # Keyed by the slot's own control entity_id, not `i` — an index into these
+        # parallel lists is just the slot's current position, not a stable identity.
+        # See _migrate_load_estimator_positional_keys's docstring for the 2026-10-11
+        # incident a reorder caused under the old `_est_{i}` scheme.
+        unique_id = f"{entry.entry_id}_est_{control}"
         reg_entry = ent_reg.async_get_or_create(
             "sensor", DOMAIN, unique_id,
             suggested_object_id=f"{slugify(name)}_estimated_consumption",
@@ -1943,7 +1947,12 @@ async def _ensure_load_estimators(hass: HomeAssistant, entry: ConfigEntry) -> tu
                 continue  # already has real live power telemetry — nothing to estimate
             name = resolve_device_name(hass, control, sensor_id) or sensor_id
             seed_kw = float(max_kw_list[i]) if i < len(max_kw_list) else 1.0
-            unique_id = f"{entry.entry_id}_pwr_{i}"
+            # Keyed by the device's own energy sensor_id, not `i` — see
+            # _migrate_load_estimator_positional_keys's docstring for the 2026-10-11
+            # incident a reorder caused under the old `_pwr_{i}` scheme (Dan's Aircon's
+            # real calibration silently kept running under Christel's slot after she
+            # inherited his old index).
+            unique_id = f"{entry.entry_id}_pwr_{sensor_id}"
             reg_entry = ent_reg.async_get_or_create(
                 "sensor", DOMAIN, unique_id,
                 suggested_object_id=f"{slugify(name)}_estimated_power",
@@ -2046,6 +2055,116 @@ def _migrate_deferrable_positional_unique_ids(hass: HomeAssistant, entry: Config
                 "sensor id on entity %s",
                 suffix, i, entity_id,
             )
+
+
+async def _migrate_load_estimator_positional_keys(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Same bug class as _migrate_deferrable_positional_unique_ids above, for the two
+    unique_id/EstimateStore-key schemes _ensure_load_estimators builds itself — missed by
+    that function's suffix list, which only covers switch/select/number. An index into
+    CONF_DEFERRABLE_LOAD_SENSORS (step 2, `_pwr_{i}`) or CONF_DEFERRABLE_LOAD_EST_NAMES
+    (step 1, `_est_{i}`) is not a stable device identity, so reordering either list
+    silently reassigned a device's whole LoadEstimator state — sample_history, the
+    converged estimated_kw, everything — to whatever device now sits at that index, while
+    the device that moved started over at its raw seed_kw.
+
+    Found 2026-10-11: Dan's Aircon's Power Flow live-wattage sat at a flat 3.5kW (his
+    configured max_kw ceiling, the pre-calibration fallback) for a ~10-hour overnight run,
+    while his real ECHONET meter recorded ~0.4kWh for the same window — his 40+ samples of
+    real calibration (Aug-Sept, converged roughly 270-645W) turned out to still be running,
+    uninterrupted, under Christel's current slot, which had inherited his old `_pwr_2`
+    index after a reorder.
+
+    Fix: step 2 now keys off the device's own sensor_id (stable); step 1 keys off its
+    control entity_id (stable) — both already used as join keys elsewhere in this file.
+    This function renames each OLD index-based registry unique_id and EstimateStore entry
+    to the NEW scheme, so a device keeps its calibration instead of losing it to whoever
+    reordering put in its old slot. Must run BEFORE _ensure_load_estimators (which now
+    builds the NEW-scheme unique_ids directly) — unlike _migrate_deferrable_positional_
+    unique_ids above, this doesn't need the fully-merged sensors list: step 1's merge only
+    appends new slots at the end, never shifts an existing index, so entry.data as
+    currently stored is already the right basis for this rename. Idempotent: nothing to
+    migrate on a fresh install or one already migrated.
+    """
+    from homeassistant.helpers import entity_registry as er
+
+    from .const import (
+        CONF_DEFERRABLE_LOAD_EST_CONTROL,
+        CONF_DEFERRABLE_LOAD_EST_NAMES,
+        CONF_DEFERRABLE_LOAD_SENSORS,
+    )
+    from .load_estimation import EstimateStore
+
+    ent_reg = er.async_get(hass)
+    store = EstimateStore(hass, entry.entry_id)
+
+    def _migrate(old_uid: str, new_uid: str, log_what: str, log_i) -> None:
+        entity_id = ent_reg.async_get_entity_id("sensor", DOMAIN, old_uid)
+        if entity_id and not ent_reg.async_get_entity_id("sensor", DOMAIN, new_uid):
+            ent_reg.async_update_entity(entity_id, new_unique_id=new_uid)
+            _LOGGER.info(
+                "Grid Lens: migrated %s unique_id from positional index %s to a stable "
+                "id on entity %s", log_what, log_i, entity_id,
+            )
+
+    # Step 2 — power-only inference: "_pwr_{i}" -> "_pwr_{sensor_id}"
+    sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or []
+    for i, sensor_id in enumerate(sensors):
+        if not sensor_id:
+            continue
+        old_uid = f"{entry.entry_id}_pwr_{i}"
+        new_uid = f"{entry.entry_id}_pwr_{sensor_id}"
+        _migrate(old_uid, new_uid, "power-estimator", i)
+        await store.async_rename_key(old_uid, new_uid)
+
+    # Step 1 — estimated/unmonitored loads: "_est_{i}" -> "_est_{control}" (+ "_power" sibling)
+    names = entry.data.get(CONF_DEFERRABLE_LOAD_EST_NAMES, []) or []
+    controls = entry.data.get(CONF_DEFERRABLE_LOAD_EST_CONTROL, []) or []
+    for i, name in enumerate(names):
+        if not str(name).strip():
+            continue
+        control = str(controls[i]).strip() if i < len(controls) else ""
+        if not control:
+            continue
+        old_uid = f"{entry.entry_id}_est_{i}"
+        new_uid = f"{entry.entry_id}_est_{control}"
+        _migrate(old_uid, new_uid, "estimated-load", i)
+        _migrate(f"{old_uid}_power", f"{new_uid}_power", "estimated-load power", i)
+        await store.async_rename_key(old_uid, new_uid)
+
+
+async def _migrate_greedy_tracker_positional_keys(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Same bug/fix as _migrate_load_estimator_positional_keys above, for
+    _ensure_greedy_trackers' own "_greedy_energy_{index}" unique_id and
+    GreedyEnergyStore key (greedy_energy.py) — also missed by
+    _migrate_deferrable_positional_unique_ids's suffix list. A device's running_kwh
+    (how much Greedy Consumption itself drove it) silently stayed with its old index
+    across a reorder, exactly like the load-estimator case above.
+
+    Must run after _ensure_load_estimators (CONF_DEFERRABLE_LOAD_SENSORS needs to be in
+    its final, merged form — same ordering _migrate_deferrable_positional_unique_ids
+    relies on) and before _ensure_greedy_trackers. Idempotent.
+    """
+    from homeassistant.helpers import entity_registry as er
+
+    from .const import CONF_DEFERRABLE_LOAD_SENSORS
+    from .greedy_energy import GreedyEnergyStore
+
+    ent_reg = er.async_get(hass)
+    store = GreedyEnergyStore(hass, entry.entry_id)
+    sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or []
+    for index, sensor_id in enumerate(sensors):
+        if not sensor_id:
+            continue
+        old_uid = f"{entry.entry_id}_greedy_energy_{index}"
+        new_uid = f"{entry.entry_id}_greedy_energy_{sensor_id}"
+        entity_id = ent_reg.async_get_entity_id("sensor", DOMAIN, old_uid)
+        if entity_id and not ent_reg.async_get_entity_id("sensor", DOMAIN, new_uid):
+            ent_reg.async_update_entity(entity_id, new_unique_id=new_uid)
+            _LOGGER.info(
+                "Grid Lens: migrated greedy-consumption-tracker unique_id from "
+                "positional index %d to a stable sensor id on entity %s", index, entity_id,
+            )
+        await store.async_rename_key(str(index), sensor_id)
 
 
 async def _ensure_greedy_trackers(hass: HomeAssistant, entry: ConfigEntry) -> dict:
@@ -2181,6 +2300,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # `logger: default: warning`, where a debug line is invisible.
         _LOGGER.warning("Could not mirror Grid Lens credentials for reinstall recovery",
                         exc_info=True)
+
+    # Must run before _ensure_load_estimators, which now builds its unique_ids/store
+    # keys off stable device identity — this moves any OLD index-based entries onto that
+    # new scheme first, so a device keeps its calibration instead of a fresh estimator
+    # being created under the new key while the old data sits orphaned. See the
+    # function's own docstring for the 2026-10-11 incident this fixes.
+    await _migrate_load_estimator_positional_keys(hass, entry)
 
     # Must run first, before anything below reads entry.data and before the update
     # listener is registered (see _ensure_load_estimators's own docstring for why).
@@ -2361,6 +2487,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # greedy_reason read both come from LoadControlManager.controllers, which doesn't
     # exist until here.
     try:
+        # Same reasoning as the load-estimator migration above — move any OLD index-
+        # based tracker state onto the new sensor_id-based scheme before trackers are
+        # (re)built under it.
+        await _migrate_greedy_tracker_positional_keys(hass, entry)
         hass.data[DOMAIN][f"{entry.entry_id}_greedy_trackers"] = (
             await _ensure_greedy_trackers(hass, entry)
         )

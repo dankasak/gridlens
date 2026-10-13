@@ -150,7 +150,7 @@ def test_fresh_tracker_seeds_baseline_from_live_state_with_nothing_persisted():
 def test_async_load_restores_persisted_state():
     hass = FakeHass()
     controller = FakeController()
-    store = FakeStore(seed={"0": {"running_kwh": 3.25, "last_value": 12.0}})
+    store = FakeStore(seed={"sensor.device_energy": {"running_kwh": 3.25, "last_value": 12.0}})
     t = _tracker(hass, controller, store=store)
     _run(t.async_load())
     check("running_kwh restored from the store", t.running_kwh == 3.25)
@@ -160,7 +160,7 @@ def test_async_load_restores_persisted_state():
 def test_delta_counted_while_greedy():
     hass = FakeHass()
     controller = FakeController(greedy_reason=None)
-    store = FakeStore(seed={"0": {"running_kwh": 0.0, "last_value": 10.0}})
+    store = FakeStore(seed={"sensor.device_energy": {"running_kwh": 0.0, "last_value": 10.0}})
     t = _tracker(hass, controller, store=store)
     _run(t.async_load())
 
@@ -168,13 +168,13 @@ def test_delta_counted_while_greedy():
     _run(t._on_source_change(FakeEvent(FakeState("11.5", {"unit_of_measurement": "kWh"}))))
     check("delta added while greedy_reason is set", t.running_kwh == 1.5)
     check("baseline advances to the new reading", t._last_value == 11.5)
-    check("the accepted delta is persisted", store.saved["0"]["running_kwh"] == 1.5)
+    check("the accepted delta is persisted", store.saved["sensor.device_energy"]["running_kwh"] == 1.5)
 
 
 def test_delta_ignored_while_not_greedy():
     hass = FakeHass()
     controller = FakeController(greedy_reason=None)
-    store = FakeStore(seed={"0": {"running_kwh": 0.0, "last_value": 10.0}})
+    store = FakeStore(seed={"sensor.device_energy": {"running_kwh": 0.0, "last_value": 10.0}})
     t = _tracker(hass, controller, store=store)
     _run(t.async_load())
 
@@ -182,7 +182,7 @@ def test_delta_ignored_while_not_greedy():
     check("no energy added while greedy_reason is None", t.running_kwh == 0.0)
     check("baseline still advances so the NEXT delta measures forward from here",
           t._last_value == 11.5)
-    check("nothing persisted for a zero-contribution delta", "0" not in store.saved)
+    check("nothing persisted for a zero-contribution delta", "sensor.device_energy" not in store.saved)
 
 
 def test_only_the_reading_at_change_time_matters_not_history():
@@ -192,7 +192,7 @@ def test_only_the_reading_at_change_time_matters_not_history():
     # reading still counts in full.
     hass = FakeHass()
     controller = FakeController(greedy_reason=None)
-    store = FakeStore(seed={"0": {"running_kwh": 0.0, "last_value": 10.0}})
+    store = FakeStore(seed={"sensor.device_energy": {"running_kwh": 0.0, "last_value": 10.0}})
     t = _tracker(hass, controller, store=store)
     _run(t.async_load())
 
@@ -207,7 +207,7 @@ def test_wh_source_sensor_is_converted_to_kwh():
     controller = FakeController(greedy_reason="forecast_surplus")
     # last_value is always stored already-normalized to kWh (see _read_kwh) — 1.0 here
     # means "1000 Wh so far", matching the raw sensor's own unit at seed time.
-    store = FakeStore(seed={"0": {"running_kwh": 0.0, "last_value": 1.0}})
+    store = FakeStore(seed={"sensor.device_energy": {"running_kwh": 0.0, "last_value": 1.0}})
     t = _tracker(hass, controller, store=store)
     _run(t.async_load())
 
@@ -219,7 +219,7 @@ def test_wh_source_sensor_is_converted_to_kwh():
 def test_counter_reset_is_discarded_and_resyncs_baseline():
     hass = FakeHass()
     controller = FakeController(greedy_reason="import_free")
-    store = FakeStore(seed={"0": {"running_kwh": 2.0, "last_value": 10.0}})
+    store = FakeStore(seed={"sensor.device_energy": {"running_kwh": 2.0, "last_value": 10.0}})
     t = _tracker(hass, controller, store=store)
     _run(t.async_load())
 
@@ -232,7 +232,7 @@ def test_counter_reset_is_discarded_and_resyncs_baseline():
 def test_unavailable_reading_is_ignored():
     hass = FakeHass()
     controller = FakeController(greedy_reason="import_free")
-    store = FakeStore(seed={"0": {"running_kwh": 0.0, "last_value": 10.0}})
+    store = FakeStore(seed={"sensor.device_energy": {"running_kwh": 0.0, "last_value": 10.0}})
     t = _tracker(hass, controller, store=store)
     _run(t.async_load())
 

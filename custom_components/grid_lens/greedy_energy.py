@@ -40,8 +40,9 @@ STORE_VERSION = 1
 
 class GreedyEnergyStore:
     """One Store per config entry, holding every tracked device's persisted state (keyed
-    by the device's index as a string) — same one-store-many-keys shape as
-    load_estimation.EstimateStore."""
+    by the device's source_sensor_id — stable across a reorder of CONF_DEFERRABLE_LOAD_SENSORS,
+    unlike the plain list index this used before 2026-10-12) — same one-store-many-keys
+    shape as load_estimation.EstimateStore."""
 
     def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
         self._store = Store(hass, STORE_VERSION, f"{DOMAIN}_greedy_energy_{entry_id}")
@@ -62,6 +63,18 @@ class GreedyEnergyStore:
         self._data[key] = value
         await self._store.async_save(self._data)
 
+    async def async_rename_key(self, old_key: str, new_key: str) -> bool:
+        """Move a persisted entry from old_key to new_key, if old exists and new doesn't.
+        Used by __init__.py's one-time index->sensor_id migration (found 2026-10-11: an
+        index-keyed tracker silently inherited another device's running_kwh after a
+        reorder) — returns True if a rename happened."""
+        await self._ensure_loaded()
+        if old_key not in self._data or new_key in self._data:
+            return False
+        self._data[new_key] = self._data.pop(old_key)
+        await self._store.async_save(self._data)
+        return True
+
 
 class GreedyEnergyTracker:
     def __init__(
@@ -76,14 +89,20 @@ class GreedyEnergyTracker:
     ) -> None:
         self.hass = hass
         self._store = store
-        self._store_key = str(index)
+        # Keyed by the device's own sensor_id, not `index` — an index into
+        # CONF_DEFERRABLE_LOAD_SENSORS is just this device's current position in the
+        # array, not a stable identity (see __init__.py's
+        # _migrate_greedy_tracker_positional_keys docstring for the 2026-10-11 incident
+        # this caused: a reorder silently handed one device's running_kwh to whichever
+        # device took over its old index).
+        self._store_key = source_sensor_id
         self.index = index
         self.name = name
         self.source_sensor_id = source_sensor_id
         # DeferrableLoadController or ModulatingLoadController — only .greedy_reason is
         # ever read from it, so either works with no type check.
         self._controller = controller
-        self.unique_id = f"greedy_energy_{index}"
+        self.unique_id = f"greedy_energy_{source_sensor_id}"
         # Metadata only (never read internally by this class) — set by the caller right
         # after construction once the entity_id has been reserved via the entity
         # registry (see __init__.py._ensure_greedy_trackers), so plan_calculator.py can
