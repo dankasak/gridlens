@@ -2343,7 +2343,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # switch or setpoint writes on setup. Deadman = leave loads as-is (never forces off).
     try:
         from .control.load_control_manager import LoadControlManager
-        _load_mgr = LoadControlManager(hass, entry)
+        from .entity_lookup import async_get_energy_dashboard_names
+
+        # Fetched fresh here, not off the coordinator's own energy_dashboard_names cache:
+        # this runs before the coordinator's first async_refresh(), so that cache is still
+        # its unpopulated {} default (same ordering constraint switch.py's own visibility-
+        # switch loop documents and works around the same way).
+        _dashboard_names = await async_get_energy_dashboard_names(hass)
+        _load_mgr = LoadControlManager(hass, entry, dashboard_names=_dashboard_names)
         if _load_mgr.has_controllable():
             hass.data[DOMAIN][f"{entry.entry_id}_load_control"] = _load_mgr
     except Exception as _load_err:  # noqa: BLE001

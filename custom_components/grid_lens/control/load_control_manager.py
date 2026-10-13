@@ -182,11 +182,25 @@ class LoadControlManager:
         *,
         interval_minutes: int = 5,
         max_plan_age_minutes: float = 30.0,
+        dashboard_names: Optional[dict[str, str]] = None,
     ) -> None:
         self.hass = hass
         self.entry = entry
         self.interval_minutes = max(1, int(interval_minutes))
         self.max_plan_age = timedelta(minutes=max_plan_age_minutes)
+        # Energy Dashboard's per-device labels (e.g. "Hot Water", "Wattpilot / Xpeng") —
+        # the one place a user-facing rename actually lives (see entity_lookup.py's
+        # resolve_device_name docstring). Passed in by __init__.py, which can await the
+        # lookup; this constructor can't (see sensor.py/switch.py's own comments on the
+        # same ordering constraint). Missing here (found 2026-10-07) meant every device's
+        # control/greedy switch names fell back past the dashboard label to whatever the
+        # *device's own* entity happened to be named instead — "Hot Water" (sensor.sigen_
+        # 0_smart_load_01_total_consumption) read as "EV Mobile Charger" (an older,
+        # unrelated rename on that same raw sensor's own integration-side name), and the
+        # Wattpilot EV charger — no switch, so the setpoint anchor won first — read as
+        # "Max Charging Current", ha-wattpilot's own generic entity name for *any*
+        # install's charging-current number, not this car's.
+        self._dashboard_names: dict[str, str] = dict(dashboard_names or {})
 
         d = entry.data
         sensors: list[str] = list(d.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or [])
@@ -320,7 +334,15 @@ class LoadControlManager:
 
                 self.controllers[i] = ModulatingLoadController(
                     hass,
-                    name=self._device_name(setpoint or sw, sensor_id),
+                    # sensor_id (and dashboard_names, inside _device_name) before setpoint:
+                    # setpoint's own entity name is the vendor integration's generic label
+                    # for *any* install's charging-current number ("Max Charging Current" on
+                    # ha-wattpilot, likewise for OCPP/Easee/Wallbox) — it must never win over
+                    # a real device name or the user's own Energy Dashboard rename. Kept as
+                    # the last-resort anchor rather than dropped: still better than nothing
+                    # for an install with no switch, no dashboard rename and a generic sensor
+                    # name either.
+                    name=self._device_name(sw, sensor_id, setpoint),
                     setpoint_entity_id=setpoint,
                     max_w=max_w,
                     switch_entity_id=sw,
@@ -375,9 +397,16 @@ class LoadControlManager:
 
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self._on_hass_stop)
 
-    def _device_name(self, switch_id: str, sensor_id: str) -> str:
+    def _device_name(self, *anchors: str) -> str:
+        """Resolve a controller's display name from its configured entities, in the given
+        priority order, preferring the Energy Dashboard's user-set label (``self.
+        _dashboard_names`` — see its assignment in ``__init__`` for why that has to be
+        passed in rather than looked up here)."""
         from ..entity_lookup import resolve_device_name
-        return resolve_device_name(self.hass, switch_id, sensor_id) or sensor_id
+        return (
+            resolve_device_name(self.hass, *anchors, dashboard_names=self._dashboard_names)
+            or next((a for a in anchors if a), "")
+        )
 
     def _resolve_device_power(self, sensor_id: str, setpoint_id: str, switch_id: str) -> str:
         """Best live power (W) sensor for one modulating device, or "" if none is findable.

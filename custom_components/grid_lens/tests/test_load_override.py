@@ -84,7 +84,9 @@ def _bootstrap():
           "gl.control.executor", package="gl.control")
     _load(os.path.join(_COMPONENT, "const.py"), "gl.const", package="gl")
     el_stub = types.ModuleType("gl.entity_lookup")
-    el_stub.resolve_device_name = lambda hass, *anchors: next((a for a in anchors if a), None)
+    el_stub.resolve_device_name = (
+        lambda hass, *anchors, dashboard_names=None: next((a for a in anchors if a), None)
+    )
     el_stub.resolve_power_sensor = lambda hass, *anchors: None
     sys.modules["gl.entity_lookup"] = el_stub
     # Stub runtime_settings (pulls in homeassistant.helpers.entity_registry, unstubbed).

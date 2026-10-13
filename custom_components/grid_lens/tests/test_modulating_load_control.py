@@ -124,7 +124,9 @@ def _bootstrap():
     # stub). resolve_power_sensor is a real input here — the surplus term's "add back what
     # this device already draws" correction reads whatever it returns.
     el_stub = types.ModuleType("gl.entity_lookup")
-    el_stub.resolve_device_name = lambda hass, *anchors: next((a for a in anchors if a), None)
+    el_stub.resolve_device_name = (
+        lambda hass, *anchors, dashboard_names=None: next((a for a in anchors if a), None)
+    )
     el_stub.resolve_power_sensor = (
         lambda hass, *anchors: _POWER_SENSORS.get(anchors[0] if anchors else "")
     )
