@@ -521,6 +521,32 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             return None
         return {"percent": raw["percent"], "target_dt": dt_util.as_utc(target_dt)}
 
+    async def _export_floor(self, bundle, capacity_kwh: float) -> tuple[float | None, int | None]:
+        """The active ad-hoc export/discharge floor for the main battery, converted
+        to this horizon's units — (kwh, slot), or (None, None) if unset or its
+        deadline has already passed (the store auto-clears in that case, see
+        ExportFloorStore.async_get_active). Mirrors _charge_target but there is no
+        sensor_id (the main battery is singular) and no "reached" check (a floor
+        has nothing to reach, see export_floor.py)."""
+        store = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_export_floor")
+        if store is None:
+            return None, None
+        raw = await store.async_get_active()
+        if raw is None:
+            return None, None
+        until_dt = dt_util.parse_datetime(raw["until_iso"])
+        if until_dt is None:
+            return None, None
+        slot = ct.slot_for_datetime(
+            dt_util.as_utc(until_dt), bundle.start, bundle.slot_minutes, bundle.slots
+        )
+        if slot is None:
+            # Deadline already past this solve's horizon start, or not yet in view —
+            # same "leave it for a later rolling replan" reasoning as _charge_target's
+            # own caller (_deferrable_for_horizon).
+            return None, None
+        return capacity_kwh * raw["percent"] / 100.0, slot
+
     async def _charge_timing_preference(self, sensor_id: str) -> str:
         """Prefer early / No preference / Prefer just-in-time for sensor_id's
         floor-satisfying charge (see charge_timing_preference.py) — the default
@@ -1011,6 +1037,13 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         demand_rate, demand_window_mask, demand_mtd_peak, demand_days_left = (
             await self._demand_inputs(bundle)
         )
+        # Ad-hoc one-off export/discharge floor on the main battery
+        # (grid_lens.set_export_floor — "keep at least 50% until 7am Tuesday" ahead
+        # of a planned outage). No-op (None, None) for the common case of no active
+        # floor. See _export_floor / battery_optimizer's export_floor_kwh docstring.
+        export_floor_kwh, export_floor_slot = await self._export_floor(
+            bundle, optimizer.capacity_kwh
+        )
         result = AdvisoryPlanner(optimizer, min_export_price=min_export_price).plan(
             bundle, initial_soc_percent=soc,
             deferrable_loads=deferrable_loads,
@@ -1021,6 +1054,8 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             import_caps=import_caps,
             export_caps=export_caps,
             conditional_credits=conditional_credits,
+            export_floor_kwh=export_floor_kwh,
+            export_floor_slot=export_floor_slot,
         )
 
         # Feed the fresh plan to the control managers (they act on it only while their

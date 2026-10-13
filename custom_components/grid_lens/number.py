@@ -104,6 +104,15 @@ async def async_setup_entry(
     if entry.data.get(CONF_HAS_BATTERY, False) or entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS):
         entities.append(GridLensMinExportPriceNumber(entry))
 
+    # One-off export/discharge floor on the main battery ("keep at least 50% in
+    # reserve until 7am Tuesday" ahead of a planned outage) — paired with
+    # datetime.py's GridLensExportFloorUntilDateTime for the deadline half.
+    # Plan-level (one instance per entry, not per device), same gating as the
+    # min-export-price number above since both need a battery to mean anything.
+    if entry.data.get(CONF_HAS_BATTERY, False):
+        floor_store = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_export_floor")
+        entities.append(GridLensExportFloorPercentNumber(entry, floor_store))
+
     # One "today boost" override per configured deferrable device (Feature 2) —
     # independent of has_battery, since deferrable scheduling doesn't require one.
     sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
@@ -369,6 +378,92 @@ class GridLensChargeTargetPercentNumber(NumberEntity):
             existing = await self._store.async_get_raw(self._sensor_id)
             target_iso = existing["target_iso"] if existing else ""
             await self._store.async_set(self._sensor_id, value, target_iso)
+        self._attr_native_value = value if value > 0 else 0.0
+        self.async_write_ha_state()
+
+
+class GridLensExportFloorPercentNumber(NumberEntity):
+    """The percent half of an ad-hoc, one-off export/discharge floor on the main
+    battery — e.g. "50%" of "keep at least 50% in reserve until 7am Tuesday"
+    ahead of a planned grid outage — paired with datetime.py's
+    GridLensExportFloorUntilDateTime for the deadline half. 0 = no floor (the
+    companion datetime entity's value is then ignored — see
+    export_floor.read_target, both halves are required for a floor to be
+    considered active).
+
+    The mirror image of GridLensChargeTargetPercentNumber: that raises the
+    LP's ceiling to force charging UP to a target by a deadline; this raises
+    the LP's lower bound so the optimizer may still discharge/export freely
+    for economics, but never below this floor, until the deadline passes —
+    after which it auto-clears and normal cost-optimal dispatch resumes (see
+    FEATURES.md's Export Floor entry).
+
+    Plan-level (one instance per config entry) rather than per-device, since
+    there is exactly one main battery per install — unlike the charge target
+    above, which is one per SOC-tracked deferrable device.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Export Floor Percent"
+    _attr_icon = "mdi:battery-lock"
+    _attr_native_min_value = 0.0
+    _attr_native_max_value = 100.0
+    _attr_native_step = 1.0
+    _attr_native_unit_of_measurement = "%"
+    _attr_mode = NumberMode.BOX
+
+    def __init__(self, entry: ConfigEntry, store) -> None:
+        self._store = store
+        self._entry_id = entry.entry_id
+        self._attr_unique_id = f"{entry.entry_id}_export_floor_percent"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_native_value = 0.0
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        await self._refresh_from_store()
+        if self._store is not None:
+            from .export_floor_store import update_signal
+            from homeassistant.helpers.dispatcher import async_dispatcher_connect
+
+            async def _on_update() -> None:
+                await self._refresh_from_store()
+                self.async_write_ha_state()
+
+            self.async_on_remove(
+                async_dispatcher_connect(
+                    self.hass, update_signal(self._entry_id), _on_update,
+                )
+            )
+
+    async def _refresh_from_store(self) -> None:
+        # See GridLensChargeTargetPercentNumber._refresh_from_store — same
+        # reasoning, kept in sync via export_floor_store.update_signal.
+        if self._store is None:
+            return
+        raw = await self._store.async_get_raw()
+        self._attr_native_value = raw["percent"] if raw else 0.0
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        # export_floor_role distinguishes this from any other number entity;
+        # grid-lens-export-floor-card.js pairs this with the matching datetime
+        # entity by config_entry_id — unlike the per-device charge target pair
+        # (paired by deferrable_sensor_id), there's no device key here, so a
+        # multi-site install (more than one Grid Lens config entry) needs an
+        # explicit shared key to pair the right percent/until entities together
+        # rather than, say, entity_id string-matching.
+        return {"export_floor_role": "percent", "config_entry_id": self._entry_id}
+
+    async def async_set_native_value(self, value: float) -> None:
+        if self._store is not None:
+            existing = await self._store.async_get_raw()
+            until_iso = existing["until_iso"] if existing else ""
+            await self._store.async_set(value, until_iso)
         self._attr_native_value = value if value > 0 else 0.0
         self.async_write_ha_state()
 

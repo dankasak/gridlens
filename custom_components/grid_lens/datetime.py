@@ -17,6 +17,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     DOMAIN,
+    CONF_HAS_BATTERY,
     CONF_DEFERRABLE_LOAD_SENSORS,
     CONF_DEFERRABLE_LOAD_SOC_SENSORS,
     CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH,
@@ -29,21 +30,28 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
+    entities: list[DateTimeEntity] = []
+
     sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS, [])
     soc_sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, [])
     soc_capacities = entry.data.get(CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH, [])
-    if not soc_sensors:
-        return
-    store = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_charge_targets")
-    entities: list[DateTimeEntity] = []
-    for i, soc_sensor_id in enumerate(soc_sensors):
-        capacity = soc_capacities[i] if i < len(soc_capacities) else 0.0
-        if not soc_sensor_id or not capacity:
-            continue
-        if i >= len(sensors) or not sensors[i]:
-            continue
-        name = _device_display_name(hass, sensors[i])
-        entities.append(GridLensChargeTargetTimeDateTime(entry, store, sensors[i], name))
+    if soc_sensors:
+        store = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_charge_targets")
+        for i, soc_sensor_id in enumerate(soc_sensors):
+            capacity = soc_capacities[i] if i < len(soc_capacities) else 0.0
+            if not soc_sensor_id or not capacity:
+                continue
+            if i >= len(sensors) or not sensors[i]:
+                continue
+            name = _device_display_name(hass, sensors[i])
+            entities.append(GridLensChargeTargetTimeDateTime(entry, store, sensors[i], name))
+
+    # Deadline half of the one-off export/discharge floor on the main battery —
+    # see number.py's GridLensExportFloorPercentNumber. Plan-level, same gating.
+    if entry.data.get(CONF_HAS_BATTERY, False):
+        floor_store = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_export_floor")
+        entities.append(GridLensExportFloorUntilDateTime(entry, floor_store))
+
     if entities:
         async_add_entities(entities)
 
@@ -114,5 +122,72 @@ class GridLensChargeTargetTimeDateTime(DateTimeEntity):
             existing = await self._store.async_get_raw(self._sensor_id)
             percent = existing["percent"] if existing else 0.0
             await self._store.async_set(self._sensor_id, percent, value_utc.isoformat())
+        self._attr_native_value = value_utc
+        self.async_write_ha_state()
+
+
+class GridLensExportFloorUntilDateTime(DateTimeEntity):
+    """The deadline half of an ad-hoc export/discharge floor on the main
+    battery — see number.py's GridLensExportFloorPercentNumber for the full
+    explanation (percent/datetime pair, auto-clear-on-expiry, merge-on-write).
+    Unset (native_value None) reads as "no floor" regardless of what the
+    percent entity holds.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Export Floor Until"
+    _attr_icon = "mdi:battery-lock"
+
+    def __init__(self, entry: ConfigEntry, store) -> None:
+        self._store = store
+        self._entry_id = entry.entry_id
+        self._attr_unique_id = f"{entry.entry_id}_export_floor_until"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_native_value: dt.datetime | None = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        await self._refresh_from_store()
+        if self._store is not None:
+            from .export_floor_store import update_signal
+            from homeassistant.helpers.dispatcher import async_dispatcher_connect
+
+            async def _on_update() -> None:
+                await self._refresh_from_store()
+                self.async_write_ha_state()
+
+            self.async_on_remove(
+                async_dispatcher_connect(
+                    self.hass, update_signal(self._entry_id), _on_update,
+                )
+            )
+
+    async def _refresh_from_store(self) -> None:
+        if self._store is None:
+            return
+        raw = await self._store.async_get_raw()
+        if raw and raw.get("until_iso"):
+            parsed = dt_util.parse_datetime(raw["until_iso"])
+            self._attr_native_value = dt_util.as_utc(parsed) if parsed else None
+        else:
+            self._attr_native_value = None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        # See number.py's GridLensExportFloorPercentNumber for why config_entry_id
+        # is needed here (multi-site pairing) where the charge target pair instead
+        # uses deferrable_sensor_id.
+        return {"export_floor_role": "until", "config_entry_id": self._entry_id}
+
+    async def async_set_value(self, value: dt.datetime) -> None:
+        value_utc = dt_util.as_utc(value)
+        if self._store is not None:
+            existing = await self._store.async_get_raw()
+            percent = existing["percent"] if existing else 0.0
+            await self._store.async_set(percent, value_utc.isoformat())
         self._attr_native_value = value_utc
         self.async_write_ha_state()

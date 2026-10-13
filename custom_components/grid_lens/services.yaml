@@ -84,6 +84,40 @@ clear_charge_target:
       selector:
         text:
 
+set_export_floor:
+  name: Set Export/Discharge Floor
+  description: >
+    Set a one-off "don't discharge/export the main battery below X% until a
+    datetime" reserve — e.g. "keep at least 50% in reserve until 7am Tuesday"
+    ahead of a planned grid outage. The optimizer still discharges/exports
+    freely for economics above the floor, it just never goes below it until
+    the deadline. Auto-clears itself once the deadline passes — no need to
+    clear it manually after use. Equivalent to setting the Export Floor
+    Percent + Export Floor Until entities by hand. Needs a battery configured
+    on this install.
+  fields:
+    floor_percent:
+      name: Floor percent
+      description: The minimum SOC percent to hold until until_datetime (1-100).
+      required: true
+      example: 50
+      selector:
+        number:
+          min: 1
+          max: 100
+          unit_of_measurement: "%"
+    until_datetime:
+      name: Until datetime
+      description: When the floor stops applying (normal cost-optimal dispatch resumes).
+      required: true
+      example: "2026-10-07 07:00:00"
+      selector:
+        datetime:
+
+clear_export_floor:
+  name: Clear Export/Discharge Floor
+  description: Cancel the main battery's ad-hoc export/discharge floor, if one is set.
+
 set_daily_target:
   name: Set Daily Target
   description: >

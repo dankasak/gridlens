@@ -18,6 +18,8 @@ SERVICE_SET_DEFERRABLE_SCHEDULE = "set_deferrable_schedule"
 SERVICE_CLEAR_DEFERRABLE_SCHEDULE = "clear_deferrable_schedule"
 SERVICE_SET_CHARGE_TARGET = "set_charge_target"
 SERVICE_CLEAR_CHARGE_TARGET = "clear_charge_target"
+SERVICE_SET_EXPORT_FLOOR = "set_export_floor"
+SERVICE_CLEAR_EXPORT_FLOOR = "clear_export_floor"
 SERVICE_SET_DAILY_TARGET = "set_daily_target"
 SERVICE_CLEAR_DAILY_TARGET = "clear_daily_target"
 
@@ -176,6 +178,49 @@ async def async_setup_services(hass: HomeAssistant, entry) -> None:
         """Cancel a device's ad-hoc charge target, if one is set."""
         await _write_charge_target(call.data.get("sensor_id"), 0.0, "")
 
+    async def _write_export_floor(percent: float, until_iso: str) -> None:
+        """Shared validate-and-persist for the two export-floor services. Unlike
+        _write_charge_target there is no sensor_id/device to validate against —
+        the main battery is singular per entry — so this only needs a battery
+        configured at all (mirrors number.py/datetime.py's own CONF_HAS_BATTERY
+        gating)."""
+        if not entry.data.get("has_battery", False):
+            raise HomeAssistantError(
+                "Grid Lens export floor needs a configured battery (none set up on this entry)"
+            )
+        store = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_export_floor")
+        if store is None:
+            raise HomeAssistantError("Grid Lens export-floor store is not available")
+        await store.async_set(percent, until_iso)
+        _LOGGER.warning(
+            "Export floor %s%s",
+            "saved" if percent > 0 and until_iso else "cleared",
+            f": {percent:g}% until {until_iso}" if percent > 0 and until_iso else "",
+        )
+
+    async def handle_set_export_floor(call: ServiceCall) -> None:
+        """Set an ad-hoc one-off export/discharge floor on the main battery —
+        e.g. "keep at least 50% in reserve until 7am Tuesday" ahead of a planned
+        grid outage. The equivalent of setting the export-floor percent + until
+        entities by hand; auto-clears once the deadline passes."""
+        until = call.data.get("until_datetime")
+        try:
+            parsed = dt_util.parse_datetime(until) if until else None
+        except Exception as e:
+            raise HomeAssistantError(f"Invalid until_datetime: {e}")
+        if parsed is None:
+            raise HomeAssistantError("until_datetime is required and must be a valid datetime")
+        if parsed.tzinfo is None:
+            parsed = dt_util.as_local(parsed)
+        percent = call.data.get("floor_percent")
+        if percent is None:
+            raise HomeAssistantError("floor_percent is required")
+        await _write_export_floor(float(percent), dt_util.as_utc(parsed).isoformat())
+
+    async def handle_clear_export_floor(call: ServiceCall) -> None:
+        """Cancel the main battery's ad-hoc export/discharge floor, if one is set."""
+        await _write_export_floor(0.0, "")
+
     async def handle_set_daily_target(call: ServiceCall) -> None:
         """Pin a device (or "master") to an explicit Daily Target percent — the
         automation-friendly alternative to setting the number entity by hand.
@@ -239,6 +284,12 @@ async def async_setup_services(hass: HomeAssistant, entry) -> None:
     )
     hass.services.async_register(
         DOMAIN, SERVICE_CLEAR_CHARGE_TARGET, handle_clear_charge_target
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_EXPORT_FLOOR, handle_set_export_floor
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_CLEAR_EXPORT_FLOOR, handle_clear_export_floor
     )
     hass.services.async_register(
         DOMAIN, SERVICE_SET_DAILY_TARGET, handle_set_daily_target

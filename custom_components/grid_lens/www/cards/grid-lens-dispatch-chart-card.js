@@ -13,7 +13,7 @@
  */
 import {
   GW, GML, GMR, GridLensChartCardBase, xAxisTicks, fmtHour, actionLabel, fmtPct, fmtC, execMode,
-} from './grid-lens-chart-common.js?v=20261002d';
+} from './grid-lens-chart-common.js?v=20261012b';
 
 class GridLensDispatchChartCard extends GridLensChartCardBase {
   get title() { return 'Planned dispatch'; }
@@ -30,29 +30,37 @@ class GridLensDispatchChartCard extends GridLensChartCardBase {
   _chartSvg() {
     const g = { w: GW, h: 130, ml: GML, mr: GMR, mt: 8, mb: 22 };
     const { t0, t1, step } = this._timeScale();
-    // Only draw slots inside the current view window — with Today selected, t0/t1 span
-    // just 24h while the trajectory itself can run 72h+, so unfiltered bars land past
-    // the right edge and (since the SVG doesn't clip) visibly overflow the card.
-    let t = this._traj.filter(s => {
+    // Slots that OVERLAP the window, not just ones whose start falls inside it — a zoom
+    // window narrower than one slot (the zoom slider's ±15m stop spans 30 min total, the
+    // same as one slot) can otherwise match no slot at all even though the window sits
+    // entirely inside one slot's span. No "fall back to the whole trajectory" safety net
+    // either (removed): that was a no-op while every view was guaranteed wide relative to
+    // a slot, but it would now draw bars across the ENTIRE plan horizon crushed into a
+    // 30-minute-wide pixel mapping — massive overflow, not the blank chart it guarded
+    // against. Each bar's own rect is clamped to the plot's margins below instead, since
+    // a single slot can now be wider than the whole visible window.
+    const t = this._traj.filter(s => {
       const ms = new Date(s.start).getTime();
-      return ms >= t0 && ms <= t1;
+      return ms < t1 && ms + step > t0;
     });
-    if (!t.length) t = this._traj; // safety net — shouldn't happen, avoids a blank chart
     const X = (ms) => g.ml + (ms - t0) / (t1 - t0) * (g.w - g.ml - g.mr);
-    const bw = (g.w - g.ml - g.mr) * step / (t1 - t0);
+    const plotL = g.ml, plotR = g.w - g.mr;
     const maxP = Math.max(1000, ...t.map(s => Math.abs(s.power_w || 0)));
     const midY = g.mt + (g.h - g.mt - g.mb) / 2;
     const half = (g.h - g.mt - g.mb) / 2;
 
     let bars = '', shade = '';
     t.forEach((s) => {
-      const x = X(new Date(s.start).getTime());
+      const slotStart = new Date(s.start).getTime();
+      const x = Math.max(plotL, X(slotStart));
+      const xEnd = Math.min(plotR, X(slotStart + step));
+      const bw = Math.max(1, xEnd - x);
       if ((s.export_rate || 0) > 0) {
         shade += `<rect x="${x}" y="${g.mt}" width="${bw}" height="${g.h - g.mt - g.mb}" fill="var(--fit)"/>`;
       }
       const p = s.power_w || 0;
       const hgt = Math.abs(p) / maxP * (half - 2);
-      const gap = 1.5;
+      const gap = Math.min(1.5, bw / 4);
       let color = 'var(--idle)', y, h2;
       if (s.action === 'charge') { color = 'var(--charge)'; y = midY - hgt; h2 = hgt; }
       else if (s.action === 'discharge') { color = 'var(--discharge)'; y = midY; h2 = hgt; }
@@ -63,7 +71,7 @@ class GridLensDispatchChartCard extends GridLensChartCardBase {
         src = gw > 1 ? ` (grid ${Math.round(gw)} W)` : ' (solar)';
       }
       bars += `<rect x="${x + gap}" y="${y}" width="${Math.max(1, bw - 2 * gap)}" height="${Math.max(2, h2)}" rx="2" fill="${color}">` +
-        `<title>${fmtHour(new Date(s.start).getTime())} · ${actionLabel(s.action)} ${Math.round(Math.abs(p))} W${src} · SOC ${fmtPct(s.soc_percent)}` +
+        `<title>${fmtHour(slotStart)} · ${actionLabel(s.action)} ${Math.round(Math.abs(p))} W${src} · SOC ${fmtPct(s.soc_percent)}` +
         ` · imp ${fmtC(s.import_rate)} exp ${fmtC(s.export_rate)}</title></rect>`;
     });
     let xt = xAxisTicks(X, t0, t1, g.h - g.mb);

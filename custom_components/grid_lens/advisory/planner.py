@@ -72,6 +72,8 @@ class AdvisoryPlanner:
         import_caps: Optional[list[dict]] = None,
         export_caps: Optional[list[dict]] = None,
         conditional_credits: Optional[list[dict]] = None,
+        export_floor_kwh: Optional[float] = None,
+        export_floor_slot: Optional[int] = None,
     ) -> AdvisoryResult:
         dt_h = bundle.dt_hours
         terminal_value = (
@@ -106,6 +108,8 @@ class AdvisoryPlanner:
             conditional_credits=conditional_credits,
             min_export_price=self.min_export_price,
             slot_day_index=slot_day_index,
+            export_floor_kwh=export_floor_kwh,
+            export_floor_slot=export_floor_slot,
         )
 
         devs = deferrable_loads or []

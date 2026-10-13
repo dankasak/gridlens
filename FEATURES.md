@@ -2387,6 +2387,91 @@ cycles.
 
 ---
 
+## 9d. Export Floor (one-off discharge reserve)
+
+**What it does.** A one-off "don't discharge/export the main battery below X% until a
+datetime" reserve — e.g. "keep at least 50% until 7am Tuesday" ahead of a planned grid
+outage. The mirror image of §9a's Ad-hoc Charge Target: that raises the LP's ceiling to
+force charging UP to a target by a deadline; this raises the LP's lower bound so the
+optimizer still discharges/exports freely for economics (normal arbitrage, self-consumption,
+Greedy Consumption) above the floor, it simply never goes below it until the deadline — after
+which it auto-clears and ordinary cost-optimal dispatch resumes with no extra action needed.
+
+Set via two paired entities — `number.*_export_floor_percent` and
+`datetime.*_export_floor_until` (plan-level, one pair per install, unlike the per-device
+charge target pair — there is exactly one main battery) — or equivalently the
+`grid_lens.set_export_floor` / `grid_lens.clear_export_floor` services. Needs a battery
+configured on the entry (`CONF_HAS_BATTERY`); there's nothing to reserve otherwise.
+
+**Why this exists, not just "raise the inverter's own discharge-cutoff-SOC register".** The
+quick fix for a real outage is to raise the battery hardware's own min-discharge-SOC setting
+(e.g. Sigenergy's `number.sigen_0_plant_ess_discharge_cut_off_soc`) directly — but that's
+install-specific (a Tesla Powerwall or any other inverter brand has no such register, or a
+differently-shaped one), bypasses Grid Lens's own cost model entirely rather than
+coexisting with it, and needs a manual revert afterward with nothing to remind you. This
+feature instead lives in `battery_optimizer.py` itself — generalizes to any inverter brand
+Grid Lens supports, still lets the LP optimize everything else normally, and auto-expires on
+its own. Built 2026-10-06 in response to exactly this scenario (a planned 7am outage) — see
+`docs/GRIDLENS_CHECKLIST.md`'s 2026-10-06 entry.
+
+**Mechanism.** `battery_optimizer.optimize_hourly_schedule`'s new `export_floor_kwh`/
+`export_floor_slot` kwargs raise the scipy LP's `soc[t]` lower bound (and, if needed, its
+upper bound too — same "a target above the standing ceiling raises it for the occasion"
+reasoning as §9a) for every slot before the deadline slot; slots at/after it keep the
+ordinary `min_soc_kwh` floor, so nothing needs to explicitly "turn it off" once the deadline
+passes. Only wired into the primary scipy LP path — if that fails and the solve falls back to
+PuLP/CBC or the greedy heuristic (neither models any SOC floor beyond the instance-wide
+`min_soc_kwh`), `_lp_optimize` now refuses to hand an active floor to PuLP (raises, same
+guard as `deferrable_active`) and a loud `_LOGGER.error` names the gap if greedy is reached
+instead — a plausible number silently missing a safety-relevant reserve is worse than an
+visible failure, same reasoning as the current-plan-vs-LP split in `docs/CLAUDE.md`.
+
+**Files:** `export_floor.py` (pure maths — read/write/clear semantics, expiry; deliberately
+does NOT import `charge_target.slot_for_datetime` despite needing the identical "which slot
+does this deadline fall in" maths, to keep both pure-math modules independently
+standalone-testable — callers import `charge_target.slot_for_datetime` directly instead;
+`tests/test_export_floor.py`), `export_floor_store.py` (Store-backed wrapper; `update_signal`
+dispatcher signal), `number.py`/`datetime.py` (the entity pair, mirroring
+`GridLensChargeTargetPercentNumber`/`GridLensChargeTargetTimeDateTime` but plan-level —
+gated on `CONF_HAS_BATTERY`, same as `GridLensMinExportPriceNumber`), `services.py`/
+`services.yaml` (`set_export_floor`/`clear_export_floor`), `advisory/coordinator.py`
+(`_export_floor`, wired into `_run` right before `AdvisoryPlanner.plan`),
+`battery_optimizer.py` (the `lb[S:S+fslot]`/`ub[S:S+fslot]` bound raise in `_lp_scipy`, the
+`_lp_optimize` PuLP guard, and a `_diagnose_infeasible` relaxation branch so an infeasible
+floor names itself in the log rather than reading as "unknown"), `www/cards/grid-lens-
+export-floor-card.js` (dashboard card, registered as a Lovelace resource and seeded onto new
+installs' Settings view inside the existing `battery_control`-gated block — same pattern as
+`grid-lens-charge-target-card.js` but a single row, not one per device, since there's exactly
+one main battery per entry; paired via a new `config_entry_id` attribute on both entities
+rather than a device key, added to both `GridLensExportFloorPercentNumber` and
+`GridLensExportFloorUntilDateTime`).
+
+**Existing installs (including this dev rig) are never re-seeded** (see "Default dashboard
+for new users" above) — the card exists and is registered, but this install's own live
+Settings dashboard needs it added manually via Lovelace's "Add card" picker (search "Grid
+Lens Export Floor") if wanted there, same as any other card added after an install's
+dashboard was first seeded.
+
+**Live-verified (2026-10-06)** against the dev rig's real LP solve: synced + restarted,
+called `grid_lens.set_export_floor` with `floor_percent: 50`, `until_datetime: "2026-10-07
+07:00:00"`, waited for the next advisory tick, and confirmed via `ha_peek.py dispatch` that
+the re-solved trajectory held SOC at 50% overnight (instead of the plain plan's 10%) and
+released exactly at the 07:00 deadline slot before resuming normal charging — see
+`docs/GRIDLENS_CHECKLIST.md`'s 2026-10-06 entry for the full before/after trajectory. `scipy`
+itself isn't importable in this dev container (see `tests/test_demand_charge.py`'s header),
+so this is the live-instance confirmation that split always requires; the pure-math half
+(`export_floor.py`) is separately covered by `tests/test_export_floor.py`, run clean here.
+
+**`grid-lens-export-floor-card.js` is unclicked** — `node --check`'d clean on both the repo
+and deployed copies, the Lovelace resource registered at the new `_CARD_VERSION`, and the
+entities/attributes it auto-discovers (`export_floor_role`, `config_entry_id`) confirmed live
+via the API — but this dev container has no browser/display to actually render a Lovelace
+card in, same caveat as `grid-lens-charge-target-card`'s own unclicked note (§9a) and
+`gridlens-editor` (`docs/CLAUDE.md`). Needs the owner to look at it before this is "done" the
+way a curl-tested API change is done.
+
+---
+
 ## 10. Cards & the default dashboard
 
 All cards **auto-discover** their entities by attribute fingerprint — never a naming
@@ -2398,6 +2483,42 @@ convention, never a hardcoded entity id — so they work unmodified on any insta
 | `grid-lens-powerflow-card` | **Gated** — live radial energy flow: solar / grid / battery / home + one node per deferrable load, animated flow balls, greedy badges. A **System line** (2026-09-15, moved under the Battery node 2026-09-16) shows the inverter's own self-consumption + conversion losses as a small grey subtext row beneath the Battery node's stats — computed brand-agnostically as the energy-balance residual `(solar + grid − battery) − load_power_entity` (using the signed grid/battery conventions: +import/−export, +charge/−discharge), clamped ≥0, and shown only above the 50 W idle threshold — so the diagram balances (battery discharge ≈ Home + System) instead of silently under-reporting household draw. It started as a separate cog node on the radial fan, but that node re-spread the fan every time the residual crossed the 50 W threshold, so it was folded into the battery's own label block. No vendor-specific "self-consumption" sensor is read, so it works on any inverter brand (this install's Sigenergy publishes one via MQTT as `sensor.sigen_0_self_consumed_power`, but most don't). Classic layout only — scene mode's photoreal anchors have no natural home for an inverter-loss term. The **Grid node carries a persistent "Buy 22.1c · Sell 3.0c" line** (current slot of the dispatch sensor's `trajectory`, via `price_source_entity` / auto-discovered) — both sides always shown, the side currently flowing bold (2026-09-11; was previously an in-play-only "@ Xc/kWh" that vanished while idle). Requires the Battery Control + Power Flow add-on; see §12. `load_power_entity`/`grid_power_entity`/`battery_power_entity`/`battery_discharge_power_entity` are auto-populated in the seeded dashboard straight from the same `load_power_sensor`/`grid_power_sensor`/`battery_charge_power_sensor`/`battery_discharge_power_sensor` config_flow already collects (Sensors/Battery setup steps) — no separate onboarding needed; `solar_power_entity` auto-discovers from HA's own Energy Dashboard prefs; `ev_power_entity`/`ev_active_entity` remain manual-only (no config_flow counterpart — only needed when the EV isn't already represented as a regular deferrable load). Each load node has its own **disable button** (bottom-left corner) to drop it from the diagram — see §5's "Disable button" entry. |
 | `grid-lens-power-chart-card` | Measured & forecast power (kW) — solar, load, signed grid, signed battery, per-device deferrable, plus free-energy shading, **plus battery SOC on a right-hand 0–100% axis** (2026-08-28), **plus a per-device predicted SOC curve on that same axis for any deferrable load with an SOC model** (2026-09-07) — dashed, in the device's colour, grouped with the device; when the plan's SOC ceiling is shortening that device's charge (`soc_limited`) a faint flat line marks the ceiling and the tooltip names the kWh held back. **SOC on the historic (left-of-"now") side (2026-09-09):** the measured battery-SOC line — solid, right axis — now actually renders there (it was silently clipped to the forecast side by a missing `actual: true` flag), and a **measured per-device SOC** line (also solid, right axis, device colour) is drawn for any deferrable load whose `soc_entity` config field resolves; base class fetches it via the `_deferSocEntities()` hook into `_actualDeviceSoc`. Dashed = planned, solid = measured, matching the standalone SOC card. Click a legend name to isolate that series (forecast + measured pair, y-axis rescales to it); click it again to restore every series. SOC is exempt from isolation — it sits on its own axis, so keeping it costs the kW rescale nothing and it is context for whatever you isolated. **Left of "now" shows measured data only** (2026-09-08): each measured series carries the sensor's current live state as a final point so the line reaches the "now" divider (previously it stopped at the last recorded history row, up to a minute stale, leaving the forecast line as the only thing drawn there), and **every planned series is clipped at the divider** — the forecast flow lines, their area fills, the planned battery-SOC line and the per-device predicted-SOC curves/ceiling lines all stop at "now" (both axes), so nothing predicted renders in the past; set `show_forecast_history: true` to draw the forecast across the past again for plan-vs-actual comparison. (Still full-width: the free-energy time bands — the teal $0-import window is a known tariff fact, the orange spill band is plan-derived.) Downsampling (`ds()` in `grid-lens-chart-common.js`) also keeps each bucket's largest-magnitude sample for the measured kW series (`{peak:true}`), so a short real transient — a few-minute solar burst — survives instead of collapsing to whatever its bucket ended on. The crosshair (`continuousMeasuredPast` getter) reads the measured overlay at the exact hovered time for anything at or before "now" — including the elapsed part of the current 30-min slot — instead of snapping the read back to the last slot boundary; it only snaps to a slot in the genuine future. The other chart cards (price/cash/dispatch) are per-slot by nature and keep snapping. |
 | `grid-lens-price-chart-card` | Buy/sell rate ($/kWh) for the current plan — the forward `trajectory` **plus** the elapsed-today half from the dispatch sensor's `past_rates` attribute (`_combinedTraj()`), so the line covers midnight→horizon-end with a hover crosshair either side of "now". Falls back to forward-only if `past_rates` is absent (restored/cached plan, older integration). On the Power Flow view it sits under the power chart. |
+
+**Zoom slider (2026-10-12, all five chart cards).** Every `GridLensChartCardBase` subclass
+(`power`/`price`/`dispatch`/`soc`/`cash`-chart-card) now shows a slider under the
+Today/Full-horizon toggle, labelled `±15m` … `±24h` … `All`. It narrows `_timeScale()`'s
+`[t0,t1]` symmetrically around "now" — `[now-half, now+half]`, clamped to never widen past
+whatever Today/Horizon already produced, so `All` and a slider dragged fully out are the same
+window. Purely a display-window change: it doesn't refetch history (the Today/Horizon toggle
+already fetched the wider range this just narrows into) and doesn't touch
+`_fetchActual()`/`_viewMode`. Lives in `grid-lens-chart-common.js` — `ZOOM_STOPS`,
+`fmtZoomSpan()`, `GridLensChartCardBase._wireZoomSlider()` — not duplicated per-card.
+Deliberately rendered once in `_renderShell()`'s static shell markup, not inside
+`_toggleHtml()`/`.toggle-wrap` (which `_paint()` regenerates on every hass-driven update,
+often every few seconds): recreating a native `<input type=range>` mid-drag drops the
+browser's mouse-capture state and makes dragging feel broken. `_paint()` is now split into
+the toggle-wrap half and `_paintBody()` (legend + chart SVG only); the slider's own `input`
+handler calls just `_paintBody()`.
+
+**Zoom narrower than one slot (fixed same day).** The dispatch `trajectory` only has one
+point per 30-min slot, so the `±15m`/`±30m` zoom stops (window ≤ one slot wide) could leave
+0-1 trajectory points inside `[t0,t1]` — too few to draw a line through — and the forecast
+side of the chart silently vanished while the (densely-sampled) measured side stayed visible.
+Fixed via `clipToWindow()` in `grid-lens-chart-common.js`: instead of a strict containment
+filter, it holds the nearest point just outside each edge flat exactly AT that edge (the
+trajectory is itself a step function over 30-min slots, so holding rather than interpolating
+invents no sub-slot precision that isn't there) — same semantics `stepPath()` already uses
+for an actual step series, just applied at the view's own edges too. `multiLineChart()`'s
+`mapPoints()` uses it for every series (trajectory-row-keyed and `points`-based alike).
+`grid-lens-soc-chart-card` and `grid-lens-dispatch-chart-card` don't go through
+`multiLineChart()` — each had its own hand-rolled filter with a `if (!visible.length) visible
+= this._traj` "safety net" that was dead code until the zoom slider existed (every prior view
+was guaranteed wide relative to one slot) and would otherwise have crushed the ENTIRE plan
+horizon into a 30-minute-wide pixel mapping — massive overflow, not the blank chart it was
+guarding against. The SOC card now uses the same exported `clipToWindow()`; the dispatch
+card draws discrete bars rather than a line, so it instead filters to slots that *overlap*
+`[t0,t1]` (`ms < t1 && ms+step > t0`) and clamps each bar's own rect to the plot's margins,
+since a single slot can now be wider than the whole visible window.
 
 **Secondary axis (`multiLineChart`, `opts.rightAxis` + `series[].axis: 'right'`).** Added so
 SOC could share the Power Flow chart. A right-axis series is excluded from the left axis'

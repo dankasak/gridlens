@@ -10,7 +10,8 @@
 import {
   GW, GML, GMR, GridLensChartCardBase,
   clampPct, esc, fmtPct, fmtC, fmtHour, smoothPath, gradDef, xAxisTicks, actionLabel, reasonFor, execMode,
-} from './grid-lens-chart-common.js?v=20261002d';
+  clipToWindow,
+} from './grid-lens-chart-common.js?v=20261012b';
 
 class GridLensSocChartCard extends GridLensChartCardBase {
   get title() { return 'SOC — planned vs measured'; }
@@ -38,29 +39,36 @@ class GridLensSocChartCard extends GridLensChartCardBase {
     });
     const xticks = xAxisTicks(X, t0, t1, g.h - g.mb);
 
-    // Only plot slots inside the current view window — with Today selected, t0/t1 span
-    // just 24h while the trajectory itself can run 72h+, so unfiltered points map past
-    // the right edge and (since the SVG doesn't clip) visibly overflow the card.
-    let visible = this._traj.filter(s => {
-      const ms = new Date(s.start).getTime();
-      return ms >= t0 && ms <= t1;
-    });
-    if (!visible.length) visible = this._traj; // safety net — shouldn't happen, avoids a blank chart
-    const predPts = visible.map(s => [X(new Date(s.start).getTime()), Y(clampPct(s.soc_percent))]);
+    // Hold the nearest out-of-window slot flat at the window's own edge rather than a
+    // strict containment filter — see clipToWindow()'s own comment. This card used to
+    // fall back to the WHOLE unfiltered trajectory when nothing matched ("shouldn't
+    // happen" — true only while every view was guaranteed wide relative to one 30-min
+    // slot). The zoom slider's tightest stops make "window narrower than a slot" the
+    // common case, and that fallback would crush the entire plan horizon into a 30-min-
+    // wide pixel mapping — massive overflow, not the blank chart it was guarding against.
+    const predRows = this._traj.map(s => ({ ms: new Date(s.start).getTime(), v: clampPct(s.soc_percent) }));
+    const visible = clipToWindow(predRows, t0, t1);
+    const predPts = visible.map(p => [X(p.ms), Y(p.v)]);
     const predD = smoothPath(predPts);
     const gid = 'soc-pred';
     const base = g.h - g.mb;
-    const predFill = gradDef(gid, 'var(--predicted)', 0.42)
-      + `<path d="${predD} L${predPts[predPts.length - 1][0].toFixed(1)},${base} L${predPts[0][0].toFixed(1)},${base} Z" fill="url(#${gid})"/>`;
-    const pred = `<path d="${predD}" fill="none" stroke="var(--predicted)" stroke-width="2.5" stroke-dasharray="5 4" stroke-linejoin="round" stroke-linecap="round"/>`;
+    // visible/predPts can legitimately be empty now (a window entirely outside the plan
+    // horizon) — no fallback, so guard the first/last-index reads below instead.
+    let predFill = '', pred = '';
+    if (predPts.length) {
+      predFill = gradDef(gid, 'var(--predicted)', 0.42)
+        + `<path d="${predD} L${predPts[predPts.length - 1][0].toFixed(1)},${base} L${predPts[0][0].toFixed(1)},${base} Z" fill="url(#${gid})"/>`;
+      pred = `<path d="${predD}" fill="none" stroke="var(--predicted)" stroke-width="2.5" stroke-dasharray="5 4" stroke-linejoin="round" stroke-linecap="round"/>`;
+    }
 
     let actual = '';
-    const ap = (this._actual || []).filter(p => p.t.getTime() >= t0 && p.t.getTime() <= Date.now() + 60000);
+    const actualRows = (this._actual || []).map(p => ({ ms: p.t.getTime(), v: clampPct(p.v) }));
+    const ap = clipToWindow(actualRows, t0, Date.now() + 60000);
     if (ap.length > 1) {
-      const pts = ap.map(p => [X(p.t.getTime()), Y(clampPct(p.v))]);
+      const pts = ap.map(p => [X(p.ms), Y(p.v)]);
       actual = `<path d="${smoothPath(pts)}" fill="none" stroke="var(--actual)" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round"/>`;
     } else if (ap.length === 1) {
-      actual = `<circle cx="${X(ap[0].t.getTime())}" cy="${Y(clampPct(ap[0].v))}" r="4" fill="var(--actual)"/>`;
+      actual = `<circle cx="${X(ap[0].ms)}" cy="${Y(ap[0].v)}" r="4" fill="var(--actual)"/>`;
     }
 
     const nowX = X(Math.min(Date.now(), t1));

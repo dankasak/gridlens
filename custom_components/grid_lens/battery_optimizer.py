@@ -487,6 +487,8 @@ class BatteryOptimizer:
         conditional_credits: List[Dict] = None,
         min_export_price: float = 0.0,
         slot_day_index: List[int] = None,
+        export_floor_kwh: float = None,
+        export_floor_slot: int = None,
     ) -> Dict:
         """Return an optimal hourly schedule minimising net energy cost.
 
@@ -611,6 +613,22 @@ class BatteryOptimizer:
           rate windows — build these with retailer_plans.build_rate_caps(). Left at the
           default (None) the model behaves exactly as before.
 
+        export_floor_kwh / export_floor_slot (optional, main battery only — NOT the
+          per-device EV/deferrable floor_slot above): an ad-hoc one-off reserve
+          (grid_lens.set_export_floor — "keep at least 50% until 7am Tuesday"
+          ahead of a planned outage). Raises the LP's lower bound on soc[t] to
+          export_floor_kwh for every slot t < export_floor_slot — the optimizer
+          may still discharge/export freely for economics, it simply never goes
+          below this floor until the deadline slot, after which the ordinary
+          min_soc_kwh floor applies again. Mirrors charge_target's floor_slot
+          mechanism but in the opposite direction (a lower-bound reserve, not an
+          upper-bound-forcing target-to-reach) and scoped to the main battery
+          state variable rather than a per-device one. Both left None (the
+          default) reproduces the plain min_soc_kwh floor across the whole
+          horizon, unchanged. Only ever set by advisory/coordinator.py's rolling
+          control path (ExportFloorStore) — plan_calculator.py's plan-comparison
+          backtest never sets this, same reasoning as soc_initial_percent above.
+
         min_export_price ($/kWh, optional): below this price, export is treated as
           valueless in the objective — still legal (it remains the sink of last resort
           when nothing else can absorb surplus solar), but no longer rewarded, so the
@@ -648,12 +666,22 @@ class BatteryOptimizer:
                                      import_caps=import_caps, export_caps=export_caps,
                                      conditional_credits=conditional_credits,
                                      min_export_price=min_export_price,
-                                     slot_day_index=slot_day_index)
+                                     slot_day_index=slot_day_index,
+                                     export_floor_kwh=export_floor_kwh,
+                                     export_floor_slot=export_floor_slot)
         except ImportError:
-            _LOGGER.warning(
-                "PuLP not yet installed — using greedy fallback. "
-                "Restart HA again after the first boot to enable LP optimisation."
-            )
+            if export_floor_kwh is not None:
+                _LOGGER.error(
+                    "PuLP not yet installed — falling back to greedy, which does NOT "
+                    "honour the active export/discharge floor (%.1f kWh until slot %s). "
+                    "Restart HA again after the first boot to enable LP optimisation.",
+                    export_floor_kwh, export_floor_slot,
+                )
+            else:
+                _LOGGER.warning(
+                    "PuLP not yet installed — using greedy fallback. "
+                    "Restart HA again after the first boot to enable LP optimisation."
+                )
             return self._greedy_optimize(solar, load, r_imp, r_exp, E0, T,
                                          timestep_hours=timestep_hours)
         except Exception as exc:
@@ -670,11 +698,21 @@ class BatteryOptimizer:
                 conditional_credits=conditional_credits,
                 min_export_price=min_export_price,
                 slot_day_index=slot_day_index,
+                export_floor_kwh=export_floor_kwh,
+                export_floor_slot=export_floor_slot,
             )
-            _LOGGER.warning(
-                "LP optimisation failed (%s) — using greedy fallback. Likely cause: %s.",
-                exc, culprit,
-            )
+            if export_floor_kwh is not None:
+                _LOGGER.error(
+                    "LP optimisation failed (%s) — using greedy fallback, which does NOT "
+                    "honour the active export/discharge floor (%.1f kWh until slot %s). "
+                    "Likely cause: %s.",
+                    exc, export_floor_kwh, export_floor_slot, culprit,
+                )
+            else:
+                _LOGGER.warning(
+                    "LP optimisation failed (%s) — using greedy fallback. Likely cause: %s.",
+                    exc, culprit,
+                )
             return self._greedy_optimize(solar, load, r_imp, r_exp, E0, T,
                                          timestep_hours=timestep_hours)
 
@@ -718,6 +756,14 @@ class BatteryOptimizer:
                 return "an export rate-cap window"
             if kwargs.get("conditional_credits") and solves(deferrable_loads, conditional_credits=None):
                 return "a conditional day-credit"
+            if kwargs.get("export_floor_kwh") is not None and solves(
+                deferrable_loads, export_floor_kwh=None, export_floor_slot=None
+            ):
+                return (
+                    "an active export/discharge floor (grid_lens.set_export_floor) — "
+                    "the reserve requested can't be held given the forecast load/import "
+                    "bound over that window"
+                )
             if kwargs.get("terminal_soc_value") is None and solves(deferrable_loads, terminal_soc_value=0.0):
                 return "the hard terminal-SOC floor (soc[T-1] >= E0) — battery can't refill to its starting charge by horizon end"
             return ("unknown — still infeasible with every optional feature relaxed; "
@@ -748,7 +794,7 @@ class BatteryOptimizer:
                      soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
                      terminal_soc_value=None, import_caps=None, export_caps=None,
                      conditional_credits=None, min_export_price=0.0,
-                     slot_day_index=None):
+                     slot_day_index=None, export_floor_kwh=None, export_floor_slot=None):
         """Build and solve the LP. Raises on failure so caller can fall back.
 
         Chain is scipy → PuLP/CBC → (caller's greedy fallback).
@@ -790,7 +836,9 @@ class BatteryOptimizer:
                                   import_caps=import_caps, export_caps=export_caps,
                                   conditional_credits=conditional_credits,
                                   min_export_price=min_export_price,
-                                  slot_day_index=slot_day_index)
+                                  slot_day_index=slot_day_index,
+                                  export_floor_kwh=export_floor_kwh,
+                                  export_floor_slot=export_floor_slot)
         except ImportError:
             pass  # scipy not available — try PuLP
         except Exception as exc:
@@ -803,6 +851,15 @@ class BatteryOptimizer:
             raise RuntimeError(
                 "no solver available that models deferrable loads "
                 "(scipy failed; PuLP does not model them)"
+            )
+        if export_floor_kwh is not None:
+            # _lp_pulp models no SOC floor beyond the instance-wide min_soc_kwh either
+            # (same reasoning as deferrable_active above) — handing it an active
+            # export/discharge floor would silently drop a safety-relevant reserve
+            # (e.g. "keep 50% for a planned outage") rather than refusing outright.
+            raise RuntimeError(
+                "no solver available that models the active export/discharge floor "
+                "(scipy failed; PuLP does not model it)"
             )
         try:
             return self._lp_pulp(solar, load, r_imp, r_exp, E0, T, deferrable_loads)
@@ -825,7 +882,7 @@ class BatteryOptimizer:
                   soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
                   terminal_soc_value=None, import_caps=None, export_caps=None,
                   conditional_credits=None, min_export_price=0.0,
-                  slot_day_index=None):
+                  slot_day_index=None, export_floor_kwh=None, export_floor_slot=None):
         import numpy as np
         from scipy.optimize import linprog
         from scipy.sparse import lil_matrix
@@ -1125,6 +1182,23 @@ class BatteryOptimizer:
         ub[D:D+T] = self.max_discharge_rate_kw * dt
         lb[S:S+T] = self.min_soc_kwh
         ub[S:S+T] = self.max_soc_kwh
+        if export_floor_kwh is not None and export_floor_slot:
+            # Ad-hoc one-off export/discharge reserve (grid_lens.set_export_floor —
+            # "keep at least 50% until 7am Tuesday" ahead of a planned outage). Raises
+            # the lower bound for every slot BEFORE the deadline — never lowers it, so
+            # this can only tighten the ordinary min_soc_kwh floor, never relax it (a
+            # floor below the everyday minimum would make no sense). Slots at/after
+            # export_floor_slot keep the plain min_soc_kwh floor, so normal cost-optimal
+            # dispatch resumes automatically once the deadline passes — nothing clears
+            # this explicitly here, the LP simply stops being constrained by it.
+            fslot = min(T, int(export_floor_slot))
+            lb[S:S+fslot] = np.maximum(lb[S:S+fslot], export_floor_kwh)
+            # A floor above the standing charge ceiling (max_soc_kwh, e.g. an everyday
+            # 90% longevity cap) must raise it for this occasion too, same reasoning as
+            # charge_target's own ceiling override (FEATURES.md §9a) — otherwise lb > ub
+            # for these slots is a direct, deterministic INFEASIBLE rather than merely
+            # suboptimal.
+            ub[S:S+fslot] = np.maximum(ub[S:S+fslot], export_floor_kwh)
         for i, dev in enumerate(deferrable_loads):
             # Each device's per-slot draw is capped at its own rated max energy
             # (max_kw × dt), and forced to 0 in slots the device is unavailable.

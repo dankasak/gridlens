@@ -434,6 +434,14 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
             ],
             "grid_options": {"columns": "full"},
         })
+        # One-off "don't discharge/export below X% until a datetime" reserve on the
+        # main battery (FEATURES.md §9d) — plan-level, so gated on battery_control
+        # existing (has_battery) like the tiles above, not on deferrable_sensors
+        # below (that's the per-device charge target's own gate).
+        settings_cards.append({
+            "type": "custom:grid-lens-export-floor-card", "title": "Export Floor",
+            "grid_options": {"columns": "full"},
+        })
     if deferrable_sensors:
         # "Deferrable Loads" (grid-lens-load-control-card) is NOT seeded here (was, until
         # 2026-09-24) — its per-device controls (Today Boost, Greedy toggles, Off now/On
@@ -634,7 +642,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20261004b"
+    _CARD_VERSION = "20261012b"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -651,6 +659,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         f"/grid_lens/cards/grid-lens-load-control-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-boost-tuning-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-charge-target-card.js?v={_CARD_VERSION}",
+        f"/grid_lens/cards/grid-lens-export-floor-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-defer-schedule-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-daily-target-card.js?v={_CARD_VERSION}",
     ]
@@ -2339,6 +2348,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, entry.entry_id
     )
 
+    # Ad-hoc one-off export/discharge floor on the main battery ("keep at least
+    # 50% in reserve until 7am Tuesday" ahead of a planned outage) — the mirror
+    # image of the charge target above. Shared between the number.py/datetime.py
+    # entity pair (writers) and AdvisoryCoordinator (reader). Same "created
+    # before platforms are forwarded" reasoning as the stores above.
+    from .export_floor_store import ExportFloorStore
+    hass.data[DOMAIN][f"{entry.entry_id}_export_floor"] = ExportFloorStore(
+        hass, entry.entry_id
+    )
+
     # Daily Target: per-device + master percent-of-average targets — shared
     # between the number.py entity pair (writers) and AdvisoryCoordinator (reader).
     # Same "created before platforms are forwarded" reasoning as the stores above.
@@ -2573,6 +2592,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(f"{entry.entry_id}_load_control", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_overrides", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_charge_targets", None)
+        hass.data[DOMAIN].pop(f"{entry.entry_id}_export_floor", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_daily_targets", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_charge_timing_preferences", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_deferrable_schedules", None)

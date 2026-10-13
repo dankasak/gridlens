@@ -21,6 +21,25 @@ export const GW = 720, GML = 44, GMR = 12;  // shared plot geometry across every
 export const RIGHT_AXIS_MR = 34;
 export const VIEW_BACK_MS = 2 * 3600000;    // show 2h of history to the left of "now"
 
+// Zoom slider stops (half-span, ms) — GridLensChartCardBase._timeScale() clamps the
+// Today/Horizon window to [now-half, now+half] when zoomed. `null` (last stop) means
+// "All": no clamp, the full Today/Horizon window as selected by those buttons. Symmetric
+// around "now" (user choice, 2026-10-12) rather than trimming history only or cutting the
+// forecast outright — a slider that narrows both edges together reads like any other
+// chart-zoom control instead of inventing a third, asymmetric convention.
+export const ZOOM_STOPS = [
+  15 * 60000, 30 * 60000, 3600000, 2 * 3600000, 4 * 3600000,
+  6 * 3600000, 12 * 3600000, 24 * 3600000, null,
+];
+
+// Label for a ZOOM_STOPS half-span — "±2h" etc, "All" for the null sentinel.
+export function fmtZoomSpan(ms) {
+  if (ms == null) return 'All';
+  if (ms < 3600000) return `±${Math.round(ms / 60000)}m`;
+  const h = ms / 3600000;
+  return `±${h % 1 === 0 ? h : h.toFixed(1)}h`;
+}
+
 // ---------------------------------------------------------------- pure helpers
 
 // Downsample a {t,v} series to at most `max` points (keeps rendering light). Buckets by
@@ -352,6 +371,29 @@ export function reasonFor(row, mode) {
   return `Self-consumption — solar/battery cover load directly, no material charge or discharge planned.`;
 }
 
+// Clip a time-ordered [{ms,v},…] array to [lo,hi], holding the nearest value just
+// outside each edge flat exactly AT that edge instead of dropping it. Plain
+// `.filter(p => p.ms >= lo && p.ms <= hi)` is correct when the series is dense relative
+// to the window, but the dispatch trajectory only has one point per 30-min slot — the
+// zoom slider's tightest stops (±15m/±30m) give a window as narrow as one slot, which
+// can contain zero (sometimes one) slot boundaries, so the plain filter leaves <2 points
+// and the series silently draws nothing at all (found 2026-10-12, zoomed-in forecast
+// line vanishing). Holding rather than interpolating is deliberate: the trajectory is
+// itself a step function over 30-min slots (a planned per-slot average, no genuine
+// sub-slot value exists to interpolate toward), so this is the same semantics stepPath()
+// already uses for an actual step series, just applied at the view's own edges too.
+// Assumes `pts` is ascending by `ms` (every caller already builds its series that way).
+export function clipToWindow(pts, lo, hi) {
+  const interior = pts.filter((p) => p.ms >= lo && p.ms <= hi);
+  const before = pts.filter((p) => p.ms < lo).pop();
+  const after = pts.find((p) => p.ms > hi);
+  const out = [];
+  if (before && (!interior.length || interior[0].ms > lo)) out.push({ ms: lo, v: before.v });
+  out.push(...interior);
+  if (after && (!interior.length || interior[interior.length - 1].ms < hi)) out.push({ ms: hi, v: after.v });
+  return out;
+}
+
 // Multi-series line/area chart (forecast + optional "measured" overlays), used by the
 // power/price/cash chart cards. Pure function: gradient ids are derived from series
 // index (not a mutable counter), since each card only ever calls this once per render.
@@ -374,15 +416,16 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // just 24h while the trajectory itself can run 72h+, so unfiltered points map past
   // the right edge and (since the SVG doesn't clip) visibly overflow the card.
   const mapPoints = (s) => {
-    if (s.points) return (s.points || [])
+    if (s.points) {
       // `pointsForecast` series carry planned (future) values, so they run to the view's
       // right edge like a `key` series — the default clip at `now` is for measured
       // overlays whose last point is the real data boundary.
-      .filter(p => p.t.getTime() >= t0 && p.t.getTime() <= (s.pointsForecast ? t1 : nowMs + 60000))
-      .map(p => ({ ms: p.t.getTime(), v: p.v }));
-    return traj
-      .filter(row => { const ms = new Date(row.start).getTime(); return ms >= t0 && ms <= t1; })
-      .map(row => ({ ms: new Date(row.start).getTime(), v: (s.calc ? s.calc(row) : (+row[s.key] || 0)) * (s.scale || 1) }));
+      const upper = s.pointsForecast ? t1 : nowMs + 60000;
+      const pts = (s.points || []).map(p => ({ ms: p.t.getTime(), v: p.v }));
+      return clipToWindow(pts, t0, upper);
+    }
+    const rows = traj.map(row => ({ ms: new Date(row.start).getTime(), v: (s.calc ? s.calc(row) : (+row[s.key] || 0)) * (s.scale || 1) }));
+    return clipToWindow(rows, t0, t1);
   };
   const raw = series.map(mapPoints);
   let yMax = opts.yMax != null ? opts.yMax : 0, yMin = opts.yMin != null ? opts.yMin : 0;
@@ -1902,6 +1945,14 @@ export const STYLE = `
   .view-btn { transition:all 0.15s ease; font-weight:600; cursor:pointer; }
   .view-btn:hover { background:color-mix(in srgb, var(--ink) 8%, transparent); }
   .view-btn.active { background:var(--surface); color:var(--good); }
+  /* Zoom slider lives in the static shell (_renderShell(), not _toggleHtml()) so the
+     frequent hass-driven repaints that redraw .toggle-wrap never recreate this element —
+     recreating a <input type=range> mid-drag drops the native drag/mouse-capture state
+     and makes dragging feel broken. See GridLensChartCardBase._wireZoomSlider(). */
+  .zoom-row { display:flex; align-items:center; gap:8px; margin:6px 0 2px; }
+  .zoom-row .zoom-caption { font-size:11px; color:var(--muted); flex:none; }
+  .zoom-slider { flex:1 1 auto; min-width:60px; accent-color:var(--good); cursor:pointer; }
+  .zoom-label { font-size:11px; color:var(--ink2); font-weight:600; flex:none; min-width:28px; text-align:right; }
 `;
 
 // hass.themes.darkMode reflects the user's own light/dark TOGGLE, not necessarily
@@ -1975,6 +2026,9 @@ export class GridLensChartCardBase extends HTMLElement {
     this._deferMaxKw = [];
     this._deferSensorIds = [];
     this._viewMode = 'today';
+    // Defaults to the last ZOOM_STOPS entry (null half-span = "All" = no clamp), so a
+    // card that never touches the slider behaves exactly as before this feature existed.
+    this._zoomIdx = ZOOM_STOPS.length - 1;
     this._dark = false;
   }
 
@@ -2226,6 +2280,15 @@ export class GridLensChartCardBase extends HTMLElement {
     } else {
       t0 = planStart - VIEW_BACK_MS;
     }
+    // Zoom slider: narrows [t0,t1] toward [now-half, now+half] — never widens past
+    // whatever the Today/Horizon toggle already produced, so "All" (half == null) and a
+    // slider dragged all the way out are exactly the same window. See ZOOM_STOPS' comment.
+    const half = ZOOM_STOPS[this._zoomIdx];
+    if (half != null) {
+      const now = Date.now();
+      t0 = Math.max(t0, now - half);
+      t1 = Math.min(t1, now + half);
+    }
     return { t0, t1, step, planStart };
   }
 
@@ -2247,19 +2310,48 @@ export class GridLensChartCardBase extends HTMLElement {
           <div class="title">${esc(this.title)}</div>
           <div class="toggle-wrap"></div>
         </div>
+        <div class="zoom-row">
+          <span class="zoom-caption">Zoom</span>
+          <input type="range" class="zoom-slider" min="0" max="${ZOOM_STOPS.length - 1}" step="1" value="${this._zoomIdx}">
+          <span class="zoom-label">${fmtZoomSpan(ZOOM_STOPS[this._zoomIdx])}</span>
+        </div>
         <div class="body"></div>
       </div>
     `;
+    this._wireZoomSlider();
+  }
+
+  // Wired exactly once per _renderShell() (itself only called from setConfig(), i.e. once
+  // per card instance unless its config changes) — not re-wired every paint like
+  // _wireViewToggle()/_wireCrosshair(), because the slider element itself must never be
+  // recreated mid-drag. See STYLE's .zoom-row comment.
+  _wireZoomSlider() {
+    const slider = this.shadowRoot.querySelector('.zoom-slider');
+    const label = this.shadowRoot.querySelector('.zoom-label');
+    if (!slider || !label) return;
+    slider.addEventListener('input', () => {
+      this._zoomIdx = parseInt(slider.value, 10);
+      label.textContent = fmtZoomSpan(ZOOM_STOPS[this._zoomIdx]);
+      // Body only — repainting .toggle-wrap is unnecessary here and _paint() would be
+      // harmless anyway (it never touches .zoom-row), but skipping it avoids rewiring the
+      // Today/Horizon buttons on every slider tick for no reason.
+      this._paintBody();
+    });
   }
 
   _paint() {
-    const body = this.shadowRoot && this.shadowRoot.querySelector('.body');
     const toggleWrap = this.shadowRoot && this.shadowRoot.querySelector('.toggle-wrap');
+    if (toggleWrap) {
+      toggleWrap.innerHTML = this._toggleHtml();
+      this._wireViewToggle();
+    }
+    this._paintBody();
+  }
+
+  _paintBody() {
+    const body = this.shadowRoot && this.shadowRoot.querySelector('.body');
     if (!body) return;
     const s = this._summary || {};
-
-    if (toggleWrap) toggleWrap.innerHTML = this._toggleHtml();
-    this._wireViewToggle();
 
     if (!this._traj || s.status !== 'ok') {
       body.innerHTML = `<div class="waiting">Advisory plan not available yet${s.reason ? '<br><span class="sub">' + esc(s.reason) + '</span>' : ''}</div>`;
