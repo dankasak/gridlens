@@ -133,6 +133,11 @@
       display: flex; justify-content: space-between;
       padding: 2px 0; font-size: 11px; color: #6b7280;
     }
+    .bill-subtotal-row {
+      border-top: 1px solid #374151;
+      margin-top: 4px; padding-top: 6px;
+    }
+    .amount-secondary { display: block; font-weight: 400; opacity: 0.65; }
     .bill-fit { color: #10b981; }
     .bill-note { font-size: 10px; color: #f59e0b; font-style: italic; padding: 4px 0; }
 
@@ -193,6 +198,19 @@ let currentParams = '';
 let refreshTimer = null;
 
 function fmt(n) { return '$' + (n || 0).toFixed(2); }
+// Per-item ex-GST figure — GST is a flat 10%/(1/11) addition on every
+// bill_items amount (see plan_calculator.py), so this is pure display
+// arithmetic. `sign` is a literal HTML prefix (e.g. '&minus;' for a credit).
+function fmtDual(n, sign) {
+  sign = sign || '';
+  return `${sign}${fmt((n || 0) / 1.1)}<span class="amount-secondary">incl. GST ${sign}${fmt(n)}</span>`;
+}
+// Feed-in/export credits aren't a taxable supply, so no ex-GST/incl-GST split —
+// but keep the amount on the 2nd line so it lines up with every other row's figure.
+function fmtNoGst(n, sign) {
+  sign = sign || '';
+  return `&nbsp;<span class="amount-secondary">${sign}${fmt(n)}</span>`;
+}
 
 function dateStr(d) {
   // Returns YYYY-MM-DD in local time
@@ -313,7 +331,7 @@ function renderBreakdown(bd, days) {
       <span class="breakdown-label">${line.label}<br>
         <small>${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh</small>
       </span>
-      <span class="breakdown-value">${fmt(line.amount)}</span>
+      <span class="breakdown-value">${fmtDual(line.amount)}</span>
     </div>`;
   });
 
@@ -324,7 +342,7 @@ function renderBreakdown(bd, days) {
     <span class="breakdown-label">Supply charge<br>
       <small>${(s.rate_per_day * 100).toFixed(2)}&thinsp;c/day &times; ${s.days}&thinsp;days</small>
     </span>
-    <span class="breakdown-value">${fmt(s.amount)}</span>
+    <span class="breakdown-value">${fmtDual(s.amount)}</span>
   </div>`;
 
   // Demand charge (peak-kW) — only present when on a demand tariff
@@ -335,7 +353,7 @@ function renderBreakdown(bd, days) {
       <span class="breakdown-label">${dm.label}<br>
         <small>${dm.peak_kw.toFixed(2)}&thinsp;kW peak &times; ${(dm.rate_per_kw_per_day * 100).toFixed(2)}&thinsp;c/kW/day &times; ${dm.days}&thinsp;days</small>
       </span>
-      <span class="breakdown-value">${fmt(dm.amount)}</span>
+      <span class="breakdown-value">${fmtDual(dm.amount)}</span>
     </div>`;
   }
 
@@ -347,7 +365,7 @@ function renderBreakdown(bd, days) {
       <span class="breakdown-label" style="color:#10b981">Feed-in tariff<br>
         <small>${f.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${f.kwh.toFixed(1)}&thinsp;kWh</small>
       </span>
-      <span class="breakdown-value">&minus;${fmt(f.credit)}</span>
+      <span class="breakdown-value">${fmtNoGst(f.credit, '&minus;')}</span>
     </div>`;
   }
 
@@ -368,24 +386,30 @@ function renderBreakdown(bd, days) {
             &times; ${pb.total_kwh.toFixed(1)}&thinsp;kWh
           </small>
         </span>
-        <span class="breakdown-value">${creditSign}${fmt(creditAbs)}</span>
+        <span class="breakdown-value">${fmtNoGst(creditAbs, creditSign)}</span>
       </div>`;
     } else {
       html += `<div class="breakdown-row bill-fit">
         <span class="breakdown-label" style="color:#10b981">Price Efficiency Adjustment<br>
           <small>Estimated — actual amount varies</small>
         </span>
-        <span class="breakdown-value">&minus;${fmt(bi.pea_credit)}</span>
+        <span class="breakdown-value">${fmtNoGst(bi.pea_credit, '&minus;')}</span>
       </div>`;
     }
   }
 
-  // Total + GST
+  // Subtotal / GST / Total — see grid-lens-card.js's _renderBillRows for why
+  // all three are shown (retailer bills split ex-GST vs inc-GST differently).
+  if (bi.total_ex_gst != null) {
+    html += `<div class="bill-gst-row bill-subtotal-row">
+      <span>Subtotal (ex. GST)</span><span>${fmt(bi.total_ex_gst)}</span>
+    </div>`;
+  }
+  html += `<div class="bill-gst-row">
+    <span>GST (10%)</span><span>${fmt(bi.gst_included)}</span>
+  </div>`;
   html += `<div class="bill-total-row">
     <span>Total (inc. GST)</span><span>${fmt(bi.total)}</span>
-  </div>`;
-  html += `<div class="bill-gst-row">
-    <span>GST included (1/11)</span><span>${fmt(bi.gst_included)}</span>
   </div>`;
 
   if (bi.optimisation_note) {

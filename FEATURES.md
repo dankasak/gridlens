@@ -349,6 +349,36 @@ point is letting a customer tick GloBird-ZEROHERO-style output off against their
 bill line by line to verify the product is pricing them correctly — don't reorder or
 re-blend sections without checking against a real bill sample first (see CLAUDE.md).
 
+Both the closing summary **and every itemised row** (added 2026-10-12) show their amount
+ex-GST as well as inc-GST, because retailers split this two different ways — some itemise
+ex-GST and add GST as a separate line/row, others (like us, natively) fold GST into every
+line and print only the inc-GST figure. Showing both means the reconciliation works either
+way, instead of only matching bills that happen to lay it out the way we do:
+**GST only applies to what's actually purchased from the retailer** — energy, supply,
+subscription, demand, controlled load (`gross_charges`). FiT, VPP participation credit, PEA
+and conditional credits are reductions paid *to* the customer, not a taxable supply, so they
+carry no GST component and are subtracted at face value (found/fixed 2026-10-13 — the first
+cut of this feature wrongly derived `gst_included` from the post-credit `net_total`, which
+silently taxed every credit too).
+- **Summary**: **Subtotal (ex. GST)**, **GST (10%)**, **Total (inc. GST)**.
+  `_compute_bill_items`/`_compute_multi_segment_bill_items` in `plan_calculator.py` expose
+  `gst_included` (`gross_charges / 11` — GST on the purchased lines only, not on
+  `total`/`net_total`) and `total_ex_gst` (`total` minus that `gst_included`).
+- **Per-row (GST-bearing lines)**: supply, subscription, demand, controlled load, energy
+  lines lead with the ex-GST figure, with a small "incl. GST $X.XX" line underneath
+  (`.amount-secondary`) — ex-GST first since that's the figure most retailer bills itemise
+  per line, with GST added as a separate row/total. This is pure display arithmetic in the
+  frontend (`amount / 1.1`), not a backend field per line — GST is a flat 10%/(1/11) addition
+  on every one of these amounts by construction (see that docstring), so no new per-line data
+  is needed. `_dualAmountHtml` in `grid-lens-card.js` (mirrored as `fmtDual` in the legacy
+  `www/index.html` preview page).
+- **Per-row (credits — no GST)**: FiT lines, VPP credit, PEA credit/breakdown, and
+  conditional credits are payments *to* the customer, not a taxable supply, so there's no
+  ex-GST/incl-GST split to show for them. These show only the one figure, on the 2nd line
+  (`.amount-secondary`, same styling as the "incl. GST" sub-line) so it still lines up
+  vertically with every other row's figure, with no "GST" wording attached.
+  `_amountHtmlNoGst` in `grid-lens-card.js` (mirrored as `fmtNoGst` in `www/index.html`).
+
 ⚠ **Gotcha — LP-path FiT tiers bucket by the free/over-cap split, not the blended rate**
 (fixed 2026-09-04). For an alternative (LP-scored) plan with a daily-capped FiT (EA
 BatteryEase: 8c first 10 kWh/day, 3c beyond), the solver reports a *blended* per-step

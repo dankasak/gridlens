@@ -659,6 +659,24 @@ class GridLensCard extends HTMLElement {
   // a customer can tick this off against their actual bill line by line — see
   // the GloBird ZEROHERO reconciliation this was modelled on. Don't reorder
   // without re-checking against a real bill sample.
+  // GST is a flat 10%-of-ex-GST / (1/11)-of-inc-GST addition on every amount
+  // in bill_items (see plan_calculator.py's _compute_bill_items docstring) —
+  // so a per-line ex-GST figure is pure display arithmetic, not something
+  // the backend needs to compute and carry per line. `sign` is a literal
+  // HTML prefix (e.g. '&minus;' for a credit row) applied to both figures.
+  _dualAmountHtml(amount, sign = '') {
+    const inc = (amount || 0).toFixed(2);
+    const exc = ((amount || 0) / 1.1).toFixed(2);
+    return `${sign}$${exc}<span class="amount-secondary">incl. GST ${sign}$${inc}</span>`;
+  }
+
+  // Feed-in/export credits aren't a taxable supply, so there's no ex-GST/incl-GST
+  // split to show — but the amount still goes on the 2nd line so it lines up
+  // vertically with every other row's (GST-bearing) figure.
+  _amountHtmlNoGst(amount, sign = '') {
+    return `&nbsp;<span class="amount-secondary">${sign}$${(amount || 0).toFixed(2)}</span>`;
+  }
+
   _renderBillRows(bi) {
     let rows = '';
 
@@ -669,7 +687,7 @@ class GridLensCard extends HTMLElement {
       <div class="breakdown-label">Supply charge<br>
         <span style="font-size:11px;opacity:0.7">${(s.rate_per_day * 100).toFixed(2)}&thinsp;c/day &times; ${s.days}&thinsp;days</span>
       </div>
-      <div class="breakdown-value">$${s.amount.toFixed(2)}</div>
+      <div class="breakdown-value">${this._dualAmountHtml(s.amount)}</div>
     </div>`;
 
     // Subscription fee (e.g. Amber $25/month)
@@ -680,7 +698,7 @@ class GridLensCard extends HTMLElement {
         <div class="breakdown-label">Membership subscription<br>
           <span style="font-size:11px;opacity:0.7">$${sub.rate_per_month.toFixed(2)}/month &times; ${sub.months.toFixed(1)}&thinsp;months</span>
         </div>
-        <div class="breakdown-value">$${sub.amount.toFixed(2)}</div>
+        <div class="breakdown-value">${this._dualAmountHtml(sub.amount)}</div>
       </div>`;
     }
 
@@ -697,7 +715,7 @@ class GridLensCard extends HTMLElement {
           <div class="breakdown-label">${ln.label}${this._timeRangeHtml(ln.time_range)}<br>
             <span style="font-size:11px;opacity:0.7">${(ln.peak_kw || 0).toFixed(2)}&thinsp;kW peak &times; ${((ln.rate_per_kw_per_day || 0) * 100).toFixed(2)}&thinsp;c/kW/day &times; ${ln.days}&thinsp;days</span>
           </div>
-          <div class="breakdown-value">$${(ln.amount || 0).toFixed(2)}</div>
+          <div class="breakdown-value">${this._dualAmountHtml(ln.amount || 0)}</div>
         </div>`;
       });
     }
@@ -711,7 +729,7 @@ class GridLensCard extends HTMLElement {
           <div class="breakdown-label">${line.label}<br>
             <span style="font-size:11px;opacity:0.7">${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh</span>
           </div>
-          <div class="breakdown-value">$${line.amount.toFixed(2)}</div>
+          <div class="breakdown-value">${this._dualAmountHtml(line.amount)}</div>
         </div>`;
       });
     }
@@ -723,7 +741,7 @@ class GridLensCard extends HTMLElement {
         <div class="breakdown-label">${line.label}${this._timeRangeHtml(line.time_range)}<br>
           <span style="font-size:11px;opacity:0.7">${line.rate_c.toFixed(2)}&thinsp;c/kWh &times; ${line.kwh.toFixed(1)}&thinsp;kWh</span>
         </div>
-        <div class="breakdown-value">$${line.amount.toFixed(2)}</div>
+        <div class="breakdown-value">${this._dualAmountHtml(line.amount)}</div>
       </div>`;
     });
 
@@ -740,7 +758,7 @@ class GridLensCard extends HTMLElement {
           <div class="breakdown-label" style="color:inherit">${line.label}${this._timeRangeHtml(line.time_range)}<br>
             <span style="font-size:11px;opacity:0.7">${rateLabel}</span>
           </div>
-          <div class="breakdown-value" style="color:inherit">&minus;$${line.amount.toFixed(2)}</div>
+          <div class="breakdown-value" style="color:inherit">${this._amountHtmlNoGst(line.amount, '&minus;')}</div>
         </div>`;
       });
     }
@@ -750,7 +768,7 @@ class GridLensCard extends HTMLElement {
       rows += '<div class="bill-section-head bill-fit">VPP credit</div>';
       rows += `<div class="breakdown-row bill-fit">
         <div class="breakdown-label" style="color:inherit">VPP participation credit</div>
-        <div class="breakdown-value" style="color:inherit">&minus;$${bi.vpp_credit.toFixed(2)}</div>
+        <div class="breakdown-value" style="color:inherit">${this._amountHtmlNoGst(bi.vpp_credit, '&minus;')}</div>
       </div>`;
     }
 
@@ -760,7 +778,7 @@ class GridLensCard extends HTMLElement {
       rows += '<div class="bill-section-head bill-fit">Other credits</div>';
       if (pb) {
         const creditSign = bi.pea_credit >= 0 ? '&minus;' : '+';
-        const creditAbs = Math.abs(bi.pea_credit).toFixed(2);
+        const creditAbs = Math.abs(bi.pea_credit);
         rows += `<div class="breakdown-row bill-fit">
           <div class="breakdown-label" style="color:inherit">Price Efficiency Adjustment<br>
             <span style="font-size:11px;opacity:0.7">
@@ -770,14 +788,14 @@ class GridLensCard extends HTMLElement {
               &times; ${pb.total_kwh.toFixed(1)}&thinsp;kWh
             </span>
           </div>
-          <div class="breakdown-value" style="color:inherit">${creditSign}$${creditAbs}</div>
+          <div class="breakdown-value" style="color:inherit">${this._amountHtmlNoGst(creditAbs, creditSign)}</div>
         </div>`;
       } else {
         rows += `<div class="breakdown-row bill-fit">
           <div class="breakdown-label" style="color:inherit">Price Efficiency Adjustment<br>
             <span style="font-size:11px;opacity:0.7">Estimated — actual amount varies</span>
           </div>
-          <div class="breakdown-value" style="color:inherit">&minus;$${bi.pea_credit.toFixed(2)}</div>
+          <div class="breakdown-value" style="color:inherit">${this._amountHtmlNoGst(bi.pea_credit, '&minus;')}</div>
         </div>`;
       }
     }
@@ -790,17 +808,26 @@ class GridLensCard extends HTMLElement {
           <div class="breakdown-label" style="color:inherit">${label}${this._timeRangeHtml(c.time_range)}<br>
             <span style="font-size:11px;opacity:0.7">Earned ${c.days_earned}/${c.days_total}&thinsp;days</span>
           </div>
-          <div class="breakdown-value" style="color:inherit">&minus;$${c.amount.toFixed(2)}</div>
+          <div class="breakdown-value" style="color:inherit">${this._amountHtmlNoGst(c.amount, '&minus;')}</div>
         </div>`;
       });
     }
 
-    // Total + GST
+    // Subtotal / GST / Total — shown as a 3-line summary (rather than just
+    // the inc-GST total) because retailer bills split this two different
+    // ways: some itemise ex-GST and add GST at the bottom, others fold GST
+    // into every line like we do and print only the inc-GST total. Showing
+    // all three lets a customer match ours against whichever their bill uses.
+    if (bi.total_ex_gst != null) {
+      rows += `<div class="bill-gst-row bill-subtotal-row">
+        <span>Subtotal (ex. GST)</span><span>$${bi.total_ex_gst.toFixed(2)}</span>
+      </div>`;
+    }
+    rows += `<div class="bill-gst-row">
+      <span>GST (10%)</span><span>$${bi.gst_included.toFixed(2)}</span>
+    </div>`;
     rows += `<div class="bill-total-row">
       <span>Total (inc. GST)</span><span>$${bi.total.toFixed(2)}</span>
-    </div>`;
-    rows += `<div class="bill-gst-row">
-      <span>GST included (1/11)</span><span>$${bi.gst_included.toFixed(2)}</span>
     </div>`;
 
     if (bi.optimisation_note) {
@@ -1114,7 +1141,8 @@ class GridLensCard extends HTMLElement {
         }
         .breakdown-row:last-child { border-bottom: none; }
         .breakdown-label { color: var(--secondary-text-color); flex: 1; }
-        .breakdown-value { color: var(--primary-text-color); font-weight: 500; white-space: nowrap; margin-left: 8px; }
+        .breakdown-value { color: var(--primary-text-color); font-weight: 500; white-space: nowrap; margin-left: 8px; text-align: right; }
+        .amount-secondary { display: block; font-weight: 400; opacity: 0.65; }
         .bill-section-head {
           font-size: 10px; font-weight: 700; letter-spacing: 0.8px;
           text-transform: uppercase; color: var(--disabled-text-color);
@@ -1128,6 +1156,10 @@ class GridLensCard extends HTMLElement {
         .bill-gst-row {
           display: flex; justify-content: space-between;
           padding: 2px 0; font-size: 11px; color: var(--disabled-text-color);
+        }
+        .bill-subtotal-row {
+          border-top: 1px solid var(--divider-color);
+          margin-top: 4px; padding-top: 6px;
         }
         .bill-fit { color: var(--success-color, #4CAF50); }
         .bill-note { font-size: 11px; color: var(--warning-color, #FF9800); font-style: italic; padding: 4px 0; }

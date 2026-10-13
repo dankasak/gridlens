@@ -2011,6 +2011,7 @@ class PlanCalculator:
         ), 2)
         gross_charges = round(sum(d['bill_items']['gross_charges'] for d in seg_details), 2)
         gst_included = round(sum(d['bill_items']['gst_included'] for d in seg_details), 2)
+        total_ex_gst = round(sum(d['bill_items']['total_ex_gst'] for d in seg_details), 2)
         supply_amount = round(sum(d['bill_items']['supply']['amount'] for d in seg_details), 2)
         fit_credit = round(sum(d['bill_items']['fit']['credit'] for d in seg_details), 2)
         fit_kwh = round(sum(d['bill_items']['fit']['kwh'] for d in seg_details), 4)
@@ -2025,6 +2026,7 @@ class PlanCalculator:
             'conditional_credits': None,
             'gross_charges': gross_charges,
             'gst_included': gst_included,
+            'total_ex_gst': total_ex_gst,
             'total': total,
             'total_energy_cost': total_energy_cost,
             'note': (
@@ -2169,7 +2171,13 @@ class PlanCalculator:
         """Return itemised bill breakdown matching Australian electricity bill format.
 
         All amounts are inc-GST (Australian advertised rates include GST).
-        The 'gst_included' line shows the GST component of the total (total / 11).
+        GST only applies to charges actually purchased from the retailer (energy,
+        supply, subscription, demand, controlled load — gross_charges); FiT, VPP,
+        PEA and conditional credits are not a taxable supply and carry no GST
+        component. 'gst_included' is therefore gross_charges / 11, not total / 11;
+        'total_ex_gst' is 'total' with that same GST component subtracted out, so
+        a bill that itemises ex-GST (or shows a 3-line ex-GST/GST/inc-GST summary)
+        can still be reconciled against ours line-for-line.
 
         For LP-optimised plans, opt_result is used so the quantities reflect the
         solver's dispatch (not historical data).
@@ -2640,7 +2648,17 @@ class PlanCalculator:
 
         net_total = round(
             gross_charges - fit_credit - pea_credit - vpp_credit - conditional_amount, 2)
-        gst_included = round(net_total / 11, 2)
+        # GST only applies to what's actually purchased from the retailer (energy,
+        # supply/subscription/demand/controlled-load charges) — gross_charges. FiT,
+        # VPP, PEA and conditional credits are not a taxable supply (the customer
+        # isn't selling anything to the retailer in a GST sense), so they're
+        # subtracted at face value and must not shrink the GST component.
+        gst_included = round(gross_charges / 11, 2)
+        # Some retailers print line items / subtotals ex-GST with GST added at the
+        # bottom; others fold GST into every line like we do and only show the
+        # inc-GST total. Exposing both lets a customer reconcile against either
+        # bill layout instead of just the one we compute natively.
+        total_ex_gst = round(net_total - gst_included, 2)
 
         result: dict = {
             'energy_lines': energy_lines,
@@ -2669,6 +2687,7 @@ class PlanCalculator:
             'conditional_credits': conditional_detail or None,
             'gross_charges': gross_charges,
             'gst_included': gst_included,
+            'total_ex_gst': total_ex_gst,
             'total': net_total,
         }
 
