@@ -1156,6 +1156,21 @@ class BatteryOptimizer:
         # real price difference between slots. "No preference" (or a
         # single-slot window, nothing to break a tie over) adds nothing, so
         # behaviour is byte-for-byte unchanged from before this feature existed.
+        #
+        # The window the nudge spreads across is the device's own REACHABLE
+        # slots within [0, floor_slot[i]) — i.e. where hour_mask actually
+        # allows it to draw energy — not every slot up to floor_slot[i]
+        # blindly. floor_slot[i] is day0_slots (midnight) for the everyday
+        # case, which can span hours the device's own schedule blocks (e.g. a
+        # car only allowed 10:30-14:30 and 21:00-24:00 today, blocked
+        # 14:30-21:00 in between) — dividing the fixed total swing by the RAW
+        # slot count (~26) instead of the ~15 the device can actually use
+        # dilutes the per-slot nudge well below its intended magnitude for any
+        # device whose real window is much narrower than "the rest of today",
+        # silently neutering the preference for exactly the devices (an EV
+        # with a daytime-only plug window) it matters most for. Found live
+        # 2026-10-14: flipping an EV's preference to "Prefer early" produced a
+        # verified reoptimize with zero change to its charging slots.
         for i in ev_soc_idx:
             fslot = floor_slot[i]
             if fslot <= 1:
@@ -1163,11 +1178,15 @@ class BatteryOptimizer:
             preference = deferrable_loads[i].get('charge_timing_preference') or ''
             if preference == _NO_PREFERENCE:
                 continue
+            mask = deferrable_loads[i].get('hour_mask')
+            reachable = [t for t in range(fslot) if mask is None or (t < len(mask) and mask[t] > 0)]
+            if len(reachable) <= 1:
+                continue
             def_col0 = (5 + i) * T
-            step = _CHARGE_TIMING_TIE_BREAK_MAGNITUDE / (fslot - 1)
-            for t in range(fslot):
-                rank = t if preference == _PREFER_EARLY else (fslot - 1 - t)
-                c_obj[def_col0 + t] += step * rank
+            step = _CHARGE_TIMING_TIE_BREAK_MAGNITUDE / (len(reachable) - 1)
+            for rank, t in enumerate(reachable):
+                r = rank if preference == _PREFER_EARLY else (len(reachable) - 1 - rank)
+                c_obj[def_col0 + t] += step * r
 
         lb = np.zeros(n)
         ub = np.full(n, np.inf)

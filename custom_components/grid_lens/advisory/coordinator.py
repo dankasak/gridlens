@@ -572,15 +572,24 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         every hour) until the user paints one — the schedule card is the only place
         this is set (see const.py's note on the retired static hours config field).
 
-        A device currently under a manual Force On/Off override (select.py) has that
-        override overlaid on top of the schedule mask: Force Off zeroes the whole
-        horizon (GridLens won't touch the switch again until Auto is reselected, so it
-        genuinely cannot run — see DeferrableLoadController.override), Force On opens
-        the whole horizon regardless of the painted window. Without this the LP (and
-        the forecast line the Power Chart card draws straight from it) keeps planning
-        around the device's normal schedule and shows a charge that will never
-        physically happen, e.g. an EV charger left on Force Off overnight — found
-        2026-08-12.
+        A device currently under a manual Force Off override (select.py) has that
+        overlaid on top of the schedule mask: Force Off zeroes the whole horizon
+        (GridLens won't touch the switch again until Auto is reselected, so it
+        genuinely cannot run — see DeferrableLoadController.override).
+
+        Force On deliberately does NOT do the equivalent (open the whole horizon
+        regardless of the painted window) — that was tried 2026-08-12 and reverted
+        2026-10-14. The painted schedule on a device like an EV charger represents
+        physical availability (plugged in vs. driven away), not merely a cost
+        preference GridLens chose on the user's behalf; Force On can command the
+        switch, but it cannot make an absent car present, so planning a charge
+        through a blocked window was never actually achievable — it just produced a
+        forecast that disagreed with the user's own schedule for no physical reason.
+        Force On still bypasses the plan entirely for LIVE actuation (LoadControlManager
+        short-circuits straight past planning for an overridden device — see
+        load_control_manager.py's override check), so the device still gets commanded
+        on now; only the planning horizon's mask stops being forced open for hours the
+        schedule disallows.
 
         Returns exactly one entry per device in self._deferrable_params, in the same
         order — a device with nothing to schedule is made inert (see below), never
@@ -677,8 +686,12 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             override = self._device_override(dev.get("sensor_id", ""))
             if override == "off":
                 mask = [0] * bundle.slots
-            elif override == "on":
-                mask = [1] * bundle.slots
+            # No "elif override == 'on'" branch — see this method's docstring
+            # (reverted 2026-10-14): Force On must not force the schedule mask
+            # open too. It still actuates the device live regardless of mask
+            # (load_control_manager.py short-circuits past planning for an
+            # overridden device), this only stops the PLAN from showing a charge
+            # the user's own painted availability window says can't happen.
             out.append({"daily_kwh": daily, "max_kw": maxkw, "hour_mask": mask,
                         # Reserved for a later semi-continuous constraint — carried through
                         # so the optimiser already receives it; nothing in the model reads it
