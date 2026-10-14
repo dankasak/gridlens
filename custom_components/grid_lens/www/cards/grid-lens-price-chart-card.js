@@ -9,10 +9,22 @@
  *   type: custom:grid-lens-price-chart-card
  *   entity: sensor.roof_grid_lens_nsw_planned_dispatch   (required)
  */
-import { GridLensChartCardBase, multiLineChart, fmtHour, fmtC } from './grid-lens-chart-common.js?v=20261012b';
+import { GridLensChartCardBase, multiLineChart, fmtHour, fmtC, RIGHT_AXIS_MR } from './grid-lens-chart-common.js?v=20261014a';
 
 class GridLensPriceChartCard extends GridLensChartCardBase {
   get title() { return 'Price ($/kWh)'; }
+  // This card draws no right-axis series of its own, but it sits directly under
+  // grid-lens-power-chart-card on the Power Flow view and both cover the same time
+  // range — their X axes need to land on the SAME pixel columns for "now", the start
+  // and the end, or a glance between the two reads as subtly misaligned even though
+  // both are technically correct. The power chart reserves RIGHT_AXIS_MR of extra right
+  // margin for its SOC axis' tick labels; matching that here (via hasRightAxis, which
+  // keeps the crosshair's mouse->time math in sync — see its own comment — and via
+  // opts.mr below, which keeps the actual plotted line in sync) means this chart's own
+  // unused right-hand strip is simply left blank, at the exact width the power chart's
+  // SOC labels occupy, rather than being GMR narrower and letting this chart's plot run
+  // all the way to its own right edge instead.
+  get hasRightAxis() { return true; }
 
   _legendHtml() {
     return `
@@ -43,7 +55,7 @@ class GridLensPriceChartCard extends GridLensChartCardBase {
     return multiLineChart(this._combinedTraj(), this._timeScale(), [
       { key: 'import_rate', color: 'var(--buy)', step: true },
       { key: 'export_rate', color: 'var(--sell)', step: true },
-    ], { fmt: (v) => v.toFixed(2) });
+    ], { fmt: (v) => v.toFixed(2), mr: RIGHT_AXIS_MR });
   }
 
   // The slot covering `ms` on the elapsed-today side — the base's crosshair leaves `best`

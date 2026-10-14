@@ -408,7 +408,14 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // line to reach the edge. Widened here rather than at the constant so every other
   // chart keeps its existing plot width exactly.
   const rax = opts.rightAxis || null;
-  const g = { w: GW, h: opts.height || 160, ml: GML, mr: rax ? RIGHT_AXIS_MR : GMR, mt: 10, mb: 22 };
+  // opts.mr forces an exact right margin regardless of whether this chart actually draws
+  // a right axis — used to align a chart that has no right-axis series of its own (e.g.
+  // the price chart) with one that does (the power chart's SOC axis), so the two plot the
+  // SAME time range into the SAME pixel columns instead of the right-axis chart's extra
+  // reserved margin silently shrinking its plot width relative to the other's. See
+  // GridLensChartCardBase.hasRightAxis's own comment for the matching crosshair-side fix.
+  const mr = opts.mr != null ? opts.mr : (rax ? RIGHT_AXIS_MR : GMR);
+  const g = { w: GW, h: opts.height || 160, ml: GML, mr, mt: 10, mb: 22 };
   const { t0, t1 } = timeScale;
   const X = (ms) => g.ml + (ms - t0) / (t1 - t0) * (g.w - g.ml - g.mr);
   const nowMs = Date.now();
