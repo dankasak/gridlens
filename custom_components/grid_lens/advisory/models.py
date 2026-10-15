@@ -21,6 +21,12 @@ class ForecastBundle:
     export_rate: list[float]
     slot_minutes: int = 60
     sources: dict[str, Any] = field(default_factory=dict)
+    # Solcast's pessimistic/optimistic percentile bands (pv_estimate10/pv_estimate90),
+    # same shape as solar_kwh. None when the forecast provider has no percentile output
+    # (e.g. a non-Solcast provider, or Solcast's percentile output not enabled) -- callers
+    # that use these must treat None as "no band available", not as "band is zero".
+    solar_kwh_p10: list[float] | None = None
+    solar_kwh_p90: list[float] | None = None
 
     @property
     def slots(self) -> int:

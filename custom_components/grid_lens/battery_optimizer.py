@@ -489,6 +489,7 @@ class BatteryOptimizer:
         slot_day_index: List[int] = None,
         export_floor_kwh: float = None,
         export_floor_slot: int = None,
+        grid_charge_cap_kwh: List[float] = None,
     ) -> Dict:
         """Return an optimal hourly schedule minimising net energy cost.
 
@@ -637,6 +638,21 @@ class BatteryOptimizer:
           (export_caps above), which price their own tranches independently. Left at
           the default (0.0) the model behaves exactly as before.
 
+        grid_charge_cap_kwh (optional, length T): per-slot ceiling on how much grid
+          import, ON TOP of that slot's load + deferrable needs, may fund battery
+          charge — a graduated, per-slot generalisation of ``no_grid_charge`` (which
+          is the T-rows that fall out of this at a uniform cap of 0.0 everywhere).
+          A slot's entry is either a finite kWh allowance (restrict) or left out of
+          restriction entirely by passing ``float('inf')`` (or simply omitting the
+          whole parameter, which restricts nothing — unchanged behaviour). Built by
+          the caller (AdvisoryPlanner) from Solcast's P10/P90 bands to size a
+          pre-dawn grid-charge hedge to the genuine P10-pessimistic shortfall against
+          the next paid export window, rather than reacting to a single P50 point
+          estimate — see GRIDLENS_CHECKLIST.md 2026-10-15 ("pre-dawn grid-charge on a
+          big-solar day"): a plain point forecast makes the hedge decision a cliff
+          (0 kWh at 100% forecast accuracy, tens of kWh at 70%), with no proportionality
+          to how uncertain the forecast actually is at decision time.
+
         Tries LP first; falls back to greedy if scipy is unavailable or infeasible.
         """
         if deferrable_loads is None:
@@ -668,7 +684,8 @@ class BatteryOptimizer:
                                      min_export_price=min_export_price,
                                      slot_day_index=slot_day_index,
                                      export_floor_kwh=export_floor_kwh,
-                                     export_floor_slot=export_floor_slot)
+                                     export_floor_slot=export_floor_slot,
+                                     grid_charge_cap_kwh=grid_charge_cap_kwh)
         except ImportError:
             if export_floor_kwh is not None:
                 _LOGGER.error(
@@ -700,6 +717,7 @@ class BatteryOptimizer:
                 slot_day_index=slot_day_index,
                 export_floor_kwh=export_floor_kwh,
                 export_floor_slot=export_floor_slot,
+                grid_charge_cap_kwh=grid_charge_cap_kwh,
             )
             if export_floor_kwh is not None:
                 _LOGGER.error(
@@ -766,6 +784,8 @@ class BatteryOptimizer:
                 )
             if kwargs.get("terminal_soc_value") is None and solves(deferrable_loads, terminal_soc_value=0.0):
                 return "the hard terminal-SOC floor (soc[T-1] >= E0) — battery can't refill to its starting charge by horizon end"
+            if kwargs.get("grid_charge_cap_kwh") and solves(deferrable_loads, grid_charge_cap_kwh=None):
+                return "a restricted grid-charge hedge window (grid_charge_cap_kwh) — load/deferrable demand in that window exceeds what the capped import allows"
             return ("unknown — still infeasible with every optional feature relaxed; "
                     "likely the base battery/import-bound model itself")
 
@@ -794,7 +814,8 @@ class BatteryOptimizer:
                      soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
                      terminal_soc_value=None, import_caps=None, export_caps=None,
                      conditional_credits=None, min_export_price=0.0,
-                     slot_day_index=None, export_floor_kwh=None, export_floor_slot=None):
+                     slot_day_index=None, export_floor_kwh=None, export_floor_slot=None,
+                     grid_charge_cap_kwh=None):
         """Build and solve the LP. Raises on failure so caller can fall back.
 
         Chain is scipy → PuLP/CBC → (caller's greedy fallback).
@@ -822,6 +843,11 @@ class BatteryOptimizer:
         # current-plan-vs-LP split in CLAUDE.md: a plausible number from the wrong
         # model is worse than no number.
         deferrable_active = bool(deferrable_loads)
+        # Whether grid_charge_cap_kwh actually restricts at least one slot — a param
+        # present but all-inf (or empty) is a no-op, same as it being absent.
+        grid_charge_cap_active = bool(grid_charge_cap_kwh) and any(
+            c < float("inf") for c in grid_charge_cap_kwh
+        )
 
         try:
             return self._lp_scipy(solar, load, r_imp, r_exp, E0, T, deferrable_loads,
@@ -838,7 +864,8 @@ class BatteryOptimizer:
                                   min_export_price=min_export_price,
                                   slot_day_index=slot_day_index,
                                   export_floor_kwh=export_floor_kwh,
-                                  export_floor_slot=export_floor_slot)
+                                  export_floor_slot=export_floor_slot,
+                                  grid_charge_cap_kwh=grid_charge_cap_kwh)
         except ImportError:
             pass  # scipy not available — try PuLP
         except Exception as exc:
@@ -859,6 +886,14 @@ class BatteryOptimizer:
             # (e.g. "keep 50% for a planned outage") rather than refusing outright.
             raise RuntimeError(
                 "no solver available that models the active export/discharge floor "
+                "(scipy failed; PuLP does not model it)"
+            )
+        if grid_charge_cap_active:
+            # _lp_pulp models no grid-charge restriction at all — handing it an active
+            # hedge cap would silently let it grid-charge past what the cap allows,
+            # reproducing the exact over-hedge this parameter exists to prevent.
+            raise RuntimeError(
+                "no solver available that models the active grid-charge hedge cap "
                 "(scipy failed; PuLP does not model it)"
             )
         try:
@@ -882,7 +917,8 @@ class BatteryOptimizer:
                   soc_reward=0.0, export_penalty=0.0, no_grid_charge=False,
                   terminal_soc_value=None, import_caps=None, export_caps=None,
                   conditional_credits=None, min_export_price=0.0,
-                  slot_day_index=None, export_floor_kwh=None, export_floor_slot=None):
+                  slot_day_index=None, export_floor_kwh=None, export_floor_slot=None,
+                  grid_charge_cap_kwh=None):
         import numpy as np
         from scipy.optimize import linprog
         from scipy.sparse import lil_matrix
@@ -1488,6 +1524,15 @@ class BatteryOptimizer:
         # imp[t] - Σ def_i[t] ≤ load[t]  ⇒  grid may cover house load + deferrable devices,
         # but any battery charge must come from solar surplus only.
         ngc_rows = T if no_grid_charge else 0
+        # grid_charge_cap_kwh generalises the above to a per-slot allowance instead
+        # of a uniform zero: imp[t] - Σdef_i[t] <= load[t] + cap[t], one row per
+        # FINITELY-capped slot (an inf entry is unrestricted — no row needed, same
+        # as the slot being absent). Skipped entirely when no_grid_charge is already
+        # forbidding grid-charging outright (that's strictly tighter everywhere).
+        gcc_slots = (
+            [] if no_grid_charge or not grid_charge_cap_kwh else
+            [t for t in range(T) if grid_charge_cap_kwh[t] < float("inf")]
+        )
         # Cumulative cap rows. A STRICT cap is one row per (cap window, calendar
         # day) — Σ free[j] over that day's hours ≤ daily_cap_kwh — using the same
         # slots_per_day chunking as the deferrable-load daily totals above.
@@ -1527,7 +1572,7 @@ class BatteryOptimizer:
         # language assumes).
         credit_rows = sum(len(cb2["hours"]) for cb2 in credit_blocks)
         n_ub = (
-            term_rows + len(demand_hours) + ngc_rows + len(cap_day_groups)
+            term_rows + len(demand_hours) + ngc_rows + len(gcc_slots) + len(cap_day_groups)
             + credit_rows + len(daily_ub_specs) + n_ev_soc
         )
         A_ub = lil_matrix((n_ub, n)) if n_ub else None
@@ -1565,6 +1610,12 @@ class BatteryOptimizer:
                     A_ub[r, (5 + i) * T + t] = -1.0
                 b_ub[r] = load[t]
                 r += 1
+        for t in gcc_slots:
+            A_ub[r, I+t] = 1.0
+            for i in range(N):
+                A_ub[r, (5 + i) * T + t] = -1.0
+            b_ub[r] = load[t] + grid_charge_cap_kwh[t]
+            r += 1
         for cb, js, n_days in cap_day_groups:
             for j in js:
                 A_ub[r, cb["free_idx0"] + j] = 1.0

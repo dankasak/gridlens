@@ -97,13 +97,29 @@ class ForecastProvider:
         # pv_estimate is average kW over the period → per-slot energy = kW × dt.
         attr = "detailedForecast" if slot < 60 else "detailedHourly"
         solar_map = self._solar_by_slot(attr, slot)
-        solar = []
+        # pv_estimate10/pv_estimate90 (Solcast's pessimistic/optimistic percentile
+        # bands) ride the same rows when Solcast's percentile output is enabled.
+        # Absent for a non-Solcast provider or when it isn't — checked once per
+        # build() against the raw attribute, not inferred from zero values (a
+        # legitimate overnight pv_estimate10 of 0 must not look like "missing").
+        percentiles_available = self._has_percentile_fields(attr)
+        p10_map = self._solar_by_slot(attr, slot, field="pv_estimate10") if percentiles_available else {}
+        p90_map = self._solar_by_slot(attr, slot, field="pv_estimate90") if percentiles_available else {}
+        solar, solar_p10, solar_p90 = [], [], []
         for i in range(n_slots):
             slot_start = start + timedelta(minutes=i * slot)
             kw = max(0.0, solar_map.get(slot_start, 0.0))
-            if self.shade_factors is not None:
-                kw *= self.shade_factors[dt_util.as_local(slot_start).hour]
+            factor = (
+                self.shade_factors[dt_util.as_local(slot_start).hour]
+                if self.shade_factors is not None else 1.0
+            )
+            kw *= factor
             solar.append(kw * dt)
+            if percentiles_available:
+                kw10 = max(0.0, p10_map.get(slot_start, 0.0)) * factor
+                kw90 = max(0.0, p90_map.get(slot_start, 0.0)) * factor
+                solar_p10.append(kw10 * dt)
+                solar_p90.append(kw90 * dt)
 
         imp, exp = self.rate_forecaster.rates(start, n_slots, slot)
         if not imp or not exp:
@@ -119,12 +135,15 @@ class ForecastProvider:
             import_rate=imp,
             export_rate=exp,
             slot_minutes=slot,
+            solar_kwh_p10=solar_p10 if percentiles_available else None,
+            solar_kwh_p90=solar_p90 if percentiles_available else None,
             sources={
                 "solar_slots": sum(
                     1 for i in range(n_slots)
                     if (start + timedelta(minutes=i * slot)) in solar_map
                 ),
                 "shade_correction_applied": self.shade_factors is not None,
+                "solar_percentiles_available": percentiles_available,
                 "rate_model": type(self.rate_forecaster).__name__,
                 "load_model": type(self.load_forecaster).__name__,
                 "slot_minutes": slot,
@@ -132,7 +151,9 @@ class ForecastProvider:
         )
 
     # ------------------------------------------------------------------ sources
-    def _solar_by_slot(self, attr: str, slot_minutes: int) -> dict[datetime, float]:
+    def _solar_by_slot(
+        self, attr: str, slot_minutes: int, field: str = "pv_estimate"
+    ) -> dict[datetime, float]:
         out: dict[datetime, float] = {}
         for eid in (self.e["solar_today"], self.e["solar_tomorrow"]):
             st = self.hass.states.get(eid)
@@ -142,8 +163,22 @@ class ForecastProvider:
                 dt = self._parse(row.get("period_start"))
                 if dt is None:
                     continue
-                out[self._floor_slot(dt, slot_minutes)] = float(row.get("pv_estimate", 0.0))
+                out[self._floor_slot(dt, slot_minutes)] = float(row.get(field, 0.0))
         return out
+
+    def _has_percentile_fields(self, attr: str) -> bool:
+        """True if Solcast's pv_estimate10/pv_estimate90 are present on at least
+        one forecast row -- checked against the raw attribute, since a slot with
+        a genuinely-zero pv_estimate10 must not be mistaken for the field being
+        absent (see ``build()``)."""
+        for eid in (self.e["solar_today"], self.e["solar_tomorrow"]):
+            st = self.hass.states.get(eid)
+            if st is None:
+                continue
+            for row in st.attributes.get(attr, []) or []:
+                if "pv_estimate10" in row and "pv_estimate90" in row:
+                    return True
+        return False
 
     # ------------------------------------------------------------------ helpers
     @staticmethod

@@ -88,6 +88,7 @@ class AdvisoryPlanner:
         slot_day_index = slot_calendar_day_index(
             bundle.start, bundle.slots, bundle.slot_minutes
         )
+        grid_charge_cap_kwh = self._grid_charge_hedge_cap(bundle, initial_soc_percent)
         result = self.optimizer.optimize_hourly_schedule(
             bundle.solar_kwh,
             bundle.load_kwh,
@@ -110,6 +111,7 @@ class AdvisoryPlanner:
             slot_day_index=slot_day_index,
             export_floor_kwh=export_floor_kwh,
             export_floor_slot=export_floor_slot,
+            grid_charge_cap_kwh=grid_charge_cap_kwh,
         )
 
         devs = deferrable_loads or []
@@ -250,6 +252,98 @@ class AdvisoryPlanner:
         if not rates:
             return 0.0
         return sum(rates) / len(rates)
+
+    def _grid_charge_hedge_cap(
+        self, bundle: ForecastBundle, initial_soc_percent: float
+    ) -> Optional[list[float]]:
+        """Per-slot grid-charge allowance (kWh), beyond that slot's own solar, fed to
+        ``battery_optimizer``'s ``grid_charge_cap_kwh``.
+
+        Why this exists: a plain point (P50) solar forecast makes the LP's "should I
+        grid-charge as insurance against today's solar coming up short" decision a
+        cliff rather than a graduated response to how uncertain the forecast actually
+        is -- reproduced 2026-10-15 (GRIDLENS_CHECKLIST.md): feeding the real solver
+        today's actual rates/deferrables and a midday solar forecast at 100% of what
+        materialised chose zero pre-dawn grid-charge, but at 70% of that same actual
+        outcome it swung to ~9kWh, and at 50% to ~18kWh -- a bang-bang response with no
+        proportionality to forecast confidence, which is exactly what let a single
+        pessimistic-but-plausible morning burn real import money charging a battery that
+        solar alone would have filled within hours (then had to dump at a near-floor
+        export rate all afternoon).
+
+        The fix: restrict how much grid import may fund battery charge (on top of
+        load/deferrables, which are untouched) ONLY for the pre-solar slots at the
+        start of the horizon, sized from Solcast's own uncertainty band rather than
+        the single P50 estimate --
+          * skip the hedge entirely if the P90 (optimistic-but-plausible) forecast,
+            net of load, would already close the gap to the battery's ceiling before
+            the next genuinely-paid (>= min_export_price) export window;
+          * otherwise size it to the P10 (pessimistic-but-plausible) shortfall against
+            that same gap -- never more.
+        A genuinely low-solar day (P10/P50/P90 all low together, no forecast *error*,
+        just weak sun) still hedges at full strength, since P90 alone won't cover the
+        gap either -- this only suppresses the hedge when the optimistic case is
+        plausible enough to make pre-charging pointless.
+
+        Returns None (no restriction -- unchanged behaviour) when the forecast
+        provider has no percentile bands (``bundle.solar_kwh_p10``/``_p90`` unset --
+        see ``ForecastProvider._has_percentile_fields``), never a false "nothing to
+        hedge" from treating a missing band as zero.
+        """
+        if bundle.solar_kwh_p10 is None or bundle.solar_kwh_p90 is None:
+            return None
+        T = bundle.slots
+        if T == 0:
+            return None
+        solar_p50 = bundle.solar_kwh[:T]
+        solar_p90 = bundle.solar_kwh_p90[:T]
+        solar_p10 = bundle.solar_kwh_p10[:T]
+        load = bundle.load_kwh[:T]
+        export_rate = bundle.export_rate[:T]
+        dt_h = bundle.dt_hours
+        opt = self.optimizer
+        hardware_cap = opt.max_charge_rate_kw * dt_h
+        caps = [float("inf")] * T
+
+        # The pre-solar window: slots from "now" until cumulative P50 solar first
+        # becomes non-negligible (0.05 kWh -- a rounding/noise floor, not a real
+        # contribution). Only this window's grid-charge decision is a blind bet on
+        # a forecast with nothing yet observed to correct it; once solar is flowing
+        # the rolling re-solve has real data to react to every ~2 minutes.
+        cum_p50 = 0.0
+        pre_solar_slots: list[int] = []
+        for t in range(T):
+            if cum_p50 > 0.05:
+                break
+            cum_p50 += solar_p50[t]
+            pre_solar_slots.append(t)
+        if not pre_solar_slots or pre_solar_slots[-1] + 1 >= T:
+            return caps
+
+        start = pre_solar_slots[-1] + 1
+        cutoff = T
+        for t in range(start, T):
+            if export_rate[t] >= self.min_export_price:
+                cutoff = t
+                break
+
+        gap_to_ceiling = max(
+            0.0, opt.max_soc_kwh - opt.capacity_kwh * initial_soc_percent / 100.0
+        )
+        cum_p90 = sum(solar_p90[start:cutoff])
+        cum_p10 = sum(solar_p10[start:cutoff])
+        cum_load = sum(load[start:cutoff])
+
+        if cum_p90 - cum_load >= gap_to_ceiling:
+            hedge_kwh = 0.0
+        else:
+            shortfall = gap_to_ceiling - max(0.0, cum_p10 - cum_load)
+            hedge_kwh = max(0.0, min(shortfall, gap_to_ceiling))
+
+        per_slot = min(hardware_cap, hedge_kwh / len(pre_solar_slots))
+        for t in pre_solar_slots:
+            caps[t] = per_slot
+        return caps
 
     def _classify(self, step: dict, dt_h: float) -> tuple[BatteryAction, float, float, float]:
         """Map an optimizer slot to a battery action + average power (W) + grid-charge (W)

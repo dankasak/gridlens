@@ -591,6 +591,21 @@ lets a plan with FiT above its import rate farm unlimited arbitrage.
   The same setting also widens Greedy Consumption's real-time export bar (§7 condition 2).
 - **No-grid-charge** option — the battery only ever charges from solar surplus; blocks
   buy-low/sell-high arbitrage for users who don't want it.
+- **Grid-charge hedge cap (`grid_charge_cap_kwh`, added 2026-10-15)** — a plain P50 point
+  solar forecast makes the "grid-charge now as insurance against today's solar coming up
+  short" decision a cliff: reproduced against the real solver with a real day's actual
+  rates/deferrables, 0 kWh pre-dawn grid-charge at 100% forecast accuracy, ~9-18 kWh at
+  50-70%, no proportionality to how uncertain the forecast actually was. `AdvisoryPlanner.
+  _grid_charge_hedge_cap` restricts how much grid import may fund battery charge (load/
+  deferrables untouched), for the pre-solar slots only, sized from Solcast's P10/P90 bands
+  (`ForecastBundle.solar_kwh_p10/_p90`, same `detailedForecast`/`detailedHourly` rows as the
+  main forecast): skips the hedge if P90 alone would already close the gap to the battery's
+  ceiling before the next paid export window, otherwise sizes it to the P10 shortfall. A
+  genuinely low-solar day (P10/P50/P90 all low together) still hedges at full strength.
+  Returns `None` (no restriction, unchanged behaviour) when the forecast provider has no
+  percentile bands. Caused the 2026-10-15 incident this fixes: AGL Battery Rewards grid-
+  charged the home battery from ~27% to ~56%+ SOC pre-dawn, then had to dump the resulting
+  midday solar glut at near-floor export rates all afternoon.
 - **Deferrable devices stay in the energy balance** — `def_i` is priced via import/export
   like any other load. A past bug was double-counting them in *reporting*, not in the model;
   don't "fix" it by re-adding deferred energy to import.
