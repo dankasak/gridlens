@@ -147,6 +147,16 @@ class FakeBatteryController:
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+        # None (default) => read_status() reports no telemetry, matching a driver that
+        # doesn't populate battery_power_w (or hasn't connected yet) — the existing
+        # solar-charge tests above rely on this to behave exactly as before this field
+        # existed. Tests exercising the live-shortfall escalation set this explicitly.
+        self.battery_power_w: float | None = None
+
+    async def read_status(self):
+        if self.battery_power_w is None:
+            return None
+        return BASE.InverterState(battery_power_w=self.battery_power_w)
 
     async def force_charge(self, power_w, duration=None):
         self.calls.append(("force_charge", power_w, duration))
@@ -230,6 +240,117 @@ def test_solar_charge_transition_economy_no_respam():
     _tick(ex, _FIXED_NOW + timedelta(minutes=5))  # same slot, next tick
 
     assert bc.names().count("set_self_consumption_mode") == 1, bc.calls
+
+
+# ------------------------------------------ live-shortfall escalation (2026-10-15)
+def test_live_shortfall_single_tick_blip_does_not_escalate():
+    """A single tick where self-use's live charge rate trails the target must NOT
+    force a grid charge — ordinary solar variability (a cloud passing over) should be
+    absorbed by self-use, not escalated on one reading."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.CHARGE,
+        power_w=5_900.0, grid_charge_w=0.0,  # plan thinks this is solar-only
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    bc.battery_power_w = 1_000.0  # live charge rate is way below the 5.9 kW target
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+
+    assert "force_charge" not in bc.names(), bc.calls
+    assert bc.names() == ["set_self_consumption_mode"], bc.calls
+
+
+def test_live_shortfall_escalates_after_debounce():
+    """A sustained shortfall (crossing the debounce threshold) — e.g. an unplanned load
+    like a DNSP-switched Hot Water circuit eating the solar surplus self-use counted on
+    — escalates to a real grid force_charge sized to the live gap, not the plan's own
+    (now-stale) grid_charge_w of 0."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.CHARGE,
+        power_w=5_900.0, grid_charge_w=0.0,
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    bc.battery_power_w = 1_000.0  # unplanned load is eating the solar surplus
+
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))          # tick 1 — still self-use
+    assert "force_charge" not in bc.names(), bc.calls
+    _tick(ex, _FIXED_NOW + timedelta(minutes=5))           # tick 2 — debounce satisfied
+
+    assert bc.names()[-1] == "force_charge", bc.calls
+    _name, power_w, _dur = bc.calls[-1]
+    assert power_w == 4_900.0, f"expected the live gap (5900-1000=4900), got {power_w}"
+
+
+def test_live_shortfall_escalation_persists_through_slot():
+    """Once escalated for a slot, the grid charge must hold for the rest of that slot
+    even once it starts closing the gap it was raised to fix — re-deriving the gap every
+    tick would see the escalation's own charging as 'no gap' and immediately revert to
+    self-use, undoing itself every cycle."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.CHARGE,
+        power_w=5_900.0, grid_charge_w=0.0,
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    bc.battery_power_w = 1_000.0
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    _tick(ex, _FIXED_NOW + timedelta(minutes=5))           # escalates here
+    assert bc.names()[-1] == "force_charge", bc.calls
+
+    # The forced charge "worked" — live battery power now matches the target exactly.
+    bc.battery_power_w = 5_900.0
+    _tick(ex, _FIXED_NOW + timedelta(minutes=10))          # still the same slot
+
+    assert bc.names()[-1] == "force_charge", (
+        f"escalation reverted to self-use mid-slot once the gap closed: {bc.calls}")
+    _name, power_w, _dur = bc.calls[-1]
+    assert power_w == 4_900.0, f"expected the committed escalation value, got {power_w}"
+
+
+def test_live_shortfall_does_not_override_a_real_grid_charge_slot():
+    """A slot the plan already wants as a material grid charge is untouched by the
+    live-shortfall path — it only kicks in when the plan thought this was solar-only."""
+    ex, bc = _make_executor()
+    slot = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.CHARGE,
+        power_w=10_000.0, grid_charge_w=6_000.0,
+    )
+    ex.set_plan([slot], updated_at=_FIXED_NOW)
+    bc.battery_power_w = 1_000.0  # would look like a huge "gap" if this path fired
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    _tick(ex, _FIXED_NOW + timedelta(minutes=5))
+
+    assert bc.names() == ["force_charge", "force_charge"], bc.calls
+    for _name, power_w, _dur in bc.calls:
+        assert power_w == 6_000.0, f"plan's own grid watts must be unaffected, got {power_w}"
+
+
+def test_live_shortfall_resets_on_next_slot():
+    """Escalation is scoped to the slot it fired for — a fresh slot re-evaluates from
+    scratch rather than inheriting the previous slot's forced charge."""
+    ex, bc = _make_executor()
+    slot1 = DispatchInterval(
+        start=_FIXED_NOW, action=BatteryAction.CHARGE,
+        power_w=5_900.0, grid_charge_w=0.0,
+    )
+    slot2_start = _FIXED_NOW + timedelta(minutes=15)
+    slot2 = DispatchInterval(
+        start=slot2_start, action=BatteryAction.CHARGE,
+        power_w=5_900.0, grid_charge_w=0.0,
+    )
+    ex.set_plan([slot1, slot2], updated_at=_FIXED_NOW)
+    bc.battery_power_w = 1_000.0
+    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
+    _tick(ex, _FIXED_NOW + timedelta(minutes=5))           # escalates in slot1
+    assert bc.names()[-1] == "force_charge", bc.calls
+
+    # Solar recovers for slot2 — self-use alone now keeps up with the target.
+    bc.battery_power_w = 5_900.0
+    _tick(ex, slot2_start + timedelta(seconds=1))
+
+    assert bc.names()[-1] == "set_self_consumption_mode", (
+        f"new slot inherited the old slot's escalation: {bc.calls}")
 
 
 def test_grid_charge_below_eps_is_solar():
