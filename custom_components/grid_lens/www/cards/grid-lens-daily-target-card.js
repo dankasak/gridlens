@@ -49,6 +49,7 @@ class GridLensDailyTargetCard extends HTMLElement {
     // Local-override state for the sliders — see grid-lens-advisory-card.js's
     // constructor comment for the "snaps back on release" bug this fixes.
     this._pinned = {};
+    this._sent = {};  // last value sent per slider — dedupes pointerup + change, see _commit
     this._dragEid = null;
     this._repaintPending = false;
     this._pointerUpHandler = () => this._onSliderPointerUp();
@@ -179,6 +180,8 @@ class GridLensDailyTargetCard extends HTMLElement {
                border: 1px solid var(--border); background: transparent; color: var(--ink2);
                cursor: pointer; font-family: inherit; flex: 0 0 auto; }
         .reset-btn:hover { border-color: var(--good); color: var(--good); }
+        .following { font-size: 10.5px; font-weight: 500; padding: 4px 8px; color: var(--ink2);
+                     opacity: .75; flex: 0 0 auto; }
         .empty { padding: 14px 2px; font-size: 12.5px; color: var(--ink2); }
       </style>
       <div class="card">
@@ -279,8 +282,9 @@ class GridLensDailyTargetCard extends HTMLElement {
       if (ctActive) note = 'Charge target active — overrides this until reached/expired';
       else if (boostActive) note = `Today Boost active (${fmtKwh(parseFloat(boostSt.state))}) — overrides this today`;
 
-      const resetBtn = r.targetEid && isOverride
-        ? `<button class="reset-btn" data-reset-for="${d.energy_entity}">Follow master</button>` : '';
+      const resetBtn = isOverride
+        ? `<button class="reset-btn" data-reset-for="${d.energy_entity}">Follow master</button>`
+        : `<span class="following" title="Uses the Daily Target slider above — move this slider to set its own target">Following master</span>`;
 
       if (!r.targetEid) {
         return `
@@ -305,10 +309,30 @@ class GridLensDailyTargetCard extends HTMLElement {
     this._attachListeners();
   }
 
+  // Commits on pointerup rather than trusting the input's own `change`, which fires
+  // AFTER pointerup — by then the deferred repaint had already replaced the <input>, so
+  // set_value was never called and the slider snapped back (same bug and fix as
+  // grid-lens-advisory-card.js's _onDtSliderPointerUp, 2026-10-16).
   _onSliderPointerUp() {
-    if (!this._dragEid) return;
+    const eid = this._dragEid;
+    if (!eid) return;
     this._dragEid = null;
-    if (this._repaintPending) { this._repaintPending = false; this._paint(); }
+    const pinned = this._pinned[eid];
+    if (pinned) this._commit(eid, pinned.value);
+    if (this._repaintPending) {
+      this._repaintPending = false;
+      setTimeout(() => this._paint(), 0);
+    }
+  }
+
+  _commit(eid, value) {
+    if (!eid || !this._hass) return;
+    const now = Date.now();
+    this._pinned[eid] = { value, ts: now };
+    const last = this._sent[eid];
+    if (last && last.value === value && now - last.ts < 2000) return;
+    this._sent[eid] = { value, ts: now };
+    this._hass.callService('number', 'set_value', { entity_id: eid, value });
   }
 
   _attachListeners() {
@@ -325,11 +349,7 @@ class GridLensDailyTargetCard extends HTMLElement {
         this._pinned[eid] = { value, ts: Date.now() };
         if (readout) readout.textContent = `${value.toFixed(0)}%`;
       });
-      el.addEventListener('change', () => {
-        const value = clampTargetPct(el.value);
-        this._pinned[eid] = { value, ts: Date.now() };
-        this._hass.callService('number', 'set_value', { entity_id: eid, value });
-      });
+      el.addEventListener('change', () => this._commit(eid, clampTargetPct(el.value)));
     });
     root.querySelectorAll('[data-reset-for]').forEach((el) => {
       el.addEventListener('click', () => {

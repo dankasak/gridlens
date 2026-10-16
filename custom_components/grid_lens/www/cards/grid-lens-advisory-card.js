@@ -132,6 +132,9 @@ class GridLensAdvisoryCard extends HTMLElement {
     // _dtDragEid names whichever slider is currently under a held pointer, so _paint()
     // can defer a mid-drag repaint instead of yanking the element out from under it.
     this._dtPinned = {};
+    // Last value sent per slider entity — see _dtCommit (release can be committed from
+    // both pointerup and the input's own `change`; this dedupes the pair).
+    this._dtSent = {};
     this._dtDragEid = null;
     this._dtRepaintPending = false;
     this._dtPointerUpHandler = () => this._onDtSliderPointerUp();
@@ -832,8 +835,11 @@ class GridLensAdvisoryCard extends HTMLElement {
       if (ctActive) note = 'Charge target active — overrides this until reached/expired';
       else if (boostActive) note = `Today Boost active (${fmtKwh(parseFloat(boostSt.state))}) — overrides this today`;
 
+      // Unpinned rows show a passive "Following master" marker in the same spot, so the
+      // reset control's absence reads as a state rather than a missing feature.
       const resetBtn = isOverride
-        ? `<button class="dt-reset-btn" data-dt-reset-for="${d.energy_entity}">Follow master</button>` : '';
+        ? `<button class="dt-reset-btn" data-dt-reset-for="${d.energy_entity}">Follow master</button>`
+        : `<span class="dt-following" title="Uses the Daily Target slider above — move this slider to set its own target">Following master</span>`;
 
       // Load control (FEATURES.md §6/§6a) — merged into this same per-device row
       // 2026-09-24, same content as grid-lens-load-control-card.js's own row, built from
@@ -909,9 +915,18 @@ class GridLensAdvisoryCard extends HTMLElement {
   _onDtSliderChange(ev) {
     const el = ev.target;
     if (!el || !el.matches || !el.matches('input[type=range][data-dt-eid]') || !this._hass) return;
-    const eid = el.getAttribute('data-dt-eid');
-    const value = clampTargetPct(el.value);
-    this._dtPinned[eid] = { value, ts: Date.now() };
+    this._dtCommit(el.getAttribute('data-dt-eid'), clampTargetPct(el.value));
+  }
+
+  // Sends a slider's value to its number entity. Called from both `change` and pointerup
+  // (see _onDtSliderPointerUp) — whichever lands first wins, the other is a no-op.
+  _dtCommit(eid, value) {
+    if (!eid || !this._hass) return;
+    const now = Date.now();
+    this._dtPinned[eid] = { value, ts: now };
+    const last = this._dtSent[eid];
+    if (last && last.value === value && now - last.ts < 2000) return;
+    this._dtSent[eid] = { value, ts: now };
     this._hass.callService('number', 'set_value', { entity_id: eid, value });
   }
 
@@ -924,10 +939,23 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._dtDragEid = el.getAttribute('data-dt-eid');
   }
 
+  // Commits the dragged value HERE rather than relying on the input's `change` event:
+  // browsers fire `change` after pointerup, so the deferred repaint below used to replace
+  // the <input> first, its `change` then fired on a detached element that never reached
+  // .body's delegated listener, set_value was never called, and the slider snapped back
+  // once the pin expired (reported 2026-10-16 — nearly every drag, since this card's
+  // signature changes every few seconds on live power readings). The repaint is also
+  // pushed to the next task so a surviving input's own `change` still runs first.
   _onDtSliderPointerUp() {
-    if (!this._dtDragEid) return;
+    const eid = this._dtDragEid;
+    if (!eid) return;
     this._dtDragEid = null;
-    if (this._dtRepaintPending) { this._dtRepaintPending = false; this._paint(); }
+    const pinned = this._dtPinned[eid];
+    if (pinned) this._dtCommit(eid, pinned.value);
+    if (this._dtRepaintPending) {
+      this._dtRepaintPending = false;
+      setTimeout(() => this._paint(), 0);
+    }
   }
 
   // ---------------------------------------------- Load control (merged 2026-09-24)
@@ -1170,6 +1198,8 @@ class GridLensAdvisoryCard extends HTMLElement {
                         border:1px solid var(--border); background:transparent; color:var(--ink2);
                         cursor:pointer; font-family:inherit; flex:0 0 auto; }
         .dt-reset-btn:hover { border-color:var(--good); color:var(--good); }
+        .dt-following { font-size:10px; font-weight:500; padding:3px 7px; color:var(--ink2);
+                        opacity:.75; flex:0 0 auto; }
         .dt-empty { padding:8px 2px; font-size:11.5px; color:var(--ink2); }
 
         /* Load control (FEATURES.md §6/§6a) — merged into the per-device panel 2026-09-24

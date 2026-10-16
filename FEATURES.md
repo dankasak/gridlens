@@ -2226,7 +2226,8 @@ anyone who wants Daily Target as its own card on a different dashboard. Both car
 built from the SAME exported functions in `grid-lens-chart-common.js` ("Daily Target
 helpers" section) rather than keeping two copies that could drift — one slider per device
 with its 14-day average and computed "≈X kWh at this rate" readout, a "Follow master"
-reset button when a device is pinned, and **both today's remaining forecast solar and
+reset button when a device is pinned (a passive "Following master" marker in the same spot
+when it isn't — added 2026-10-16 after the button's absence read as a missing feature), and **both today's remaining forecast solar and
 tomorrow's** (with a placeholder weather icon each) for context while dialing.
 
 **That same per-device expander is no longer Daily-Target-only (2026-09-24, see §6b).**
@@ -2289,6 +2290,15 @@ the real remaining balance — via the new `battery_optimizer._day0_target_kwh` 
 Absent (the default — `plan_calculator.py`'s plan-comparison backtest never sets it, same
 reasoning as `soc_initial_percent`) reproduces the old proration byte-for-byte. See
 `tests/test_day0_target_kwh.py` and the checklist's 2026-09-24 entry.
+
+**Slider commit-on-release fix (2026-10-16).** Both cards commit a dragged slider's value
+from their window `pointerup` handler (`_dtCommit`/`_commit`), not only from the input's own
+`change` event. Browsers fire `change` *after* `pointerup`, and the drag-deferred repaint
+that `pointerup` runs was replacing the `<input>` first — so `set_value` was never sent, and
+the slider snapped back to the old value once its 15s local pin expired. Nearly every drag
+was affected on a live install, because the advisory card's repaint signature changes every
+few seconds with power readings. A side effect: per-device sliders could never pin, so no
+"Follow master" button ever appeared.
 
 **Why 0% can't mean "clear" here (unlike Today Boost's 0 kWh).** Today Boost's 0 kWh is
 meaningless as a boost, so it doubles as the "unset" sentinel. Daily Target's 0% is a
