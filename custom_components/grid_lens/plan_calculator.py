@@ -1161,7 +1161,8 @@ class PlanCalculator:
                 # total correct — an itemised bill of all-zero kWh.
                 if battery_hod_avg and opt_result is not None:
                     for slot in opt_result.get('schedule') or []:
-                        h = slot.get('hour')
+                        # battery_hod_avg is keyed by hour-of-day, not the step index
+                        h = slot['local_hour']
                         batt = battery_hod_avg.get(h, {})
                         slot['charge_kwh']    = round(batt.get('charge_kwh', 0.0), 3)
                         slot['discharge_kwh'] = round(batt.get('discharge_kwh', 0.0), 3)
@@ -1571,8 +1572,10 @@ class PlanCalculator:
 
         # Peak kW within the window. For optimised alternatives the LP dispatch
         # already reflects battery peak-shaving; for the current plan we use the
-        # actual metered import. LP schedule slots have no weekday, so the day
-        # filter is applied only on the actual-usage path.
+        # actual metered import. LP schedule slots carry their true local
+        # hour/weekday (`local_hour`/`local_dow`, stamped in
+        # _calculate_plan_cost_with_battery_optimization), so both filters apply
+        # on either path.
         lp_schedule = opt_result.get('schedule', []) if opt_result else []
         opt_peak = opt_result.get('demand_peak_kw') if opt_result else None
         peak_kw = 0.0
@@ -1585,8 +1588,7 @@ class PlanCalculator:
         elif not prefer_actual and lp_schedule:
             source = 'optimised'
             for step in lp_schedule:
-                h = step.get('hour', 0) % 24
-                if hour_ok(h):
+                if hour_ok(step['local_hour']) and day_ok(step['local_dow']):
                     peak_kw = max(peak_kw, step.get('import_kwh', 0.0))
         else:
             for d in (usage_data or []):
@@ -1678,8 +1680,8 @@ class PlanCalculator:
             source = 'optimised-lp' if opt_result.get('demand_peak_kw') is not None else 'optimised'
             peak = opt_result.get('demand_peak_kw')
             if peak is None:
-                # Union of every period's hours-of-day (LP schedule steps carry
-                # only an hour index, no date, so season can't be applied here).
+                # Union of every period's hours-of-day, matched on each step's true
+                # local hour (no date on the step, so season can't be applied here).
                 union_hours: set[int] = set()
                 for period in periods:
                     ph = period.get('hours')
@@ -1695,7 +1697,7 @@ class PlanCalculator:
                                         else set(range(sh, 24)) | set(range(0, eh)))
                 peak = 0.0
                 for step in opt_result.get('schedule', []) or []:
-                    if (step.get('hour', 0) % 24) in union_hours:
+                    if step['local_hour'] in union_hours:
                         peak = max(peak, step.get('import_kwh', 0.0))
             tot_days = sum(season_days(p) for p in periods) or actual_days
             blended_rate = (
@@ -4070,6 +4072,16 @@ class PlanCalculator:
         # GRIDLENS_CHECKLIST.md).
         from .dispatch_realism import realize_schedule
         result['schedule'] = realize_schedule(result['schedule'], dt_h=1.0)
+        # Stamp each step with its true local hour-of-day/weekday — the same values the
+        # LP was priced against (local_hods/local_dows above). A step's own 'hour' is an
+        # elapsed-hour index from start_time, and `(start hour + index) % 24` drifts one
+        # slot across a DST transition, so every consumer that needs a clock hour (the
+        # day_profile charts, demand-peak scans) must read these instead (2026-10-16).
+        for step in result['schedule']:
+            t = step.get('hour', 0)
+            if 0 <= t < len(local_hods):
+                step['local_hour'] = local_hods[t]
+                step['local_dow'] = local_dows[t]
         result['total_import_kwh'] = sum(s.get('import_kwh', 0.0) for s in result['schedule'])
         result['total_export_kwh'] = sum(s.get('export_kwh', 0.0) for s in result['schedule'])
         result['total_import_cost'] = sum(s.get('import_cost', 0.0) for s in result['schedule'])
@@ -4086,7 +4098,6 @@ class PlanCalculator:
         # Build a 24-h average day profile from the LP schedule so the dashboard
         # charts show plan-specific import/export patterns rather than historical data.
         N = len(deferrable_loads or [])
-        start_local_hour = start_time.astimezone(tz).hour
         hour_sums: dict = {h: {'import_kwh': 0.0, 'export_kwh': 0.0,
                                 'import_cost': 0.0, 'export_credit': 0.0,
                                 'import_rate_sum': 0.0, 'export_rate_sum': 0.0,
@@ -4097,8 +4108,7 @@ class PlanCalculator:
                                 'count': 0}
                            for h in range(24)}
         for step in result.get('schedule', []):
-            t = step['hour']
-            hod = (start_local_hour + t) % 24
+            hod = step['local_hour']
             s = hour_sums[hod]
             s['import_kwh']      += step.get('import_kwh', 0)
             s['export_kwh']      += step.get('export_kwh', 0)

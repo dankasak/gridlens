@@ -500,7 +500,9 @@ class PlanFromData(RetailerPlan):
         export_kwh = export_credit = 0.0
 
         for slot in schedule:
-            h   = slot.get("hour", 0) % 24
+            # True local hour when the LP stamped one (DST-safe); synthetic probe
+            # schedules built without a start time only have the index.
+            h   = slot.get("local_hour", slot.get("hour", 0) % 24)
             imp = slot.get("import_kwh", 0.0)
             ic  = slot.get("import_cost", 0.0)
             exp = slot.get("export_kwh", 0.0)

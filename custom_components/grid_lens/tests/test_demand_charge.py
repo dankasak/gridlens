@@ -496,6 +496,53 @@ def test_plan_comparison_path_keeps_full_period_pricing():
           "+ demand_amount +" in src or "demand_amount +" in src)
 
 
+def _stamped_schedule(start_utc, n, tz, import_at):
+    """An LP-shaped schedule stamped the way
+    _calculate_plan_cost_with_battery_optimization does: 'hour' is the elapsed
+    index, local_hour/local_dow the true local clock time of that index."""
+    out = []
+    for t in range(n):
+        ld = (start_utc + dt.timedelta(hours=t)).astimezone(tz)
+        out.append({"hour": t, "local_hour": ld.hour, "local_dow": ld.weekday(),
+                    "import_kwh": import_at(ld)})
+    return out
+
+
+def test_lp_schedule_peak_scan_is_dst_safe():
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Australia/Sydney")
+    c = _compute_demand_charge()
+    # Local midnight Thu 1 Oct 2026 (AEST, UTC+10); clocks go forward Sun 4 Oct.
+    start = dt.datetime(2026, 9, 30, 14, 0, tzinfo=dt.timezone.utc)
+    # 9 kWh at local 21:00 every day — just OUTSIDE the 3pm-9pm window. After the
+    # clocks go forward, (start hour + index) % 24 reads that slot as 20:00 (in-window).
+    sched = _stamped_schedule(start, 24 * 10, tz,
+                              lambda ld: 9.0 if ld.hour == 21 else (2.0 if ld.hour == 16 else 0.0))
+    check("post-DST index%24 would misfile 21:00 as 20:00",
+          any(s["hour"] % 24 == 20 and s["local_hour"] == 21 for s in sched))
+    line = c._compute_demand_charge(_Plan(), [], {"schedule": sched}, 10, tz)
+    check("LP-schedule peak scan uses true local hour (2.0, not the 9.0 at 21:00)",
+          line and abs(line["peak_kw"] - 2.0) < 1e-9, line and line.get("peak_kw"))
+
+    # Weekday filter now applies on the LP path too: a weekend-only spike is ignored.
+    sched_we = _stamped_schedule(start, 24 * 10, tz,
+                                 lambda ld: 7.0 if (ld.hour == 16 and ld.weekday() >= 5) else
+                                 (1.0 if ld.hour == 16 else 0.0))
+    line_we = c._compute_demand_charge(_Plan(), [], {"schedule": sched_we}, 10, tz)
+    check("LP-schedule peak scan honours the weekdays-only window",
+          line_we and abs(line_we["peak_kw"] - 1.0) < 1e-9, line_we and line_we.get("peak_kw"))
+
+
+def test_day_profile_buckets_by_stamped_local_hour():
+    src = open(os.path.join(_COMPONENT, "plan_calculator.py")).read()
+    check("schedule steps are stamped with local_hour/local_dow from the LP's own masks",
+          "step['local_hour'] = local_hods[t]" in src and "step['local_dow'] = local_dows[t]" in src)
+    check("day_profile buckets by the stamped local hour",
+          "hod = step['local_hour']" in src)
+    check("no index-derived hour-of-day left", "start_local_hour" not in src
+          and "step.get('hour', 0) % 24" not in src)
+
+
 def main():
     mod = sys.modules[__name__]
     for name in sorted(n for n in dir(mod) if n.startswith("test_")):
