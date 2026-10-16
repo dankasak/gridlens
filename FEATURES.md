@@ -1595,6 +1595,25 @@ path, no separate chatter risk. All are suppressed entirely under a manual overr
 | 2 | **Export surplus** | Export price is **at or below the user's Minimum Export Price** (§7a — $0 when that setting is 0/disabled) **and** the house is currently exporting at least as much as this device draws — so running it can't create new import. | No new import; forgoes only below-floor export revenue the user has said they don't want. |
 | 3 | **Forecast surplus** | Over a 9 h look-ahead (clipped at the plan's own next battery drawdown), the plan expects to waste energy at an average rate that clears this device's minimum-worthwhile draw — **and** the battery has both the discharge rate and the energy-to-min-SOC to actually supply it (see below). Runs the device **proportionally** to that rate, not all-or-nothing. | No new import; forgoes only below-floor export the plan would otherwise have made — see below |
 
+**⚠ Condition #3 is being moved into the LP — SHADOW MODE since 2026-10-16.** #3 asks an
+intertemporal battery question ("the plan will spill later, so lend from the battery now")
+that the LP answers natively, and its controller-side approximations (reservation clip,
+headroom gates, plan-peak SOC widening, SOC margin, front-load) accounted for most of this
+section's fixes. The LP now has an optional per-device **bonus** variable (`battery_optimizer`
+`bonus_value`, $/kWh): energy beyond the device's daily target, credited at
+`_BONUS_VALUE_PER_KWH` (1c) so the LP takes it only from spill at/below the Minimum Export
+Price or ~free import, scoped to day 0 (or out to an ad-hoc charge target), sharing the
+device's rating with its planned draw, and capped by an SOC-tracked device's ceiling.
+`AdvisoryPlanner._shadow_bonus` runs it as a **second solve** for devices with Greedy +
+Forecast Surplus on and no override (`coordinator._device_bonus_eligible`), so the live
+plan and battery schedule are untouched. Output: `DispatchInterval.shadow_bonus_w`, a sparse
+`bonus_<j>` kWh key on trajectory rows, and `lp_bonus_w` / `lp_bonus_kwh_ahead` on each
+device's control switch next to `forecast_target_w` / `forecast_free_kwh` — **nothing acts
+on it yet**. Plan comparison never sets `bonus_value`. Cutover plan, and what has to change
+first (bonus-aware consolidation, P10 sizing): `docs/OPEN_ITEMS.md`. Tests:
+`tests/test_lp_bonus.py` (needs real scipy — run on the LXC). Conditions #1/#2 and the 30 s
+modulation loop stay controller-side permanently: they correct forecast error live.
+
 **Condition 2's bar is lower for a modulating load** (§6a). An on/off load has to clear
 `max_w` — all-or-nothing, so turning it on when only part of its draw is covered would create
 real import. A modulating load can absorb *any* surplus, so its bar is `min_w` instead. That's

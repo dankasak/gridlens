@@ -121,6 +121,14 @@ class DispatchInterval:
     # from — even though the plan's own trajectory showed the battery full and idle for
     # hours before the export even began). The battery executor never reads this.
     forecast_soc_percent: Optional[float] = None
+    # SHADOW MODE (2026-10-16): per-device opportunistic "bonus" draw (W) for this slot
+    # from a second LP solve that values extra deferrable energy beyond each device's daily
+    # target (battery_optimizer's ``bonus_value``). This is the LP-native replacement being
+    # evaluated for Greedy Consumption's forecast-surplus condition (#3); nothing acts on
+    # it yet — LoadControlManager only publishes it next to ``forecast_target_w`` for
+    # comparison. Same device order as ``deferrable_w``; empty when no device opted in or
+    # the shadow solve failed.
+    shadow_bonus_w: list[float] = field(default_factory=list)
 
 
 @dataclass

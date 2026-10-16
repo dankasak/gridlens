@@ -19,6 +19,16 @@ from .models import AdvisoryResult, ForecastBundle
 
 _LOGGER = logging.getLogger(__name__)
 
+# $/kWh the shadow solve credits for each kWh of bonus (beyond-target) deferrable draw.
+# Must sit clearly above the LP's tie-breakers — soc_reward (0.0003 per slot held, so
+# lending battery charge to a device for a few hours and refilling it from spill costs
+# ~0.002-0.004) and the charge-timing nudge — or the LP would rather bank energy it is
+# about to spill anyway. Must sit far below any real price, so it only buys energy that
+# is genuinely ~free: spill at/below the Minimum Export Price (which the LP values at $0)
+# or import at <1c. Any export the LP does value (at/above the floor) that pays more
+# than 1c still wins over bonus.
+_BONUS_VALUE_PER_KWH = 0.01
+
 
 class AdvisoryPlanner:
     """Convert an optimizer schedule into a ``DispatchInterval`` plan + SOC trajectory."""
@@ -89,13 +99,8 @@ class AdvisoryPlanner:
             bundle.start, bundle.slots, bundle.slot_minutes
         )
         grid_charge_cap_kwh = self._grid_charge_hedge_cap(bundle, initial_soc_percent)
-        result = self.optimizer.optimize_hourly_schedule(
-            bundle.solar_kwh,
-            bundle.load_kwh,
-            bundle.import_rate,
-            bundle.export_rate,
+        solve_kwargs = dict(
             initial_soc_percent=initial_soc_percent,
-            deferrable_loads=deferrable_loads or [],
             demand_rate=demand_rate,
             demand_window_mask=demand_window_mask,
             demand_peak_kw_month_to_date=demand_peak_kw_month_to_date,
@@ -113,8 +118,13 @@ class AdvisoryPlanner:
             export_floor_slot=export_floor_slot,
             grid_charge_cap_kwh=grid_charge_cap_kwh,
         )
+        result = self.optimizer.optimize_hourly_schedule(
+            bundle.solar_kwh, bundle.load_kwh, bundle.import_rate, bundle.export_rate,
+            deferrable_loads=deferrable_loads or [], **solve_kwargs,
+        )
 
         devs = deferrable_loads or []
+        shadow_bonus = self._shadow_bonus(bundle, devs, solve_kwargs)
         defer_names = [d.get("name") or f"Load {i + 1}" for i, d in enumerate(devs)]
         defer_max_kw = [float(d.get("max_kw") or 0.0) for d in devs]
         defer_sensor_ids = [d.get("sensor_id") or "" for d in devs]
@@ -157,6 +167,10 @@ class AdvisoryPlanner:
                         float(step["soc_percent"]) if step.get("soc_percent") is not None
                         else None
                     ),
+                    shadow_bonus_w=(
+                        [kwh / dt_h * 1000.0 for kwh in shadow_bonus[t]]
+                        if shadow_bonus and t < len(shadow_bonus) else []
+                    ),
                 )
             )
             row = {
@@ -198,6 +212,13 @@ class AdvisoryPlanner:
             for j, pct in soc_map.items():
                 if pct is not None and 0 <= j < len(defer_names):
                     row[f"defer_{j}_soc"] = round(pct, 1)
+            # Shadow-mode bonus kWh per device (see _shadow_bonus) — only written where
+            # non-zero, so the (already large) trajectory attribute doesn't grow a key per
+            # device per slot for a feature that is idle most of the day.
+            if shadow_bonus and t < len(shadow_bonus):
+                for j, kwh in enumerate(shadow_bonus[t]):
+                    if kwh > 0.001:
+                        row[f"bonus_{j}"] = round(kwh, 3)
             trajectory.append(row)
 
         demand_summary = None
@@ -232,6 +253,49 @@ class AdvisoryPlanner:
             ev_soc_status=result.get("ev_soc_status", []),
             demand=demand_summary,
         )
+
+    def _shadow_bonus(
+        self, bundle: ForecastBundle, devs: list[dict], solve_kwargs: dict
+    ) -> Optional[list[list[float]]]:
+        """Per-slot, per-device bonus kWh from a second, SHADOW solve — or None.
+
+        The shadow solve is the live plan's exact inputs plus ``bonus_value`` on every
+        device the coordinator marked ``bonus_eligible`` (Greedy + Forecast Surplus on).
+        It is solved separately rather than folded into the live plan so evaluating it
+        cannot move the battery schedule the executor is acting on: only its bonus column
+        is published, next to Greedy Consumption's own forecast-surplus target, to compare
+        the two before the LP version takes over (FEATURES.md §7). Any failure is logged
+        and swallowed — the live plan is already solved and must never depend on this.
+        """
+        if not any(d.get("bonus_eligible") for d in devs):
+            return None
+        shadow_devs = [
+            {**d, "bonus_value": _BONUS_VALUE_PER_KWH} if d.get("bonus_eligible") else d
+            for d in devs
+        ]
+        try:
+            shadow = self.optimizer.optimize_hourly_schedule(
+                bundle.solar_kwh, bundle.load_kwh, bundle.import_rate, bundle.export_rate,
+                deferrable_loads=shadow_devs, **solve_kwargs,
+            )
+        except Exception:  # noqa: BLE001 — shadow must never break the live plan
+            _LOGGER.exception("Shadow bonus solve failed")
+            return None
+        if not str(shadow.get("solver", "")).startswith("lp/"):
+            # The greedy fallback models no deferrable loads at all, so it has no bonus
+            # to report — publishing its zeros would read as "the LP saw no surplus".
+            return None
+        rows = shadow.get("schedule", [])
+        out = [
+            [float(v) for v in (row.get("bonus_per_device") or [0.0] * len(devs))]
+            for row in rows
+        ]
+        _LOGGER.debug(
+            "Shadow bonus solve: %s",
+            {d.get("name") or i: round(sum(r[i] for r in out if i < len(r)), 2)
+             for i, d in enumerate(devs) if d.get("bonus_eligible")},
+        )
+        return out
 
     @staticmethod
     def _terminal_soc_value(bundle: ForecastBundle) -> float:

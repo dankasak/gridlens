@@ -700,8 +700,34 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
                         "min_kw": dev.get("min_kw", 0.0),
                         "name": dev.get("name"), "sensor_id": dev.get("sensor_id"),
                         "consumed_today_kwh": dev.get("consumed_today_kwh"),
+                        # Shadow-mode only: the planner runs a second solve with bonus
+                        # energy enabled for these devices (AdvisoryPlanner._shadow_bonus).
+                        # The live plan's optimizer ignores this key.
+                        "bonus_eligible": self._device_bonus_eligible(dev.get("sensor_id", "")),
                         **soc_kwargs})
         return out
+
+    def _device_bonus_eligible(self, sensor_id: str) -> bool:
+        """True when the device's own Greedy and Forecast Surplus switches are both on
+        and it isn't under a manual override — i.e. exactly the devices Greedy
+        Consumption's forecast-surplus condition (#3) could drive today, which the
+        shadow bonus solve is being compared against. Looked up by sensor_id, same
+        reasoning as _device_override."""
+        if not sensor_id:
+            return False
+        load_mgr = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_load_control")
+        if load_mgr is None:
+            return False
+        sensors = self._cfg("deferrable_load_sensors", []) or []
+        try:
+            index = sensors.index(sensor_id)
+        except ValueError:
+            return False
+        return (
+            load_mgr.is_greedy(index)
+            and load_mgr.is_greedy_forecast_surplus(index)
+            and load_mgr.get_override(index) is None
+        )
 
     # ------------------------------------------------------------- conditional credits
     async def _exclude_lost_credits_today(self, credits: list[dict]) -> list[dict]:

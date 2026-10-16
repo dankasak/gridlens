@@ -233,6 +233,9 @@ def test_deferrable_for_horizon_never_shortens_the_list():
         def _device_override(self, sensor_id):
             return None
 
+        def _device_bonus_eligible(self, sensor_id):
+            return False
+
         async def _charge_target(self, sensor_id, live_soc_percent):
             return None
 
@@ -275,6 +278,9 @@ def test_deferrable_for_horizon_carries_consumed_today_kwh_through():
 
         def _device_override(self, sensor_id):
             return None
+
+        def _device_bonus_eligible(self, sensor_id):
+            return False
 
         async def _charge_target(self, sensor_id, live_soc_percent):
             return None

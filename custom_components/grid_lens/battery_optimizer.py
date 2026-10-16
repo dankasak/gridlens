@@ -1032,6 +1032,31 @@ class BatteryOptimizer:
             floor_slot[i] = min(T, int(target_slot)) if has_target else day0_slots
             track_slots[i] = max(day0_slots, floor_slot[i])
 
+        # Opportunistic "bonus" energy — the LP-native form of Greedy Consumption's
+        # forecast-surplus condition (FEATURES.md §7 #3). A device whose dict carries
+        # bonus_value > 0 ($/kWh) gets a second variable block bon_i[t]: energy drawn ON
+        # TOP of its daily target, which earns bonus_value in the objective. Its cost is
+        # implicit exactly like def_i (it sits in the energy balance), so the LP only takes
+        # it where that marginal cost is below bonus_value — spill priced at/below the
+        # Minimum Export Price (valued $0 via r_exp_priced) or ~free import — and decides
+        # WHEN against the full battery trajectory, rather than the controller's
+        # reservation-clip/headroom-gate approximations of it.
+        #
+        # Scoped to the device's tracked window (day 0, or out to an ad-hoc charge target)
+        # for the same reason SOC tracking is: there is no model of whether extra energy
+        # is useful days ahead, and the rolling replan re-decides long before then. An
+        # SOC-tracked device's bonus also enters its SOC dynamics, so the configured
+        # ceiling caps it. Never set by plan_calculator.py — plan comparison must not be
+        # credited with consumption that only exists because of spill.
+        bonus_idx: dict[int, int] = {}       # device index -> bonus block start
+        bonus_slots: dict[int, int] = {}     # device index -> slots the bonus may use
+        for i, dev in enumerate(deferrable_loads):
+            if float(dev.get('bonus_value') or 0.0) <= 0.0 or float(dev.get('max_kw') or 0.0) <= 0.0:
+                continue
+            bonus_idx[i] = n
+            n += T
+            bonus_slots[i] = min(T, track_slots.get(i, day0_slots))
+
         # Capped-rate windows (e.g. GloBird ZEROHERO's 50 kWh/day free import window):
         # for each hour inside a window, imp[t] (or exp[t]) is decomposed into a free
         # tranche and an over-cap tranche via a linking equality, each block sized to
@@ -1223,6 +1248,8 @@ class BatteryOptimizer:
             for rank, t in enumerate(reachable):
                 r = rank if preference == _PREFER_EARLY else (len(reachable) - 1 - rank)
                 c_obj[def_col0 + t] += step * r
+        for i, idx in bonus_idx.items():
+            c_obj[idx:idx + bonus_slots[i]] = -float(deferrable_loads[i]['bonus_value'])
 
         lb = np.zeros(n)
         ub = np.full(n, np.inf)
@@ -1266,6 +1293,15 @@ class BatteryOptimizer:
                     ub[(5+i)*T+t] = dev['max_kw'] * dt * float(mask[t])
             else:
                 ub[(5+i)*T:(5+i)*T+T] = dev['max_kw'] * dt
+        for i, idx in bonus_idx.items():
+            # Same per-slot availability as def_i, zero outside the bonus window. The
+            # shared def_i + bon_i ≤ max_kw·dt·mask row (A_ub, below) keeps the two from
+            # jointly exceeding the device's rating.
+            mask = deferrable_loads[i].get('hour_mask')
+            cap = deferrable_loads[i]['max_kw'] * dt
+            ub[idx:idx + T] = 0.0
+            for t in range(bonus_slots[i]):
+                ub[idx + t] = cap * (float(mask[t]) if mask else 1.0)
         for i, idx in ev_soc_idx.items():
             # lb stays 0 (np.zeros default) — this model never discharges the device, so a
             # floor below 0 is not meaningful. Bounded uniformly across the whole T-length
@@ -1338,6 +1374,8 @@ class BatteryOptimizer:
             A_eq[t, D+t] =  1.0
             for i in range(N):
                 A_eq[t, (5+i)*T+t] = -1.0
+            for idx in bonus_idx.values():
+                A_eq[t, idx + t] = -1.0
             b_eq[t] = load[t] - solar[t]
 
             # SOC update
@@ -1488,9 +1526,17 @@ class BatteryOptimizer:
                 A_eq[eq_row, idx + t] = 1.0
                 if t == 0:
                     b_eq[eq_row] = spec['initial_kwh']
+                    # Slot 0's draw must count toward the ceiling too — slot 0 is the
+                    # slot control acts on right now. (def_i[0] is still left out of
+                    # this row, a pre-existing quirk tracked in OPEN_ITEMS.md; the
+                    # bonus doesn't inherit it.)
+                    if i in bonus_idx:
+                        A_eq[eq_row, bonus_idx[i]] = -spec['eta']
                 else:
                     A_eq[eq_row, idx + t - 1] = -1.0
                     A_eq[eq_row, def_col0 + t] = -spec['eta']
+                    if i in bonus_idx:
+                        A_eq[eq_row, bonus_idx[i] + t] = -spec['eta']
                     b_eq[eq_row] = 0.0
                 eq_row += 1
 
@@ -1571,9 +1617,10 @@ class BatteryOptimizer:
         # varies: 30-min slots here, vs the 1-hour slots the plan's fact sheet
         # language assumes).
         credit_rows = sum(len(cb2["hours"]) for cb2 in credit_blocks)
+        bonus_rows = sum(bonus_slots.values())
         n_ub = (
             term_rows + len(demand_hours) + ngc_rows + len(gcc_slots) + len(cap_day_groups)
-            + credit_rows + len(daily_ub_specs) + n_ev_soc
+            + credit_rows + len(daily_ub_specs) + n_ev_soc + bonus_rows
         )
         A_ub = lil_matrix((n_ub, n)) if n_ub else None
         b_ub = np.zeros(n_ub) if n_ub else None
@@ -1608,14 +1655,27 @@ class BatteryOptimizer:
                 A_ub[r, I+t] = 1.0
                 for i in range(N):
                     A_ub[r, (5 + i) * T + t] = -1.0
+                for idx in bonus_idx.values():
+                    A_ub[r, idx + t] = -1.0
                 b_ub[r] = load[t]
                 r += 1
         for t in gcc_slots:
             A_ub[r, I+t] = 1.0
             for i in range(N):
                 A_ub[r, (5 + i) * T + t] = -1.0
+            for idx in bonus_idx.values():
+                A_ub[r, idx + t] = -1.0
             b_ub[r] = load[t] + grid_charge_cap_kwh[t]
             r += 1
+        # Bonus shares the device's rating with its planned draw: def_i + bon_i ≤ cap.
+        for i, idx in bonus_idx.items():
+            mask = deferrable_loads[i].get('hour_mask')
+            cap = deferrable_loads[i]['max_kw'] * dt
+            for t in range(bonus_slots[i]):
+                A_ub[r, (5 + i) * T + t] = 1.0
+                A_ub[r, idx + t] = 1.0
+                b_ub[r] = cap * (float(mask[t]) if mask else 1.0)
+                r += 1
         for cb, js, n_days in cap_day_groups:
             for j in js:
                 A_ub[r, cb["free_idx0"] + j] = 1.0
@@ -1680,6 +1740,13 @@ class BatteryOptimizer:
             e = max(0.0, x[X+t])
             # Sum across all devices for this hour (for schedule display only)
             deferred = sum(max(0.0, x[(5+i)*T+t]) for i in range(N))
+            # Bonus draw is real device consumption, so it counts toward the slot's
+            # deferrable total — keeps import - export = load + deferrable + charge -
+            # discharge - solar balanced for every downstream reader (_grid_charge_w).
+            bonus_per_device = [
+                max(0.0, x[bonus_idx[ii] + t]) if ii in bonus_idx else 0.0 for ii in range(N)
+            ]
+            deferred += sum(bonus_per_device)
             # i_raw already reflects all grid import (including deferrable shortfall
             # when solar is insufficient) because def_i is in the energy balance.
             i = i_raw
@@ -1730,6 +1797,7 @@ class BatteryOptimizer:
                 'import_kwh': i, 'export_kwh': e,
                 'deferrable_kwh': deferred,
                 'deferrable_per_device': [max(0.0, x[(5+ii)*T+t]) for ii in range(N)],
+                'bonus_per_device': bonus_per_device,
                 'soc_percent': so / self.capacity_kwh * 100.0,
                 'import_rate': imp_rate_out, 'export_rate': exp_rate_out,
                 'import_cost': ic, 'export_credit': ec,
@@ -1739,7 +1807,11 @@ class BatteryOptimizer:
                 'export_cap_free_rate': exp_free_rate, 'export_cap_over_rate': exp_over_rate,
             })
 
-        if N:
+        # Consolidation moves def_i between slots without knowing about bon_i, so it could
+        # push def_i + bon_i past the device's rating. Skipped for a bonus solve (today
+        # only the shadow solve — AdvisoryPlanner._shadow_bonus), which publishes nothing
+        # but the bonus itself. Must be made bonus-aware before bonus drives control.
+        if N and not bonus_idx:
             protected_hours = (
                 set(demand_hours)
                 | {t for cb in cap_blocks for t in cb["hours"]}

@@ -1608,17 +1608,51 @@ class LoadControlManager:
         return (now - self._plan_updated_at) > self.max_plan_age
 
     # ------------------------------------------------------------------ status
+    def _shadow_bonus(self, index: int, now: datetime) -> tuple[Optional[float], Optional[float]]:
+        """``(bonus_w_now, bonus_kwh_ahead)`` from the plan's SHADOW bonus solve
+        (``DispatchInterval.shadow_bonus_w``) — or ``(None, None)`` when the plan carries
+        none for this device (not opted in, or the shadow solve failed).
+
+        Published beside ``forecast_target_w`` / ``forecast_free_kwh`` so the LP-native
+        bonus and Greedy Consumption's forecast-surplus condition (#3) can be compared on
+        the same tick before the former replaces the latter. Read-only: nothing acts on
+        it. ``bonus_kwh_ahead`` is summed over the rest of the plan from now (the bonus is
+        scoped to today's slots by the LP, so this is "the rest of today")."""
+        plan = self._plan
+        if not plan or not any(index < len(iv.shadow_bonus_w) for iv in plan):
+            return None, None
+        current = self._current_interval(now)
+        now_w = (
+            float(current.shadow_bonus_w[index])
+            if current is not None and index < len(current.shadow_bonus_w) else 0.0
+        )
+        ahead_kwh = 0.0
+        for pos, iv in enumerate(plan):
+            if index >= len(iv.shadow_bonus_w):
+                continue
+            o_start = max(iv.start, now)
+            o_end = self._slot_end(plan, pos)
+            if o_end <= o_start:
+                continue
+            ahead_kwh += iv.shadow_bonus_w[index] * (o_end - o_start).total_seconds() / 3.6e6
+        return now_w, ahead_kwh
+
     def status(self) -> dict:
+        now = dt_util.now()
+        devices = {}
+        for i, c in self.controllers.items():
+            bonus_w, bonus_kwh = self._shadow_bonus(i, now)
+            devices[i] = {
+                "enabled": self._enabled.get(i, False),
+                "want_enabled": self._want_enabled.get(i, False),
+                **c.status(),
+                # Shadow mode (2026-10-16): the LP's own answer to condition #3's question.
+                "lp_bonus_w": round(bonus_w, 1) if bonus_w is not None else None,
+                "lp_bonus_kwh_ahead": round(bonus_kwh, 2) if bonus_kwh is not None else None,
+            }
         return {
             "entitled": self._entitled,
             "degraded": self._degraded,
             "plan_updated_at": self._plan_updated_at.isoformat() if self._plan_updated_at else None,
-            "devices": {
-                i: {
-                    "enabled": self._enabled.get(i, False),
-                    "want_enabled": self._want_enabled.get(i, False),
-                    **c.status(),
-                }
-                for i, c in self.controllers.items()
-            },
+            "devices": devices,
         }
