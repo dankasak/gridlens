@@ -137,13 +137,6 @@ class _ExecStatus:
     plan_updated_at: Optional[datetime] = None
     note: str = "not_started"
     consecutive_apply_failures: int = 0
-    # Live-shortfall escalation (see ScheduleExecutor._live_charge_gap_w): consecutive
-    # ticks the live battery charge rate has materially trailed a solar-only CHARGE
-    # slot's target, and — once that's persisted past the debounce — the slot start
-    # we escalated for and the grid_w we committed to for the rest of it.
-    live_shortfall_streak: int = 0
-    live_escalated_slot_start: Optional[datetime] = None
-    live_escalated_grid_w: float = 0.0
 
 
 class ScheduleExecutor:
@@ -208,8 +201,6 @@ class ScheduleExecutor:
             # next start() must always re-issue on its first tick rather than "hold".
             self._status.applied_action = None
             self._status.applied_power_w = 0.0
-        self._status.live_shortfall_streak = 0
-        self._status.live_escalated_slot_start = None
 
     # ------------------------------------------------------------------ core tick
     async def _tick(self, now: Optional[datetime] = None) -> None:
@@ -224,7 +215,7 @@ class ScheduleExecutor:
                 await self._enter_safe_state("plan stale")
                 return
 
-            action, power_w = await self._desired(now)
+            action, power_w = self._desired(now)
 
             # Transition economy: don't re-spam self-consumption every tick — unless
             # the hardware has drifted from what we believe we applied (e.g. a
@@ -319,8 +310,6 @@ class ScheduleExecutor:
         self._status.applied_action = None  # see stop(): handback isn't a commanded self-use
         self._status.applied_power_w = 0.0
         self._status.note = f"safe_state:{reason}"
-        self._status.live_shortfall_streak = 0
-        self._status.live_escalated_slot_start = None
         if self._status.consecutive_apply_failures >= _APPLY_FAILURE_NOTIFY_THRESHOLD:
             await self._dismiss_apply_failure_notice()
         self._status.consecutive_apply_failures = 0
@@ -331,7 +320,7 @@ class ScheduleExecutor:
             return True
         return (now - self._plan_updated_at) > self.max_plan_age
 
-    async def _desired(self, now: datetime) -> tuple[BatteryAction, float]:
+    def _desired(self, now: datetime) -> tuple[BatteryAction, float]:
         """Return the *effective* (action, power) for the interval covering ``now``.
 
         No covering interval → safe self-consumption (a gap in an otherwise fresh plan).
@@ -348,7 +337,7 @@ class ScheduleExecutor:
         if current is None:
             return BatteryAction.SELF_USE, 0.0
         if current.action == BatteryAction.CHARGE:
-            return await self._resolve_charge(current)
+            return self._resolve_charge(current)
         if current.action == BatteryAction.DISCHARGE:
             return self._resolve_discharge(current)
         return current.action, current.power_w
@@ -371,14 +360,8 @@ class ScheduleExecutor:
     _GRID_CHARGE_MIN_FRACTION = GRID_CHARGE_MIN_FRACTION
     # $/kWh — at/below this, the slot's import is genuinely free (GloBird-style windows).
     _FREE_RATE_EPS = 1e-6
-    # Consecutive ticks a live charge shortfall must persist before _live_charge_gap_w
-    # escalates — at the default 5-min tick, 2 ticks is 10 minutes. Guards against
-    # reacting to ordinary solar variability (a cloud passing over), which self-use is
-    # deliberately built to absorb without ever importing grid (see _resolve_charge's
-    # docstring) — only a *sustained* shortfall should override that.
-    _LIVE_SHORTFALL_DEBOUNCE_TICKS = 2
 
-    async def _resolve_charge(self, iv: DispatchInterval) -> tuple[BatteryAction, float]:
+    def _resolve_charge(self, iv: DispatchInterval) -> tuple[BatteryAction, float]:
         """Split a CHARGE slot into its real execution intent.
 
         * genuinely free import (``import_rate`` ~0): any above-floor grid contribution
@@ -390,76 +373,17 @@ class ScheduleExecutor:
         * material grid contribution at a priced rate (e.g. the evening pre-peak grid
           top-up) → genuine grid charge: force-charge at the *grid* watts only, so a real
           cost is never paid for more than the plan intends.
-        * otherwise → the plan thinks this is a solar-only slot. Normally that means
-          self-consumption (fills from PV surplus, never imports grid to charge). But if
-          the live battery charge rate is *sustainedly* falling material short of the
-          slot's target (see ``_live_charge_gap_w`` — e.g. an unplanned load, such as a
-          DNSP-switched Controlled Load circuit the LP has no sensor on, eating the solar
-          surplus the plan counted on), escalate to a real grid charge sized to the live
-          gap instead: the plan's own solar-surplus assumption has been invalidated by
-          reality, and holding self-use would otherwise silently leave the SOC trajectory
-          — and the arbitrage it was built for — unmet. Found 2026-10-15: EV (Wattpilot)
-          + Hot Water running concurrently left no solar surplus at all, and self-use held
-          for the whole slot regardless.
+        * otherwise → solar charge: run self-consumption so the battery fills from PV
+          surplus at the hardware-max rate and the inverter never imports grid to charge it.
         """
         grid_w = iv.grid_charge_w
         if grid_w <= self._GRID_CHARGE_MIN_W:
-            live_gap_w = await self._live_charge_gap_w(iv)
-            if live_gap_w is not None:
-                self._status.live_escalated_slot_start = iv.start
-                self._status.live_escalated_grid_w = live_gap_w
-                return BatteryAction.CHARGE, live_gap_w
             return BatteryAction.SELF_USE, 0.0
         if iv.import_rate is not None and iv.import_rate <= self._FREE_RATE_EPS:
             return BatteryAction.CHARGE, iv.power_w
         if grid_w >= self._GRID_CHARGE_MIN_FRACTION * max(iv.power_w, 0.0):
             return BatteryAction.CHARGE, grid_w
         return BatteryAction.SELF_USE, 0.0
-
-    async def _live_charge_gap_w(self, iv: DispatchInterval) -> Optional[float]:
-        """Live-recomputed grid contribution a solar-only CHARGE slot actually needs,
-        for ``_resolve_charge`` to use in place of the plan's own (here, ~0) forecast.
-
-        Once escalated for a given slot (``iv.start``), stays escalated — at the value
-        committed to when it first crossed the debounce — for the rest of that slot,
-        rather than re-deriving the gap every tick: the escalation's own charging closes
-        the gap it was raised to fix, so re-checking live state tick-to-tick would see
-        "no gap" and immediately revert to self-use, undoing itself (then reopening the
-        gap, re-escalating, …) every cycle. Re-evaluates fresh once the plan moves to
-        its next slot.
-
-        None (no change from the plan's own grid_charge_w) when: there's no live
-        battery-power telemetry to check against (fails open — no behaviour change on a
-        driver/install that doesn't report ``battery_power_w``); the gap isn't material
-        by the same floor/fraction rule ``_resolve_charge`` already applies to the plan's
-        own grid_charge_w; or it hasn't yet persisted for ``_LIVE_SHORTFALL_DEBOUNCE_TICKS``
-        consecutive ticks.
-        """
-        if self._status.live_escalated_slot_start == iv.start:
-            return self._status.live_escalated_grid_w
-
-        # getattr, not a hard call: older/test BatteryController doubles that predate
-        # this check have no read_status() — treat exactly like a failed/unsupported
-        # read (fails open), not a crash.
-        read_status = getattr(self.bc, "read_status", None)
-        status = await read_status() if read_status is not None else None
-        if status is None or status.battery_power_w is None:
-            self._status.live_shortfall_streak = 0
-            return None
-
-        gap_w = iv.power_w - status.battery_power_w
-        material = (
-            gap_w > self._GRID_CHARGE_MIN_W
-            and gap_w >= self._GRID_CHARGE_MIN_FRACTION * max(iv.power_w, 0.0)
-        )
-        if not material:
-            self._status.live_shortfall_streak = 0
-            return None
-
-        self._status.live_shortfall_streak += 1
-        if self._status.live_shortfall_streak < self._LIVE_SHORTFALL_DEBOUNCE_TICKS:
-            return None
-        return gap_w
 
     # A DISCHARGE slot only runs as a forced "battery first" discharge when the plan wants
     # a *material* amount of export: a real share of the slot (fraction) AND above an
@@ -516,8 +440,4 @@ class ScheduleExecutor:
             "last_tick": s.last_tick.isoformat() if s.last_tick else None,
             "interval_minutes": self.interval_minutes,
             "consecutive_apply_failures": s.consecutive_apply_failures,
-            "live_shortfall_streak": s.live_shortfall_streak,
-            "live_escalated_slot_start": (
-                s.live_escalated_slot_start.isoformat() if s.live_escalated_slot_start else None
-            ),
         }

@@ -147,16 +147,6 @@ class FakeBatteryController:
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
-        # None (default) => read_status() reports no telemetry, matching a driver that
-        # doesn't populate battery_power_w (or hasn't connected yet) — the existing
-        # solar-charge tests above rely on this to behave exactly as before this field
-        # existed. Tests exercising the live-shortfall escalation set this explicitly.
-        self.battery_power_w: float | None = None
-
-    async def read_status(self):
-        if self.battery_power_w is None:
-            return None
-        return BASE.InverterState(battery_power_w=self.battery_power_w)
 
     async def force_charge(self, power_w, duration=None):
         self.calls.append(("force_charge", power_w, duration))
@@ -242,115 +232,122 @@ def test_solar_charge_transition_economy_no_respam():
     assert bc.names().count("set_self_consumption_mode") == 1, bc.calls
 
 
-# ------------------------------------------ live-shortfall escalation (2026-10-15)
-def test_live_shortfall_single_tick_blip_does_not_escalate():
-    """A single tick where self-use's live charge rate trails the target must NOT
-    force a grid charge — ordinary solar variability (a cloud passing over) should be
-    absorbed by self-use, not escalated on one reading."""
-    ex, bc = _make_executor()
-    slot = DispatchInterval(
-        start=_FIXED_NOW, action=BatteryAction.CHARGE,
-        power_w=5_900.0, grid_charge_w=0.0,  # plan thinks this is solar-only
-    )
-    ex.set_plan([slot], updated_at=_FIXED_NOW)
-    bc.battery_power_w = 1_000.0  # live charge rate is way below the 5.9 kW target
-    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
-
-    assert "force_charge" not in bc.names(), bc.calls
-    assert bc.names() == ["set_self_consumption_mode"], bc.calls
+class _FakeState:
+    def __init__(self, state, unit):
+        self.state = str(state)
+        self.attributes = {"unit_of_measurement": unit} if unit is not None else {}
 
 
-def test_live_shortfall_escalates_after_debounce():
-    """A sustained shortfall (crossing the debounce threshold) — e.g. an unplanned load
-    like a DNSP-switched Hot Water circuit eating the solar surplus self-use counted on
-    — escalates to a real grid force_charge sized to the live gap, not the plan's own
-    (now-stale) grid_charge_w of 0."""
-    ex, bc = _make_executor()
-    slot = DispatchInterval(
-        start=_FIXED_NOW, action=BatteryAction.CHARGE,
-        power_w=5_900.0, grid_charge_w=0.0,
-    )
-    ex.set_plan([slot], updated_at=_FIXED_NOW)
-    bc.battery_power_w = 1_000.0  # unplanned load is eating the solar surplus
+class _FakeStates:
+    def __init__(self, table):
+        self._t = table
 
-    _tick(ex, _FIXED_NOW + timedelta(seconds=1))          # tick 1 — still self-use
-    assert "force_charge" not in bc.names(), bc.calls
-    _tick(ex, _FIXED_NOW + timedelta(minutes=5))           # tick 2 — debounce satisfied
-
-    assert bc.names()[-1] == "force_charge", bc.calls
-    _name, power_w, _dur = bc.calls[-1]
-    assert power_w == 4_900.0, f"expected the live gap (5900-1000=4900), got {power_w}"
+    def get(self, entity_id):
+        return self._t.get(entity_id)
 
 
-def test_live_shortfall_escalation_persists_through_slot():
-    """Once escalated for a slot, the grid charge must hold for the rest of that slot
-    even once it starts closing the gap it was raised to fix — re-deriving the gap every
-    tick would see the escalation's own charging as 'no gap' and immediately revert to
-    self-use, undoing itself every cycle."""
-    ex, bc = _make_executor()
-    slot = DispatchInterval(
-        start=_FIXED_NOW, action=BatteryAction.CHARGE,
-        power_w=5_900.0, grid_charge_w=0.0,
-    )
-    ex.set_plan([slot], updated_at=_FIXED_NOW)
-    bc.battery_power_w = 1_000.0
-    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
-    _tick(ex, _FIXED_NOW + timedelta(minutes=5))           # escalates here
-    assert bc.names()[-1] == "force_charge", bc.calls
-
-    # The forced charge "worked" — live battery power now matches the target exactly.
-    bc.battery_power_w = 5_900.0
-    _tick(ex, _FIXED_NOW + timedelta(minutes=10))          # still the same slot
-
-    assert bc.names()[-1] == "force_charge", (
-        f"escalation reverted to self-use mid-slot once the gap closed: {bc.calls}")
-    _name, power_w, _dur = bc.calls[-1]
-    assert power_w == 4_900.0, f"expected the committed escalation value, got {power_w}"
+def _sigen_status(table):
+    sig = _load(os.path.join(_COMPONENT, "inverters", "sigenergy_mqtt.py"),
+                "gl.inverters.sigenergy_mqtt", package="gl.inverters")
+    hass = types.SimpleNamespace(states=_FakeStates(table))
+    drv = sig.SigenergyMqttController(hass)
+    return asyncio.run(drv.get_status()), drv
 
 
-def test_live_shortfall_does_not_override_a_real_grid_charge_slot():
-    """A slot the plan already wants as a material grid charge is untouched by the
-    live-shortfall path — it only kicks in when the plan thought this was solar-only."""
-    ex, bc = _make_executor()
-    slot = DispatchInterval(
-        start=_FIXED_NOW, action=BatteryAction.CHARGE,
-        power_w=10_000.0, grid_charge_w=6_000.0,
-    )
-    ex.set_plan([slot], updated_at=_FIXED_NOW)
-    bc.battery_power_w = 1_000.0  # would look like a huge "gap" if this path fired
-    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
-    _tick(ex, _FIXED_NOW + timedelta(minutes=5))
+def test_sigen_power_telemetry_honours_entity_units():
+    """Regression for 2026-10-16: sensor.sigen_0_total_pv_power reports W while its
+    siblings report kW; a blanket kW->W conversion read 3.8 kW of PV as 3.8 MW."""
+    probe, drv = _sigen_status({})
+    e = drv._e
+    table = {
+        e["pv_power"]: _FakeState(3795.0, "W"),
+        e["battery_power"]: _FakeState(4.602, "kW"),
+        e["grid_power"]: _FakeState(1.154, "kW"),
+        e["load_power"]: _FakeState(0.333, None),  # no unit -> native kW
+    }
+    st, _ = _sigen_status(table)
+    assert abs(st.pv_power_w - 3795.0) < 1e-6, st.pv_power_w
+    assert abs(st.battery_power_w - 4602.0) < 1e-6, st.battery_power_w
+    assert abs(st.grid_power_w - 1154.0) < 1e-6, st.grid_power_w
+    assert abs(st.load_power_w - 333.0) < 1e-6, st.load_power_w
 
-    assert bc.names() == ["force_charge", "force_charge"], bc.calls
-    for _name, power_w, _dur in bc.calls:
-        assert power_w == 6_000.0, f"plan's own grid watts must be unaffected, got {power_w}"
+
+class _FakeSigenHass:
+    """hass stand-in whose service calls mutate state like the bridge does: the Remote
+    EMS mode select is only available while the master enable is on, and the plant
+    remembers its last mode across an off/on cycle. ``drop_enable`` makes turn_on not
+    read back (the slow-bridge case)."""
+
+    def __init__(self, e, *, ems_on, mode, drop_enable=False):
+        self.e, self.ems_on, self.mode, self.drop_enable = e, ems_on, mode, drop_enable
+        self.log = []
+        self.numbers = {e["charge_limit"]: 4.6, e["discharge_limit"]: 14.4}
+        hass = self
+
+        class _States:
+            def get(self, eid):
+                if eid == e["enable"]:
+                    return _FakeState("on" if hass.ems_on else "off", None)
+                if eid == e["mode"]:
+                    return _FakeState(hass.mode, None) if hass.ems_on else None
+                if eid in hass.numbers:
+                    st = _FakeState(hass.numbers[eid], "kW")
+                    st.attributes["max"] = 100.0
+                    return st
+                return None
+
+        class _Services:
+            async def async_call(self, domain, service, data, blocking=True):
+                eid = data["entity_id"]
+                hass.log.append((domain, service, eid, data.get("option", data.get("value"))))
+                if domain == "switch":
+                    if service == "turn_on" and hass.drop_enable:
+                        return
+                    hass.ems_on = service == "turn_on"
+                elif domain == "select":
+                    hass.mode = data["option"]
+                elif domain == "number":
+                    hass.numbers[eid] = data["value"]
+
+        self.states, self.services = _States(), _Services()
 
 
-def test_live_shortfall_resets_on_next_slot():
-    """Escalation is scoped to the slot it fired for — a fresh slot re-evaluates from
-    scratch rather than inheriting the previous slot's forced charge."""
-    ex, bc = _make_executor()
-    slot1 = DispatchInterval(
-        start=_FIXED_NOW, action=BatteryAction.CHARGE,
-        power_w=5_900.0, grid_charge_w=0.0,
-    )
-    slot2_start = _FIXED_NOW + timedelta(minutes=15)
-    slot2 = DispatchInterval(
-        start=slot2_start, action=BatteryAction.CHARGE,
-        power_w=5_900.0, grid_charge_w=0.0,
-    )
-    ex.set_plan([slot1, slot2], updated_at=_FIXED_NOW)
-    bc.battery_power_w = 1_000.0
-    _tick(ex, _FIXED_NOW + timedelta(seconds=1))
-    _tick(ex, _FIXED_NOW + timedelta(minutes=5))           # escalates in slot1
-    assert bc.names()[-1] == "force_charge", bc.calls
+def _sigen_driver(**kw):
+    sig = _load(os.path.join(_COMPONENT, "inverters", "sigenergy_mqtt.py"),
+                "gl.inverters.sigenergy_mqtt", package="gl.inverters")
+    sig._VERIFY_DELAY_S = 0.0
+    probe = sig.SigenergyMqttController(types.SimpleNamespace(states=_FakeStates({})))
+    hass = _FakeSigenHass(probe._e, **kw)
+    return sig, sig.SigenergyMqttController(hass), hass
 
-    # Solar recovers for slot2 — self-use alone now keeps up with the target.
-    bc.battery_power_w = 5_900.0
-    _tick(ex, slot2_start + timedelta(seconds=1))
 
-    assert bc.names()[-1] == "set_self_consumption_mode", (
-        f"new slot inherited the old slot's escalation: {bc.calls}")
+def test_sigen_restore_normal_parks_mode_before_disabling_ems():
+    """Regression for 2026-10-16: the deadman left the select on Command Charging; the
+    first enable after restart resumed it at the just-reset 12.6 kW cap (~10 kW import)."""
+    sig, drv, hass = _sigen_driver(ems_on=True, mode=sig_mode_charge_pv())
+    assert asyncio.run(drv.restore_normal())
+    assert hass.mode == sig.MODE_SELF_CONSUMPTION, hass.log
+    assert not hass.ems_on
+    order = [(d, sv) for d, sv, _e, _v in hass.log]
+    assert order.index(("select", "select_option")) < order.index(("switch", "turn_off")), hass.log
+
+
+def test_sigen_unconfirmed_enable_is_undone():
+    """An enable that doesn't read back is followed by a turn_off, so a late landing
+    can't run the plant's remembered (possibly forced) mode ungoverned."""
+    sig, drv, hass = _sigen_driver(ems_on=False, mode=sig_mode_charge_pv(), drop_enable=True)
+    assert asyncio.run(drv.set_self_consumption_mode()) is False
+    assert hass.log[-1][:2] == ("switch", "turn_off"), hass.log
+
+
+def test_sigen_enable_already_on_is_noop():
+    sig, drv, hass = _sigen_driver(ems_on=True, mode="Maximum Self-consumption (Default)")
+    assert asyncio.run(drv.set_self_consumption_mode())
+    assert not any(d == "switch" for d, *_ in hass.log), hass.log
+
+
+def sig_mode_charge_pv():
+    return "Command Charging (Consume power from the PV first)"
 
 
 def test_grid_charge_below_eps_is_solar():

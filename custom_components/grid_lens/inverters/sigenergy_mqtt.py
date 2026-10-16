@@ -14,7 +14,7 @@ driver drives the entities that bridge already publishes:
   Telemetry (read):
     sensor.sigen_0_plant_battery_soc            % (SOC)
     sensor.sigen_0_plant_battery_power          kW, >0 charging / <0 discharging
-    sensor.sigen_0_total_pv_power               kW
+    sensor.sigen_0_total_pv_power               W (power units read from each entity)
     sensor.sigen_plant_grid_sensor_active_power kW, >0 import / <0 export
     sensor.sigen_0_general_load_power           kW
     sensor.sigen_plant_ess_rated_energy_capacity kWh
@@ -26,7 +26,8 @@ driver drives the entities that bridge already publishes:
   this bridge and claimed the "clean" entity_id first; that integration is gone now, so the
   IDs were reset to the bridge's own defaults.
 
-All native values are kW; this driver converts to/from canonical watts.
+Native values are kW (except where an entity's own unit says otherwise — telemetry
+reads honour ``unit_of_measurement``); this driver converts to/from canonical watts.
 """
 from __future__ import annotations
 
@@ -57,6 +58,9 @@ _DEFAULT_DISCHARGE_CAP_KW = 14.4
 # reflected in HA state — but a mismatch that survives these retries is real.
 _VERIFY_RETRIES = 3
 _VERIFY_DELAY_S = 1.0
+# Enabling Remote EMS takes ~7-9 s to read back on the bridge (the mode select only
+# appears once it's on) — far longer than a number/select write. Observed 2026-10-16.
+_ENABLE_VERIFY_RETRIES = 20
 
 # Expected mode string per abstract action, for verify_mode(). DISCHARGE isn't listed —
 # it depends on ``discharge_mode_pv_first`` (instance config), so it's resolved from
@@ -137,12 +141,12 @@ class SigenergyMqttController(InverterController):
             status=status,
             is_curtailed=self._saved_export_kw is not None,
             soc_pct=soc,
-            battery_power_w=self._kw_to_w(self._float(self._e["battery_power"])),  # charge+
+            battery_power_w=self._power_w(self._e["battery_power"]),  # charge+
             battery_capacity_wh=(cap_kwh * 1000.0) if cap_kwh is not None else None,
             soh_pct=self._float(self._e["soh"]),
-            pv_power_w=self._kw_to_w(self._float(self._e["pv_power"])),
-            grid_power_w=self._kw_to_w(self._float(self._e["grid_power"])),  # import+
-            load_power_w=self._kw_to_w(self._float(self._e["load_power"])),
+            pv_power_w=self._power_w(self._e["pv_power"]),
+            grid_power_w=self._power_w(self._e["grid_power"]),  # import+
+            load_power_w=self._power_w(self._e["load_power"]),
         )
         state.extra["ems_mode"] = running
         return state
@@ -208,6 +212,17 @@ class SigenergyMqttController(InverterController):
         # that apply regardless of EMS mode, so leaving them low would silently throttle
         # native/self-consumption charging and discharging after handback.
         ok = await self._reset_rate_limits() and ok
+        # Park the mode select on self-consumption BEFORE disabling the master enable.
+        # The bridge only exposes the select while Remote EMS is on, and the plant
+        # remembers it: left on a forced mode, the next enable (e.g. our own first tick
+        # after an HA restart) resumes that forced mode — now with the rate caps just
+        # reset to max above. Found 2026-10-16: a stale "Command Charging (PV first)"
+        # resumed at 12.6 kW after a restart and imported ~10 kW. Best-effort: a failure
+        # here must not block the handback itself.
+        mode = self._state(self._e["mode"])
+        if mode is not None and mode.state != MODE_SELF_CONSUMPTION:
+            if not await self._set_mode(MODE_SELF_CONSUMPTION):
+                _LOGGER.warning("Could not park Remote EMS mode on self-consumption before handback")
         # Disabling the master enable hands control back to native EMS.
         ok = await self._switch(self._e["enable"], turn_on=False) and ok
         _LOGGER.info("Sigenergy Remote EMS disabled; native control restored")
@@ -279,7 +294,20 @@ class SigenergyMqttController(InverterController):
 
     # --------------------------------------------------------------------- I/O
     async def _enable_ems(self) -> bool:
-        return await self._switch(self._e["enable"], turn_on=True)
+        st = self._state(self._e["enable"])
+        if st is not None and st.state == "on":
+            return True
+        if await self._call(
+            "switch", "turn_on", self._e["enable"], {}, retries=_ENABLE_VERIFY_RETRIES
+        ):
+            return True
+        # The enable didn't read back, but it may still land late — and an enable that
+        # lands after we've given up resumes whatever mode the plant last remembered,
+        # with nothing following up to set the mode we wanted. Undo it so a late enable
+        # can't run ungoverned; the next tick retries from a known (native) state.
+        _LOGGER.warning("Remote EMS enable unconfirmed — issuing turn_off so a late enable can't run a stale mode")
+        await self._switch(self._e["enable"], turn_on=False)
+        return False
 
     async def _set_mode(self, option: str) -> bool:
         return await self._call(
@@ -296,7 +324,10 @@ class SigenergyMqttController(InverterController):
             "switch", "turn_on" if turn_on else "turn_off", entity_id, {}
         )
 
-    async def _call(self, domain: str, service: str, entity_id: str, data: dict) -> bool:
+    async def _call(
+        self, domain: str, service: str, entity_id: str, data: dict,
+        *, retries: int = _VERIFY_RETRIES,
+    ) -> bool:
         if self._state(entity_id) is None:
             _LOGGER.error(
                 "Sigenergy %s.%s on %s refused: entity unavailable", domain, service, entity_id
@@ -313,10 +344,10 @@ class SigenergyMqttController(InverterController):
             _LOGGER.error("Sigenergy %s.%s on %s failed: %s", domain, service, entity_id, err)
             return False
 
-        for attempt in range(_VERIFY_RETRIES):
+        for attempt in range(retries):
             if self._write_applied(domain, service, entity_id, data):
                 return True
-            if attempt < _VERIFY_RETRIES - 1:
+            if attempt < retries - 1:
                 await asyncio.sleep(_VERIFY_DELAY_S)
 
         # A clean services.async_call return is NOT proof the command reached the hardware:
@@ -333,7 +364,7 @@ class SigenergyMqttController(InverterController):
             domain,
             service,
             entity_id,
-            _VERIFY_RETRIES,
+            retries,
             getattr(self.hass.states.get(entity_id), "state", "missing"),
         )
         return False
@@ -380,6 +411,19 @@ class SigenergyMqttController(InverterController):
                 pass
         return max(0.0, min(value_kw, cap))
 
-    @staticmethod
-    def _kw_to_w(value_kw: Optional[float]) -> Optional[float]:
-        return None if value_kw is None else value_kw * 1000.0
+    # Power sensor unit -> watts multiplier. A missing/unknown unit falls back to kW, the
+    # bridge's documented native unit.
+    _POWER_UNIT_TO_W = {"w": 1.0, "kw": 1000.0, "mw": 1_000_000.0}
+
+    def _power_w(self, entity_id: str) -> Optional[float]:
+        """Read a power sensor as canonical watts, honouring its ``unit_of_measurement``
+        rather than assuming kW. Found 2026-10-16: ``sensor.sigen_0_total_pv_power``
+        reports **W** while its siblings report kW, so a blanket kW→W conversion read
+        ~3.8 kW of PV as ~3.8 MW — silently defeating the executor's live-shortfall
+        solar-forecast check, which then grid-charged ~1–2 kW to cover a PV miss."""
+        value = self._float(entity_id)
+        if value is None:
+            return None
+        st = self._state(entity_id)
+        unit = str(st.attributes.get("unit_of_measurement") or "").strip().lower() if st else ""
+        return value * self._POWER_UNIT_TO_W.get(unit, 1000.0)

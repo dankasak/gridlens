@@ -27,7 +27,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 
-from ..inverters.base import BatteryAction, InverterController, InverterState
+from ..inverters.base import BatteryAction, InverterController
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -198,17 +198,6 @@ class BatteryController:
             return state.soc_pct
         except Exception as err:  # noqa: BLE001 — read must not crash a control decision
             _LOGGER.error("SOC read failed: %s", err)
-            return None
-
-    async def read_status(self) -> Optional[InverterState]:
-        """Live canonical snapshot (PV/grid/battery/load, brand-agnostic — see
-        ``InverterState``'s sign conventions). Read-only. For callers that need more
-        than SOC, e.g. the executor's live-shortfall check in ``ScheduleExecutor``.
-        None on a failed read; never raises."""
-        try:
-            return await self.driver.get_status()
-        except Exception as err:  # noqa: BLE001 — read must not crash a control decision
-            _LOGGER.error("Status read failed: %s", err)
             return None
 
     async def _ensure_hardware_floor(self) -> None:

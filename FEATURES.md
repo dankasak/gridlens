@@ -817,6 +817,9 @@ right):
     the inverter import whenever instantaneous PV < `power_w` (the 10 kW import-spike bug);
     force-charging at a *tiny* `grid_charge_w` instead throttles the solar charge and dumps
     surplus to a $0 export.
+    No live "shortfall" escalation to grid: one existed briefly (2026-10-15/16) and was
+      removed after it imported at 21.6c to chase a solar SOC path the LP never priced as
+      a grid charge — the LP re-plans from live SOC every few minutes and decides that.
   - **Material grid charge** → `force_charge(grid_charge_w)`.
   - **Free-import window** (`import_rate ≈ 0`) → `force_charge(power_w)`, the full ceiling —
     there's no cost risk in over-committing when import is free.
