@@ -16,7 +16,7 @@ from .battery_optimizer import BatteryOptimizer
 from .retailer_plans import (
     plans_from_api_data, versioned_plans_from_history, build_rate_caps,
     build_conditional_credits, slot_calendar_day_index, RetailerPlan, PlanFromData,
-    rate_time_ranges, format_window_range, cap_label_base,
+    rate_time_ranges, format_window_range, cap_label_base, local_tz,
 )
 from .const import (
     DOMAIN,
@@ -1849,11 +1849,7 @@ class PlanCalculator:
         identically on the dashboard.
         """
         from collections import defaultdict
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-        tz = ZoneInfo("Australia/Sydney")
+        tz = local_tz()
 
         credit_defs = plan.get_conditional_credits()
         if not credit_defs or not usage_data:
@@ -2185,11 +2181,7 @@ class PlanCalculator:
         solver's dispatch (not historical data).
         """
         from collections import defaultdict
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-        tz = ZoneInfo("Australia/Sydney")
+        tz = local_tz()
 
         # Human time-range per declared rate value (e.g. "2pm–8pm (weekdays)"),
         # keyed the same way as rate_to_label below (round(rate, 4)) so every
@@ -2720,11 +2712,7 @@ class PlanCalculator:
     ) -> list[dict]:
         """Return average import/export kWh per hour-of-day (0-23) in Sydney timezone."""
         from collections import defaultdict
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-        tz = ZoneInfo("Australia/Sydney")
+        tz = local_tz()
         imp_by_h: dict = defaultdict(list)
         exp_by_h: dict = defaultdict(list)
         for d in usage_data:
@@ -2745,11 +2733,7 @@ class PlanCalculator:
     ) -> dict:
         """Return {hour: avg_price} from price sensor state history over the period."""
         from collections import defaultdict
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-        tz = ZoneInfo("Australia/Sydney")
+        tz = local_tz()
         try:
             from homeassistant.components.recorder import history as recorder_history
             states = await get_instance(self.hass).async_add_executor_job(
@@ -2773,11 +2757,7 @@ class PlanCalculator:
     def _aggregate_kwh_by_hod(self, data: list[dict]) -> dict:
         """Average kWh by hour-of-day (Sydney time). Returns {0-23: avg_kwh}."""
         from collections import defaultdict
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-        tz = ZoneInfo("Australia/Sydney")
+        tz = local_tz()
         by_hod: dict = defaultdict(list)
         for d in data:
             by_hod[d['timestamp'].astimezone(tz).hour].append(d['value'])
@@ -3028,11 +3008,7 @@ class PlanCalculator:
             )
             if not stats or sensor_id not in stats:
                 return {}
-            try:
-                from zoneinfo import ZoneInfo
-            except ImportError:
-                from backports.zoneinfo import ZoneInfo
-            tz = ZoneInfo("Australia/Sydney")
+            tz = local_tz()
             from collections import defaultdict
             by_hod: dict = defaultdict(list)
             for rec in stats[sensor_id]:
@@ -3251,11 +3227,7 @@ class PlanCalculator:
         Returns {hour_of_day: {'charge_kwh': float, 'discharge_kwh': float}}.
         """
         from collections import defaultdict
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-        tz = ZoneInfo("Australia/Sydney")
+        tz = local_tz()
         sums: dict = defaultdict(lambda: {'charge_kwh': 0.0, 'discharge_kwh': 0.0, 'count': 0})
         for d in battery_data:
             hod = d['timestamp'].astimezone(tz).hour
@@ -3324,11 +3296,7 @@ class PlanCalculator:
         start_date: datetime,
     ) -> list[dict]:
         """Apply plan rates to the hourly day profile, returning per-hour cost/income."""
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-        tz = ZoneInfo("Australia/Sydney")
+        tz = local_tz()
         # Use mid-period date for DST-aware rate lookup
         sample_date = start_date + timedelta(days=15)
         result = []
@@ -3912,11 +3880,7 @@ class PlanCalculator:
         else:
             start_time = datetime.now(timezone.utc) - timedelta(days=2)
 
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-        tz = ZoneInfo("Australia/Sydney")
+        tz = local_tz()
 
         # Demand-charge peak-shaving inputs. Build a per-LP-hour window mask so
         # the optimiser lowers the peak grid import inside the metered window.

@@ -716,11 +716,8 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         already happened. A no-op (returns credits unchanged) when the window
         hasn't started yet today, or when history can't be checked.
         """
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-        tz = ZoneInfo("Australia/Sydney")
+        from ..retailer_plans import local_tz
+        tz = local_tz()
         now_local = dt_util.now().astimezone(tz)
         today_ord = now_local.date().toordinal()
 
@@ -796,11 +793,8 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         elif not (self._cfg(CONF_HAS_DEMAND_TARIFF, False) and legacy_rate > 0):
             return 0.0, None, 0.0, 0.0
 
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:  # pragma: no cover
-            from backports.zoneinfo import ZoneInfo
-        tz = ZoneInfo("Australia/Sydney")
+        from ..retailer_plans import local_tz
+        tz = local_tz()
 
         start_local = bundle.start.astimezone(tz)
         now_local = dt_util.now().astimezone(tz)

@@ -365,6 +365,14 @@ no hourly profile. `_renderDispatchSummary` in `grid-lens-card.js`.
   averaged ~10c). LP schedule steps now carry `local_hour`/`local_dow`, stamped from the masks
   the LP was priced against; `day_profile`, the demand-peak fallback scans and
   `get_display_breakdown` read those, never the step index.
+- **Time zone (2026-10-16).** Every tariff-window lookup, plan-version effective date and
+  hour-of-day profile is read in **HA's configured time zone** (Settings → General), via
+  `retailer_plans.local_tz()` — never a hardcoded zone. It used to be `Australia/Sydney`
+  everywhere, which read every TOU window an hour late for half the year on a QLD install
+  and 2–3 hours off in WA. Falls back to Sydney only where HA isn't importable (standalone
+  tests). `tests/test_local_tz.py` also fails if a `ZoneInfo("Australia/...")` reappears
+  outside the helper. Open: `_build_plan_hourly_profile` still prices the current plan's
+  profile against one mid-period sample date.
 
 **Bill breakdown mirrors a real retailer bill, on purpose.** The "our bill breakdown" card
 (`grid-lens-card.js`) orders and labels its rows to match how an Australian electricity bill

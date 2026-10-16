@@ -9,6 +9,29 @@ from typing import Dict
 
 _LOGGER = logging.getLogger(__name__)
 
+_FALLBACK_TZ = "Australia/Sydney"
+
+
+def local_tz():
+    """The install's local timezone — what tariff windows, effective dates and
+    hour-of-day profiles are read in.
+
+    HA's configured zone (Settings → General), i.e. where the meter is. Used to be
+    a hardcoded Australia/Sydney at every call site, which put every TOU window an
+    hour late for half the year on a QLD install (no DST) and 2–3 hours off in WA.
+    Falls back to Sydney only where Home Assistant isn't importable (the
+    standalone tests)."""
+    try:
+        from homeassistant.util import dt as dt_util
+    except ImportError:
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        return ZoneInfo(_FALLBACK_TZ)
+    get = getattr(dt_util, "get_default_time_zone", None)
+    return get() if get else dt_util.DEFAULT_TIME_ZONE
+
 
 def _format_clock(value) -> str:
     """'HH:MM'[:SS] -> 12-hour clock string, e.g. '14:00' -> '2pm', '00:30' ->
@@ -652,7 +675,7 @@ class VersionedPlan(RetailerPlan):
     latest version.
     """
 
-    _TZ = None  # lazily resolved Australia/Sydney (effective dates are local)
+    _TZ = None  # lazily resolved local_tz() (effective dates are local)
 
     def __init__(self, segments: list[tuple[str | None, str | None, "PlanFromData"]],
                  period_start: datetime, period_end: datetime) -> None:
@@ -685,11 +708,7 @@ class VersionedPlan(RetailerPlan):
     @classmethod
     def _local_date(cls, dt: datetime) -> date:
         if cls._TZ is None:
-            try:
-                from zoneinfo import ZoneInfo
-            except ImportError:
-                from backports.zoneinfo import ZoneInfo
-            cls._TZ = ZoneInfo("Australia/Sydney")
+            cls._TZ = local_tz()
         return dt.astimezone(cls._TZ).date() if dt.tzinfo else dt.date()
 
     def _plan_at(self, dt: datetime) -> "PlanFromData":
@@ -846,15 +865,11 @@ def build_rate_caps(
     case) — the optimizer then behaves exactly as it did before caps existed.
 
     ``start`` is added to in its original tz (usually UTC) and only converted to
-    Australia/Sydney per resulting instant — matching PlanCalculator's rate-window
+    local_tz() per resulting instant — matching PlanCalculator's rate-window
     lookups elsewhere — because converting once up front and then adding hours to
     an already-localized datetime does not correctly track DST transitions.
     """
-    try:
-        from zoneinfo import ZoneInfo
-    except ImportError:
-        from backports.zoneinfo import ZoneInfo
-    tz = ZoneInfo("Australia/Sydney")
+    tz = local_tz()
 
     def _build(get_info, cap_labels: Dict) -> list[Dict]:
         groups: Dict[str, Dict] = {}
@@ -917,11 +932,7 @@ def slot_calendar_day_index(start: datetime, n_slots: int, slot_minutes: int = 6
     one real calendar day in two). Real dates group correctly regardless of
     what time the solve happens to start.
     """
-    try:
-        from zoneinfo import ZoneInfo
-    except ImportError:
-        from backports.zoneinfo import ZoneInfo
-    tz = ZoneInfo("Australia/Sydney")
+    tz = local_tz()
     return [
         (start + timedelta(minutes=t * slot_minutes)).astimezone(tz).toordinal()
         for t in range(n_slots)
@@ -941,11 +952,7 @@ def build_conditional_credits(
 
     Returns [] for a plan with none (the common case).
     """
-    try:
-        from zoneinfo import ZoneInfo
-    except ImportError:
-        from backports.zoneinfo import ZoneInfo
-    tz = ZoneInfo("Australia/Sydney")
+    tz = local_tz()
     all_days = slot_calendar_day_index(start, n_slots, slot_minutes)
 
     out: list[Dict] = []
