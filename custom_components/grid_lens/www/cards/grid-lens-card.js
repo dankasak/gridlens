@@ -848,7 +848,10 @@ class GridLensCard extends HTMLElement {
   // hour-of-day averages to chart from. Colour legend matches the main flat
   // view: amber=the plan actually held that period, deep-cyan=cheapest
   // contender, green=cheaper than the actual bill, red=pricier.
-  _renderPeriodPlanCard(planName, billItems, total, isCurrentPlan, isCheapest, savings, showBreakdown, strategy) {
+  // No dispatch summary here (unlike the flat view's _renderDispatchSummary): with
+  // no hourly profile there is nothing computed to summarise, and the static
+  // per-plan `strategy` text it used to show is retired (see that method).
+  _renderPeriodPlanCard(planName, billItems, total, isCurrentPlan, isCheapest, savings, showBreakdown) {
     let bannerColor, savingsLabel;
     if (isCurrentPlan) {
       bannerColor = GridLensCard.HOUSEHOLD_COLOR;
@@ -865,11 +868,6 @@ class GridLensCard extends HTMLElement {
     }
     const breakdownHtml = (showBreakdown && billItems)
       ? `<div class="breakdown-section">${this._renderBillRows(billItems)}</div>` : '';
-    const strategyHtml = strategy ? `
-      <div class="strategy-box">
-        <div class="strategy-title">📋 Optimisation Strategy</div>
-        <div class="strategy-text">${strategy}</div>
-      </div>` : '';
     return `
       <div class="plan-card period-plan-card${isCurrentPlan ? ' current-plan' : ''}" data-retailer="${this._esc(this._retailerOf(planName))}">
         <div class="plan-title">
@@ -881,7 +879,110 @@ class GridLensCard extends HTMLElement {
           <div class="cost-label">${savingsLabel}</div>
         </div>
         ${breakdownHtml}
-        ${strategyHtml}
+      </div>`;
+  }
+
+  // Plain-language summary of what the LP actually did on this plan, built from
+  // the 24-slot hour-of-day averaged `hourly_profile` (kWh per slot = kWh/day at
+  // that hour). Replaces the hand/AI-written per-plan `strategy` text (retired
+  // 2026-10-16): that text quoted rates that went stale on every price update,
+  // gave battery advice to installs with no battery, and could contradict the LP
+  // ranking the very same card. Everything here comes from this install's own
+  // optimisation, so rates always match the plan's priced schedule and clauses
+  // for hardware the install doesn't have simply never appear.
+  _renderDispatchSummary(profile) {
+    if (!profile || profile.length !== 24) return '';
+    const v = (s, k) => s[k] || 0;
+    const defOf = (s) => {
+      const per = s.deferrable_per_device || [];
+      return per.length ? per.reduce((a, x) => a + x, 0) : v(s, 'deferrable_kwh');
+    };
+    // Grid share of each hour's battery charge: whatever charge solar surplus
+    // (solar beyond household + flexible load) can't account for, bounded by
+    // what was actually imported. Approximate on averaged slots, which is fine
+    // for picking out a window.
+    const gridChg = profile.map(s => {
+      const surplus = Math.max(0, v(s, 'solar_kwh') - v(s, 'home_load_kwh') - defOf(s));
+      return Math.min(v(s, 'import_kwh'), Math.max(0, v(s, 'charge_kwh') - surplus));
+    });
+    const series = {
+      grid: gridChg,
+      dis: profile.map(s => v(s, 'discharge_kwh')),
+      exp: profile.map(s => v(s, 'export_kwh')),
+      def: profile.map(defOf),
+    };
+    // An hour counts toward a window when it carries a meaningful share of that
+    // flow — absolute floor so a near-idle series yields no window at all, plus
+    // a relative floor so one dominant window isn't smeared across the day by
+    // averaging noise.
+    const active = (arr) => {
+      const max = Math.max(...arr);
+      const thr = Math.max(0.05, max * 0.15);
+      const on = arr.map(x => x >= thr);
+      // Bridge a single quiet hour between two active ones, so one dispatch
+      // window isn't printed as "09:00–10:00, 11:00–15:00" over an averaging dip.
+      return on.map((x, h) => x || (on[(h + 23) % 24] && on[(h + 1) % 24]));
+    };
+    // Contiguous runs of active hours, joined across midnight; at most 3, largest
+    // energy first, then shown in clock order.
+    const windows = (arr) => {
+      const on = active(arr);
+      if (!on.some(Boolean)) return [];
+      if (on.every(Boolean)) return [[0, 24]];
+      const start = on.findIndex((x, i) => !x && on[(i + 1) % 24]) + 1;
+      const runs = [];
+      let cur = null;
+      for (let k = 0; k < 24; k++) {
+        const h = (start + k) % 24;
+        if (on[h]) {
+          if (!cur) cur = { s: h, n: 0, kwh: 0 };
+          cur.n++; cur.kwh += arr[h];
+        } else if (cur) { runs.push(cur); cur = null; }
+      }
+      if (cur) runs.push(cur);
+      return runs.sort((a, b) => b.kwh - a.kwh).slice(0, 3)
+        .sort((a, b) => a.s - b.s).map(r => [r.s, r.s + r.n]);
+    };
+    const hh = (h) => `${String(h % 24).padStart(2, '0')}:00`;
+    const fmtWin = (ws) => ws.map(([a, b]) => b - a >= 24 ? 'all day' : `${hh(a)}–${hh(b)}`).join(', ');
+    const total = (arr) => arr.reduce((a, x) => a + x, 0);
+    // kWh-weighted average of a rate over a flow — the price that flow actually
+    // met, not a plain mean over hours where it barely happened.
+    const wRate = (arr, key) => {
+      const kwh = total(arr);
+      if (kwh <= 0) return null;
+      return profile.reduce((a, s, h) => a + arr[h] * v(s, key), 0) / kwh;
+    };
+    const c = (r) => `${(r * 100).toFixed(1)}c`;
+    const kwh = (x) => `${x.toFixed(1)} kWh/day`;
+
+    const lines = [];
+    const add = (arr, minDaily, text) => {
+      if (total(arr) < minDaily) return;
+      const ws = windows(arr);
+      if (ws.length) lines.push(text(fmtWin(ws), total(arr)));
+    };
+    add(series.grid, 0.3, (w, k) => {
+      const r = wRate(series.grid, 'import_rate');
+      return `Charges the battery from the grid ${w}${r != null ? ` at ~${c(r)}` : ''} (${kwh(k)})`;
+    });
+    add(series.dis, 0.3, (w, k) => {
+      const r = wRate(series.dis, 'import_rate');
+      // Discharge may serve the home or be exported, so state the buy price it
+      // coincides with rather than claiming it all displaced imports.
+      return `Discharges the battery ${w}${r != null ? `, while grid power costs ~${c(r)}` : ''} (${kwh(k)})`;
+    });
+    add(series.exp, 0.3, (w, k) => {
+      const r = wRate(series.exp, 'export_rate');
+      return `Exports ${kwh(k)}, ${w === 'all day' ? 'across the day' : `mostly ${w}`}${r != null ? ` at ~${c(r)}` : ''}`;
+    });
+    add(series.def, 0.3, (w, k) => `Schedules flexible loads ${w} (${kwh(k)})`);
+    if (!lines.length) return '';
+    return `
+      <div class="strategy-box">
+        <div class="strategy-title">📋 How the optimiser runs this plan</div>
+        <ul class="strategy-list">${lines.map(l => `<li>${this._esc(l)}</li>`).join('')}</ul>
+        <div class="strategy-foot">Typical day, averaged over the comparison period — not a fixed daily schedule.</div>
       </div>`;
   }
 
@@ -911,7 +1012,7 @@ class GridLensCard extends HTMLElement {
         total: curTotal,
         html: this._renderPeriodPlanCard(
           period.current_plan_name || '(unknown plan)', period.current_plan_bill_items,
-          curTotal, true, false, 0, showBreakdown, null,
+          curTotal, true, false, 0, showBreakdown,
         ),
       },
       ...alts.map(a => {
@@ -920,7 +1021,7 @@ class GridLensCard extends HTMLElement {
         return {
           total: a.total,
           html: this._renderPeriodPlanCard(
-            a.plan_key, bi, a.total, false, isCheapest, a.total - curTotal, showBreakdown, a.strategy,
+            a.plan_key, bi, a.total, false, isCheapest, a.total - curTotal, showBreakdown,
           ),
         };
       }),
@@ -1276,7 +1377,9 @@ class GridLensCard extends HTMLElement {
         .period-section-dates { font-size: 15px; font-weight: 600; color: var(--primary-text-color); }
         .period-section-days { font-size: 12px; color: var(--secondary-text-color); }
         .period-alt-count { opacity: 0.75; }
-        .strategy-text { font-size: 12px; color: var(--secondary-text-color); line-height: 1.4; white-space: pre-line; }
+        .strategy-list { font-size: 12px; color: var(--secondary-text-color); line-height: 1.4; margin: 0; padding-left: 18px; }
+        .strategy-list li { margin: 2px 0; }
+        .strategy-foot { font-size: 10px; color: var(--secondary-text-color); opacity: 0.8; margin-top: 6px; font-style: italic; }
         .error { padding: 16px; color: var(--error-color); text-align: center; }
         .loading { padding: 16px; text-align: center; color: var(--secondary-text-color); }
         .stream-track {
@@ -1470,7 +1573,8 @@ class GridLensCard extends HTMLElement {
         .fullscreen-plan .bill-section-head { font-size: 12px; }
         .fullscreen-plan .strategy-box { padding: 18px; }
         .fullscreen-plan .strategy-title { font-size: 17px; }
-        .fullscreen-plan .strategy-text { font-size: 15px; }
+        .fullscreen-plan .strategy-list { font-size: 15px; }
+        .fullscreen-plan .strategy-foot { font-size: 13px; }
       </style>
     `;
 
@@ -1739,11 +1843,11 @@ class GridLensCard extends HTMLElement {
       }
 
 
-      const strategyHtml = details.strategy ? `
-        <div class="strategy-box">
-          <div class="strategy-title">📋 Optimisation Strategy</div>
-          <div class="strategy-text">${details.strategy}</div>
-        </div>` : '';
+      // Only an LP-dispatched profile describes a strategy. The current plan's
+      // profile (outside a what-if) and the no-battery SIMPLE path come from
+      // actual usage — there `optimization` is null/absent.
+      const strategyHtml = details.optimization
+        ? this._renderDispatchSummary(profile) : '';
 
       // The fullscreen instance renders as a <dialog> (see render()'s post-innerHTML
       // wiring, which calls .showModal() on it) — top-layer rendering is what actually

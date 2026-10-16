@@ -339,6 +339,33 @@ construction, not a detection bug. Only computed for spot-priced plans; capped a
 shown with a count. `plan_calculator._calculate_plan_cost_with_battery_optimization`
 ("Spikes" comment) / `renderSpikes` in `grid-lens-card.js`.
 
+**"How the optimiser runs this plan" summary** (2026-10-16). Under each plan card's bill
+breakdown in the flat view, a short bullet list generated from that plan's own LP
+`hourly_profile`: when it grid-charges the battery (and at what kWh-weighted buy rate),
+when it discharges (and the buy rate it coincides with — not "avoids", since discharge can
+also be exported), how much it exports and when (at the sell rate actually met), and when
+flexible loads are scheduled. Windows are contiguous runs of hours carrying ≥15% of that
+flow's peak hour (absolute floor 0.05 kWh), a single quiet hour bridged, joined across
+midnight, at most 3; a flow under 0.3 kWh/day is omitted. Footer says it's a typical day,
+not a schedule. Shown only when `details.optimization` exists (an LP ran) — the current plan
+outside a what-if, and the no-battery SIMPLE path, have actual-usage profiles with no
+dispatch to describe, so no box. Not shown on multi-period (bill-boundary) cards: those carry
+no hourly profile. `_renderDispatchSummary` in `grid-lens-card.js`.
+- **Replaced** the old static per-plan `strategy` text (DB column `plans.strategy`, shown as
+  "📋 Optimisation Strategy"): hand/AI-written on 43 of 771 current plans during early
+  onboarding, it quoted rates that went stale on every price update (nothing in `prd_sync`
+  maintains it; `engie_vpp_advantage_ea011`'s claimed identical peak and off-peak rates), gave
+  battery advice regardless of install, and every real caveat in it (VPP auto-dispatch,
+  pooled caps, PEA, sign-up credits) already lives in a structured field, `notes` or
+  `vpp_note`. **The column is deprecated, not dropped** — still served/imported and in the
+  editor; don't populate it for new plans. Still read by the legacy 4-plan
+  `optimization_notes` metric sensor (`PLAN_ID_TO_KEY`, `__init__.py`).
+- **DST (fixed 2026-10-16).** Hour-of-day bucketing used to be `(start hour + index) % 24`,
+  filing every hour after a DST transition one slot off (ZeroHero's free 12–3pm import
+  averaged ~10c). LP schedule steps now carry `local_hour`/`local_dow`, stamped from the masks
+  the LP was priced against; `day_profile`, the demand-peak fallback scans and
+  `get_display_breakdown` read those, never the step index.
+
 **Bill breakdown mirrors a real retailer bill, on purpose.** The "our bill breakdown" card
 (`grid-lens-card.js`) orders and labels its rows to match how an Australian electricity bill
 actually reads — fixed charges (supply/subscription/demand/controlled load) first, usage
