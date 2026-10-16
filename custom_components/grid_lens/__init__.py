@@ -1129,10 +1129,11 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 }
                 zf.writestr('config.json', json.dumps(config, indent=2, default=str))
 
-                # All plan rate structures (from cached coordinator data, if available)
-                coordinator_data = self.hass.data.get(DOMAIN, {}).get(entry_obj.entry_id)
-                if coordinator_data and hasattr(coordinator_data, 'data') and coordinator_data.data:
-                    plan_rates = coordinator_data.data.get('plan_data', {})
+                # All plan rate structures, as served by /plans on the coordinator's last
+                # fetch. They live on its PlanCalculator, not in coordinator.data (which
+                # never had a 'plan_data' key, so this file was never written).
+                plan_rates = getattr(getattr(coordinator, 'calculator', None), 'plan_data', None)
+                if plan_rates:
                     zf.writestr('plan_rates.json', json.dumps(plan_rates, indent=2, default=str))
 
                 # Per-plan costs and savings
