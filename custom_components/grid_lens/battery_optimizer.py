@@ -490,6 +490,7 @@ class BatteryOptimizer:
         export_floor_kwh: float = None,
         export_floor_slot: int = None,
         grid_charge_cap_kwh: List[float] = None,
+        relax_truncated_day: bool = True,
     ) -> Dict:
         """Return an optimal hourly schedule minimising net energy cost.
 
@@ -653,6 +654,12 @@ class BatteryOptimizer:
           (0 kWh at 100% forecast accuracy, tens of kWh at 70%), with no proportionality
           to how uncertain the forecast actually is at decision time.
 
+        relax_truncated_day (default True): relax the horizon's final, shorter-than-a-day
+          chunk's per-device daily total from an equality to a ≤ cap (see _lp_scipy's
+          day_groups comment) — right for a rolling horizon, whose next replan sees the
+          rest of that day. Plan comparison passes False: its window is fixed history,
+          and relaxing the last partial day there just drops that day's deferrable energy.
+
         Tries LP first; falls back to greedy if scipy is unavailable or infeasible.
         """
         if deferrable_loads is None:
@@ -685,7 +692,8 @@ class BatteryOptimizer:
                                      slot_day_index=slot_day_index,
                                      export_floor_kwh=export_floor_kwh,
                                      export_floor_slot=export_floor_slot,
-                                     grid_charge_cap_kwh=grid_charge_cap_kwh)
+                                     grid_charge_cap_kwh=grid_charge_cap_kwh,
+                                  relax_truncated_day=relax_truncated_day)
         except ImportError:
             if export_floor_kwh is not None:
                 _LOGGER.error(
@@ -718,6 +726,7 @@ class BatteryOptimizer:
                 export_floor_kwh=export_floor_kwh,
                 export_floor_slot=export_floor_slot,
                 grid_charge_cap_kwh=grid_charge_cap_kwh,
+                relax_truncated_day=relax_truncated_day,
             )
             if export_floor_kwh is not None:
                 _LOGGER.error(
@@ -815,7 +824,8 @@ class BatteryOptimizer:
                      terminal_soc_value=None, import_caps=None, export_caps=None,
                      conditional_credits=None, min_export_price=0.0,
                      slot_day_index=None, export_floor_kwh=None, export_floor_slot=None,
-                     grid_charge_cap_kwh=None):
+                     grid_charge_cap_kwh=None,
+                     relax_truncated_day=True):
         """Build and solve the LP. Raises on failure so caller can fall back.
 
         Chain is scipy → PuLP/CBC → (caller's greedy fallback).
@@ -865,7 +875,8 @@ class BatteryOptimizer:
                                   slot_day_index=slot_day_index,
                                   export_floor_kwh=export_floor_kwh,
                                   export_floor_slot=export_floor_slot,
-                                  grid_charge_cap_kwh=grid_charge_cap_kwh)
+                                  grid_charge_cap_kwh=grid_charge_cap_kwh,
+                                  relax_truncated_day=relax_truncated_day)
         except ImportError:
             pass  # scipy not available — try PuLP
         except Exception as exc:
@@ -918,7 +929,8 @@ class BatteryOptimizer:
                   terminal_soc_value=None, import_caps=None, export_caps=None,
                   conditional_credits=None, min_export_price=0.0,
                   slot_day_index=None, export_floor_kwh=None, export_floor_slot=None,
-                  grid_charge_cap_kwh=None):
+                  grid_charge_cap_kwh=None,
+                  relax_truncated_day=True):
         import numpy as np
         from scipy.optimize import linprog
         from scipy.sparse import lil_matrix
@@ -946,10 +958,16 @@ class BatteryOptimizer:
         # just like any full day. Relaxing today too would let the LP satisfy today's
         # quota by scheduling it all tomorrow instead whenever tomorrow is cheaper,
         # which is the exact bug this parameter exists to fix (GRIDLENS_CHECKLIST.md).
+        #
+        # relax_truncated_day=False turns the relaxation off: plan comparison solves a
+        # fixed historical window with no "next replan" to pick up the slack, so a
+        # relaxed final chunk just silently drops that day's deferrable energy — and a
+        # today-only window is nothing BUT that chunk, so every alternative plan showed
+        # zero deferrable consumption (2026-10-16).
         day_groups = _day_groups(T, slots_per_day, slot_day_index)
         n_days = len(day_groups)
         truncated_days = set()
-        if day_groups and len(day_groups[-1][1]) < slots_per_day:
+        if relax_truncated_day and day_groups and len(day_groups[-1][1]) < slots_per_day:
             truncated_days.add(day_groups[-1][0])
 
         # Peak-demand shaving: add one auxiliary variable P (peak kW), constrained

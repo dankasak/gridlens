@@ -480,6 +480,15 @@ the non-deferrable "other load" hour-of-day average (that must keep reflecting r
 energy flow regardless of *why* a device drew power). Has no effect on a period predating
 the tracker (§7's "no retroactive data" caveat) — expected, not a bug.
 
+**Partial final day is held to its prorated target (fixed 2026-10-16).** The LP normally
+relaxes a horizon's last, shorter-than-24h day-chunk to a "≤ target" cap (right for the
+rolling advisory plan — the next replan sees the rest of that day). Plan comparison solves
+fixed history with no next replan, so that relaxation let the LP schedule *zero* deferrable
+energy for the final partial day — and a today-only range is nothing but that chunk, so
+every alternative plan showed no deferrable consumption while the current plan (actual
+metered data) did. `plan_calculator` now passes `relax_truncated_day=False` to
+`optimize_hourly_schedule`; the advisory planner keeps the default (`True`).
+
 **"Excludes Greedy Consumption" hazard stripe (added 2026-08-30).** While the checkbox
 above is checked, every *alternative* plan's card (never the current plan) shows a
 diagonal-stripe banner under its hourly charts (`grid-lens-card.js::_greedyStripeHtml`),

@@ -4008,6 +4008,9 @@ class PlanCalculator:
                 conditional_credits=conditional_credits,
                 min_export_price=self._get_min_export_price(),
                 slot_day_index=slot_day_index,
+                # A fixed historical window, not a rolling horizon: a partial final day
+                # (any window ending today) must still be held to its prorated target.
+                relax_truncated_day=False,
             )
         )
         # Carried through to _compute_bill_items so capped-rate tiers in the cost
