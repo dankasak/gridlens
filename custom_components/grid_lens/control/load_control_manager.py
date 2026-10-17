@@ -1639,9 +1639,31 @@ class LoadControlManager:
 
     def status(self) -> dict:
         now = dt_util.now()
+        current = self._current_interval(now)
         devices = {}
         for i, c in self.controllers.items():
             bonus_w, bonus_kwh = self._shadow_bonus(i, now)
+            plan_w = max(0.0, self._device_power_now(i, current))
+            # The series that is actually comparable to `forecast_target_w`.
+            #
+            # Condition #3 publishes the rate it wants the device to run at NOW. The LP's
+            # bonus is energy ON TOP of the plan, so it reads 0 whenever the plan already
+            # covers the slot — which is most of the time. Comparing the two raw numbers
+            # therefore measures nothing: over the first 26 h of shadow data they were
+            # never both non-zero on the same tick (207 greedy-only, 7 shadow-only, 0
+            # both), not because they disagreed but because they are different quantities.
+            # `plan_w + bonus_w`, snapped to what the device can physically do (#3's
+            # target is already snapped, so an unsnapped total wouldn't be commensurable
+            # either), is the LP's answer to #3's question. Snapping here also covers the
+            # cutover gap noted in OPEN_ITEMS: the raw bonus is unsnapped (3300 W = 13.75 A
+            # on a 240 V charger), and step 5 of the cutover deletes #3's `_snap_w` path.
+            # Snap only a positive want: an on/off load's _forecast_surplus_snap_w returns
+            # max_w regardless of what it was handed (it can only run fully on), so
+            # snapping a zero would report the device's full rating as the LP's answer.
+            total_w = None
+            if bonus_w is not None:
+                want_w = plan_w + bonus_w
+                total_w = c._forecast_surplus_snap_w(want_w) if want_w > 0.0 else 0.0
             devices[i] = {
                 "enabled": self._enabled.get(i, False),
                 "want_enabled": self._want_enabled.get(i, False),
@@ -1649,6 +1671,14 @@ class LoadControlManager:
                 # Shadow mode (2026-10-16): the LP's own answer to condition #3's question.
                 "lp_bonus_w": round(bonus_w, 1) if bonus_w is not None else None,
                 "lp_bonus_kwh_ahead": round(bonus_kwh, 2) if bonus_kwh is not None else None,
+                "lp_bonus_total_w": round(total_w, 1) if total_w is not None else None,
+                # The plan's own rate for this device in the current slot, and that slot's
+                # start. Both published so a history-based comparison can be reconstructed
+                # from the control switch alone: `sensor.*_planned_dispatch` is in
+                # configuration.yaml's recorder `exclude` (its trajectory attribute busts
+                # the 16 KB limit), so nothing else in the recorder says what the plan was.
+                "plan_w": round(plan_w, 1),
+                "plan_slot_start": current.start.isoformat() if current is not None else None,
             }
         return {
             "entitled": self._entitled,

@@ -1623,6 +1623,33 @@ first (bonus-aware consolidation, P10 sizing): `docs/OPEN_ITEMS.md`. Tests:
 `tests/test_lp_bonus.py` (needs real scipy — run on the LXC). Conditions #1/#2 and the 30 s
 modulation loop stay controller-side permanently: they correct forecast error live.
 
+**Comparing the shadow bonus against condition #3 — use `lp_bonus_total_w`, not
+`lp_bonus_w`** (added 2026-10-17, after the first 26 h of shadow data). The two are
+different quantities: `forecast_target_w` is the rate #3 wants *now*, while `lp_bonus_w` is
+energy **on top of** the plan, so it reads 0 whenever the plan already covers the slot.
+Comparing them raw measures nothing — over that first window they were never both non-zero
+on the same tick (207 greedy-only, 7 shadow-only, 0 both), because of the units mismatch,
+not disagreement. So the manager also publishes:
+
+| Attribute | Meaning |
+|---|---|
+| `plan_w` | the plan's own rate for this device in the current slot |
+| `lp_bonus_total_w` | `plan_w + lp_bonus_w`, snapped to what the device can physically do — the LP's actual answer to #3's question, and the series to compare against `forecast_target_w` |
+| `plan_slot_start` | the current plan slot's start, so a history-only comparison can be reconstructed from the control switch alone (`sensor.*_planned_dispatch` is in `configuration.yaml`'s recorder `exclude` — its `trajectory` busts the 16 KB attribute limit — so nothing else in the recorder records what the plan was) |
+| `plugged_in` | now on **every** control switch (`None` = no plug signal configured, read as "assume connected"), not just modulating ones, so a comparison can discard samples where the device physically couldn't draw |
+
+`forecast_target_w` is also **zeroed when the device is known unplugged**. It used to keep
+advertising a target an absent car could not act on: 26% of that first shadow window was an
+unplugged EV still showing a mean 1627 W, every sample of it scored as the LP "disagreeing".
+The forecast-surplus *condition* still matches while unplugged (so `greedy_reason` reads
+`forecast_surplus`) — that lives in #3's controller code, which the cutover deletes anyway.
+
+**Analysing this from the recorder:** HA's history API drops attribute-only changes unless
+you pass `significant_changes_only=0`, and then silently truncates long windows (a 40 h
+request returned rows only to the 16 h mark, with no error) — query in chunks of ~4 h and
+stitch, or you will conclude there is no data. `tools/ha_peek.py why` prints all of the
+above.
+
 **Condition 2's bar is lower for a modulating load** (§6a). An on/off load has to clear
 `max_w` — all-or-nothing, so turning it on when only part of its draw is covered would create
 real import. A modulating load can absorb *any* surplus, so its bar is `min_w` instead. That's
@@ -2817,7 +2844,7 @@ that?" has to be answerable from the dashboard alone.
 | Surface | Answers |
 |---|---|
 | `switch.*_battery_control` attributes | Applied action/power, last tick, plan age, degraded state, note. |
-| `switch.*_<device>_control` attributes | Commanded state, threshold, override, all three greedy toggles, **`greedy_reason`**, **`greedy_blocked`**, **`forecast_free_kwh` / `forecast_needed_kwh` / `forecast_target_w` / `forecast_battery_headroom_w` / `forecast_battery_headroom_kwh`**, note. `forecast_target_w` is the proportional power condition 3 is asking for right now (0 when it isn't firing); the `_kwh` headroom figure backs the transient-dip check. Modulating devices add `control_type`, `setpoint_entity`, `min_w`/`cap_w`, `commanded_w`/`commanded_setpoint`, `plugged_in`, `last_write`, `modulation_source`. **Refreshed every tick** (`_tick_device` / `_fast_tick_device` call `_notify`, added 2026-09-11) — before, these froze at whatever the last `enable`/`disable`/override action produced, so the card could show `note: not_started` for hours while greedy was in fact evaluating every 5 min. |
+| `switch.*_<device>_control` attributes | Commanded state, threshold, override, all three greedy toggles, **`greedy_reason`**, **`greedy_blocked`**, **`forecast_free_kwh` / `forecast_needed_kwh` / `forecast_target_w` / `forecast_battery_headroom_w` / `forecast_battery_headroom_kwh`**, note. `forecast_target_w` is the proportional power condition 3 is asking for right now (0 when it isn't firing, and 0 whenever `plugged_in` is `False` — see §7); the `_kwh` headroom figure backs the transient-dip check. Also `name` (the authoritative device label — an entity_id slug is **not**, see §11a), `plugged_in`, `plan_w`, `plan_slot_start`, and the shadow-bonus trio `lp_bonus_w` / `lp_bonus_kwh_ahead` / `lp_bonus_total_w`. Modulating devices add `control_type`, `setpoint_entity`, `min_w`/`cap_w`, `commanded_w`/`commanded_setpoint`, `last_write`, `modulation_source`. **Refreshed every tick** (`_tick_device` / `_fast_tick_device` call `_notify`, added 2026-09-11) — before, these froze at whatever the last `enable`/`disable`/override action produced, so the card could show `note: not_started` for hours while greedy was in fact evaluating every 5 min. |
 | **Load Control card** | Per row: control state, and a live greedy line — the firing reason (condition 3 shows the proportional draw, e.g. "soaking forecast surplus at ~840 W"), or why it's blocked (including **"export is being wasted, but no grid power sensor is set"**, §7 — the only blocked state that will *never* clear on its own, so it names the fix rather than reading as "not yet"), or the **forecast-surplus progress bar** (`6.2 / 8.0 kWh`, hover/focus tooltip explains it — the bar reaches 100% exactly when the rate would clear an on/off device's full draw). Shown both while armed and tracking toward the trigger, and after it's fired (condition 3 held it on) — the same bar, capped at 100%, rather than only appearing pre-trigger. For a modulating device (§6a): live amps + kW, the max-current ceiling input, and a one-line "why" — `modulation_source` (plan / surplus / override / off) and `plugged_in`. "Why is my car charging at 8 A right now?" must be answerable from the row. A device whose SOC ceiling is why today's scheduled charge falls short of its 14-day average (`ev_soc_status.soc_limited`) gets a **"SOC-limited · `<got>` of ~`<target>` kWh"** line next to that average, tooltip explaining the headroom maths and pointing at Max SOC % in Reconfigure (2026-09-07). |
 | **Load Control card → Estimator panel** | Per-device toggle (rows backed by a `LoadEstimator`, §5, only) expanding: current estimate/seed kW/sample count/calibration source, a convergence chart of the estimate over time, and the last 8 accept/reject decisions with why (`implausible`, `contaminated`, own-meter `too_short`/`counter_reset`). "Why does this estimate look wrong?" must be answerable without `ha core logs`. |
 | **Power Flow card** | A badge on a load node while *greedy*, not the plan, is holding it on — leaf for the two instantaneous reasons, sun-alert for forecast surplus, with the kWh figures in the tooltip. |

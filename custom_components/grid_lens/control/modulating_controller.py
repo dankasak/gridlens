@@ -897,7 +897,7 @@ class ModulatingLoadController(DeferrableLoadController):
             "max_current_a": (
                 round(self._current_cap_a, 2) if self._current_cap_a is not None else None
             ),
-            "plugged_in": self.plugged_in(),
+            # `plugged_in` is set by the base status() (which calls this class's override).
             "last_write": self._last_write_at.isoformat() if self._last_write_at else None,
             "modulation_source": self._modulation_source,
             "planned_w": round(self._planned_w, 1),

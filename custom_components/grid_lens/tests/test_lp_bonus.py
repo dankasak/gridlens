@@ -20,6 +20,7 @@ What's covered:
   7. def + bonus never exceeds the device's rating in a slot.
   8. Bonus is scoped to day 0 (no bonus on later calendar days).
   9. Minimum Export Price: below-floor export counts as spill.
+ 10. The bonus can land in SLOT 0 — the only slot live control would act on.
 
 Run:  python3 test_lp_bonus.py
 """
@@ -185,6 +186,31 @@ def test_min_export_price_floor():
           f"bonus={sum(_bonus(with_floor)):.2f}")
     check("9. 3c export with no floor -> no bonus", sum(_bonus(no_floor)) < 1e-3,
           f"bonus={sum(_bonus(no_floor)):.3f}")
+
+
+def test_bonus_can_land_in_slot_0():
+    """The bonus must be allocatable to slot 0 — the only slot live control acts on.
+
+    Why this is pinned: over shadow mode's first 26 h (2026-10-16/17) the published
+    ``lp_bonus_w`` — slot 0's bonus — was 0 in 929 of 941 samples, while
+    ``lp_bonus_kwh_ahead`` was non-zero in 524 of them. The solve kept saying "bonus
+    later, none now". That is legitimate whenever the plan already fills slot 0 at the
+    device's rating (test 7 covers the sharing), but it is also exactly the shape a
+    rolling-horizon "always defer" bug makes: each replan pushes the bonus one slot out
+    and it never executes. Known adjacent defect, still unfixed: ``ev_soc[0]`` is pinned
+    to ``initial_kwh`` without slot 0's draw (OPEN_ITEMS). So assert the reachable case
+    directly — spill in slot 0, with the daily target too small to claim the whole rating.
+    """
+    opt = _optimizer()
+    solar = [12.0] + _solar(8.0)[1:]        # spilling right now, not just this afternoon
+    res = _solve(opt, solar, LOAD, IMP, [0.0] * 24, [_dev(max_kw=2.0, daily=0.5)])
+    b = _bonus(res)
+    slot0 = res["schedule"][0]
+    check("10. bonus can land in slot 0", b[0] > 1e-3,
+          f"slot0_bonus={b[0]:.3f} total_bonus={sum(b):.2f}")
+    check("10. slot 0 def + bonus <= max_kw",
+          slot0["deferrable_per_device"][0] + b[0] <= 2.0 + 1e-6,
+          f"def={slot0['deferrable_per_device'][0]:.3f} bonus={b[0]:.3f}")
 
 
 if __name__ == "__main__":

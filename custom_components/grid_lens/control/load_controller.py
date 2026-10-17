@@ -378,6 +378,17 @@ class DeferrableLoadController:
             return True
         return False
 
+    def plugged_in(self) -> Optional[bool]:
+        """Whether the device is physically connected and therefore able to draw at all.
+
+        ``None`` means "no plug signal is configured, so we can't tell", and every caller
+        must read that as "assume connected" — GridLens never withholds energy because it
+        couldn't confirm a plug. Only ``ModulatingLoadController`` (an EV charger with a
+        plug/charger-status entity) can really answer this; it's defined here so
+        ``status()`` always carries the key and a consumer never has to treat an absent
+        key as a third case."""
+        return None
+
     def _export_surplus_threshold_w(self) -> float:
         """Export (W) the house must already be spilling before greedy condition #2 fires.
 
@@ -830,7 +841,21 @@ class DeferrableLoadController:
             "forecast_needed_kwh": (
                 round(self._greedy_needed_kwh, 2) if self._greedy_needed_kwh is not None else None
             ),
-            "forecast_target_w": round(self._greedy_forecast_target_w, 1),
+            # Zeroed when the device is KNOWN unplugged: it cannot draw, so a non-zero
+            # target here is a rate nothing can act on. It was published anyway until
+            # 2026-10-17, which quietly corrupted the shadow comparison against the LP
+            # bonus below — 26% of the first shadow window's samples were an unplugged car
+            # still advertising a mean 1627 W, all of them counted as the LP "disagreeing".
+            # `plugged_in() is None` ("can't tell") deliberately still reports the target,
+            # same assume-connected rule as plugged_in()'s own docstring.
+            # NOTE: the forecast-surplus *condition* still matches while unplugged (so
+            # `greedy_reason` reads "forecast_surplus"); that lives in #3's controller code,
+            # which the LP-bonus cutover deletes outright — see OPEN_ITEMS.
+            "forecast_target_w": round(
+                0.0 if self.plugged_in() is False else self._greedy_forecast_target_w, 1
+            ),
+            # Always present, None on everything but a modulating load with a plug entity.
+            "plugged_in": self.plugged_in(),
             # Battery headroom backing the forecast-surplus gate: free discharge rate now
             # (W) and energy to the configured minimum SOC (kWh). None = no battery / no
             # capacity configured, or a sensor couldn't be read.
