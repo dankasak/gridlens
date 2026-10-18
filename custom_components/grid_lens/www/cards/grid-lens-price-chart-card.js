@@ -17,7 +17,7 @@
  *   entity: sensor.roof_grid_lens_nsw_planned_dispatch   (required)
  *   show_cash_bars: true     (optional, default true — false = rates only, as before)
  */
-import { GridLensChartCardBase, multiLineChart, fmtHour, fmtC, RIGHT_AXIS_MR } from './grid-lens-chart-common.js?v=20261018a';
+import { GridLensChartCardBase, multiLineChart, fmtHour, fmtC, RIGHT_AXIS_MR } from './grid-lens-chart-common.js?v=20261018b';
 
 class GridLensPriceChartCard extends GridLensChartCardBase {
   get title() { return this._cashBars() ? 'Price ($/kWh) & today\'s cost / credit' : 'Price ($/kWh)'; }
@@ -120,6 +120,13 @@ class GridLensPriceChartCard extends GridLensChartCardBase {
     ], {
       fmt: (v) => v.toFixed(2),
       mr: RIGHT_AXIS_MR,
+      // Headroom above the day's highest rate. Without it the buy line runs along the
+      // top frame through the whole evening peak — the most interesting part of the day
+      // drawn where it's least legible, and indistinguishable from a line clipped off
+      // the top. 20% is enough to read the peak as a peak while barely compressing the
+      // rest of the range, and it also opens a gap for the credit bars hanging from
+      // that same edge.
+      yPad: 0.2,
       // Cost shares the buy line's colour and credit the sell line's, because each bar
       // is literally that rate times the energy it moved — the pairing is the point,
       // and a fourth and fifth hue here would read as two more unrelated series.

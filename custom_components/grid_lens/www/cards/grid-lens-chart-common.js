@@ -448,6 +448,20 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
     if (extentSeries[i] && extentSeries[i].axis === 'right') return;
     for (const p of pts) { if (p.v > yMax) yMax = p.v; if (p.v < yMin) yMin = p.v; }
   });
+  // opts.yPad adds headroom as a fraction of the data range, so a series peaking at the
+  // day's maximum isn't drawn along the very top edge of the plot — where it merges with
+  // the frame and its peak can't be told from a clipped one. Matters more on the price
+  // chart than elsewhere, because the cost/credit bars hang from that same top edge.
+  // Applied before `symmetric` so a symmetric axis stays symmetric, and only to a side
+  // the caller didn't pin: an explicit yMin/yMax is a deliberate scale, not a hint.
+  if (opts.yPad) {
+    const pad = (yMax - yMin) * opts.yPad;
+    if (opts.yMax == null) yMax += pad;
+    // The floor is padded only when the data actually goes negative (a negative feed-in
+    // rate, say). Otherwise zero IS the natural bottom of the axis, and lifting the
+    // baseline off it would draw "free" as visibly above the axis' own zero line.
+    if (opts.yMin == null && yMin < 0) yMin -= pad;
+  }
   if (opts.symmetric) { const m = Math.max(Math.abs(yMin), Math.abs(yMax)); yMin = -m; yMax = m; }
   if (yMax === yMin) yMax = yMin + 1;
   const Y = (v) => g.mt + (1 - (v - yMin) / (yMax - yMin)) * (g.h - g.mt - g.mb);
@@ -561,8 +575,11 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // asks of this overlay is "did the sell side cover the buy side" — which a pair of
   // independently-normalised scales silently answers wrong, making a 4c credit bar and
   // a $4 cost bar the same height. `frac` caps how much of the plot height either
-  // direction may claim (default 0.34), leaving the middle band clear for the rate
-  // lines that are still the chart's primary subject.
+  // direction may claim (default 0.42), leaving the middle band clear for the rate
+  // lines that are still the chart's primary subject. Raised from 0.34: a day's typical
+  // half-hour is a small fraction of its peak half-hour, so capping tightly against that
+  // peak left the ordinary slots as stubs — the cap only has to keep the *peak* bar off
+  // the rate lines, and `opts.yPad` now keeps those lines clear of both edges anyway.
   //
   // A row's own `actual` flag (not its position relative to "now") picks the opacity:
   // measured money is drawn solid, planned money faintly. The current slot is part
@@ -571,7 +588,7 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   const barCfg = opts.bars;
   if (barCfg && (barCfg.up || barCfg.down)) {
     const rows = barCfg.rows || traj;
-    const frac = barCfg.frac != null ? barCfg.frac : 0.34;
+    const frac = barCfg.frac != null ? barCfg.frac : 0.42;
     const plotH = g.h - g.mt - g.mb;
     const bottom = g.h - g.mb;
     const step = barCfg.step || timeScale.step || 1800000;

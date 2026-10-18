@@ -2733,9 +2733,26 @@ the legend. `show_cash_bars: false` returns the card to rates-only.
 - **Both bar directions share ONE magnitude scale**, because the question the overlay is
   actually asked is "did the sell side cover the buy side" — two independently-normalised
   scales answer that silently wrong, making a 4c credit bar and a $4 cost bar the same
-  height. `frac` (default 0.34) caps how much of the plot height either direction may claim.
+  height. `frac` (default 0.42) caps how much of the plot height either direction may claim.
   The scale is computed from the **visible** rows only, so zooming into a quiet evening
   doesn't leave every bar a 1px stub measured against the day's solar-export peak.
+- **Headroom tuning (2026-10-18, same day).** As first shipped, the bars were capped at
+  `frac` 0.34 and the left price axis ran exactly to the day's highest rate — so the buy
+  line was drawn *along the top frame* for the whole evening peak (the most interesting
+  part of the day rendered where it's least legible, and indistinguishable from a line
+  clipped off the top), while a typical half-hour's bar, measured against that day's peak
+  half-hour, was a stub. Two changes, from opposite ends:
+  - `multiLineChart` gained **`opts.yPad`** — headroom as a fraction of the data range,
+    added to the extent *after* it's computed from the data and *before* `opts.symmetric`
+    (so a symmetric axis stays symmetric). The price chart passes `yPad: 0.2`. Only widens,
+    and only on a side the caller hasn't pinned with an explicit `yMin`/`yMax`, which is a
+    deliberate scale rather than a hint. The floor is padded **only when the data actually
+    goes negative** (a negative feed-in rate) — otherwise zero is the natural bottom of the
+    axis and lifting the baseline off it would draw "free" as visibly above zero. Opt-in:
+    no other chart passes it, so no other chart's scale moved.
+  - `frac` default 0.34 → **0.42**, letting ordinary slots read as something other than
+    stubs. The cap only ever has to keep the *peak* bar off the rate lines, and `yPad` now
+    keeps those lines clear of both edges anyway.
 - **Degrades to nothing.** No energy sensors configured, no statistics yet, a restored/cached
   plan, or an older integration → no row carries a figure, `_barRows()` returns null and the
   chart is exactly what it was before this feature existed. Note that is *not* the same as an
