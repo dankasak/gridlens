@@ -546,6 +546,88 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
     }
     bands += `<rect ${rectAttrs} fill="${b.color}" opacity="${op}"/>`;
   });
+
+  // Optional per-slot bar overlay drawn UNDER the grid and every line, from
+  // opts.bars = { rows, up: {key, color}, down: {key, color}, frac?, ticks?, step? }.
+  //
+  // `up` bars grow from the plot's bottom edge, `down` bars hang from its top edge —
+  // one slot-wide rect each, so a slot that both bought and sold (quite normal across
+  // 30 minutes) shows both without either hiding the other. This is a magnitude
+  // overlay, not a third line: it deliberately does NOT use the left axis (that one is
+  // $/kWh — a rate) and it has no business stretching it, nor using `rightAxis`, whose
+  // whole job is scaling one *line* against a second labelled scale.
+  //
+  // Both directions share ONE magnitude scale, because the question a reader actually
+  // asks of this overlay is "did the sell side cover the buy side" — which a pair of
+  // independently-normalised scales silently answers wrong, making a 4c credit bar and
+  // a $4 cost bar the same height. `frac` caps how much of the plot height either
+  // direction may claim (default 0.34), leaving the middle band clear for the rate
+  // lines that are still the chart's primary subject.
+  //
+  // A row's own `actual` flag (not its position relative to "now") picks the opacity:
+  // measured money is drawn solid, planned money faintly. The current slot is part
+  // elapsed and part forecast, and only the publisher knows which side a row came from.
+  let barSvg = '', barTicks = '', barPeak = 0;
+  const barCfg = opts.bars;
+  if (barCfg && (barCfg.up || barCfg.down)) {
+    const rows = barCfg.rows || traj;
+    const frac = barCfg.frac != null ? barCfg.frac : 0.34;
+    const plotH = g.h - g.mt - g.mb;
+    const bottom = g.h - g.mb;
+    const step = barCfg.step || timeScale.step || 1800000;
+    const val = (row, cfg) => (cfg ? Math.abs(+row[cfg.key] || 0) : 0);
+    // Scale off the VISIBLE rows only, so zooming into a quiet evening doesn't leave
+    // every bar a 1px stub measured against the day's solar-export peak.
+    const vis = (rows || []).map((row) => {
+      const ms = new Date(row.start).getTime();
+      return { row, ms, visible: ms + step > t0 && ms < t1 };
+    }).filter((r) => r.visible && !isNaN(r.ms));
+    for (const { row } of vis) {
+      barPeak = Math.max(barPeak, val(row, barCfg.up), val(row, barCfg.down));
+    }
+    if (barPeak > 0) {
+      const barH = (v) => (v / barPeak) * plotH * frac;
+      for (const { row, ms } of vis) {
+        const x0 = Math.max(X(ms), g.ml), x1 = Math.min(X(ms + step), g.w - g.mr);
+        const w = x1 - x0;
+        if (!(w > 0.3)) continue;
+        // Hairline gap between neighbours so a run of similar slots still reads as
+        // discrete half-hours rather than one solid block, but never so wide that a
+        // zoomed-out bar disappears into its own gap.
+        const gap = Math.min(0.8, w * 0.12);
+        const op = row.actual ? 0.55 : 0.2;
+        const rect = (cfg, fromTop) => {
+          const h = barH(val(row, cfg));
+          if (!(h > 0.3)) return '';
+          return `<rect x="${(x0 + gap / 2).toFixed(1)}" y="${(fromTop ? g.mt : bottom - h).toFixed(1)}"`
+            + ` width="${(w - gap).toFixed(1)}" height="${h.toFixed(1)}" fill="${cfg.color}" opacity="${op}"/>`;
+        };
+        barSvg += rect(barCfg.up, false) + rect(barCfg.down, true);
+      }
+      // Tick MARKS only — no values. The overlay's job is comparison between slots and
+      // between the two directions, and a reader gets that from bar heights against
+      // evenly-spaced marks; printing dollar figures up the edge would both clutter the
+      // chart and invite reading the rate lines off the same numbers. Each direction's
+      // marks take that direction's colour so which scale runs from which edge is never
+      // ambiguous, and the exact figures live in the crosshair tooltip.
+      const nTicks = barCfg.ticks != null ? barCfg.ticks : 3;
+      const axX = g.w - g.mr;
+      for (let k = 1; k <= nTicks; k++) {
+        const h = plotH * frac * (k / nTicks);
+        const len = k === nTicks ? 5 : 3;
+        if (barCfg.up) {
+          barTicks += `<line x1="${axX}" y1="${(bottom - h).toFixed(1)}" x2="${axX + len}" y2="${(bottom - h).toFixed(1)}"`
+            + ` stroke="${barCfg.up.color}" stroke-width="1" opacity="0.8"/>`;
+        }
+        if (barCfg.down) {
+          barTicks += `<line x1="${axX}" y1="${(g.mt + h).toFixed(1)}" x2="${axX + len}" y2="${(g.mt + h).toFixed(1)}"`
+            + ` stroke="${barCfg.down.color}" stroke-width="1" opacity="0.8"/>`;
+        }
+      }
+      barTicks += `<line x1="${axX}" y1="${g.mt}" x2="${axX}" y2="${bottom}" stroke="var(--axis)" stroke-width="1" opacity="0.5"/>`;
+    }
+  }
+
   // Right-axis ticks are drawn in the axis' own colour, and its series is drawn in that
   // same colour, because the one real hazard of a secondary axis is a reader taking a
   // value off the wrong scale. Colour is what ties a curve to the axis it belongs to;
@@ -682,7 +764,10 @@ export function multiLineChart(traj, timeScale, series, opts = {}) {
   // explicit CSS height (e.g. grid-lens-power-chart-card's max_height) whose aspect
   // ratio doesn't match the viewBox gets letterboxed: the default "xMidYMid meet"
   // scales uniformly and pads the mismatch as empty space above/below the plot.
-  return `<svg viewBox="0 0 ${g.w} ${g.h}" preserveAspectRatio="none" class="chart-svg" role="img"><defs>${bandDefs}${defs}</defs>${bands}${grid}${zero}${rgrid}${xt}${now}${paths}`
+  // Bars sit above the time bands but below the gridlines, so the horizontal rules stay
+  // readable across them and the rate lines they exist to contextualise are never
+  // occluded. Their tick marks go after the grid, outside the plot, with the axes.
+  return `<svg viewBox="0 0 ${g.w} ${g.h}" preserveAspectRatio="none" class="chart-svg" role="img"><defs>${bandDefs}${defs}</defs>${bands}${barSvg}${grid}${zero}${barTicks}${rgrid}${xt}${now}${paths}`
     + `<line class="xhair" x1="0" x2="0" y1="${g.mt}" y2="${g.h - g.mb}" stroke="var(--ink2)" stroke-width="1" opacity="0"/></svg>`;
 }
 

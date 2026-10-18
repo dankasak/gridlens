@@ -58,6 +58,9 @@ class AdvisoryDispatchSensor(CoordinatorEntity, SensorEntity):
             if data.get("past_rates"):
                 # Elapsed-today buy/sell rate slots — the price chart card prepends these to
                 # the forward trajectory so it can draw the part of today already gone.
+                # Each row also carries what that slot actually cost/earned (metered kWh
+                # priced against the plan — see advisory/today_cash.py), which is what the
+                # chart's cost/credit bars draw for the elapsed half of the day.
                 attrs["past_rates"] = data["past_rates"]
             attrs.update(data.get("attributes", {}))  # generated_at, trajectory, soc, cost…
         return attrs

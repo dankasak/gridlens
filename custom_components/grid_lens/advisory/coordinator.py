@@ -23,6 +23,8 @@ from .. import charge_target as ct
 from .. import charge_timing_preference as ctp
 from ..battery_optimizer import BatteryOptimizer
 from ..const import (
+    CONF_ENERGY_SENSOR,
+    CONF_GRID_EXPORT_SENSOR,
     CONF_HAS_DEMAND_TARIFF,
     CONF_SHADE_CORRECTION_ENABLED,
     DEFAULT_DEMAND_WINDOW_HOURS,
@@ -40,6 +42,7 @@ from .forecast import FlatLoadForecaster, ForecastProvider, HourOfDayLoadForecas
 from .load_history import build_hour_of_day_load
 from .planner import AdvisoryPlanner
 from .rates import PlanRateForecaster
+from .today_cash import async_attach_actual_cash
 from ..retailer_plans import build_rate_caps, build_conditional_credits
 
 _LOGGER = logging.getLogger(__name__)
@@ -1107,7 +1110,7 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             "next_action": next_action,
             "next_power_w": round(next_power, 1),
             "attributes": result.to_attributes(),
-            "past_rates": self._elapsed_today_rates(bundle.start),
+            "past_rates": await self._elapsed_today_cash(bundle.start),
             "sources": bundle.sources,
             "plan_name": f"{self._plan.retailer} - {self._plan.plan_name}",
         }
@@ -1140,3 +1143,24 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("elapsed-today rate curve failed", exc_info=True)
             return []
         return out
+
+    async def _elapsed_today_cash(self, plan_start: datetime) -> list[dict]:
+        """``_elapsed_today_rates`` plus what each elapsed slot actually cost/earned.
+
+        The rate curve is built first and published whether or not the money can be
+        worked out, so a missing energy sensor or an empty recorder costs the price
+        chart its cost/credit bars and nothing else. See advisory/today_cash.py for
+        why these figures are metered rather than taken from the LP's trajectory.
+        """
+        rows = self._elapsed_today_rates(plan_start)
+        if not rows:
+            return rows
+        try:
+            return await async_attach_actual_cash(
+                self.hass, self._plan, rows, SLOT_MINUTES,
+                self._cfg(CONF_ENERGY_SENSOR, None),
+                self._cfg(CONF_GRID_EXPORT_SENSOR, None),
+            )
+        except Exception:  # noqa: BLE001 — bars are cosmetic; the plan is not
+            _LOGGER.debug("elapsed-today cash curve failed", exc_info=True)
+            return rows
