@@ -50,11 +50,30 @@ def _stub_ha():
 
 
 def _load():
+    """Load advisory/today_cash.py with just enough package context for its
+    ``from ..cap_periods import ...`` to resolve, without importing the real
+    component (which would drag in Home Assistant proper). cap_periods.py is
+    pure, so it loads from source as-is and these tests exercise the same
+    bucketing/allowance code the bill breakdown uses."""
     _stub_ha()
-    path = os.path.join(_COMPONENT, "advisory", "today_cash.py")
-    spec = importlib.util.spec_from_file_location("today_cash", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    pkg = types.ModuleType("_gl")
+    pkg.__path__ = [_COMPONENT]
+    sys.modules["_gl"] = pkg
+    sub = types.ModuleType("_gl.advisory")
+    sub.__path__ = [os.path.join(_COMPONENT, "advisory")]
+    sys.modules["_gl.advisory"] = sub
+
+    def _load_src(name, path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    caps = _load_src("_gl.cap_periods", os.path.join(_COMPONENT, "cap_periods.py"))
+    mod = _load_src("_gl.advisory.today_cash",
+                    os.path.join(_COMPONENT, "advisory", "today_cash.py"))
+    mod._caps = caps
     return mod
 
 
@@ -87,6 +106,26 @@ class CappedExportPlan(FlatPlan):
     def get_export_rate_info(self, dt):
         return {"rate": self._boosted, "label": "Feed-in", "daily_cap_kwh": self._cap,
                 "rate_after_cap": self._base, "cap_period": self._period,
+                "cap_application": self._application}
+
+
+class WindowCappedPlan(FlatPlan):
+    """Boosted export capped only inside a window — outside it there's no cap at
+    all, so a cap scan must not conclude from one slot that there's nothing to
+    seed (or from another that there is)."""
+
+    def __init__(self, lo=10, hi=15, period="day", application="pooled"):
+        super().__init__()
+        self._lo, self._hi = lo, hi
+        self._period, self._application = period, application
+
+    def get_export_rate_info(self, dt):
+        if not (self._lo <= dt.hour < self._hi):
+            return {"rate": 0.05, "label": "Feed-in", "daily_cap_kwh": None,
+                    "rate_after_cap": None, "cap_period": "day",
+                    "cap_application": "strict"}
+        return {"rate": 0.20, "label": "Super Export", "daily_cap_kwh": 5.0,
+                "rate_after_cap": 0.03, "cap_period": self._period,
                 "cap_application": self._application}
 
 
@@ -163,15 +202,167 @@ def test_daily_export_cap(m):
     check("slot 3 rate is post-cap", rows[3]["export_rate"], 0.03)
 
 
-def test_non_daily_cap_left_alone(m):
-    print("monthly/pooled cap: priced at posted rate, not guessed")
-    for period, application in (("month", "strict"), ("day", "pooled")):
+def test_pooled_cap_pools_over_the_billing_period(m):
+    print("pooled day cap: allowance is the per-day figure x the billing period")
+    # 5 kWh/day pooled over a 31-day October = 155 kWh for the month, so 8 kWh
+    # exported today is nowhere near it and every kWh earns the boosted rate.
+    rows = _rows(4)
+    m.attach_cash(CappedExportPlan(boosted=0.20, base=0.03, cap=5.0,
+                                   period="day", application="pooled"),
+                  rows, [0] * 4, [2.0] * 4, None, 31)
+    check("all 8 kWh boosted", round(sum(r["credit"] for r in rows), 6), 1.60)
+    # Priced as STRICT daily it would have hit the 5 kWh cap mid-morning — the
+    # bug this fixes drew that as a credit collapse the retailer never applied.
+    strict = _rows(4)
+    m.attach_cash(CappedExportPlan(boosted=0.20, base=0.03, cap=5.0),
+                  strict, [0] * 4, [2.0] * 4)
+    check("strict daily would have under-credited", round(sum(r["credit"] for r in strict), 6), 1.09)
+
+
+def test_pooled_cap_with_period_to_date_seed(m):
+    print("pooled cap, allowance mostly spent earlier in the month")
+    plan = CappedExportPlan(boosted=0.20, base=0.03, cap=5.0,
+                            period="day", application="pooled")
+    # 150 of the month's 155 kWh already exported before today -> 5 kWh left.
+    seed = {("export", None, "Feed-in"): 150.0}
+    rows = _rows(4)
+    m.attach_cash(plan, rows, [0] * 4, [2.0] * 4, seed, 31)
+    check("slot 0 fully boosted", rows[0]["credit"], 0.40)
+    check("slot 1 fully boosted", rows[1]["credit"], 0.40)
+    check("slot 2 straddles the pool", rows[2]["credit"], 0.20 + 0.03)
+    check("slot 3 fully post-cap", rows[3]["credit"], 0.06)
+    check("day total", round(sum(r["credit"] for r in rows), 6), 1.09)
+    # Over-stating the credit is exactly the symptom that was reported; an
+    # exhausted pool must price at the base rate, not the posted one.
+    spent = {("export", None, "Feed-in"): 155.0}
+    rows2 = _rows(4)
+    m.attach_cash(plan, rows2, [0] * 4, [2.0] * 4, spent, 31)
+    check("exhausted pool prices at the base rate",
+          round(sum(r["credit"] for r in rows2), 6), 0.24)
+
+
+def test_strict_monthly_cap(m):
+    print("strict monthly cap: one allowance for the whole month")
+    rows = _rows(4)
+    m.attach_cash(CappedExportPlan(boosted=0.20, base=0.03, cap=5.0,
+                                   period="month", application="strict"),
+                  rows, [0] * 4, [2.0] * 4)
+    check("5 kWh free then base rate", round(sum(r["credit"] for r in rows), 6), 1.09)
+    seeded = {("export", (2026, 10), "Feed-in"): 5.0}
+    rows2 = _rows(4)
+    m.attach_cash(CappedExportPlan(boosted=0.20, base=0.03, cap=5.0,
+                                   period="month", application="strict"),
+                  rows2, [0] * 4, [2.0] * 4, seeded)
+    check("month's allowance already gone", round(sum(r["credit"] for r in rows2), 6), 0.24)
+
+
+def test_cap_period_start(m):
+    print("cap_period_start: where the seed walk begins")
+    caps = m._caps
+    d = datetime(2026, 10, 18, 14, 30, tzinfo=TZ)   # a Sunday
+    check("strict day = today's midnight",
+          caps.cap_period_start("day", "strict", d).isoformat(),
+          datetime(2026, 10, 18, tzinfo=TZ).isoformat())
+    check("strict week = Monday",
+          caps.cap_period_start("week", "strict", d).isoformat(),
+          datetime(2026, 10, 12, tzinfo=TZ).isoformat())
+    check("strict month = the 1st",
+          caps.cap_period_start("month", "strict", d).isoformat(),
+          datetime(2026, 10, 1, tzinfo=TZ).isoformat())
+    check("strict quarter = 1 Oct",
+          caps.cap_period_start("quarter", "strict", d).isoformat(),
+          datetime(2026, 10, 1, tzinfo=TZ).isoformat())
+    check("strict year = 1 Jan",
+          caps.cap_period_start("year", "strict", d).isoformat(),
+          datetime(2026, 1, 1, tzinfo=TZ).isoformat())
+    # A pooled cap ignores cap_period entirely — its bucket is the billing
+    # period however the figure is expressed (GloBird's is "per day", pooled).
+    check("pooled day = billing period start",
+          caps.cap_period_start("day", "pooled", d).isoformat(),
+          datetime(2026, 10, 1, tzinfo=TZ).isoformat())
+    check("October bills 31 days", caps.billing_period_days(d), 31)
+    check("strict daily needs no history",
+          caps.cap_needs_history("day", "strict"), False)
+    check("pooled daily does", caps.cap_needs_history("day", "pooled"), True)
+    check("strict monthly does", caps.cap_needs_history("month", "strict"), True)
+
+
+def test_caps_needing_history_scan(m):
+    print("caps_needing_history: which directions need a seed walk, and from when")
+    slots = [datetime(2026, 10, 18, 0, 0, tzinfo=TZ) + timedelta(minutes=30 * i)
+             for i in range(48)]
+    need = m.caps_needing_history(FlatPlan(), slots)
+    check("no caps at all -> no walk", need, {})
+    need = m.caps_needing_history(CappedExportPlan(), slots)
+    check("strict daily cap -> no walk", need, {})
+    need = m.caps_needing_history(WindowCappedPlan(), slots)
+    check("pooled cap found on the export side only", sorted(need), ["export"])
+    check("walks from the billing period start", need["export"].isoformat(),
+          datetime(2026, 10, 1, tzinfo=TZ).isoformat())
+    # The capped rate only exists inside 10:00-15:00; slots outside it report no
+    # cap, and must not cancel out the ones that do.
+    need = m.caps_needing_history(WindowCappedPlan(), slots[:4])  # 00:00-01:30
+    check("no in-window slot today -> nothing to seed", need, {})
+
+
+def test_seed_from_hourly(m):
+    print("seed_from_hourly: spend the allowance the month already used")
+    plan = CappedExportPlan(boosted=0.20, base=0.03, cap=5.0,
+                            period="day", application="pooled")
+    midnight = datetime(2026, 10, 18, 0, 0, tzinfo=TZ)
+    recs = [_stat(midnight - timedelta(hours=h), 3.0) for h in range(1, 11)]
+    recs.append(_stat(midnight - timedelta(hours=3), -9.0))   # meter reset
+    recs.append(_stat(midnight + timedelta(hours=2), 7.0))    # today: not ours
+    cap_used = {}
+    walked = m.seed_from_hourly(plan, "export", recs, midnight, cap_used, 31)
+    check("walked only the pre-today hours", round(walked, 6), 30.0)
+    check("allowance spent matches", round(cap_used[("export", None, "Feed-in")], 6), 30.0)
+    # And the seed then prices today correctly: 155 - 30 = 125 kWh still free.
+    rows = _rows(2)
+    m.attach_cash(plan, rows, [0, 0], [2.0, 2.0], dict(cap_used), 31)
+    check("today still in the free tier", round(sum(r["credit"] for r in rows), 6), 0.80)
+
+
+def test_seed_falls_back_to_sum_diff(m):
+    print("hourly rows without `change`: differenced from `sum` instead")
+    plan = CappedExportPlan(boosted=0.20, base=0.03, cap=5.0,
+                            period="day", application="pooled")
+    midnight = datetime(2026, 10, 18, 0, 0, tzinfo=TZ)
+    # Cumulative sums only — no `change` key at all. 100 -> 130 over 3 hours.
+    recs = [{"start": (midnight - timedelta(hours=h)).astimezone(timezone.utc).timestamp(),
+             "sum": s}
+            for h, s in ((4, 100.0), (3, 110.0), (2, 120.0), (1, 130.0))]
+    cap_used = {}
+    walked = m.seed_from_hourly(plan, "export", recs, midnight, cap_used, 31)
+    check("differenced, first row is the baseline", round(walked, 6), 30.0)
+    check("allowance spent", round(cap_used[("export", None, "Feed-in")], 6), 30.0)
+    # A reset mid-window (sum drops) must not subtract.
+    reset = recs + [{"start": (midnight - timedelta(minutes=30)).astimezone(timezone.utc).timestamp(),
+                     "sum": 5.0}]
+    cap2 = {}
+    check("a sum that goes backwards is discarded, not subtracted",
+          round(m.seed_from_hourly(plan, "export", reset, midnight, cap2, 31), 6), 30.0)
+    # `change` wins when both are present.
+    both = [{"start": (midnight - timedelta(hours=1)).astimezone(timezone.utc).timestamp(),
+             "sum": 999.0, "change": 2.0}]
+    cap3 = {}
+    check("change preferred over sum when both present",
+          round(m.seed_from_hourly(plan, "export", both, midnight, cap3, 31), 6), 2.0)
+
+
+def test_seed_not_consumed_by_today(m):
+    print("a cached seed must still mean 'before today' after pricing today")
+    plan = CappedExportPlan(boosted=0.20, base=0.03, cap=5.0,
+                            period="day", application="pooled")
+    seed = {("export", None, "Feed-in"): 150.0}
+    for _ in range(3):
         rows = _rows(4)
-        m.attach_cash(CappedExportPlan(boosted=0.20, base=0.03, cap=5.0,
-                                       period=period, application=application),
-                      rows, [0] * 4, [2.0] * 4)
-        total = round(sum(r["credit"] for r in rows), 6)
-        check(f"{period}/{application} total stays at posted rate", total, 1.60)
+        # The entry point hands attach_cash a copy for exactly this reason; if it
+        # handed over the cache itself, each tick would re-spend today's export
+        # and the bars would decay through the afternoon.
+        m.attach_cash(plan, rows, [0] * 4, [2.0] * 4, dict(seed), 31)
+        check("same total on every tick", round(sum(r["credit"] for r in rows), 6), 1.09)
+    check("seed untouched", seed[("export", None, "Feed-in")], 150.0)
 
 
 def test_zero_kwh_keeps_posted_rate(m):
@@ -237,7 +428,12 @@ def test_shorter_kwh_lists(m):
 def main():
     m = _load()
     for fn in (test_flat_pricing, test_import_and_export_same_slot, test_daily_export_cap,
-               test_non_daily_cap_left_alone, test_zero_kwh_keeps_posted_rate,
+               test_pooled_cap_pools_over_the_billing_period,
+               test_pooled_cap_with_period_to_date_seed, test_strict_monthly_cap,
+               test_cap_period_start, test_caps_needing_history_scan,
+               test_seed_from_hourly, test_seed_falls_back_to_sum_diff,
+               test_seed_not_consumed_by_today,
+               test_zero_kwh_keeps_posted_rate,
                test_bucketing, test_bucketing_accepts_datetime_starts,
                test_tou_boundary, test_shorter_kwh_lists):
         fn(m)

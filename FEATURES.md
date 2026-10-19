@@ -2721,15 +2721,34 @@ the legend. `show_cash_bars: false` returns the card to rates-only.
   `cost`/`credit` are used **only** for future slots, where there is nothing else to show.
   Published as new keys (`buy_kwh`, `sell_kwh`, `cost`, `credit`, `actual`) on each
   `past_rates` row, so the card's existing `_combinedTraj()` picks them up unchanged.
-- **Daily capped tiers are honoured.** A plan with a boosted rate for the first N kWh/day
-  (and a base rate after) is walked cumulatively through the day, so the slot that straddles
-  the cap is split across both rates and its published `import_rate`/`export_rate` becomes
-  the blended rate actually charged — matching what the forward trajectory already does
-  for a tranche-split slot (`exp_rate_out` in `battery_optimizer.py`), so the line doesn't
-  change meaning at "now". A cap pooled over, or resetting on, a **longer** period
-  (week/month/billing period) needs usage from before today, which this deliberately does
-  not fetch; those are priced at the posted rate, the same safe direction
-  `PlanCalculator._cap_allowance` picks when it can't pool.
+- **Capped tiers are honoured, in every shape the plan data can express
+  (pooled caps fixed 2026-10-19).** A plan with a boosted rate for the first N kWh (and a
+  base rate after) is walked cumulatively, so the slot that straddles the cap is split
+  across both rates and its published `import_rate`/`export_rate` becomes the blended rate
+  actually charged — matching what the forward trajectory already does for a tranche-split
+  slot (`exp_rate_out` in `battery_optimizer.py`), so the line doesn't change meaning at
+  "now".
+  - The bucketing, the pooled-allowance sizing and the period start all come from
+    **`cap_periods.py`**, imported by both this module and `PlanCalculator._split_capped_kwh`.
+    They used to be private methods on `PlanCalculator`, and the bars shipped with their own
+    simplified second copy — see the "pooled caps" entry below for what that cost.
+  - A **pooled** cap accrues its stated per-day figure across the whole billing period, so
+    unused headroom banks (GloBird: "20kWh per day … 30 days in the billing period … your
+    step one allowance would be 600kWh"). Grid Lens treats the **calendar month** as the
+    billing period, the same assumption `advisory/demand.py` prices the demand charge on.
+  - A cap whose period began before today (pooled, or resetting weekly/monthly/quarterly/
+    yearly) needs to know how much allowance is already spent, so
+    `async_seed_cap_usage` walks **hourly** statistics from the period start to midnight and
+    spends the allowance through the same pricing function before today's first slot is
+    priced. 5-minute statistics are only retained for days, hence hourly; each hour is
+    priced as two half-hour halves so a rate window opening on the half hour doesn't take
+    the whole hour's energy into one tier. `change` is preferred per row, falling back to
+    differencing `sum` — a silently empty walk would look exactly like a fresh billing
+    period and restore the over-statement.
+  - The walk is **cached for the local day** (coordinator's `_cap_seed_cache`): its answer
+    covers [period start, today 00:00), which is fixed until tomorrow. `caps_needing_history`
+    gates it on the rate structure today's own slots resolve to, so a plan with no cap or a
+    strict daily cap does no history read at all.
 - **Both bar directions share ONE magnitude scale**, because the question the overlay is
   actually asked is "did the sell side cover the buy side" — two independently-normalised
   scales answer that silently wrong, making a 4c credit bar and a $4 cost bar the same
@@ -2758,6 +2777,18 @@ the legend. `show_cash_bars: false` returns the card to rates-only.
   chart is exactly what it was before this feature existed. Note that is *not* the same as an
   overlay of zeroes: a day with genuinely no trade still shows its (empty) scale, because
   missing data must not read as a free day.
+- **Pooled export caps over-stated the credit (shipped broken 2026-10-18, fixed
+  2026-10-19).** As first written this module handled only a `cap_period == "day"` /
+  `cap_application == "strict"` tier and priced every other cap shape at the **posted**
+  rate, on the reasoning that anything else needed history it didn't fetch. That was the
+  wrong trade: `prd_sync status` lists **GloBird and Origin as `DAY` / `POOLED_BILLING_PERIOD`**,
+  so the shape left unhandled was the one real plans actually use, and "posted rate" means
+  the *boosted* rate — the bars claimed the top tier all month. Measured on the dev rig's own
+  October data: 478.89 kWh exported month-to-date against a 5 kWh/day pooled cap (155 kWh for
+  the month, gone by about the 8th), so 12 kWh exported today should credit **$0.36** and the
+  old code drew **$2.40** — 6.7x high, and growing through the month. Fixed by the seed walk
+  and the shared `cap_periods.py` above. The bill breakdown was never affected: it always
+  pooled correctly via `_split_capped_kwh`, which is now the same code.
 - **Conditional day-credits are out of scope** of the bars — they're a per-day award
   (e.g. a $1/day bonus), not attributable to a 30-min slot, and remain on the bill
   breakdown card.
@@ -3249,6 +3280,9 @@ custom_components/grid_lens/
 ├── ev_charger_vendors.py    per-brand EV-charger entity patterns for the optional
 │                            load_ev_brand wizard step — §6a
 ├── plan_calculator.py       plan cost engine
+├── cap_periods.py           capped-tier bucketing / pooled-allowance sizing / period start —
+│                            shared by plan_calculator.py (the bill) and advisory/today_cash.py
+│                            (the price chart's bars), which must not disagree
 ├── retailer_plans.py        plan fetch/cache from the API
 ├── battery_optimizer.py     the LP/MILP
 ├── sensor.py                comparison sensors + deferrable_loads attribute

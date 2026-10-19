@@ -273,7 +273,10 @@ def _compute_demand_charge(has_demand_tariff=True):
     lifted out of the HA-importing module."""
     src = open(os.path.join(_COMPONENT, "plan_calculator.py")).read()
     i = src.index("    def _compute_demand_charge")
-    j = src.index("    # How many of a rate's cap periods", i)
+    # Ends at the next class-level name, not at the prose comment that used to
+    # introduce it — a comment is free to be reworded (and was, when the cap
+    # helpers moved out to cap_periods.py), an attribute name is not.
+    j = src.index("    _CAP_PERIOD_DAYS", i)
     # _demand_days_predicate is a module-level helper the sliced method calls
     # into (shared with the LP-forecast demand predicate) — lift its real
     # source too, so this test exercises the actual unrecognised-days-value

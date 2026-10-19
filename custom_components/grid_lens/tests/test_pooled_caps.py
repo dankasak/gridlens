@@ -46,13 +46,26 @@ def check(name, cond, detail=""):
 
 
 def _cap_helpers():
-    """PlanCalculator's cap helpers, without importing Home Assistant."""
-    src = open(os.path.join(_COMPONENT, "plan_calculator.py")).read()
-    i = src.index("    _CAP_PERIOD_DAYS")
-    j = src.index("    def _split_capped_kwh")
-    ns: dict = {}
-    exec("class C:\n" + src[i:j], ns)
-    return ns["C"]()
+    """The cap bucketing/allowance primitives, without importing Home Assistant.
+
+    These used to be private methods on ``PlanCalculator`` and this loaded them
+    by scraping the class body out of ``plan_calculator.py`` and ``exec``-ing it,
+    because importing that module pulls in HA. They now live in ``cap_periods.py``
+    — a pure module, imported by both ``PlanCalculator`` and
+    ``advisory/today_cash.py`` so the bill breakdown and the price chart's
+    cost/credit bars can't disagree about a retailer's own rate structure. So
+    this just imports it, and the assertions below are now on the shared code
+    rather than on one caller's copy of it. The method names are kept so the
+    tests read the same.
+    """
+    import cap_periods
+
+    class C:
+        _CAP_PERIOD_DAYS = cap_periods.CAP_PERIOD_DAYS
+        _cap_bucket = staticmethod(cap_periods.cap_bucket)
+        _cap_allowance = staticmethod(cap_periods.cap_allowance)
+
+    return C()
 
 
 def test_allowance_strict_vs_pooled():

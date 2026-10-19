@@ -101,6 +101,11 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
         # know it's happening before the new plan lands, not just after.
         self.is_optimizing = False
         self._plan = None
+        # Period-to-date free-tier usage for a capped rate whose allowance didn't
+        # start today (a pooled or weekly/monthly cap). Reading it means walking a
+        # month of hourly statistics, and the answer is fixed until midnight, so
+        # today_cash keeps it here rather than re-deriving it every tick.
+        self._cap_seed_cache: dict = {}
         self._load_forecaster = FlatLoadForecaster()
         self._meta_refreshed = None
         self._last_main_kick = None  # rate-limits _request_main_refresh()
@@ -1160,6 +1165,7 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
                 self.hass, self._plan, rows, SLOT_MINUTES,
                 self._cfg(CONF_ENERGY_SENSOR, None),
                 self._cfg(CONF_GRID_EXPORT_SENSOR, None),
+                self._cap_seed_cache,
             )
         except Exception:  # noqa: BLE001 — bars are cosmetic; the plan is not
             _LOGGER.debug("elapsed-today cash curve failed", exc_info=True)

@@ -13,6 +13,7 @@ from homeassistant.components.recorder.statistics import statistics_during_perio
 from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
 
 from .battery_optimizer import BatteryOptimizer
+from .cap_periods import CAP_PERIOD_DAYS, cap_allowance, cap_bucket
 from .retailer_plans import (
     plans_from_api_data, versioned_plans_from_history, build_rate_caps,
     build_conditional_credits, slot_calendar_day_index, RetailerPlan, PlanFromData,
@@ -1725,52 +1726,20 @@ class PlanCalculator:
             'approximate': True,
         }
 
-    # How many of a rate's cap periods fall in a billing period, and how a
-    # STRICT cap buckets time. Only 'day' occurs in the plan DB today; the rest
-    # are here so a non-daily threshold is stored and priced rather than
-    # silently treated as daily.
-    _CAP_PERIOD_DAYS = {"day": 1.0, "week": 7.0, "month": 30.44,
-                        "quarter": 91.31, "year": 365.25}
+    # Cap bucketing and pooled-allowance sizing live in cap_periods.py, shared
+    # with advisory/today_cash.py — the price chart's cost/credit bars price the
+    # same capped tiers against the same plan, and a second copy of a retailer's
+    # own rate structure is how the bars came to over-state every pooled cap.
+    # Kept as thin methods because they read better at the call site below and
+    # subclasses/tests may already reference them.
+    _CAP_PERIOD_DAYS = CAP_PERIOD_DAYS
 
-    @staticmethod
-    def _cap_bucket(cap_period: str, local_dt):
-        """The key a STRICT cap resets on."""
-        if cap_period == "week":
-            return local_dt.isocalendar()[:2]
-        if cap_period == "month":
-            return (local_dt.year, local_dt.month)
-        if cap_period == "quarter":
-            return (local_dt.year, (local_dt.month - 1) // 3)
-        if cap_period == "year":
-            return local_dt.year
-        if cap_period == "billing_period":
-            return "bill"          # one bucket for the whole bill
-        return local_dt.date()     # 'day' — the default and the common case
+    _cap_bucket = staticmethod(cap_bucket)
 
     def _cap_allowance(self, cap: float, cap_period: str, cap_application: str,
                        period_days: int | None) -> float:
-        """Total free kWh available to one cap key.
-
-        STRICT: `cap` per bucket, which is what daily_cap_kwh has always meant.
-        POOLED: the allowance accrues over the whole billing period — GloBird
-        state it plainly ("if step one is allocated at 20kWh per day, and there
-        are 30 days in the billing period, your step one allowance would be
-        600kWh"), and EnergyAustralia apply the same regulated Solar Sharer cap
-        as "an average of 24 kWh per day across your billing period". Pricing a
-        pooled cap as strict understates the plan, because a quiet day can no
-        longer subsidise a heavy one.
-        """
-        if cap_application != "pooled":
-            return cap
-        if not period_days:
-            # No billing-period length to pool over: fall back to the strict
-            # reading rather than inventing an allowance. Understates the plan,
-            # which is the safe direction to be wrong in.
-            return cap
-        per = self._CAP_PERIOD_DAYS.get(cap_period)
-        if per is None:          # 'billing_period' — already the whole period
-            return cap
-        return cap * (period_days / per)
+        """Total free kWh available to one cap key — see cap_periods.py."""
+        return cap_allowance(cap, cap_period, cap_application, period_days)
 
     def _split_capped_kwh(
         self, plan, direction: str, local_dt, kwh: float,
