@@ -2906,6 +2906,42 @@ the legend. `show_cash_bars: false` returns the card to rates-only.
 | `grid-lens-defer-schedule-card` | The 7 × 48 allowed-run-times editor. |
 | `grid-lens-flex-row-card` | Layout helper — per-child `flex` control, stacks below a breakpoint, and collapses children that hide themselves (native `conditional` cards) out of the row. |
 
+**Deferrable-load node icons** (Power Flow card; mdi tier added 2026-10-23). A load has no
+icon of its own in config, so the card resolves one, first match wins: an explicit
+`deferrable_icons` card-YAML entry (keyed on the load's display name) → an **appliance `mdi:`
+glyph already set on one of the load's own entities** → the `DEFER_ICON_RULES` keyword rules
+over the load's name + power/switch entity ids (hot water, EV) → a configured battery/SOC
+sensor, which in practice only an EV has → the dashed ring with a generic `mdi:power-plug`.
+
+The mdi tier means a smart plug themed `mdi:pool` draws a pool rather than a plug, with no
+configuration at all: an icon the user set in HA is them naming the appliance in HA's own
+idiom, so it outranks guessing from the name. Three things make it safe. (1) Only *allowlisted
+appliance* glyphs are recognised at all — `MDI_ICON_KEYS` (glyphs that map to an icon key) and
+`MDI_APPLIANCE_GLYPHS` (appliances we will never draw art for, e.g. `mdi:fridge`, recognised
+as a placeholder only). `attributes.icon` is populated for any entity that has an icon at all,
+including one its integration chose, and it cannot distinguish the two, so a free-form
+passthrough reads an integration default as a user's statement: the first cut of this tier did
+exactly that and put `mdi:chart-bell-curve-cumulative` — *Grid Lens's own* estimated-load
+sensor icon — and the ECHONET aircons' `mdi:flash` on four deferrable nodes, which is worse
+than the plug they replaced. Socket/plug/switch/flash/chart glyphs are therefore absent from
+both lists and fall through to the keyword rules. (2) A glyph that maps
+to an icon key with **no artwork yet** never displaces a keyword rule that has artwork, so an
+install whose hot-water plug happens to carry `mdi:water-pump` keeps its real water-heater
+icon. (3) A glyph only ever replaces the *generic plug* placeholder, never a matched
+appliance's own glyph — once a rule has identified the appliance, `mdi:water-boiler` describes
+it better than whatever the entity was themed with. Anchors are checked switch → energy →
+power sensor, in descending order of "a human deliberately themed this". Covered by
+`gridlens-api/tests/test_defer_icon.mjs` (26 checks, `node tests/…`, no runner needed; 5 of
+them fail against the pre-2026-10-23 resolver).
+
+Known gap, by design for now: the override is still card YAML keyed on the *display name*,
+which `resolve_device_name` can legitimately change on a reload — so a rename silently
+orphans it, and the chart cards' per-load *colour* still comes from a separate name-matcher
+(`deferColorFor`/`HOT_WATER_RE` in `chart-common.js`), so icon and colour can disagree about
+the same load. The fix for both — a `sensor_id`-keyed store-backed select, and resolution
+moved into the integration so every card reads one published `icon_key` — is specced as
+phases B–D of `DEFER_ICON_RESOLUTION_PLAN.md` (private repo) and not built.
+
 **Aggregated Aircon node** (Power Flow card, added 2026-08-02, wattage+estimate cue added
 2026-08-05). Every `climate.*` entity that isn't a group/aggregator wrapper (identified by the
 *absence* of a `member_entities` attribute — not by name or integration, so any HA climate
