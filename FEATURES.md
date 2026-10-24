@@ -2906,12 +2906,21 @@ the legend. `show_cash_bars: false` returns the card to rates-only.
 | `grid-lens-defer-schedule-card` | The 7 × 48 allowed-run-times editor. |
 | `grid-lens-flex-row-card` | Layout helper — per-child `flex` control *or* aspect-driven justified sizing (`max_row_height`, see "Justified row sizing" below), stacks below a breakpoint, and collapses children that hide themselves (native `conditional` cards) out of the row. |
 
-**Deferrable-load node icons** (Power Flow card; mdi tier added 2026-10-23). A load has no
+**Deferrable-load node icons** (Power Flow card; mdi tier added 2026-10-23, pool artwork
+2026-10-24). A load has no
 icon of its own in config, so the card resolves one, first match wins: an explicit
 `deferrable_icons` card-YAML entry (keyed on the load's display name) → an **appliance `mdi:`
 glyph already set on one of the load's own entities** → the `DEFER_ICON_RULES` keyword rules
-over the load's name + power/switch entity ids (hot water, EV) → a configured battery/SOC
+over the load's name + power/switch entity ids (hot water, EV, pool) → a configured battery/SOC
 sensor, which in practice only an EV has → the dashed ring with a generic `mdi:power-plug`.
+
+Icon keys with real artwork: `solar`, `battery_*` (5 SOC levels × charge/discharge),
+`home`, `grid`, `ev`, `water_heater`, `aircon*` (heat/cool/neutral) and **`pool_pump`** — a
+toy-3D in-ground pool with a ring float, static when the pump is off and circulating
+(jet swirl, ripples, bobbing float) while it draws power. It is the first icon rendered
+from the catalogue in `DEFER_ICON_RESOLUTION_PLAN.md` §4; the other seven keys in that
+catalogue (`dishwasher`, `washing_machine`, `dryer`, `heat_pump`, `irrigation`, `spa`,
+`server`) are mapped but have no art, so they resolve to a glyph, not an image.
 
 The mdi tier means a smart plug themed `mdi:pool` draws a pool rather than a plug, with no
 configuration at all: an icon the user set in HA is them naming the appliance in HA's own
@@ -2931,43 +2940,7 @@ icon. (3) A glyph only ever replaces the *generic plug* placeholder, never a mat
 appliance's own glyph — once a rule has identified the appliance, `mdi:water-boiler` describes
 it better than whatever the entity was themed with. Anchors are checked switch → energy →
 power sensor, in descending order of "a human deliberately themed this". Covered by
-`gridlens-api/tests/test_defer_icon.mjs` (26 checks, `node tests/…`, no runner needed; 5 of
-them fail against the pre-2026-10-23 resolver).
-
-Known gap, by design for now: the override is still card YAML keyed on the *display name*,
-which `resolve_device_name` can legitimately change on a reload — so a rename silently
-orphans it, and the chart cards' per-load *colour* still comes from a separate name-matcher
-(`deferColorFor`/`HOT_WATER_RE` in `chart-common.js`), so icon and colour can disagree about
-the same load. The fix for both — a `sensor_id`-keyed store-backed select, and resolution
-moved into the integration so every card reads one published `icon_key` — is specced as
-phases B–D of `DEFER_ICON_RESOLUTION_PLAN.md` (private repo) and not built.
-
-**Deferrable-load node icons** (Power Flow card; mdi tier added 2026-10-23). A load has no
-icon of its own in config, so the card resolves one, first match wins: an explicit
-`deferrable_icons` card-YAML entry (keyed on the load's display name) → an **appliance `mdi:`
-glyph already set on one of the load's own entities** → the `DEFER_ICON_RULES` keyword rules
-over the load's name + power/switch entity ids (hot water, EV) → a configured battery/SOC
-sensor, which in practice only an EV has → the dashed ring with a generic `mdi:power-plug`.
-
-The mdi tier means a smart plug themed `mdi:pool` draws a pool rather than a plug, with no
-configuration at all: an icon the user set in HA is them naming the appliance in HA's own
-idiom, so it outranks guessing from the name. Three things make it safe. (1) Only *allowlisted
-appliance* glyphs are recognised at all — `MDI_ICON_KEYS` (glyphs that map to an icon key) and
-`MDI_APPLIANCE_GLYPHS` (appliances we will never draw art for, e.g. `mdi:fridge`, recognised
-as a placeholder only). `attributes.icon` is populated for any entity that has an icon at all,
-including one its integration chose, and it cannot distinguish the two, so a free-form
-passthrough reads an integration default as a user's statement: the first cut of this tier did
-exactly that and put `mdi:chart-bell-curve-cumulative` — *Grid Lens's own* estimated-load
-sensor icon — and the ECHONET aircons' `mdi:flash` on four deferrable nodes, which is worse
-than the plug they replaced. Socket/plug/switch/flash/chart glyphs are therefore absent from
-both lists and fall through to the keyword rules. (2) A glyph that maps
-to an icon key with **no artwork yet** never displaces a keyword rule that has artwork, so an
-install whose hot-water plug happens to carry `mdi:water-pump` keeps its real water-heater
-icon. (3) A glyph only ever replaces the *generic plug* placeholder, never a matched
-appliance's own glyph — once a rule has identified the appliance, `mdi:water-boiler` describes
-it better than whatever the entity was themed with. Anchors are checked switch → energy →
-power sensor, in descending order of "a human deliberately themed this". Covered by
-`gridlens-api/tests/test_defer_icon.mjs` (26 checks, `node tests/…`, no runner needed; 5 of
+`gridlens-api/tests/test_defer_icon.mjs` (32 checks, `node tests/…`, no runner needed; 5 of
 them fail against the pre-2026-10-23 resolver).
 
 Known gap, by design for now: the override is still card YAML keyed on the *display name*,
@@ -3060,6 +3033,57 @@ drive them too (e.g. scene only on the wall tablet in the evening).
 **Justified row sizing** (added 2026-10-23). Each diagram reports its own natural aspect
 and the row sizes itself from that, so every combination of the two layout toggles fills
 the space instead of only the one the numbers were tuned for.
+
+**⚠ The aspect is only as good as the viewBox, and the viewBox is only as good as
+`_actorBox()`'s label-width estimate (2026-10-24).** Four consecutive layout fixes were
+shipped against a dead-space complaint that was not in the row, the cap or the handshake at
+all — it was in the one number all three are derived from. `_actorBox()` estimates a label's
+width from its **character count** (0.55em average advance; `getComputedTextLength()` only
+exists post-render). Label text is interpolated into the SVG **raw** by `_valueLines()`/
+`_pnode()`, so a value may legitimately carry markup — and the Grid node's buy/sell line
+bolds whichever side is currently in play with a `<tspan style="font-weight:700">` wrapper.
+Those 38 characters paint nothing, but they were counted. Measured against this rig's live
+state:
+
+| grid state | viewBox before | aspect | dead units right of the last circle | after |
+|---|---|---|---|---|
+| idle (no bold, no tags) | 494×462 | 1.069 | 32 | unchanged |
+| importing | 680×482 | 1.412 | **161** | 494×462, 1.069, 32 |
+| exporting | 680×482 | 1.412 | **161** | 494×462, 1.069, 32 |
+| exporting, negative FiT | 684×482 | 1.420 | 165 | 498×462, 1.078, 36 |
+| **spread across a day** | | **32.9%** | | **0.82%** |
+
+Both open symptoms, one cause. The 161 units are ~134 CSS px of nothing down the card's
+right-hand side — the row was faithfully sizing a box that genuinely *was* that shape, just
+mostly empty, which is why every measurement of the row itself came back correct. And
+because the bold only exists while importing or exporting, the reported aspect jumped 33%
+each time the grid crossed the idle threshold and the row resized every card on the line:
+*"it's been ok for most of the day, but now looks like this"* was the grid going idle.
+`_actorBox()` now strips tags before counting, for value, name and subtext alike — at the
+measurement site rather than the one call site that currently emits markup, since anything
+rendered through `_pnode()` may carry it. Guarded by §8 of
+`gridlens-api/tests/test_powerflow_aspect_report.mjs` (both label anchors, and that
+stripping doesn't swallow the newlines the label *drop* is counted from).
+
+**`:host { display: block }` is load-bearing, not cosmetic (2026-10-24).** A custom element
+is `display: inline` until told otherwise, and **ResizeObserver reports no content box for a
+non-replaced inline element** — it fires once with 0×0 and never again. `_hostW` therefore
+sat at 0 for the life of every card, so the entire width-aware half of the classic layout
+(compact geometry below 480px, the label font boost) had been dead. It read as working
+because every consumer treats 0 as "width not known yet" and falls back to exact desktop
+geometry: correct on a desktop, wrong on a phone. Found by the `debug` readout printing
+`host 0` next to `card 568`. The rule lives in `_paletteCss()`, the one style block both
+layouts emit verbatim, so the two can't drift; §9 of the same test pins it there.
+
+**`debug: true`** (Power Flow card, classic layout) prints one small grey line under the
+diagram: `js <?v= from import.meta.url>`, `vb <W>x<H> a=<aspect>`, `--aspect <resolved>
+--cap <resolved>`, `host <_hostW>`, `card <measured rect>`, `svg <measured rect>` — the
+asked-for and the given halves side by side, rects read in a `requestAnimationFrame`. It
+exists because a card whose size depends on a handshake between two components across three
+shadow roots cannot otherwise be diagnosed from a screenshot: no amount of reasoning from
+pixels distinguishes "the fix is wrong" from "the fix isn't loaded", and `js ?v=…`, read
+from the module's own URL, is the only thing that settles which build a browser actually
+ran. Both of the fixes above came straight off one line of it.
 
 - `grid-lens-powerflow-card._reportAspect()` dispatches a **bubbling, composed**
   `grid-lens-aspect` event carrying `{ aspect, maxHeight }` whenever its shape changes.

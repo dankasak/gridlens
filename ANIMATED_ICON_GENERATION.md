@@ -52,6 +52,52 @@ Reachable directly via HTTP/curl from the HA add-on container — no tunnel need
   more emphatically. If a render's color drifts warm/pink when you wanted violet/blue (or
   the equivalent in any other hue direction), broaden the color vocabulary in the next
   attempt instead of just re-asserting the same single word.
+- **Design the subject opaque at the T2I stage — it's cheaper than any chroma-key tuning
+  downstream.** §2b below documents what translucent/reflective material costs you. The
+  counterpart, confirmed on the pool icon (2026-10-24): a subject that *would* naturally be
+  rendered as translucent (water, in that case) can simply be **prompted** opaque — "solid
+  opaque matte azure blue, a thick painted plastic-toy surface with a single soft highlight,
+  not see-through" instead of describing real pool water. The resulting APNG had an
+  opaque-pixel count **identical across all 41 frames** (spread: 0 px, versus the 2000-5000 px
+  swings §2b describes for clear glass), first attempt, with no `deadzone`/`tol` tuning at
+  all. Same trick for the silhouette: anything that would sit against the white background
+  gets a *non-white* color word ("pale sandstone-beige" coping, not white), so the border
+  flood-fill can never reach into the object. This costs one sentence in the prompt and
+  saves a re-render.
+- **Animate objects moving IN PLACE, never travelling across the frame.** Wan 2.2 restarts
+  its motion at temporal chunk boundaries — roughly 1/3 and 2/3 through an 81-frame render —
+  and anything that has *translated* by then snaps back to where it started, mid-clip. The
+  pool icon's first render (2026-10-24) had a ring float prompted to "drift on the moving
+  water": it slid ~30px left, teleported back in a single frame, slid left again, teleported
+  back again. Three visible jumps per loop, not one. Re-prompting the same object to stay put
+  ("stays in exactly the same spot… bobbing gently up and down and rocking very slightly
+  where it sits. The ring float does not travel") cut its total travel to 2.9px with no
+  discontinuities. Bob, rotate, pulse, ripple, breathe — all safe. Drift, slide, orbit, walk
+  — all snap. This is also why §2's loop-blend cannot rescue a travelling object: crossfading
+  two frames that show the object in different places gives a ghost, not a loop.
+- **A continuously-generated effect (bubbles, smoke, foam, sparks) will ACCUMULATE across the
+  clip unless you pin it, and an accumulating effect cannot loop.** Adding spa bubbles to the
+  pool icon (2026-10-24) took four renders to get right, and the shape of the problem is
+  general. Measure the effect's own level per frame (e.g. bright-pixel count inside the
+  subject) rather than trusting the motion check alone — it catches the resulting bad wrap,
+  not the cause:
+  - **Plain I2V from a clean still** ramps the effect from nothing to saturation (foam
+    2946 → 6443 px) and never settles, so the wrap snaps from "full effect" back to "none".
+    Trimming the lead-in does not help when the growth is monotonic — there is no flat window.
+  - **FLF2V (same image both ends)** pins the *level* perfectly (foam held at ~4100, range
+    298) but suppresses the churn — median step fell to 0.33, *below* the no-bubbles version's
+    0.61. It is a still effect, not a moving one. This is the same motion-suppression that got
+    the dragon and governors FLF2V attempts rejected; it is a loop, but a frozen one.
+  - **What worked: I2V from an already-mid-effect frame**, with growth pushed into the
+    negative prompt ("foam growing, foam spreading, more and more foam") and the positive
+    asserting constancy ("keep exactly the same size and shape throughout"). Extract the
+    anchor from an earlier render's *source mp4* at the density you want
+    (`ffmpeg -vf "select=eq(n\,12)"`), not from the finalized 160px APNG. Foam then held at
+    ~4000 (range 228) with a clean wrap.
+  - **Pick the anchor frame by eye, from a montage** — build a 1×4 contact sheet of candidate
+    frames and look at it, rather than reading a number. The pool's foam went from "two spa
+    patches on blue water" at source frame 12 to a full bubble bath by frame 70, and only the
+    picture shows where the line is.
 - **Verify a deploy without `gh` CLI.** This environment has no `gh auth` configured, so
   `gh run list` / workflow-status checks fail. For the private `gridlens-api` repo (which
   auto-deploys to the LXC via a GitHub Actions self-hosted runner on push to `main`), confirm
@@ -271,8 +317,36 @@ seam, or a less padded `anchor_max` if chroma-keying eats into the subject).
 
 ## 3. Review before deploying
 
-Pull a frame or two down to actually look at it — cheap sanity check before committing to a
-2-minute-plus round trip:
+**Run the motion check first — it is the one thing eyeballing frames cannot do.**
+
+```bash
+# on the GPU box
+python3 ~/src/comfyui/scripts/check_icon_motion.py /tmp/<output-name>.apng   # exit 0 = ship
+```
+
+It reports two things, both judged against the clip's *own* median frame-to-frame step so
+there is nothing to tune per icon:
+
+- **teleports** — any step that is both >2.5× the median and >3.0 absolute, which is what a
+  chunk-boundary snap-back looks like (see §0's "in place, never travelling" note). The last
+  two steps are excluded because `finalize_icon_i2v_chromakey.py`'s own crossfade manufactures
+  a discontinuity there by design.
+- **loop wrap** — the last→first step, the one the viewer sees on every lap.
+
+Both thresholds were calibrated against the five already-shipped icons (all pass) and the
+pool's first, bad render (fails on both of its snaps). **Do not raise a threshold to make a
+render pass** — re-prompt instead.
+
+⚠ **Do not substitute a whole-frame mean pixel diff for this.** That was the mistake that
+shipped the bad pool clip: a mean diff over the full frame is dominated by the thousands of
+*static* pixels an icon is mostly made of, so one small object teleporting barely moves the
+number. The bad clip read 2.43 at the wrap against a 3.41 frame-0→1 step — i.e. "cleaner than
+normal motion" — and its opaque-pixel count was perfectly flat across all 41 frames. It was
+obviously broken the instant it rendered in a browser. A flat alpha count proves the
+chroma-key is stable; it says nothing whatsoever about whether the animation holds together.
+
+Then pull a frame or two down to actually look at it — cheap sanity check before committing to
+a 2-minute-plus round trip:
 
 ```bash
 # on the GPU box
