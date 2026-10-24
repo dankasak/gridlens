@@ -294,6 +294,9 @@ class GridLensAdvisoryCard extends HTMLElement {
       status: a.status || st.state,
       plan_name: a.plan_name,
       solver: a.solver,
+      // Set only when the solve was degraded — greedy fallback, or a constraint the
+      // user asked for that had to be dropped/clamped. See _statusBadge().
+      solver_note: a.solver_note || null,
       generated_at: a.generated_at,
       reason: a.reason,
       restored: a.restored === true,
@@ -334,6 +337,40 @@ class GridLensAdvisoryCard extends HTMLElement {
     if (html === this._statusSig) return;
     const st = this.shadowRoot && this.shadowRoot.querySelector('.hd2 .st');
     if (st) { st.innerHTML = html; this._statusSig = html; } else this._paint();
+  }
+
+  // The header badge — the one at-a-glance "is Grid Lens actually working" signal on
+  // the dashboard. It must NOT read OK when the plan did not come from a real
+  // optimisation: `status === 'ok'` only means the coordinator produced a plan, and says
+  // nothing about which solver produced it. A greedy-fallback plan models no deferrable
+  // loads, no rate arbitrage and no SOC floor (battery_optimizer._greedy_optimize), and
+  // on 2026-10-23 one ran for a whole morning behind a green OK badge while skipping a
+  // 28c/kWh export window and buying grid power overnight to hold the battery at 87%.
+  // The solver name was visible in the subtitle the entire time, which nobody reads when
+  // the badge says OK — so the badge now carries it.
+  _statusBadge() {
+    const s = this._summary || {};
+    if (s.restored) {
+      return { cls: 'stale', text: 'LAST PLAN',
+               tip: 'Showing the last good plan — a live one has not landed yet.' };
+    }
+    if (s.status !== 'ok') {
+      return { cls: '', text: String(s.status || 'unknown').toUpperCase(),
+               tip: s.reason || '' };
+    }
+    // Allowlist, not a blocklist of known fallbacks: battery_optimizer labels real
+    // solves 'lp/scipy', 'lp/scipy-milp' or 'milp/cbc', and anything else ('greedy',
+    // 'none', 'unknown', a label added later) is by definition not an optimisation.
+    const solver = String(s.solver || '').toLowerCase();
+    if (!(solver.startsWith('lp/') || solver.startsWith('milp/'))) {
+      return { cls: 'bad', text: 'NOT OPTIMISED',
+               tip: s.solver_note
+                 || 'This plan came from the greedy fallback, not the optimiser. '
+                    + 'Check the Home Assistant log for why the LP solve failed.' };
+    }
+    // An LP did run, but something the user asked for could not be honoured in full.
+    if (s.solver_note) return { cls: 'stale', text: 'DEGRADED', tip: s.solver_note };
+    return { cls: 'ok', text: 'OK', tip: `Optimised by ${s.solver}.` };
   }
 
   // Same lazy-fetch-and-cache pattern as grid-lens-load-control-card.js's own
@@ -1051,6 +1088,14 @@ class GridLensAdvisoryCard extends HTMLElement {
         .hd { justify-content:flex-start; }
         .hd-plan { flex:0 1 auto; min-width:0; }
         .hd-right { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-left:auto; }
+        /* "NOT OPTIMISED" badge (see _statusBadge). Reuses --buy rather than adding a
+           token: it is the only theme-aware red in the shared palette (chart-common.js)
+           and already reads as "this is costing you" in both light and dark. Filled, not
+           just outlined, so it does not scan as another quiet status word next to OK.
+           No backtick characters in this comment: it sits inside a template literal. */
+        .badge.bad { color:var(--buy); font-weight:700;
+                     border-color:color-mix(in srgb,var(--buy) 55%,transparent);
+                     background:color-mix(in srgb,var(--buy) 12%,transparent); }
         .rates-now { display:flex; gap:14px; margin-top:4px; font-size:12px;
                      color:var(--ink2); font-variant-numeric:tabular-nums; }
         .rates-now .rk { font-weight:650; }
@@ -1373,7 +1418,7 @@ class GridLensAdvisoryCard extends HTMLElement {
         <div class="hd-right">
           ${this._toggleChipsHtml()}
           ${Date.now() < this._optDotUntil ? '<span class="opt-dot" title="Optimizer is running — recalculating the plan now"></span>' : ''}
-          <div class="badge ${s.restored ? 'stale' : (s.status === 'ok' ? 'ok' : '')}">${s.restored ? 'LAST PLAN' : esc((s.status || 'unknown').toUpperCase())}</div>
+          ${(() => { const b = this._statusBadge(); return `<div class="badge ${b.cls}"${b.tip ? ` title="${esc(b.tip)}"` : ''}>${esc(b.text)}</div>`; })()}
         </div>
       </div>
       ${this._hd2Html()}

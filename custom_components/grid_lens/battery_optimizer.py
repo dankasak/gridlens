@@ -124,6 +124,45 @@ def _import_bound(load, solar, deferrable_loads, dt, max_charge_kw, max_discharg
     return max(battery_floor, demand_based)
 
 
+def _floor_reach_ramp(E0, fslot, solar, load, dt, eta, max_charge_kw, ceiling,
+                      no_grid_charge, grid_charge_cap_kwh) -> List[float]:
+    """Highest SOC (kWh) the battery could possibly hold at the end of each of the
+    first ``fslot`` slots, charging as hard as that slot's own energy allows.
+
+    Used to CLAMP an ad-hoc export/discharge floor (``set_export_floor``) to something
+    physically attainable. A floor the battery is already below cannot be satisfied
+    retroactively, and an unreachable ``lb`` on the SOC variable is not a mildly
+    awkward constraint — it is a deterministic INFEASIBLE that discards the entire
+    model (see the caller in ``_lp_scipy`` for the incident this comes from).
+
+    Each slot's charge energy is its own solar surplus plus whatever grid import is
+    allowed to fund battery charge on top of house load, capped by the charge rating:
+      * ``no_grid_charge`` → solar surplus only;
+      * an active ``grid_charge_cap_kwh[t]`` (the pre-solar hedge, see
+        planner._grid_charge_hedge_cap) → surplus + that slot's allowance;
+      * otherwise unrestricted grid import, so the charge rating is the only limit.
+
+    OPTIMISTIC by design in one respect: it assumes deferrable loads cede the slot's
+    energy to the battery, which they need not. It therefore narrows the infeasible
+    window rather than closing it for certain — ``optimize_hourly_schedule``'s
+    floor-relaxation retry is the backstop for the remainder.
+    """
+    out: List[float] = []
+    reach = E0
+    for t in range(fslot):
+        if no_grid_charge:
+            grid_allow = 0.0
+        elif grid_charge_cap_kwh is not None and t < len(grid_charge_cap_kwh):
+            grid_allow = max(0.0, float(grid_charge_cap_kwh[t]))
+        else:
+            grid_allow = float("inf")
+        room = min(max_charge_kw * dt,
+                   max(0.0, solar[t] - load[t]) + grid_allow)
+        reach = min(ceiling, reach + eta * room)
+        out.append(reach)
+    return out
+
+
 def _reprice_slot(row: Dict, delta_kwh: float) -> tuple:
     """Recompute a slot's import/export kWh and $ cost after shifting
     ``delta_kwh`` of deferrable-load energy into (positive) or out of
@@ -677,23 +716,33 @@ class BatteryOptimizer:
         E0    = initial_soc_percent / 100.0 * self.capacity_kwh
         dmask = demand_window_mask[:T] if demand_window_mask else None
 
+        solve_kwargs = dict(
+            demand_rate=demand_rate, demand_window_mask=dmask,
+            demand_peak_kw_month_to_date=demand_peak_kw_month_to_date,
+            demand_days_remaining=demand_days_remaining,
+            timestep_hours=timestep_hours,
+            soc_reward=soc_reward, export_penalty=export_penalty,
+            no_grid_charge=no_grid_charge,
+            terminal_soc_value=terminal_soc_value,
+            import_caps=import_caps, export_caps=export_caps,
+            conditional_credits=conditional_credits,
+            min_export_price=min_export_price,
+            slot_day_index=slot_day_index,
+            export_floor_kwh=export_floor_kwh,
+            export_floor_slot=export_floor_slot,
+            grid_charge_cap_kwh=grid_charge_cap_kwh,
+            relax_truncated_day=relax_truncated_day,
+        )
+
+        def greedy(note: str) -> Dict:
+            out = self._greedy_optimize(solar, load, r_imp, r_exp, E0, T,
+                                        timestep_hours=timestep_hours)
+            out["solver_note"] = note
+            return out
+
         try:
-            return self._lp_optimize(solar, load, r_imp, r_exp, E0, T, deferrable_loads,
-                                     demand_rate=demand_rate, demand_window_mask=dmask,
-                                     demand_peak_kw_month_to_date=demand_peak_kw_month_to_date,
-                                     demand_days_remaining=demand_days_remaining,
-                                     timestep_hours=timestep_hours,
-                                     soc_reward=soc_reward, export_penalty=export_penalty,
-                                     no_grid_charge=no_grid_charge,
-                                     terminal_soc_value=terminal_soc_value,
-                                     import_caps=import_caps, export_caps=export_caps,
-                                     conditional_credits=conditional_credits,
-                                     min_export_price=min_export_price,
-                                     slot_day_index=slot_day_index,
-                                     export_floor_kwh=export_floor_kwh,
-                                     export_floor_slot=export_floor_slot,
-                                     grid_charge_cap_kwh=grid_charge_cap_kwh,
-                                  relax_truncated_day=relax_truncated_day)
+            out = self._lp_optimize(solar, load, r_imp, r_exp, E0, T, deferrable_loads,
+                                    **solve_kwargs)
         except ImportError:
             if export_floor_kwh is not None:
                 _LOGGER.error(
@@ -707,28 +756,43 @@ class BatteryOptimizer:
                     "PuLP not yet installed — using greedy fallback. "
                     "Restart HA again after the first boot to enable LP optimisation."
                 )
-            return self._greedy_optimize(solar, load, r_imp, r_exp, E0, T,
-                                         timestep_hours=timestep_hours)
+            return greedy("No LP solver installed yet — this plan came from the greedy "
+                          "fallback, which prices nothing properly. Restart HA.")
         except Exception as exc:
             culprit = self._diagnose_infeasible(
-                solar, load, r_imp, r_exp, E0, T, deferrable_loads,
-                demand_rate=demand_rate, demand_window_mask=dmask,
-                demand_peak_kw_month_to_date=demand_peak_kw_month_to_date,
-                demand_days_remaining=demand_days_remaining,
-                timestep_hours=timestep_hours,
-                soc_reward=soc_reward, export_penalty=export_penalty,
-                no_grid_charge=no_grid_charge,
-                terminal_soc_value=terminal_soc_value,
-                import_caps=import_caps, export_caps=export_caps,
-                conditional_credits=conditional_credits,
-                min_export_price=min_export_price,
-                slot_day_index=slot_day_index,
-                export_floor_kwh=export_floor_kwh,
-                export_floor_slot=export_floor_slot,
-                grid_charge_cap_kwh=grid_charge_cap_kwh,
-                relax_truncated_day=relax_truncated_day,
+                solar, load, r_imp, r_exp, E0, T, deferrable_loads, **solve_kwargs
             )
             if export_floor_kwh is not None:
+                # Last resort before greedy: re-solve with the floor dropped entirely.
+                # _lp_scipy already clamps the floor to what's physically reachable, so
+                # reaching here means something it is deliberately optimistic about
+                # (deferrable loads competing for the same slot energy) still collides
+                # with the reserve. Dropping ONE user constraint and keeping a real LP
+                # beats keeping that constraint nominally and losing the entire model to
+                # greedy — which would not honour the floor either (it models no SOC
+                # floor at all), while additionally mispricing every slot. Strictly more
+                # of the user's intent survives this way, and the log + solver_note say
+                # plainly which part did not.
+                relaxed_kwargs = dict(solve_kwargs,
+                                      export_floor_kwh=None, export_floor_slot=None)
+                try:
+                    out = self._lp_optimize(solar, load, r_imp, r_exp, E0, T,
+                                            deferrable_loads, **relaxed_kwargs)
+                except Exception:  # noqa: BLE001 — genuinely out of options, use greedy
+                    pass
+                else:
+                    _LOGGER.error(
+                        "LP optimisation failed (%s) with the active export/discharge "
+                        "floor (%.1f kWh until slot %s) — re-solved WITHOUT the floor, "
+                        "so the plan is still cost-optimal but holds no reserve. "
+                        "Likely cause: %s.",
+                        exc, export_floor_kwh, export_floor_slot, culprit,
+                    )
+                    out["solver_note"] = (
+                        f"Export floor of {export_floor_kwh:.1f} kWh could not be held "
+                        "— re-solved without it. The plan is optimal but keeps no reserve."
+                    )
+                    return out
                 _LOGGER.error(
                     "LP optimisation failed (%s) — using greedy fallback, which does NOT "
                     "honour the active export/discharge floor (%.1f kWh until slot %s). "
@@ -740,8 +804,32 @@ class BatteryOptimizer:
                     "LP optimisation failed (%s) — using greedy fallback. Likely cause: %s.",
                     exc, culprit,
                 )
-            return self._greedy_optimize(solar, load, r_imp, r_exp, E0, T,
-                                         timestep_hours=timestep_hours)
+            return greedy(
+                f"LP optimisation failed — this plan came from the greedy fallback, "
+                f"which ignores deferrable loads, rate arbitrage and any SOC floor. "
+                f"Likely cause: {culprit}."
+            )
+
+        # Reached only on a successful solve (both handlers above return). A floor that
+        # had to be CLAMPED still solves cleanly, but the user is not getting the reserve
+        # they asked for in the early slots — say so rather than reporting a bare "OK".
+        # Same ramp the clamp itself used, so the two can never disagree.
+        if export_floor_kwh is not None and export_floor_slot:
+            ramp = _floor_reach_ramp(
+                E0, min(T, int(export_floor_slot)), solar, load, timestep_hours,
+                self.eta, self.max_charge_rate_kw,
+                max(self.max_soc_kwh, export_floor_kwh),
+                no_grid_charge, grid_charge_cap_kwh,
+            )
+            short = sum(1 for r in ramp if r < export_floor_kwh - 1e-6)
+            if short:
+                out["solver_note"] = (
+                    f"Export floor of {export_floor_kwh:.1f} kWh cannot be held for the "
+                    f"first {short} of {len(ramp)} slots — the battery is at "
+                    f"{E0:.1f} kWh and can only reach {ramp[0]:.1f} kWh by then. "
+                    "The floor applies in full after that."
+                )
+        return out
 
     def _diagnose_infeasible(self, solar, load, r_imp, r_exp, E0, T, deferrable_loads,
                               **kwargs) -> str:
@@ -905,6 +993,17 @@ class BatteryOptimizer:
             # reproducing the exact over-hedge this parameter exists to prevent.
             raise RuntimeError(
                 "no solver available that models the active grid-charge hedge cap "
+                "(scipy failed; PuLP does not model it)"
+            )
+        if min_export_price:
+            # _lp_pulp prices export at the raw rate in every slot, so it would sell
+            # below the user's Minimum Export Price and call it optimal. This guard was
+            # missing while test_min_export_price.py's
+            # test_floor_never_reaches_a_solver_that_ignores_it asserted it existed —
+            # the test had been failing (found 2026-10-23) and the other three guards
+            # beside it made it look covered.
+            raise RuntimeError(
+                "no solver available that models the active minimum export price "
                 "(scipy failed; PuLP does not model it)"
             )
         try:
@@ -1292,13 +1391,58 @@ class BatteryOptimizer:
             # dispatch resumes automatically once the deadline passes — nothing clears
             # this explicitly here, the LP simply stops being constrained by it.
             fslot = min(T, int(export_floor_slot))
-            lb[S:S+fslot] = np.maximum(lb[S:S+fslot], export_floor_kwh)
-            # A floor above the standing charge ceiling (max_soc_kwh, e.g. an everyday
-            # 90% longevity cap) must raise it for this occasion too, same reasoning as
-            # charge_target's own ceiling override (FEATURES.md §9a) — otherwise lb > ub
-            # for these slots is a direct, deterministic INFEASIBLE rather than merely
-            # suboptimal.
-            ub[S:S+fslot] = np.maximum(ub[S:S+fslot], export_floor_kwh)
+            # ⚠ The floor is CLAMPED to what the battery can physically reach, slot by
+            # slot, rather than imposed as the user typed it. A floor the battery is
+            # already BELOW cannot be satisfied retroactively — nothing can put charge
+            # into slot 0 that slot 0's own energy cannot supply — and an unreachable
+            # lower bound is not "suboptimal", it is a deterministic INFEASIBLE that
+            # throws away the entire solve: deferrable scheduling, rate arbitrage,
+            # min-export price, caps, AND the floor itself, all replaced by the greedy
+            # fallback which honours none of them. The user asked for MORE reserve and
+            # silently got NO optimisation.
+            #
+            # Found 2026-10-23: a 25%-until-09:00 floor with the battery at 20.4% and
+            # the current slot's grid-charge allowance pinned to 0 by the hedge cap
+            # (see planner._grid_charge_hedge_cap, fixed in the same change) left slot 0
+            # reachable only to 5.731 kWh against a 6.000 kWh floor — infeasible by
+            # 269 Wh, for every 2-minute re-solve across a whole morning.
+            #
+            # So: ramp the reachable ceiling forward from E0 at each slot's genuinely
+            # available charge energy (own solar surplus, plus whatever grid import is
+            # allowed to fund charging on top of load, capped by the charge rating), and
+            # ask for min(floor, reachable). The floor is still honoured the moment it
+            # becomes physically attainable — typically within a slot or two — and the
+            # LP keeps solving the whole rest of the problem in the meantime.
+            #
+            # See _floor_reach_ramp for exactly what "reachable" accounts for, and for
+            # the one way it is deliberately optimistic.
+            ramp = _floor_reach_ramp(
+                E0, fslot, solar, load, dt, self.eta, self.max_charge_rate_kw,
+                max(self.max_soc_kwh, export_floor_kwh),
+                no_grid_charge, grid_charge_cap_kwh,
+            )
+            for t in range(fslot):
+                want = min(export_floor_kwh, ramp[t])
+                lb[S+t] = max(lb[S+t], want)
+                # A floor above the standing charge ceiling (max_soc_kwh, e.g. an everyday
+                # 90% longevity cap) must raise it for this occasion too, same reasoning as
+                # charge_target's own ceiling override (FEATURES.md §9a) — otherwise lb > ub
+                # for these slots is a direct, deterministic INFEASIBLE rather than merely
+                # suboptimal.
+                ub[S+t] = max(ub[S+t], want)
+            # The ramp is non-decreasing, so ramp[0] is the worst slot: if the floor is
+            # short anywhere it is short at the START of the window, which is precisely
+            # the reserve the user loses. Counting the short slots says how long for.
+            short = sum(1 for r in ramp if r < export_floor_kwh - 1e-6)
+            if short:
+                _LOGGER.warning(
+                    "Export/discharge floor of %.2f kWh is not reachable from the "
+                    "battery's current %.2f kWh for the first %d of %d slots in its "
+                    "window — holding the most it can actually reach (%.2f kWh at the "
+                    "start) instead of making the whole solve infeasible. The floor "
+                    "applies in full from slot %d onward.",
+                    export_floor_kwh, E0, short, fslot, ramp[0], short,
+                )
         for i, dev in enumerate(deferrable_loads):
             # Each device's per-slot draw is capped at its own rated max energy
             # (max_kw × dt), and forced to 0 in slots the device is unavailable.

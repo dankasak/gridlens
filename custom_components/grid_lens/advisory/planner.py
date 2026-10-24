@@ -242,6 +242,7 @@ class AdvisoryPlanner:
             final_soc_percent=result.get("final_soc_percent", initial_soc_percent),
             net_cost=result.get("net_cost", 0.0),
             solver=result.get("solver", "unknown"),
+            solver_note=result.get("solver_note"),
             plan=plan,
             trajectory=trajectory,
             deferrable_names=defer_names,
@@ -369,15 +370,26 @@ class AdvisoryPlanner:
         hardware_cap = opt.max_charge_rate_kw * dt_h
         caps = [float("inf")] * T
 
-        # The pre-solar window: slots from "now" until cumulative P50 solar first
-        # becomes non-negligible (0.05 kWh -- a rounding/noise floor, not a real
-        # contribution). Only this window's grid-charge decision is a blind bet on
-        # a forecast with nothing yet observed to correct it; once solar is flowing
-        # the rolling re-solve has real data to react to every ~2 minutes.
+        # The pre-solar window: slots from "now" up to (not including) the first slot
+        # whose own P50 solar, or the running total before it, is non-negligible
+        # (0.05 kWh -- a rounding/noise floor, not a real contribution). Only this
+        # window's grid-charge decision is a blind bet on a forecast with nothing yet
+        # observed to correct it; once solar is flowing the rolling re-solve has real
+        # data to react to every ~2 minutes. A horizon that starts with solar already
+        # up therefore has NO pre-solar window and gets no restriction at all.
         cum_p50 = 0.0
         pre_solar_slots: list[int] = []
         for t in range(T):
-            if cum_p50 > 0.05:
+            # Two separate exits, and the second one matters: a slot that ALREADY has
+            # meaningful solar of its own is not a blind bet on a forecast, so it does
+            # not belong in this window at all. Testing only the running total let the
+            # CURRENT slot in unconditionally (cum_p50 is 0 before slot 0 is added),
+            # which made every mid-day re-solve treat "now" as pre-dawn and, on a sunny
+            # day, cap its grid-charge allowance at 0. Harmless on its own — nobody
+            # wants to grid-charge at 08:00 in full sun — but it silently removed the
+            # only way slot 0 could reach an active export floor, and the whole LP went
+            # INFEASIBLE by 269 Wh (found 2026-10-23, see GRIDLENS_CHECKLIST.md).
+            if cum_p50 > 0.05 or solar_p50[t] > 0.05:
                 break
             cum_p50 += solar_p50[t]
             pre_solar_slots.append(t)

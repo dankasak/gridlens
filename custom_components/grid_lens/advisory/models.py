@@ -64,6 +64,12 @@ class AdvisoryResult:
     solver: str
     plan: list  # list[DispatchInterval]
     trajectory: list[dict]  # per-hour {start, soc_percent, action, power_w, ...}
+    # Set only when the solve was DEGRADED — the greedy fallback ran, or a constraint
+    # the user asked for had to be dropped to get any answer at all. A plain,
+    # user-readable sentence (battery_optimizer sets it); None on a clean solve.
+    # The advisory card's status badge keys off this: a greedy plan is not "OK"
+    # however cheerfully the rest of the pipeline reports success.
+    solver_note: str | None = None
     deferrable_names: list[str] = field(default_factory=list)
     # Each device's rated power (kW) — lets a consumer (e.g. the advisory card) judge
     # whether a slot's continuous def_i kWh output amounts to a real "recommended on"
@@ -111,6 +117,7 @@ class AdvisoryResult:
             "final_soc_percent": round(self.final_soc_percent, 1),
             "net_cost": round(self.net_cost, 4),
             "solver": self.solver,
+            "solver_note": self.solver_note,
             "deferrable_names": self.deferrable_names,
             "deferrable_max_kw": self.deferrable_max_kw,
             "deferrable_sensor_ids": self.deferrable_sensor_ids,

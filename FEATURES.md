@@ -650,6 +650,15 @@ lets a plan with FiT above its import rate farm unlimited arbitrage.
   percentile bands. Caused the 2026-10-15 incident this fixes: AGL Battery Rewards grid-
   charged the home battery from ~27% to ~56%+ SOC pre-dawn, then had to dump the resulting
   midday solar glut at near-floor export rates all afternoon.
+  **"Pre-solar" means genuinely pre-solar** (fixed 2026-10-23): the window loop originally
+  tested only its running P50 total, which is 0 before the first slot is added, so the
+  CURRENT slot always got in — every mid-day re-solve treated "now" as pre-dawn and, on a
+  sunny day, pinned that slot's grid-charge allowance to 0 kWh. Harmless alone, since
+  nobody wants to grid-charge at 08:00 in full sun, but it removed the only way slot 0
+  could reach an active §9d export floor and took the whole LP INFEASIBLE by 269 Wh for a
+  morning. The loop now also stops at the first slot with meaningful solar of its own, so a
+  horizon that starts with solar already up has **no** pre-solar window and no restriction.
+  Regression-tested in `tests/test_floor_feasibility.py`.
 - **Deferrable devices stay in the energy balance** — `def_i` is priced via import/export
   like any other load. A past bug was double-counting them in *reporting*, not in the model;
   don't "fix" it by re-adding deferred energy to import.
@@ -682,6 +691,22 @@ consume it.
 The `planned_dispatch` sensor also carries a `demand` attribute on a demand tariff:
 `{planned_peak_kw, prior_peak_kw, rate_per_kw_per_day, days_remaining, window_slots}` —
 `null` for plans without a demand charge.
+
+**`solver` and `solver_note` — how to tell a real optimisation from a fallback.** `solver`
+is `lp/scipy`, `lp/scipy-milp` or `milp/cbc` for a genuine solve, and `greedy` or `none`
+otherwise. `solver_note` (added 2026-10-23) is set **only on a degraded solve** — the greedy
+fallback ran, or a constraint the user asked for had to be clamped or dropped to get an
+answer — and holds a plain user-readable sentence; it is `null` on a clean solve.
+
+⚠ **`status: "ok"` does NOT mean the plan was optimised.** It means the coordinator produced
+a plan, nothing more. The Battery Plan card's header badge (§10) therefore keys off `solver`
+and `solver_note`, not `status`: a non-`lp/` solver shows a red **NOT OPTIMISED**, a
+`solver_note` alongside a real LP shows **DEGRADED**, and only a clean LP solve shows the
+green **OK**. This exists because on 2026-10-23 an infeasible §9d export floor sent every
+2-minute re-solve to greedy for a whole morning — which models no deferrable loads, no rate
+arbitrage and no SOC floor, so the published plan skipped a 28c/kWh export window and bought
+grid power overnight to hold 87% SOC — entirely behind a green OK badge. The solver name was
+in the card's subtitle the whole time; nobody reads the subtitle when the badge says OK.
 
 **Files:** `advisory/coordinator.py`, `advisory/dispatch_sensor.py`, `advisory/models.py`.
 
@@ -734,6 +759,22 @@ from whenever it last went true regardless of how fast the run actually finishes
 this install the LP solve is sub-200ms, faster than a human can register a flash without
 that forced minimum. Genuinely slower solves (larger horizons, a PuLP fallback) still
 stay visible for their actual, longer duration on top of that floor.
+
+**Status badge (`_statusBadge()`, reworked 2026-10-23).** The badge beside that dot is the
+one at-a-glance "is Grid Lens actually working" signal on the dashboard, so it reports the
+**solver**, not just `status` (see §3 for why `status: "ok"` is not enough):
+
+| Badge | Colour | When |
+|---|---|---|
+| `OK` | green | `status: ok`, `solver` starts `lp/` or `milp/`, no `solver_note` |
+| `DEGRADED` | amber | a real LP solved, but `solver_note` is set (a clamped/dropped constraint) |
+| `NOT OPTIMISED` | red, filled | `solver` is anything else — `greedy`, `none`, unknown |
+| `LAST PLAN` | amber | `restored` — showing the last good plan, no live one yet |
+| *(status word)* | plain | `status != ok` (`waiting`, `disabled`, …) |
+
+The solver check is an **allowlist** (`lp/`/`milp/` prefix), not a blocklist of known
+fallback names, so a fallback label added later can't quietly read as OK. `solver_note` is
+the badge's `title` tooltip in every degraded case.
 
 **Files:** `reoptimize.py` (new), `advisory/coordinator.py`, `advisory/dispatch_sensor.py`,
 `www/cards/grid-lens-advisory-card.js`, `www/cards/grid-lens-chart-common.js`.
@@ -2564,7 +2605,31 @@ its own. Built 2026-10-06 in response to exactly this scenario (a planned 7am ou
 upper bound too — same "a target above the standing ceiling raises it for the occasion"
 reasoning as §9a) for every slot before the deadline slot; slots at/after it keep the
 ordinary `min_soc_kwh` floor, so nothing needs to explicitly "turn it off" once the deadline
-passes. Only wired into the primary scipy LP path — if that fails and the solve falls back to
+passes.
+
+**⚠ The floor is CLAMPED to what the battery can physically reach, not applied as typed**
+(2026-10-23). A floor the battery is already *below* cannot be satisfied retroactively, and
+an unreachable `lb` on `soc[t]` is not a mildly awkward constraint — it is a deterministic
+INFEASIBLE that discards the entire model: deferrable scheduling, rate arbitrage, caps,
+min-export price *and the floor itself*, all replaced by the greedy fallback, which honours
+none of them. The user asks for more reserve and silently gets no optimisation.
+`_floor_reach_ramp` therefore ramps the reachable SOC forward from the live SOC at each
+slot's genuinely available charge energy (own solar surplus + whatever grid import may fund
+charging on top of load, capped by the charge rating) and the LP asks for
+`min(floor, reachable)` per slot. The floor binds in full the moment it becomes attainable —
+usually within a slot or two. A `_LOGGER.warning` names how many slots were short, and
+`solver_note` carries it to the dashboard badge (see §10's status badge). Three defences in
+depth, because this failure is silent by nature:
+1. the per-slot clamp (above), which is deliberately *optimistic* about deferrable loads
+   ceding slot energy to the battery, so it narrows the infeasible window rather than
+   closing it for certain;
+2. if the solve still fails with a floor active, `optimize_hourly_schedule` **re-solves once
+   with the floor dropped entirely** before considering greedy — an LP that honours
+   everything *except* the impossible constraint beats greedy, which would drop the floor
+   too *and* misprice every slot;
+3. only if that also fails does greedy answer, now always carrying a `solver_note`.
+
+Only wired into the primary scipy LP path — if that fails and the solve falls back to
 PuLP/CBC or the greedy heuristic (neither models any SOC floor beyond the instance-wide
 `min_soc_kwh`), `_lp_optimize` now refuses to hand an active floor to PuLP (raises, same
 guard as `deferrable_active`) and a loud `_LOGGER.error` names the gap if greedy is reached
@@ -2581,9 +2646,11 @@ dispatcher signal), `number.py`/`datetime.py` (the entity pair, mirroring
 gated on `CONF_HAS_BATTERY`, same as `GridLensMinExportPriceNumber`), `services.py`/
 `services.yaml` (`set_export_floor`/`clear_export_floor`), `advisory/coordinator.py`
 (`_export_floor`, wired into `_run` right before `AdvisoryPlanner.plan`),
-`battery_optimizer.py` (the `lb[S:S+fslot]`/`ub[S:S+fslot]` bound raise in `_lp_scipy`, the
-`_lp_optimize` PuLP guard, and a `_diagnose_infeasible` relaxation branch so an infeasible
-floor names itself in the log rather than reading as "unknown"), `www/cards/grid-lens-
+`battery_optimizer.py` (the per-slot `lb[S+t]`/`ub[S+t]` bound raise in `_lp_scipy`, the
+`_floor_reach_ramp` reachability clamp, the floor-relaxation retry and `solver_note` in
+`optimize_hourly_schedule`, the `_lp_optimize` PuLP guard, and a `_diagnose_infeasible`
+relaxation branch so an infeasible floor names itself in the log rather than reading as
+"unknown"; `tests/test_floor_feasibility.py`), `www/cards/grid-lens-
 export-floor-card.js` (dashboard card, registered as a Lovelace resource and seeded onto new
 installs' Settings view inside the existing `battery_control`-gated block — same pattern as
 `grid-lens-charge-target-card.js` but a single row, not one per device, since there's exactly
