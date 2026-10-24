@@ -1011,9 +1011,42 @@ loads, never sensor wiring.
 **Files:** `plan_calculator.py`, `advisory/coordinator.py::_deferrable_for_horizon`,
 `entity_lookup.py` (name/power-sensor auto-discovery).
 
-**Naming.** Display names resolve via `resolve_device_name()`: entity-registry name → Energy
-Dashboard per-device label → trimmed entity id. The Energy Dashboard label is where a rename
-like "Hot Water" actually lives, so it wins over the raw registry name.
+**Naming.** Display names resolve via `resolve_device_name()`, which is handed the load's
+identifying entities ("anchors" — the control switch first, then the energy sensor) and tries
+each naming source across **every** anchor before dropping to the next source: entity-registry
+`name` override → Energy Dashboard per-device label → registry `original_name`, falling back to
+the **device** name when `original_name` is only a role noun ("Outlet", "Switch", "Plug",
+"Relay", "Energy", "Power" — `_GENERIC_ENTITY_NAMES`) → live `friendly_name` → humanized entity
+id. Trailing metering words (" Energy", " Power", " Consumption", " Total Consumption") are
+trimmed throughout.
+
+An **indexed** role noun ("Outlet 2", "Switch 0", "Power1") is the one case that keeps HA's
+full concatenation — "Power Strip Outlet 2" — because the index is the only thing telling two
+loads on one device apart, and the bare device name would give a multi-channel power strip two
+deferrable loads with identical names. A trailing number on a name that *isn't* a role noun
+("Smart Load 01", "Charger 2") is part of the appliance name and is left alone.
+
+Two things that order exists for. The Energy Dashboard label is where a rename like "Hot
+Water" actually lives, so it wins over any registry name — and because the sweep is
+source-major rather than anchor-major, a label set on the *energy sensor* still wins over a
+generic registry name on the *control switch*. And on a `has_entity_name` integration (Meross,
+Shelly, Tasmota, TP-Link — most modern smart plugs) the appliance identity is in the device
+name while each entity gets a bare noun, so device "Pool" + switch "Outlet" must read "Pool",
+not "Outlet". A device hosting *several* appliances (one Sigenergy plant with multiple smart
+loads) keeps its per-entity `original_name` ("Smart Load 01") instead of collapsing every load
+onto the plant's name. Guarded by `tests/test_device_name_resolution.py`.
+
+Note the metering words appear in **both** lists deliberately. `_NAME_SUFFIXES` only strips
+them from a longer name ("Dishwasher Energy" → "Dishwasher"); a `has_entity_name` sensor's
+*whole* name is often the bare word ("Energy"), which no suffix match touches, so those words
+are in `_GENERIC_ENTITY_NAMES` too. That is the case a load configured with an energy sensor
+and **no control switch** hits — the ordinary "added the plug to the Energy Dashboard" shape.
+
+Names are resolved **at setup time**, so a rename (on the entity, the device, or the Energy
+Dashboard) reaches the control-panel entities only after an integration reload or HA restart.
+Entity *ids* are keyed on the energy sensor's id, not the name, so they never move on a rename
+— a load first created under a wrong name keeps that slug (`switch.…_outlet_control`) until
+hand-renamed in HA.
 
 **SOC ceiling (added 2026-08-29)** — for a device with the `..._soc_sensors` field above
 also set, two more per-device fields become meaningful: `deferrable_load_soc_max_percent`

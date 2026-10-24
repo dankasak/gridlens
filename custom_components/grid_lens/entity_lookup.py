@@ -15,6 +15,7 @@ is returned directly.
 """
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from homeassistant.core import HomeAssistant
@@ -69,6 +70,112 @@ def _power_sensors_on_device(reg, device_id: str) -> list[str]:
 
 _NAME_SUFFIXES = (" Total Consumption", " Consumption", " Energy", " Power")
 
+# Entity names that describe the *entity's role on a device* rather than the appliance.
+# Integrations that set `has_entity_name = True` (Meross, Shelly, Tasmota, TP-Link, most
+# modern smart-plug/switch platforms) put the appliance identity in the DEVICE name and
+# give each entity a bare noun — device "Pool" + entity "Outlet", rendered by HA as
+# "Pool Outlet". Taking `original_name` alone there yields "Outlet", which names nothing.
+#
+# The metering words are here as well as in _NAME_SUFFIXES because that tuple only strips
+# them as a *suffix on a longer name* ("Dishwasher Energy" → "Dishwasher"); a `has_entity_name`
+# sensor's whole name is often the bare word ("Energy"), which no suffix match touches. A
+# deferrable load configured with only an energy sensor and no control switch — the ordinary
+# "I added the plug to the Energy Dashboard" shape — hits exactly that.
+_GENERIC_ENTITY_NAMES = frozenset(
+    {
+        "outlet",
+        "socket",
+        "plug",
+        "switch",
+        "relay",
+        "load",
+        "output",
+        "channel",
+        "state",
+        "status",
+        "on/off",
+        "toggle",
+        "total",
+        # Bare metering names (see above — not reachable via _NAME_SUFFIXES).
+        "energy",
+        "power",
+        "consumption",
+        "total consumption",
+        "energy total",
+        "power consumption",
+    }
+)
+
+# A trailing channel index on a role noun: "Outlet 2", "Switch 0", "Power1", "Relay_3".
+# Kept separate from the noun so the noun can be recognised as generic while the index is
+# preserved — two channels of one power strip must not both resolve to the strip's name.
+_INDEX_RE = re.compile(r"^(.*?)[\s_-]*(\d+)$")
+
+
+def _trim_suffixes(name: str) -> str:
+    for suffix in _NAME_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _role_noun_index(name: str) -> Optional[str]:
+    """`""` if `name` is a bare role noun, the channel index if it's an indexed one, else None.
+
+    `None` means "this name carries the appliance, use it as-is". The empty string and an
+    index are distinguished because they want different fallbacks — see _registry_name.
+    """
+    stripped = name.strip()
+    if stripped.lower() in _GENERIC_ENTITY_NAMES:
+        return ""
+    m = _INDEX_RE.match(stripped)
+    if m and m.group(1).strip().lower() in _GENERIC_ENTITY_NAMES:
+        return m.group(2)
+    return None
+
+
+def _device_name(hass: HomeAssistant, ent) -> Optional[str]:
+    """The appliance name from the device registry (user rename first), if any."""
+    if ent is None or not ent.device_id:
+        return None
+    from homeassistant.helpers import device_registry as dr
+
+    dev = dr.async_get(hass).async_get(ent.device_id)
+    if dev is None:
+        return None
+    return dev.name_by_user or dev.name or None
+
+
+def _registry_name(hass: HomeAssistant, anchor: str, ent) -> Optional[str]:
+    """``original_name``, promoted to the device name when it's only a role noun.
+
+    ``original_name`` is populated from disk at startup, before the owning integration has
+    published state, so it beats reading a live ``friendly_name`` that may not exist yet.
+    But on a `has_entity_name` entity it is only the *entity's* half of the displayed name
+    — see _GENERIC_ENTITY_NAMES. Three outcomes:
+
+    * A name that carries the appliance ("Smart Load 01 Total Consumption") is used as-is, so
+      a multi-appliance device (one Sigenergy plant hosting several smart loads) names each
+      load distinctly instead of collapsing them all onto the plant's name.
+    * A bare role noun ("Outlet", "Energy") or an absent name becomes the **device** name
+      ("Pool") — not HA's full concatenation ("Pool Outlet"), which reads like a wiring
+      diagram rather than an appliance.
+    * An *indexed* role noun ("Outlet 2", "Switch 0") keeps HA's concatenation ("Power Strip
+      Outlet 2"). Here the index is the only thing distinguishing two loads on one device, so
+      dropping to the bare device name would give a multi-channel power strip two deferrable
+      loads with the same name.
+    """
+    if ent is None:
+        return None
+    trimmed = _trim_suffixes(ent.original_name or "")
+    index = _role_noun_index(trimmed) if trimmed else ""
+    if index is None:
+        return trimmed
+    device = _device_name(hass, ent)
+    if not device:
+        return trimmed or (ent.original_name or None)
+    return f"{device} {trimmed}".strip() if index else device
+
 
 def resolve_device_name(
     hass: HomeAssistant,
@@ -77,42 +184,46 @@ def resolve_device_name(
 ) -> Optional[str]:
     """A clean display name for a deferrable load, resolved reliably at setup time.
 
-    Tries each anchor (e.g. the control switch first — it names the appliance — then the
-    energy sensor), in priority order: the entity registry's explicit ``name`` override, then
-    the Energy Dashboard's per-device label (``dashboard_names``, if the caller has one — this
-    is where a user-facing rename like "Hot Water" actually lives, since it's set on the Energy
-    Dashboard's individual-device tracker, not on the entity itself), then the registry's
-    ``original_name`` (populated from disk at startup, before the owning integration has
-    published state, so it beats reading a live ``friendly_name`` that may not exist yet), then
-    the live ``friendly_name``, then a humanized object_id. Trailing metering words are trimmed
-    so a "… Energy" sensor doesn't make the load read "Foo Energy"."""
+    Anchors are the entities that identify the load (e.g. the control switch first — it
+    names the appliance — then the energy sensor). Resolution is **priority-major, not
+    anchor-major**: each naming source is tried across *every* anchor before falling back to
+    the next source, in this order:
+
+    1. the entity registry's explicit ``name`` override (the user renamed the entity itself);
+    2. the Energy Dashboard's per-device label (``dashboard_names``, if the caller has one —
+       this is where a user-facing rename like "Hot Water" actually lives, since it's set on
+       the Energy Dashboard's individual-device tracker, not on the entity itself);
+    3. the entity/device registry name (see _registry_name);
+    4. the live ``friendly_name``;
+    5. a humanized object_id.
+
+    The per-source sweep matters: looping anchor-major instead let a *lower*-priority source
+    on an earlier anchor beat a higher-priority one later, so a control switch whose registry
+    name was the generic "Outlet" short-circuited the "Pool" the user had typed on the Energy
+    Dashboard against the same load's energy sensor (2026-10-23). Trailing metering words are
+    trimmed so a "… Energy" sensor doesn't make the load read "Foo Energy"."""
     reg = er.async_get(hass)
     dashboard_names = dashboard_names or {}
-    for anchor in anchors:
-        if not anchor:
-            continue
-        name = None
-        ent = reg.async_get(anchor)
-        if ent is not None:
-            name = ent.name
-        if not name:
-            name = dashboard_names.get(anchor)
-        if not name and ent is not None:
-            name = ent.original_name
-        if not name:
-            st = hass.states.get(anchor)
-            if st is not None:
-                name = st.attributes.get("friendly_name")
-        if not name:
-            continue
-        for suffix in _NAME_SUFFIXES:
-            if name.endswith(suffix):
-                name = name[: -len(suffix)]
-        return name
+    anchors = tuple(a for a in anchors if a)
+    ents = {a: reg.async_get(a) for a in anchors}
+
+    def _live(anchor: str) -> Optional[str]:
+        st = hass.states.get(anchor)
+        return st.attributes.get("friendly_name") if st is not None else None
+
+    for source in (
+        lambda a: (ents[a].name if ents[a] is not None else None),
+        lambda a: dashboard_names.get(a),
+        lambda a: _registry_name(hass, a, ents[a]),
+        _live,
+    ):
+        for anchor in anchors:
+            name = source(anchor)
+            if name:
+                return _trim_suffixes(name)
     # Last resort: humanize the first anchor's object_id.
     for anchor in anchors:
-        if anchor:
-            return anchor.split(".", 1)[-1].replace("_", " ").title()
+        return anchor.split(".", 1)[-1].replace("_", " ").title()
     return None
 
 
