@@ -256,16 +256,21 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
     # than sitting on the diagrams, so the whole "what am I looking at / when was it
     # computed" bar reads as one unit (user request 2026-08-20).
     #
-    # Sizing differs per layout on purpose — don't copy one layout's numbers onto the
-    # other:
-    #  - classic renders square, so max_width is what actually sets its size and
-    #    max_height only needs to be a non-clipping ceiling above it (the "move all
-    #    three together" rule is about not distorting that square). 550 rather than a
-    #    full 700: side by side with the scene layout, a 700px classic crowds the row
-    #    and reads oversized on its own (matches the width this dev rig had hand-tuned
-    #    to before the split — 2026-08-20 user feedback: "a bit large").
-    #  - scene is pinned to its background's aspect ratio instead; the shipped v9 cabin
-    #    is 1360x752, so ~900x498 keeps it undistorted.
+    # Sizing is NOT set per layout any more — the row justifies itself. Each diagram
+    # reports its own natural aspect (scene: its background image's, a fixed 1360x752;
+    # classic: its computed viewBox, which moves with node count and icon_scale) and
+    # grid-lens-flex-row-card turns that into a flex basis, so widths come out
+    # proportional to aspect and the diagrams therefore render at EQUAL height, filling
+    # the row. `max_row_height` on the row below is the only size knob.
+    #
+    # It used to be a hand-tuned max_height + max_width + flex basis per layout, with
+    # flex-grow 0 — which meant a visible card could never claim the space a hidden
+    # sibling gave back, so the numbers were only right for one combination of the two
+    # layout toggles and every other combination left dead space (measured 2026-10-23 on
+    # a 1571px viewport with both on: 105px dead to the right, and a 101px height
+    # mismatch between the two diagrams). Don't reintroduce max_height/max_width here:
+    # the row intersects a card's own max_height with max_row_height, so a per-layout
+    # max_height is exactly how you get unequal heights back.
     layout_cards = []
     for layout, unique_suffix, geometry, extra in (
         # show_labels off for scene: its photoreal elements ARE the indicators (a turning
@@ -273,10 +278,10 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
         # artwork — the classic layout has no other way to identify a node, so it keeps
         # its labels. Nodes stay tappable either way via the invisible hit-circle.
         ("scene", "powerflow_show_scene",
-         {"max_height": 498, "max_width": 900, "flex": "0 1 900px"},
+         {"flex": "0 1 900px"},
          {"show_labels": False}),
         ("classic", "powerflow_show_classic",
-         {"max_height": 780, "max_width": 550, "flex": "0 1 550px"},
+         {"flex": "0 1 550px"},
          {}),
     ):
         card = {
@@ -294,6 +299,12 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
             # wrapper. The flex-row card collapses a hidden conditional child out of the
             # row entirely (see its _syncVisibility), so the surviving layout reclaims
             # the space instead of sitting next to an empty slot.
+            # These bases are now only a FALLBACK: once the diagram inside reports its
+            # natural aspect (grid-lens-aspect, see _reportAspect in the powerflow card)
+            # the row replaces them with an aspect-derived basis. They're kept so an
+            # install whose card JS is older than its flex-row JS still lays out sanely —
+            # each is ~that layout's natural aspect x its old max_height, so the fallback
+            # renders what this dashboard rendered before the change.
             layout_cards.append({
                 "type": "conditional",
                 "conditions": [{"condition": "state", "entity": toggle, "state": "on"}],
@@ -323,6 +334,14 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
     }]}, {"column_span": 3, "cards": [{
         "type": "custom:grid-lens-flex-row-card",
         "gap": 16,
+        # The single size knob for this row: the px ceiling on an aspect-reporting
+        # child's DIAGRAM height (the card's ha-card is taller by a fixed header, the
+        # same in both layouts, which is why it cancels out of the equal-height result).
+        # 540 keeps both diagrams a touch taller than the 527px the scene layout
+        # rendered at before, while still fitting a laptop viewport without scrolling.
+        # A narrower row just justifies itself down from here; this only binds on wide
+        # screens.
+        "max_row_height": 540,
         "cards": [
             *layout_cards,
             {
@@ -642,7 +661,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20261023b"
+    _CARD_VERSION = "20261023i"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",

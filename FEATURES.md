@@ -2725,7 +2725,7 @@ convention, never a hardcoded entity id — so they work unmodified on any insta
 | Card | Shows |
 |---|---|
 | `grid-lens-card` | Full plan comparison (the Plan Comparison view). |
-| `grid-lens-powerflow-card` | **Gated** — live radial energy flow: solar / grid / battery / home + one node per deferrable load, static direction arrows along each connector, greedy badges. A **System line** (2026-09-15, moved under the Battery node 2026-09-16) shows the inverter's own self-consumption + conversion losses as a small grey subtext row beneath the Battery node's stats — computed brand-agnostically as the energy-balance residual `(solar + grid − battery) − load_power_entity` (using the signed grid/battery conventions: +import/−export, +charge/−discharge), clamped ≥0, and shown only above the 50 W idle threshold — so the diagram balances (battery discharge ≈ Home + System) instead of silently under-reporting household draw. It started as a separate cog node on the radial fan, but that node re-spread the fan every time the residual crossed the 50 W threshold, so it was folded into the battery's own label block. No vendor-specific "self-consumption" sensor is read, so it works on any inverter brand (this install's Sigenergy publishes one via MQTT as `sensor.sigen_0_self_consumed_power`, but most don't). Classic layout only — scene mode's photoreal anchors have no natural home for an inverter-loss term. The **Grid node carries a persistent "Buy 22.1c · Sell 3.0c" line** (current slot of the dispatch sensor's `trajectory`, via `price_source_entity` / auto-discovered) — both sides always shown, the side currently flowing bold (2026-09-11; was previously an in-play-only "@ Xc/kWh" that vanished while idle). Requires the Battery Control + Power Flow add-on; see §12. `load_power_entity`/`grid_power_entity`/`battery_power_entity`/`battery_discharge_power_entity` are auto-populated in the seeded dashboard straight from the same `load_power_sensor`/`grid_power_sensor`/`battery_charge_power_sensor`/`battery_discharge_power_sensor` config_flow already collects (Sensors/Battery setup steps) — no separate onboarding needed; `solar_power_entity` auto-discovers from HA's own Energy Dashboard prefs; `ev_power_entity`/`ev_active_entity` remain manual-only (no config_flow counterpart — only needed when the EV isn't already represented as a regular deferrable load). Each load node has its own **disable button** (bottom-left corner) to drop it from the diagram — see §5's "Disable button" entry. **Nothing in the diagram animates (2026-10-19).** Until then each connector carried a stream of pulsating balls travelling it via SMIL `animateMotion`, which meant the SVG was re-rendered every vsync forever: a Firefox profile put the content process at **57% of one core on an idle dashboard**, ~80% of the main thread under the refresh tick, with two full display-list rebuilds per frame. Static arrows carry the same three signals (that a connector is live, which way energy is going, how much) and are redrawn only when the power data changes, every few seconds. Arrow size scales sqrt from a small chevron near 0kW to full size at `max_ball_kw` — **that option keeps its old name for YAML compatibility** and now means arrow size. Arrow count comes from how many arrow-lengths fit the rail (capped at 5), *not* an absolute unit count, because classic's viewBox is node-bounds-derived while scene's is the background image's pixel size; it's measured against the connector's *max* arrow size so the count doesn't shift as kW moves. Placement is measured off the live rail with `getPointAtLength()`, so classic's straight spoke and scene's smoothed curve need no separate geometry, and both layouts author `d` in the flow direction so the tangent always points the way the energy actually goes. **There are no CSS filters left in this card** — a filter on a moving/resizing element forces WebRender onto its CPU-rasterised blob-image path, which is what the balls' `drop-shadow` glow was doing. |
+| `grid-lens-powerflow-card` | **Gated** — live radial energy flow: solar / grid / battery / home + one node per deferrable load, static direction arrows along each connector, greedy badges. A **System line** (2026-09-15, moved under the Battery node 2026-09-16) shows the inverter's own self-consumption + conversion losses as a small grey subtext row beneath the Battery node's stats — computed brand-agnostically as the energy-balance residual `(solar + grid − battery) − load_power_entity` (using the signed grid/battery conventions: +import/−export, +charge/−discharge), clamped ≥0, and shown only above the 50 W idle threshold — so the diagram balances (battery discharge ≈ Home + System) instead of silently under-reporting household draw. It started as a separate cog node on the radial fan, but that node re-spread the fan every time the residual crossed the 50 W threshold, so it was folded into the battery's own label block. **The fan spaces itself off each node's full box — circle *and* label block — not just its circle (2026-10-23).** Until then the only guard was `(2·maxR + 18) / (2·sin(dφ/2))`, which kept the circles apart while a node's label (taller than the node, often wider) ran under its neighbour: on a five-node fan the Battery's four-line block sat on top of the Aircon node and the EV's name ran into the Pool's value, with every circle comfortably clear. The fan now grows by bisection until no node's box touches another's or the hub's, so **it needs no re-tuning as loads are added** — verified for 1–9 nodes. **A crowded fan splits onto two rings rather than just spreading wider**: alternate nodes drop to a second, deeper ring (`RING_STAGGER`), which separates neighbours radially as well as angularly and so buys the same clearance for far less diagram. Ring assignment is `min(i, M−1−i) % 2` — symmetric, so the fan doesn't lean, and the fan's *end* nodes always stay on the inner ring since they're what set the viewBox's width. **Which shape is used is decided by measuring both and keeping the smaller viewBox, not by node count**: staggering wins 17–31% from five actors up but *loses* 8–12% at three and four, where the flat arc already fits, so a count-based rule would be wrong for an install with short labels. A margin is required before switching, so a borderline fan can't flip between one and two rings as a label changes width ("Charging" → "Discharging" is enough) and jump every node on screen. Net effect on this dev rig's five nodes: the fan doesn't grow at all — the same base radius the old *overlapping* layout used — so the overlap fix costs nothing. Growth is still capped at 1.9× so a freak long label can't shrink the card into illegibility; past that, a little overlap is accepted deliberately. Because the viewBox hugs the layout, anything that enlarges it makes the whole diagram render *smaller* at a fixed card width, which `max_height`/`max_width` cannot offset — but the card **doesn't have to be at a fixed width**: it reports that viewBox ratio to its container as a bubbling, composed `grid-lens-aspect` event (`_reportAspect()`), and `grid-lens-flex-row-card` sizes the row from it, so a fan that reshapes itself is given a card shaped to match. See "Justified row sizing" below. Text width is estimated (0.55em average advance), not measured, since `getComputedTextLength()` only exists post-render. `_actorBox()` mirrors `_pnode()`'s label offsets by hand, so **a change to the label block's shape must update both in the same edit** or the layout silently goes back to being wrong about node size, with no error. No vendor-specific "self-consumption" sensor is read, so it works on any inverter brand (this install's Sigenergy publishes one via MQTT as `sensor.sigen_0_self_consumed_power`, but most don't). Classic layout only — scene mode's photoreal anchors have no natural home for an inverter-loss term. The **Grid node carries a persistent "Buy 22.1c · Sell 3.0c" line** (current slot of the dispatch sensor's `trajectory`, via `price_source_entity` / auto-discovered) — both sides always shown, the side currently flowing bold (2026-09-11; was previously an in-play-only "@ Xc/kWh" that vanished while idle). Requires the Battery Control + Power Flow add-on; see §12. `load_power_entity`/`grid_power_entity`/`battery_power_entity`/`battery_discharge_power_entity` are auto-populated in the seeded dashboard straight from the same `load_power_sensor`/`grid_power_sensor`/`battery_charge_power_sensor`/`battery_discharge_power_sensor` config_flow already collects (Sensors/Battery setup steps) — no separate onboarding needed; `solar_power_entity` auto-discovers from HA's own Energy Dashboard prefs; `ev_power_entity`/`ev_active_entity` remain manual-only (no config_flow counterpart — only needed when the EV isn't already represented as a regular deferrable load). Each load node has its own **disable button** (bottom-left corner) to drop it from the diagram — see §5's "Disable button" entry. **Nothing in the diagram animates (2026-10-19).** Until then each connector carried a stream of pulsating balls travelling it via SMIL `animateMotion`, which meant the SVG was re-rendered every vsync forever: a Firefox profile put the content process at **57% of one core on an idle dashboard**, ~80% of the main thread under the refresh tick, with two full display-list rebuilds per frame. Static arrows carry the same three signals (that a connector is live, which way energy is going, how much) and are redrawn only when the power data changes, every few seconds. Arrow size scales sqrt from a small chevron near 0kW to full size at `max_ball_kw` — **that option keeps its old name for YAML compatibility** and now means arrow size. Arrow count comes from how many arrow-lengths fit the rail (capped at 5), *not* an absolute unit count, because classic's viewBox is node-bounds-derived while scene's is the background image's pixel size; it's measured against the connector's *max* arrow size so the count doesn't shift as kW moves. Placement is measured off the live rail with `getPointAtLength()`, so classic's straight spoke and scene's smoothed curve need no separate geometry, and both layouts author `d` in the flow direction so the tangent always points the way the energy actually goes. **There are no CSS filters left in this card** — a filter on a moving/resizing element forces WebRender onto its CPU-rasterised blob-image path, which is what the balls' `drop-shadow` glow was doing. |
 | `grid-lens-power-chart-card` | Measured & forecast power (kW) — solar, load, signed grid, signed battery, per-device deferrable, plus free-energy shading, **plus battery SOC on a right-hand 0–100% axis** (2026-08-28), **plus a per-device predicted SOC curve on that same axis for any deferrable load with an SOC model** (2026-09-07) — dashed, in the device's colour, grouped with the device; when the plan's SOC ceiling is shortening that device's charge (`soc_limited`) a faint flat line marks the ceiling and the tooltip names the kWh held back. **SOC on the historic (left-of-"now") side (2026-09-09):** the measured battery-SOC line — solid, right axis — now actually renders there (it was silently clipped to the forecast side by a missing `actual: true` flag), and a **measured per-device SOC** line (also solid, right axis, device colour) is drawn for any deferrable load whose `soc_entity` config field resolves; base class fetches it via the `_deferSocEntities()` hook into `_actualDeviceSoc`. Dashed = planned, solid = measured, matching the standalone SOC card. Click a legend name to isolate that series (forecast + measured pair, y-axis rescales to it); click it again to restore every series. SOC is exempt from isolation — it sits on its own axis, so keeping it costs the kW rescale nothing and it is context for whatever you isolated. **Left of "now" shows measured data only** (2026-09-08): each measured series carries the sensor's current live state as a final point so the line reaches the "now" divider (previously it stopped at the last recorded history row, up to a minute stale, leaving the forecast line as the only thing drawn there), and **every planned series is clipped at the divider** — the forecast flow lines, their area fills, the planned battery-SOC line and the per-device predicted-SOC curves/ceiling lines all stop at "now" (both axes), so nothing predicted renders in the past; set `show_forecast_history: true` to draw the forecast across the past again for plan-vs-actual comparison. (Still full-width: the free-energy time bands — the teal $0-import window is a known tariff fact, the orange spill band is plan-derived.) Downsampling (`ds()` in `grid-lens-chart-common.js`) also keeps each bucket's largest-magnitude sample for the measured kW series (`{peak:true}`), so a short real transient — a few-minute solar burst — survives instead of collapsing to whatever its bucket ended on. The crosshair (`continuousMeasuredPast` getter) reads the measured overlay at the exact hovered time for anything at or before "now" — including the elapsed part of the current 30-min slot — instead of snapping the read back to the last slot boundary; it only snaps to a slot in the genuine future. The other chart cards (price/cash/dispatch) are per-slot by nature and keep snapping. |
 | `grid-lens-price-chart-card` | Buy/sell rate ($/kWh) for the current plan — the forward `trajectory` **plus** the elapsed-today half from the dispatch sensor's `past_rates` attribute (`_combinedTraj()`), so the line covers midnight→horizon-end with a hover crosshair either side of "now". Falls back to forward-only if `past_rates` is absent (restored/cached plan, older integration). On the Power Flow view it sits under the power chart. **X-axis pixel-aligned with the power chart above it** (2026-10-14): this card has no right-axis series of its own, but `grid-lens-power-chart-card` reserves extra right margin (`RIGHT_AXIS_MR`) for its SOC axis' tick labels, which narrows its plot width relative to a chart with no right axis — so even showing the identical time range, the two cards' "now"/start/end columns would land a few pixels apart. Fixed by passing `multiLineChart` the same `mr: RIGHT_AXIS_MR` explicitly (`opts.mr`, a new override that forces an exact right margin independent of whether a right axis is actually drawn — see the "Secondary axis" entry below) and setting `hasRightAxis` true here too so the crosshair's mouse→time math uses the same margin. The reserved strip is simply left blank — no ticks, since this card draws no right-axis series — but the plotted line itself now maps the same `[t0,t1]` onto the same pixel range as the power chart. Only correct as long as both cards are showing the *same* time window (same Today/Horizon + zoom state) — each card's view/zoom toggle is still fully independent (user request, see the chart-cards' own module docstring), so manually putting them in different states still produces different, legitimately non-aligned ranges. **Also carries the per-slot cost/credit bar overlay (2026-10-18) — see "Today's cost & credit bars" below.** |
 
@@ -2904,7 +2904,43 @@ the legend. `show_cash_bars: false` returns the card to rates-only.
 | `grid-lens-daily-target-card` | Standalone Daily Target card (§9b) — same content as `grid-lens-advisory-card`'s header block, always expanded, no chevron. No longer seeded onto the default Settings view (2026-09-22) since the advisory-card header is now the default home; still installed/registered for a dashboard that wants it as its own card. |
 | `grid-lens-charge-target-card` | One row per SOC-tracked deferrable load: ad-hoc "charge to X% by a datetime" target (§9a) — a percent tile + a datetime tile, auto-paired via the `charge_target_role`/`deferrable_sensor_id` state attributes, plus a plain-text "Target: 95% by Sat, 2:22 am" / "No target set" status line, plus a third "Timing" tile (§9c's Prefer early/No preference/Prefer just-in-time select, matched via `charge_timing_preference_role: 'select'`) shown whenever the entity exists, independent of whether a target is currently active. Empty state when no device has SOC tracking configured. |
 | `grid-lens-defer-schedule-card` | The 7 × 48 allowed-run-times editor. |
-| `grid-lens-flex-row-card` | Layout helper — per-child `flex` control, stacks below a breakpoint, and collapses children that hide themselves (native `conditional` cards) out of the row. |
+| `grid-lens-flex-row-card` | Layout helper — per-child `flex` control *or* aspect-driven justified sizing (`max_row_height`, see "Justified row sizing" below), stacks below a breakpoint, and collapses children that hide themselves (native `conditional` cards) out of the row. |
+
+**Deferrable-load node icons** (Power Flow card; mdi tier added 2026-10-23). A load has no
+icon of its own in config, so the card resolves one, first match wins: an explicit
+`deferrable_icons` card-YAML entry (keyed on the load's display name) → an **appliance `mdi:`
+glyph already set on one of the load's own entities** → the `DEFER_ICON_RULES` keyword rules
+over the load's name + power/switch entity ids (hot water, EV) → a configured battery/SOC
+sensor, which in practice only an EV has → the dashed ring with a generic `mdi:power-plug`.
+
+The mdi tier means a smart plug themed `mdi:pool` draws a pool rather than a plug, with no
+configuration at all: an icon the user set in HA is them naming the appliance in HA's own
+idiom, so it outranks guessing from the name. Three things make it safe. (1) Only *allowlisted
+appliance* glyphs are recognised at all — `MDI_ICON_KEYS` (glyphs that map to an icon key) and
+`MDI_APPLIANCE_GLYPHS` (appliances we will never draw art for, e.g. `mdi:fridge`, recognised
+as a placeholder only). `attributes.icon` is populated for any entity that has an icon at all,
+including one its integration chose, and it cannot distinguish the two, so a free-form
+passthrough reads an integration default as a user's statement: the first cut of this tier did
+exactly that and put `mdi:chart-bell-curve-cumulative` — *Grid Lens's own* estimated-load
+sensor icon — and the ECHONET aircons' `mdi:flash` on four deferrable nodes, which is worse
+than the plug they replaced. Socket/plug/switch/flash/chart glyphs are therefore absent from
+both lists and fall through to the keyword rules. (2) A glyph that maps
+to an icon key with **no artwork yet** never displaces a keyword rule that has artwork, so an
+install whose hot-water plug happens to carry `mdi:water-pump` keeps its real water-heater
+icon. (3) A glyph only ever replaces the *generic plug* placeholder, never a matched
+appliance's own glyph — once a rule has identified the appliance, `mdi:water-boiler` describes
+it better than whatever the entity was themed with. Anchors are checked switch → energy →
+power sensor, in descending order of "a human deliberately themed this". Covered by
+`gridlens-api/tests/test_defer_icon.mjs` (26 checks, `node tests/…`, no runner needed; 5 of
+them fail against the pre-2026-10-23 resolver).
+
+Known gap, by design for now: the override is still card YAML keyed on the *display name*,
+which `resolve_device_name` can legitimately change on a reload — so a rename silently
+orphans it, and the chart cards' per-load *colour* still comes from a separate name-matcher
+(`deferColorFor`/`HOT_WATER_RE` in `chart-common.js`), so icon and colour can disagree about
+the same load. The fix for both — a `sensor_id`-keyed store-backed select, and resolution
+moved into the integration so every card reads one published `icon_key` — is specced as
+phases B–D of `DEFER_ICON_RESOLUTION_PLAN.md` (private repo) and not built.
 
 **Deferrable-load node icons** (Power Flow card; mdi tier added 2026-10-23). A load has no
 icon of its own in config, so the card resolves one, first match wins: an explicit
@@ -3020,11 +3056,86 @@ drive them too (e.g. scene only on the wall tablet in the evening).
 - The toggle chips are rendered by `grid-lens-advisory-card`'s `layout_toggles` config
   (a generic list of `{entity, label}` — nothing Power-Flow-specific about it; works in
   the full card too, not just `compact`).
-- **Sizing differs per layout on purpose** — don't copy one's numbers onto the other.
-  Classic renders square, so `max_width` (550) is what sets its size and `max_height`
-  (780) is just a non-clipping ceiling; the §10 "move all three together" gotcha is about
-  not distorting that square. Scene is pinned to its background's aspect ratio instead
-  (shipped v9 cabin is 1360×752 → ~900×498). The scene instance also sets
+
+**Justified row sizing** (added 2026-10-23). Each diagram reports its own natural aspect
+and the row sizes itself from that, so every combination of the two layout toggles fills
+the space instead of only the one the numbers were tuned for.
+
+- `grid-lens-powerflow-card._reportAspect()` dispatches a **bubbling, composed**
+  `grid-lens-aspect` event carrying `{ aspect, maxHeight }` whenever its shape changes.
+  Classic reports its computed viewBox ratio (which moves with node count, the fan's
+  growth guard and `icon_scale`); scene reports its background image's (fixed 1360×752 →
+  1.81). `composed` is required — the card sits inside a `conditional` card's shadow root
+  on the seeded dashboard, and a non-composed event never leaves it.
+- `grid-lens-flex-row-card` ignores that child's configured `flex` and sets
+  **`flex: 0 1 <aspect × cap>px`** instead. One line does the whole job: flex-shrink is
+  distributed *in proportion to basis*, so when the line overflows every item shrinks by
+  the same factor and the ratios survive — width ∝ aspect means **height equal**, with no
+  measuring, no `ResizeObserver` and no height arithmetic on either side. Shrink-only
+  (grow 0) stops a diagram inflating past the cap when there's slack, leaving it for a
+  growable sibling (the power chart) or `justify-content: center`.
+- `cap` = the row's `max_row_height`, **intersected** with the child's own `max_height` if
+  the user explicitly set one. Neither → `DEFAULT_DIAGRAM_HEIGHT` (560). The cap is only an
+  upper bound: a narrower row justifies itself down from it.
+- **The cap goes back the other way too**, as the inherited custom property
+  `--gl-diagram-max-h` on the row's wrapper. The card's `max_height` **default is 420px**,
+  so without the explicit-only rule above every justified row came out 420px tall.
+- **⚠ The cap is applied as a cap on the card's WIDTH, never as `max-height` on the diagram
+  box** (`_diagramMaxW()`: `max-width: calc(var(--gl-aspect) * (cap − padY) + padX)`, with
+  `--gl-aspect` published by each render). This is not a style preference. The classic
+  layout's box is an `<svg>` — a **replaced element** — so CSS's replaced-element constraint
+  algorithm transfers a binding `max-height` back through the aspect ratio and shrinks the
+  **width** as well; the box ends up narrower than its card and, being a block, flush left.
+  That is the "stuck in the top-left corner with dead space to the right" the user reported
+  twice on 2026-10-23. The scene layout's box is a plain `div`, where the same `max-height`
+  doesn't transfer — it just crops the photo via `object-fit: cover`. **One cap, two
+  completely different failures, neither of them an error**, which is what made it hard to
+  read on screen. Capping the width means the box always fills its card exactly and what
+  shrinks is the card. It also makes the cap immune to aspect drift: `--gl-aspect` is the
+  current render's, while the width a row gave the card can be up to one deadband stale.
+- **What this replaced, and why it looked wrong.** A fixed px basis plus `max_width` per
+  card, with **flex-grow 0** — so a visible card could never claim space a hidden sibling
+  gave back, at any width. Measured on a 1571px viewport with both layouts on: 105px dead
+  to the right of the row and a **101px height mismatch** between the two diagrams (scene
+  900×527, classic 550×426, classic sitting exactly on its own 550 cap). After: scene
+  977×540 + classic 578×540, row exactly filled.
+- **Gotcha: the nested `.group` needs an explicit summed basis, never `auto`.** Two wrong
+  answers were tried first. `flex: 1 1 auto` (the original) let the group claim the line's
+  leftover with no child willing to expand into it, stranding 139px *inside* the group
+  where the chart couldn't reach it. `flex: 0 1 auto` was worse: an `auto` basis makes a
+  flex container size to its **max-content**, which for shrink-only children is derived
+  from their own intrinsic sizes — the CSS default 300×150 replaced box — not from the
+  flex bases just set, so the whole row collapsed to ~150px tall ("both views are very
+  very very small"). `_syncVisibility()` sums the children's bases itself.
+- **Gotcha: a child's FIRST announcement is its only obligatory one.** The card dedupes, so
+  a layout whose aspect never changes (scene's constant 1.81) that is missed once is missed
+  for the life of the page — and the row silently falls back to the configured `flex` with
+  no error anywhere. The original code set `el.hass` on a **detached** element before
+  appending it and before attaching the listener; the powerflow card renders synchronously
+  on `set hass`, so whether it worked at all depended on whether the row already had `hass`
+  by the time its async build ran. It worked in one screenshot and not the next. Three
+  things now make it order-independent: one delegated listener on `.wrap` created before any
+  child exists (the child is identified from `composedPath()`, since `event.target` has been
+  retargeted to the `conditional` wrapper); `hass` set **last**, after every child is in the
+  tree and connected; and the card clearing its own dedupe in `connectedCallback()`.
+- **Gotcha: aspect reporting is a closed loop and is deliberately damped.** A new aspect
+  changes the card's rendered width → `_hostW` → `_fontBoost` → label sizes → the classic
+  viewBox → the aspect. Three brakes: the `ResizeObserver`'s existing 8px deadband, a 3%
+  deadband in `_reportAspect`, and a rate fuse (6 reports in 2s freezes reporting for the
+  life of the element). A slightly-wrong size beats a flickering one.
+- Tests: `custom_components/grid_lens/tests/test_flex_row_sizing.mjs` (45 checks — drives
+  the real card class against a DOM stub, then resolves the flex line with a miniature
+  CSS-flexbox implementation, because the load-bearing step — basis-weighted shrink —
+  lives in the browser, not in our code) and `gridlens-api/tests/test_powerflow_aspect_report.mjs`
+  (28 checks, the reporting side). Both run with plain `node`, no npm install.
+- **Sizing is no longer set per layout — the row justifies itself** (2026-10-23, user
+  request: *"is there a way to make the sizing dynamic too… different combinations of
+  these being enabled/disabled look quite wrong"*). See **Justified row sizing** below.
+  There is now exactly one size number for the whole row, `max_row_height: 540` on the
+  flex-row card; `max_height`/`max_width` are **deliberately absent** from both diagram
+  cards in the seed, and re-adding a per-layout `max_height` is precisely how you get
+  unequal heights back (the row intersects a card's own `max_height` with
+  `max_row_height`). The scene instance also sets
   `show_labels: false` — its photoreal elements are themselves the indicators, so
   overlaid name/value text just clutters the artwork; classic keeps its labels since it
   has no other way to identify a node. Nodes stay tappable either way.
@@ -3475,4 +3586,6 @@ custom_components/grid_lens/
 ```
 
 **Tests.** Every suite runs offline with stubbed HA: `python3 tests/test_*.py`. Run them all
-before shipping — they're the only automated safety net in this repo.
+before shipping — they're the only automated safety net in this repo. Card tests live in the
+same folder as `.mjs` files and run the same way, with `node` instead of `python3`
+(`node tests/test_flex_row_sizing.mjs`) — stubbed DOM, no npm install, no test runner.
