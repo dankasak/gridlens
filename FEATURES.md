@@ -562,6 +562,105 @@ stale cached real data mislabeled as a what-if result), `www/cards/grid-lens-car
 
 ---
 
+### 1h. Comparing a household from its paper bill (2026-10-25)
+
+**What it is.** The Plan Comparison page gains a **data source** selector. `My data` is
+the recorder, unchanged and the default. Pick an uploaded **bill** instead and the whole
+page — ranking, bill breakdown, hourly charts, the What-If panel — runs off a
+reconstructed half-hourly model of a household that has never installed Grid Lens. The
+motivating case is "my relative sent me their quarterly bill, could they do better, and
+should they buy solar and a battery?".
+
+**Why it is one selector and not a second feature.** Every energy series in a comparison
+arrives through one method, `PlanCalculator._get_usage_data`. Setting
+`calculator._usage_source` replaces the recorder for all of them; everything downstream
+is untouched and does not know the difference. Nothing else in the comparison changed.
+
+**The honesty machinery, which is most of the design.** A bill is a *sum*, not a
+*shape*, and battery value is almost entirely a shape question.
+
+- **The bill must reconcile before it is accepted.** Every line is kWh x rate, every
+  period the sum of its lines, the bill the sum of its periods. A parse that does not
+  reproduce the printed amounts is rejected (HTTP 422, with the failing figures). This is
+  mechanical, not a confidence score — a parse that invents a feed-in rate looks exactly
+  like a correct one.
+- **PV size is not identifiable from a bill.** Every system from ~3.6 kW to ~12 kW fits
+  the test bill's import *and* export registers to within 0.5%, each with a compensating
+  daytime load share — and a 10 kWh battery's annual saving spans a factor of 2.5 across
+  that range. Entering the inverter's kW rating collapses it. Leaving it blank is allowed
+  and the banner then shows the **range**, not a midpoint dressed up as an answer.
+- **Load archetypes, run and compared, not one hardcoded night curve.** `evening_peak`,
+  `daytime_occupied`, `shift_worker`, plus a `flat` control whose job is to bound the
+  spread. For a household with **no** solar the import total is identical whatever hour
+  the energy was used, so the shape is unconstrained by the bill and the banner says so.
+- **Plans a bill cannot price are refused with a stated reason, never priced on missing
+  data.** A plan priced on data a bill cannot supply does not drop out of a ranking — it
+  tops it. Refused: other distributors' plans, market-linked plans (no AEMO spot series),
+  demand tariffs (peak kW, which kWh totals destroy — *unless* the uploaded bill is
+  itself a demand bill, which prints the peak), and plans holding no controlled-load rate
+  for a controlled-load household.
+- **The baseline is the printed bill**, not a re-derivation of it
+  (`PlanCalculator.baseline_total_override`). Necessary as well as better: the bill's own
+  plan is usually one of the plans we hold no CL rate for, so it gets refused too.
+- **Everything is tagged MODELLED** and the banner carries the assumptions in force, the
+  model's residual against both registers, and the one-season caveat (a single bill is
+  one season; a battery sized on a winter quarter is wrong for summer).
+
+**Controlled load is the scenario axis** — the question the feature exists to answer. On
+the test bill it is **56% of consumption**. Three positions, all priced as a *package*:
+
+| scenario | tariff for that energy | CL supply charge |
+|---|---|---|
+| as billed | the plan's controlled-load rate, overnight | charged |
+| moved to the main circuit, run midday | the plan's general rate at those hours, competing with PV | dropped |
+| moved to the main circuit, still overnight | the plan's general rate overnight | dropped |
+
+The third is a control: strictly worse than today, there to split any benefit into
+re-wiring versus re-timing. The move is modelled as a **declared controlled-load device**
+on the synthetic entry, so no new LP or pricing machinery was needed. Moving it loses the
+cheap CL rate (+$668/yr on the test bill before any offset), drops the CL daily supply
+charge, and gains the ability to soak up solar — all three are in the delta, and the
+element's kW rating caps how fast the energy can be absorbed (a window too short is
+widened, with a warning).
+
+**The controlled-load data gap, and the opt-in that works around it.** 153 of 178
+Endeavour plans hold no controlled-load rate, so for a CL household almost nothing is
+comparable — the household's own plan included. The banner offers to carry **one assumed
+CL rate** (pre-filled with the rate the household is already paying, which they can
+check on their own bill) onto plans that have none: 1 priceable becomes 154. **Off by
+default.** Every bill line it touches is labelled "(assumed rate)" and carries
+`rate_assumed: true`; the plans involved are listed in `cl_assumed_plans`. It is a
+labelled workaround — the plan data is the fix (OPEN_ITEMS.md).
+
+**Privacy.** Bills live in a local HA `Store`, never the API. The uploaded document is
+never persisted. `BillFacts` has **no field** for a name, supply address, NMI, account
+number or payment reference and **rejects** any key it does not recognise, so an
+over-eager extractor has nowhere to put them rather than us filtering afterwards.
+
+**Not built yet:** PDF → figures. That needs the fact-sheet pipeline (`pdftotext`/OCR on
+the GPU box plus the local LLM and its grounding guards), which lives in `gridlens-api`
+and arrives with the cloud parser. Today the panel takes the parsed figures as JSON and
+is already shaped for that parser's output.
+
+**Entities:** none. **Config:** none — nothing to configure, the selector appears once a
+bill is stored, so the dashboard seed is unaffected.
+
+**Endpoints:** `GET/POST /api/grid_lens/bills`, `PUT/DELETE
+/api/grid_lens/bills/{bill_id}`, and `?source=bill:<id>&scenario=<id>` on
+`/api/grid_lens/plan_calc/start`.
+
+**Files:** `bill_model.py` (pure stdlib — schema, self-check, archetypes, solar geometry,
+calibration, scenario synthesis), `bill_source.py` (`BillUsageSource`, `SyntheticEntry`,
+`BillGates`), `plan_calculator.py` (`_usage_source`, `plan_filter`, `cl_rate_fallback`,
+`baseline_total_override`), `__init__.py` (`BillsView`, `BillItemView`, the `?source=`
+branch of `PlanCalcStartView`), `retailer_plans.py` (`PlanFromData.network`),
+`www/cards/grid-lens-card.js` (`renderBillsPanel`, `renderBillBanner`).
+Design: `gridlens-api/docs/BILL_UPLOAD_COMPARISON_DESIGN.md`.
+Tests: `tests/test_bill_model.py`, `tests/test_bill_source.py` (the latter reproduces a
+real issued bill to $0.00 from the reconstruction).
+
+---
+
 ## 2. The optimiser (layer 2 core)
 
 **What it does.** A linear/mixed-integer program over a 72-hour horizon at 30-minute
@@ -3580,6 +3679,12 @@ custom_components/grid_lens/
 │                            shared by plan_calculator.py (the bill) and advisory/today_cash.py
 │                            (the price chart's bars), which must not disagree
 ├── retailer_plans.py        plan fetch/cache from the API
+├── bill_model.py            paper-bill energy reconstruction — §1h. Pure stdlib, no HA
+│                            imports: schema + arithmetic self-check, load archetypes,
+│                            solar geometry, calibration, CL-placement scenarios
+├── bill_source.py           feeds bill_model into PlanCalculator through the
+│                            _get_usage_data seam — BillUsageSource, SyntheticEntry,
+│                            BillGates (which plans a bill may not price, and why) — §1h
 ├── battery_optimizer.py     the LP/MILP
 ├── sensor.py                comparison sensors + deferrable_loads attribute
 ├── plan_sensors.py          per-plan metric sensors

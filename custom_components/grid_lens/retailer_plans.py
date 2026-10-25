@@ -265,6 +265,16 @@ class PlanFromData(RetailerPlan):
         self.plan_id   = plan_data.get("id", "")
         self.retailer  = plan_data.get("retailer", "")
         self.plan_name = plan_data.get("name", "")
+        # Distribution network (DNSP) whose charges this plan's rates include,
+        # as the plan data names it ("Endeavour Energy", "Ausgrid", …). Blank
+        # means the data does not say. Carried through because a plan priced for
+        # one distributor is simply the wrong price on another's network, and a
+        # caller that knows the household's DNSP by name — a bill prints it —
+        # otherwise has nothing to filter on. Added 2026-10-25: without it the
+        # bill-sourced comparison ranked an Ausgrid plan for an Endeavour
+        # household. The live path filters on network tariff code and postcode
+        # instead, which only works when the user has configured them.
+        self.network = plan_data.get("network", "") or ""
 
         charges = plan_data.get("charges", {})
         self.daily_supply_charge    = charges.get("daily_supply_charge", 0.0)

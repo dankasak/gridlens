@@ -182,6 +182,60 @@ class PlanCalculator:
         # Set by the SSE handler before calling calculate_plan_costs.
         self.plan_data: dict | None = None
 
+        # ── The usage seam ──────────────────────────────────────────────────
+        # Every energy series in a comparison arrives through _get_usage_data.
+        # Setting a source here replaces the recorder for ALL of them, which is
+        # how a comparison runs off an uploaded paper bill with no HA history at
+        # all (bill_source.BillUsageSource; see BILL_UPLOAD_COMPARISON_DESIGN.md
+        # §2). Anything downstream of this — ranking, _compute_bill_items, the
+        # caps, the LP, the charts, the What-If panel — is unchanged and does
+        # not know the difference.
+        #
+        # It is NOT a complete substitution: battery actuals, price sensors and
+        # AEMO RRP read the recorder or entity states directly and bypass this.
+        # A synthetic entry must therefore leave the corresponding sensor fields
+        # unset so those paths never run, and refuse the plans that need them
+        # (that is what plan_filter below is for) rather than pricing them on
+        # nothing.
+        self._usage_source = None
+
+        # Optional per-plan refusal hook: plan → reason string, or None to
+        # price it. Used by the bill path to exclude plans a bill genuinely
+        # cannot price (market-linked, demand, missing controlled-load rate)
+        # with a reason the UI can show. A plan silently priced on missing data
+        # does not vanish from the ranking — it tops it.
+        self.plan_filter = None
+        self.excluded_plans: dict = {}
+
+        # {register: {rate, daily_supply_charge}} used ONLY where a plan holds
+        # no controlled-load rate of its own. Normally None, and it must stay
+        # that way on the live path: it is an assumption about a retailer's
+        # pricing, not a fact about it. Only 24 of 588 NSW plans carry CL rates,
+        # so for a CL household the comparison is otherwise unanswerable for
+        # almost every plan — this exists so the user can opt into one assumed
+        # rate and see the comparison, with every line that used it labelled
+        # "(assumed)" and counted in `cl_assumed_plans`. See
+        # bill_source.BillGates.cl_fallback.
+        self.cl_rate_fallback: dict | None = None
+        self.cl_assumed_plans: set = set()
+
+        # The baseline every alternative plan's saving is measured against,
+        # when the household's own plan cannot be priced from our plan data.
+        # Normally None: the live path derives the baseline from actual metered
+        # usage on the plan actually held, which is the right answer and must
+        # never be replaced by a model (see CLAUDE.md, "Current-plan cost").
+        #
+        # A bill-sourced run sets it, because there the baseline is not a
+        # calculation at all — it is the total the retailer printed, which is a
+        # fact and strictly better than re-deriving it. It is also necessary:
+        # the bill's own plan is frequently one of the plans we hold no
+        # controlled-load rate for, so it gets gated out and leaves no baseline
+        # at all. Without this, every "saves $X" figure was measured against a
+        # fallback built from a hardcoded 1.342 $/day supply charge.
+        self.baseline_total_override: float | None = None
+        self.baseline_energy_override: float | None = None
+        self.baseline_label: str | None = None
+
         # Plan version history for the analysis period, fetched from
         # /plans/history at the start of calculate_plan_costs. When present,
         # _get_plans() returns VersionedPlan wrappers so past intervals are
@@ -922,6 +976,37 @@ class PlanCalculator:
         # must always be priceable, tariff mismatch or not — _detect_current_plan
         # already identified it from unfiltered _get_plans()).
         _candidate_plans = self._get_plans()
+
+        # Data-availability filter (bill-sourced runs). Unlike the eligibility
+        # filters below, this one keeps its reasons: a plan dropped because we
+        # cannot price it honestly has to be *shown* as excluded and why, or the
+        # user reads its absence as "not available to me". Note the current plan
+        # is NOT exempted here, because the exemption below exists to guarantee
+        # the held plan is priceable — and if it isn't priceable, pricing it
+        # anyway is the failure, not the refusal.
+        self.excluded_plans = {}
+        if self.plan_filter is not None:
+            _kept = []
+            for _p in _candidate_plans:
+                _why = self.plan_filter(_p)
+                if _why:
+                    self.excluded_plans[self._plan_key(_p, _dup_keys)] = {
+                        'plan_id': getattr(_p, 'plan_id', ''),
+                        'retailer': getattr(_p, 'retailer', ''),
+                        'plan_name': getattr(_p, 'plan_name', ''),
+                        'reason': _why,
+                    }
+                else:
+                    _kept.append(_p)
+            if self.excluded_plans:
+                _LOGGER.warning(
+                    "Usage source cannot price %d of %d plan(s); reasons: %s",
+                    len(self.excluded_plans), len(_candidate_plans),
+                    ", ".join(sorted({v['reason'].split(':')[0]
+                                      for v in self.excluded_plans.values()})),
+                )
+            _candidate_plans = _kept
+
         if self.network_tariff_codes:
             _candidate_plans = [
                 p for p in _candidate_plans
@@ -1295,6 +1380,12 @@ class PlanCalculator:
                 else current_plan_energy_cost + current_supply
             )
 
+        # A known baseline beats any derived one — see baseline_total_override.
+        if self.baseline_total_override is not None:
+            current_plan_total = self.baseline_total_override
+            if self.baseline_energy_override is not None:
+                current_plan_energy_cost = self.baseline_energy_override
+
         # Calculate potential savings vs current plan
         savings = {}
         for plan_name, cost in plan_costs.items():
@@ -1395,7 +1486,13 @@ class PlanCalculator:
                 0.0,
             ),
             "current_plan_total": current_plan_total,
-            "current_plan_name": current_plan_name,
+            "current_plan_name": current_plan_name or self.baseline_label,
+            # True when `current_plan_total` is the baseline handed in rather
+            # than a plan priced from our own data — see
+            # baseline_total_override. The UI must say so: the figure is still
+            # the right thing to measure savings against, but there is no plan
+            # card behind it to open.
+            "baseline_is_external": self.baseline_total_override is not None,
             "alternative_plans": plan_costs,
             "plan_details": plan_optimization_results,  # New: detailed results for dashboard
             "periods": periods,  # One entry per bill boundary — see the comment above this return.
@@ -1415,6 +1512,16 @@ class PlanCalculator:
             # the What-If panel can default its battery input to "what I actually
             # have" rather than 0. 0 here genuinely means "no battery configured".
             "household_battery_kwh": self.battery_capacity if self.has_battery else 0.0,
+            # Plans the usage source could not price honestly, each with its
+            # reason — see the plan_filter block in this method. Empty on a
+            # normal recorder-backed run. Carried through so the UI can say
+            # "excluded, because…" instead of leaving them silently absent.
+            "excluded_plans": self.excluded_plans or {},
+            # Plan ids whose controlled-load line used the assumed rate rather
+            # than one we hold for that plan. Empty unless cl_rate_fallback was
+            # set. The UI must mark these — an assumed CL rate on a household
+            # with most of its usage on that register can move a ranking.
+            "cl_assumed_plans": sorted(self.cl_assumed_plans),
             # Present only to flag a "what if?" scenario to the frontend — every
             # dollar figure above (including the current plan's) is then a
             # hypothetical LP result, not a real bill. See `whatif_battery_kwh`/
@@ -2396,17 +2503,29 @@ class PlanCalculator:
         cl_lines: list = []
         for device in (cl_devices or []):
             rate_info = plan.get_controlled_load_rate(device['register'])
+            assumed = False
+            if rate_info is None and self.cl_rate_fallback:
+                # The user opted into one assumed CL rate so plans with no CL
+                # rate of their own can be compared at all (see
+                # self.cl_rate_fallback). Tagged, never silent: without the
+                # tag this is indistinguishable from a published rate.
+                rate_info = self.cl_rate_fallback.get(device['register'])
+                assumed = rate_info is not None
+                if assumed:
+                    self.cl_assumed_plans.add(getattr(plan, 'plan_id', '') or '')
             if rate_info is None:
                 continue  # this plan doesn't itemise this register — leave it in general consumption
             dev_kwh = device['daily_kwh'] * actual_days
             dev_cost = dev_kwh * float(rate_info['rate'])
             dev_supply = float(rate_info.get('daily_supply_charge') or 0.0) * actual_days
             cl_lines.append({
-                'label': f"Controlled Load — {device['name']}",
+                'label': (f"Controlled Load — {device['name']}"
+                          + (" (assumed rate)" if assumed else "")),
                 'register': device['register'],
                 'rate_c': round(float(rate_info['rate']) * 100, 2),
                 'kwh': round(dev_kwh, 2),
                 'amount': round(dev_cost + dev_supply, 2),
+                'rate_assumed': assumed,
             })
             cl_amount += dev_cost + dev_supply
             if device.get('in_aggregate'):
@@ -3383,10 +3502,18 @@ class PlanCalculator:
         period="hour" reads long-term statistics; period="5minute" reads short-term
         statistics, which only exist within the recorder's retention window — callers
         using 5minute must tolerate partial or empty coverage.
+
+        This is the single seam every energy series in a comparison comes
+        through — see `self._usage_source` in __init__ for what that is for.
         """
         sensor = sensor_id or self.energy_sensor
         if not sensor:
             return []
+
+        if self._usage_source is not None:
+            return await self._usage_source.series(
+                start_time, end_time, sensor, period
+            )
 
         try:
             stats = await get_instance(self.hass).async_add_executor_job(

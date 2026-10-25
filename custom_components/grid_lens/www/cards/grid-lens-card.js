@@ -39,6 +39,27 @@ class GridLensCard extends HTMLElement {
     this._whatifSolarPct = null;
     this._whatifApplied = null;  // {batteryKwh, solarPct} | null
 
+    // ── Data source ─────────────────────────────────────────────────────────
+    // 'live' reads this household's recorder (the default, and the only source
+    // before bill upload existed). 'bill:<id>' drives the whole page from an
+    // uploaded bill's reconstructed half-hourly model instead — see
+    // bill_source.py. Everything on this page works either way because it is
+    // all downstream of one seam in the backend; the only things that change
+    // here are the selector, the confidence banner, and the date inputs (a
+    // bill's period is fixed, so they are disabled).
+    //
+    // Persisted, unlike the What-If panel: picking a source is a standing
+    // choice ("I'm looking at my relative's bill today"), not a one-off
+    // exploration, and a page reload mid-analysis losing it is worse than the
+    // small surprise of coming back to it.
+    this._source = 'live';
+    this._billScenario = null;   // which controlled-load scenario, when source is a bill
+    this._bills = null;          // null = not loaded yet; [] = none stored
+    this._archetypes = [];
+    this._showBills = false;
+    this._billDraft = '';        // the paste-a-bill textarea's contents
+    this._billError = '';
+
     this._history = null;
     this._editingId = null;
     this._addingNew = false;
@@ -62,6 +83,8 @@ class GridLensCard extends HTMLElement {
       if (!this._startDate) this._startDate = localStorage.getItem('epc-date-start') || '';
       if (!this._endDate)   this._endDate   = localStorage.getItem('epc-date-end')   || '';
       if (!this._excludeGreedy) this._excludeGreedy = localStorage.getItem('epc-exclude-greedy') === 'true';
+      if (this._source === 'live') this._source = localStorage.getItem('epc-source') || 'live';
+      if (!this._billScenario) this._billScenario = localStorage.getItem('epc-bill-scenario') || null;
       const storedTopN = localStorage.getItem('epc-top-n');
       if (storedTopN != null) this._topN = storedTopN === 'all' ? Infinity : parseInt(storedTopN, 10) || 5;
     } catch (_) {}
@@ -74,11 +97,60 @@ class GridLensCard extends HTMLElement {
     // state change, which causes severe GC pressure in Chrome.
     if (!this._connected) {
       this._connected = true;
-      // Use saved dates on init so navigating back restores the last comparison.
+      // Bills first, and awaited: a stored source of 'bill:<id>' restored from
+      // localStorage has to be validated against what is actually stored before
+      // the comparison is kicked off, or a bill deleted in another tab leaves
+      // this one requesting a 404 on every load.
+      this._loadBills().then(() => {
+        // Use saved dates on init so navigating back restores the last comparison.
+        const s = this._startDate ? `${this._startDate}T00:00:00` : null;
+        const e = this._endDate   ? `${this._endDate}T23:59:59`   : null;
+        this.fetchData(s, e);
+      });
+    }
+  }
+
+  async _loadBills() {
+    try {
+      const resp = await fetch('/api/grid_lens/bills');
+      if (!resp.ok) throw new Error(`bills: ${resp.status}`);
+      const data = await resp.json();
+      this._bills = data.bills || [];
+      this._archetypes = data.archetypes || [];
+    } catch (err) {
+      this._bills = [];
+      this._archetypes = [];
+    }
+    if (this._source !== 'live') {
+      const id = this._source.slice(5);
+      if (!this._bills.some(b => b.id === id)) this._setSource('live', false);
+    }
+  }
+
+  _setSource(source, refetch = true) {
+    this._source = source;
+    this._billScenario = null;
+    try {
+      localStorage.setItem('epc-source', source);
+      localStorage.removeItem('epc-bill-scenario');
+    } catch (_) {}
+    if (!refetch) return;
+    if (source === 'live') {
+      // Back to the household's own data, on its own saved date range.
       const s = this._startDate ? `${this._startDate}T00:00:00` : null;
       const e = this._endDate   ? `${this._endDate}T23:59:59`   : null;
-      this.fetchData(s, e);
+      this.fetchData(s, e, true);
+    } else {
+      // The backend forces the bill's own period, so send no dates at all
+      // rather than quietly handing it a range it is going to override.
+      this.fetchData(null, null, true);
     }
+  }
+
+  _currentBill() {
+    if (this._source === 'live' || !this._bills) return null;
+    const id = this._source.slice(5);
+    return this._bills.find(b => b.id === id) || null;
   }
 
   // Unique id for an inline <svg>'s <linearGradient>, scoped to one render() pass.
@@ -97,11 +169,25 @@ class GridLensCard extends HTMLElement {
     return `whatif:${this._whatifApplied.batteryKwh}:${this._whatifApplied.solarPct}`;
   }
 
+  // Folded into every cache key alongside _whatifCacheFrag, for the same
+  // reason: a bill's comparison must never be served from the live household's
+  // cache entry, and one controlled-load scenario must never be served from
+  // another's — they differ by hundreds of dollars a year.
+  _sourceCacheFrag() {
+    if (this._source === 'live') return '';
+    return `src:${this._source}:${this._billScenario || 'default'}`;
+  }
+
+  _cacheKey(startDate, endDate) {
+    return `${startDate || ''}|${endDate || ''}|${this._excludeGreedy}` +
+           `|${this._whatifCacheFrag()}|${this._sourceCacheFrag()}`;
+  }
+
   async fetchData(startDate = null, endDate = null, forceRefresh = false) {
     if (!this._connected || this._fetching) return;
 
     // Return cached result instantly when navigating back to the card.
-    const cacheKey = `${startDate || ''}|${endDate || ''}|${this._excludeGreedy}|${this._whatifCacheFrag()}`;
+    const cacheKey = this._cacheKey(startDate, endDate);
     if (!forceRefresh) {
       const hit = GridLensCard._cache[cacheKey];
       if (hit) {
@@ -151,10 +237,14 @@ class GridLensCard extends HTMLElement {
     if (this._excludeGreedy) {
       params += params ? '&exclude_greedy=true' : '?exclude_greedy=true';
     }
+    const add = (k, v) => { params += params ? `&${k}=${v}` : `?${k}=${v}`; };
     if (this._whatifApplied) {
-      const add = (k, v) => { params += params ? `&${k}=${v}` : `?${k}=${v}`; };
       if (this._whatifApplied.batteryKwh !== null) add('battery_kwh', this._whatifApplied.batteryKwh);
       if (this._whatifApplied.solarPct !== null) add('solar_pct', this._whatifApplied.solarPct);
+    }
+    if (this._source !== 'live') {
+      add('source', encodeURIComponent(this._source));
+      if (this._billScenario) add('scenario', encodeURIComponent(this._billScenario));
     }
     this._pollCalc(params, startDate, endDate, generation);
   }
@@ -240,7 +330,7 @@ class GridLensCard extends HTMLElement {
           // its place.
           full.plan_details = (this._data && this._data.plan_details) || {};
           this._data = full;
-          const cacheKey = `${startDate || ''}|${endDate || ''}|${this._excludeGreedy}|${this._whatifCacheFrag()}`;
+          const cacheKey = this._cacheKey(startDate, endDate);
           GridLensCard._cache[cacheKey] = full;
           this._streamPhase = null;
           this._fetching = false;
@@ -1155,6 +1245,191 @@ class GridLensCard extends HTMLElement {
     </div>`;
   }
 
+  // ── Bill upload / intake ──────────────────────────────────────────────────
+
+  // The panel behind the "Bills" button: what is stored, and how to add one.
+  //
+  // Bills are entered as the parsed figures, not as a PDF: PDF extraction needs
+  // the fact-sheet pipeline (pdftotext/OCR on the GPU box plus a local LLM with
+  // the grounding guards), which lives in gridlens-api and is reached over the
+  // network — so it arrives with the cloud parser, and this panel is already
+  // shaped to take its output. Nothing here has a field for a name, address,
+  // NMI or account number, and the backend REJECTS any key it does not
+  // recognise, so there is nowhere for those to land even by accident.
+  renderBillsPanel() {
+    if (this._bills === null) {
+      return '<div style="padding:24px;text-align:center;color:var(--secondary-text-color)">Loading…</div>';
+    }
+    const _e = (t) => this._esc(t == null ? '' : t);
+    const rows = this._bills.map(b => {
+      const f = b.facts || {};
+      const days = (f.periods || []).reduce((n, p) => n + (p.days || 0), 0);
+      const gen = (f.periods || []).reduce((n, p) => n + (p.general_kwh || 0), 0);
+      const cl = (f.periods || []).reduce((n, p) => n + (p.cl_kwh || 0), 0);
+      const exp = (f.periods || []).reduce((n, p) => n + (p.export_kwh || 0), 0);
+      const chk = b.self_check || {};
+      const chkLabel = !chk.verifiable
+        ? '<span class="bill-chip bill-chip-warn" title="The parse captured no printed amounts, so its arithmetic has not been checked against anything — not the same as verified.">unverified</span>'
+        : (chk.ok
+            ? '<span class="bill-chip bill-chip-ok" title="Every line, period and total reconstructs from kWh x rate.">reconciles</span>'
+            : `<span class="bill-chip bill-chip-bad" title="${_e((chk.problems || []).join(' / '))}">does not reconcile</span>`);
+      const a = b.answers || {};
+      const pv = a.pv_kw ? `${a.pv_kw} kW` : 'PV size not given';
+      const active = this._source === `bill:${b.id}`;
+      return `<tr class="${active ? 'bill-active' : ''}">
+        <td>
+          <strong>${_e(b.label)}</strong><br>
+          <span class="bill-sub">${_e(f.retailer)} · ${_e(f.plan_name)} · ${_e(f.network)}</span>
+        </td>
+        <td>${days} days<br><span class="bill-sub">${gen.toFixed(0)} kWh general${cl > 0 ? ` · ${cl.toFixed(0)} kWh CL` : ''}${exp > 0 ? ` · ${exp.toFixed(0)} kWh export` : ''}</span></td>
+        <td>${chkLabel}<br><span class="bill-sub">${_e(pv)} · ${_e(a.archetype || '')}</span></td>
+        <td class="hist-actions">
+          ${active
+            ? '<button class="hist-btn hist-btn-sec" disabled>In use</button>'
+            : `<button class="epc-bill-use hist-btn" data-id="${_e(b.id)}">Compare</button>`}
+          <button class="epc-bill-del hist-btn hist-btn-del" data-id="${_e(b.id)}">Delete</button>
+        </td>
+      </tr>`;
+    }).join('');
+
+    const archOpts = this._archetypes.map(a =>
+      `<option value="${_e(a.id)}">${_e(a.label)} — ${_e(a.question)}</option>`).join('');
+
+    return `<div class="hist-section">
+      <p class="hist-note">
+        Compare a household that has never run Grid Lens, from its paper bill alone.
+        Everything on this page then works as usual — ranking, bill breakdown, charts
+        and What-If — driven by a reconstructed half-hourly model instead of the
+        recorder. The bill's own arithmetic has to reconcile before it is accepted.
+      </p>
+      <table class="hist-table">
+        <thead><tr><th>Bill</th><th>Period</th><th>Model</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="4" class="bill-sub">No bills stored yet.</td></tr>'}</tbody>
+      </table>
+
+      <div class="bill-add">
+        <h4>Add a bill</h4>
+        <p class="bill-sub">
+          Paste the bill's figures as JSON — one entry in <code>periods</code> per rate
+          period the bill prints (retailers split a bill whenever rates change
+          mid-cycle, and each slice carries its own rates and day count).
+          Include <code>printed_energy_total</code> so the arithmetic can be checked.
+          Rates are in dollars, not cents.
+        </p>
+        <textarea id="epc-bill-json" rows="12" spellcheck="false"
+                  placeholder="Bill JSON">${_e(this._billDraft)}</textarea>
+        <div class="bill-fields">
+          <label>Inverter size
+            <input type="number" id="epc-bill-pv" min="0" step="0.1" placeholder="kW (leave blank if unknown)">
+          </label>
+          <label>Daytime occupancy
+            <select id="epc-bill-arch">${archOpts}</select>
+          </label>
+          <label>Hot water element
+            <input type="number" id="epc-bill-clkw" min="0" step="0.1" placeholder="kW (optional)">
+          </label>
+        </div>
+        <p class="bill-sub">
+          The inverter's kW rating is the single most valuable input here. Without it
+          every system from roughly 3.5 kW to 12 kW fits a bill's import and export
+          registers equally well, each with a compensating daytime load share — and a
+          10 kWh battery's annual saving spans a factor of two and a half across that
+          range. Entering it collapses the ambiguity; leaving it blank is allowed but
+          every modelled figure is then presented as a range.
+        </p>
+        <div class="whatif-presets">
+          <button id="epc-bill-example" class="nav-btn">Insert example</button>
+          <button id="epc-bill-save">Add bill</button>
+        </div>
+        ${this._billError ? `<div class="bill-err">${_e(this._billError)}</div>` : ''}
+      </div>
+    </div>`;
+  }
+
+  // The confidence banner. A bill-sourced figure must never appear without the
+  // assumptions that produced it visible beside it — showing a battery payback
+  // at the same visual weight as a flat-rate saving is the core presentational
+  // mistake this is here to prevent.
+  renderBillBanner() {
+    const b = this._data && this._data.bill;
+    if (!b) return '';
+    const _e = (t) => this._esc(t == null ? '' : t);
+    const m = b.model || {};
+    const cl = b.controlled_load || {};
+    const _busy = this._streamPhase !== null;
+
+    const pv = m.pv_identified
+      ? `${m.pv_kw_implied} kW (as entered)`
+      : `${(m.pv_range_kw || [])[0]}–${(m.pv_range_kw || [])[1]} kW — <strong>not identified</strong>`;
+
+    const scenarios = (this._data.scenarios || []);
+    const scenarioPicker = scenarios.length > 1 ? `
+      <label class="bill-scenario">Hot water
+        <select id="epc-bill-scenario" ${_busy ? 'disabled' : ''}>
+          ${scenarios.map(s => `<option value="${_e(s.id)}"${
+            s.id === (b.scenario || {}).id ? ' selected' : ''}>${_e(s.label)}</option>`).join('')}
+        </select>
+      </label>` : '';
+
+    const excluded = this._data.excluded_plans || {};
+    const nExcluded = Object.keys(excluded).length;
+    const reasonCounts = {};
+    // Every gate reason is "<short kind>: <detail>" (see BillGates.reason), so
+    // the kind is the part before the first colon — grouping does not depend on
+    // parsing the prose.
+    for (const v of Object.values(excluded)) {
+      const k = String(v.reason || '').split(':')[0];
+      reasonCounts[k] = (reasonCounts[k] || 0) + 1;
+    }
+    const excludedHtml = nExcluded ? `
+      <div class="bill-excluded">
+        <strong>${nExcluded} plan${nExcluded === 1 ? '' : 's'} not comparable from this bill:</strong>
+        ${Object.entries(reasonCounts).map(([r, n]) => `${n} &times; ${_e(r)}`).join(' · ')}.
+        These are excluded rather than priced on missing data — a plan priced on
+        data a bill cannot supply does not drop out of a ranking, it tops it.
+        ${cl.present && cl.assumed_rate == null ? `
+          <button id="epc-bill-assume-cl" class="nav-btn" ${_busy ? 'disabled' : ''}
+                  title="Carry one assumed controlled-load rate onto plans that have none, so they can be compared. Every figure that uses it is labelled.">
+            Assume ${(cl.suggested_rate != null ? (cl.suggested_rate * 100).toFixed(3) : '?')}c/kWh controlled load
+          </button>` : ''}
+      </div>` : '';
+
+    const assumedHtml = cl.assumed_rate != null ? `
+      <div class="bill-assumed">
+        &#9888; Controlled load is being priced at an <strong>assumed
+        ${(cl.assumed_rate * 100).toFixed(3)}c/kWh</strong> on every plan that has no
+        controlled-load rate of its own. That is this household's own current rate
+        carried across, not a rate any of those retailers published — and
+        ${cl.share_pct}% of this household's usage is on that register, so it can move
+        the ranking. Lines using it are marked "(assumed rate)".
+        <button id="epc-bill-unassume-cl" class="nav-btn" ${_busy ? 'disabled' : ''}>Stop assuming</button>
+      </div>` : '';
+
+    const warnings = (m.warnings || []).map(w => `<li>${_e(w)}</li>`).join('');
+
+    return `
+      <div class="bill-banner">
+        <div class="bill-banner-head">
+          <span class="bill-chip bill-chip-modelled">MODELLED</span>
+          <strong>${_e(b.retailer)} — ${_e(b.plan_name)}</strong>
+          <span class="bill-sub">${_e(b.period)} · ${b.days} days · ${_e(b.network)}</span>
+          ${scenarioPicker}
+          <button id="epc-bill-exit" class="nav-btn" ${_busy ? 'disabled' : ''}>Back to my data</button>
+        </div>
+        <div class="bill-banner-grid">
+          <div><span class="bill-sub">Bill as issued</span><br>$${(b.billed_total || 0).toFixed(2)}</div>
+          <div><span class="bill-sub">Solar system</span><br>${pv}</div>
+          <div><span class="bill-sub">Load profile</span><br>${_e(m.archetype_label)} (${m.day_share_pct}% daytime)</div>
+          <div><span class="bill-sub">Reproduces import / export</span><br>${(m.import_err_pct >= 0 ? '+' : '') + Number(m.import_err_pct).toFixed(2)}% / ${(m.export_err_pct >= 0 ? '+' : '') + Number(m.export_err_pct).toFixed(2)}%</div>
+          ${cl.present ? `<div><span class="bill-sub">Controlled load</span><br>${cl.daily_kwh} kWh/day (${cl.share_pct}% of usage)</div>` : ''}
+        </div>
+        <div class="bill-caveat">${_e(b.one_season_caveat)}</div>
+        ${warnings ? `<ul class="bill-warnings">${warnings}</ul>` : ''}
+        ${assumedHtml}
+        ${excludedHtml}
+      </div>`;
+  }
+
   // ── Main render ───────────────────────────────────────────────────────────
 
   render() {
@@ -1487,6 +1762,85 @@ class GridLensCard extends HTMLElement {
           background: var(--card-background-color); color: var(--primary-text-color);
           border: 1px solid var(--divider-color); border-radius: 4px;
           padding: 3px 10px; cursor: pointer; font-size: 12px; white-space: nowrap;
+        }
+        /* Bill-sourced comparison: the confidence banner and the bills panel.
+           Deliberately quieter than .whatif-banner's hazard stripes — a bill
+           comparison is a legitimate mode, not a temporary hypothetical — but
+           it still has to be impossible to read a figure below without seeing
+           what it rests on. */
+        .bill-banner {
+          margin: 0 16px 12px; padding: 10px 14px; border-radius: 6px;
+          border: 1px solid var(--divider-color);
+          border-left: 4px solid var(--info-color, #2196f3);
+          background: var(--secondary-background-color);
+          font-size: 13px; color: var(--primary-text-color);
+        }
+        .bill-banner-head {
+          display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+          margin-bottom: 8px;
+        }
+        .bill-banner-head .nav-btn { margin-left: auto; }
+        .bill-banner-grid {
+          display: grid; gap: 10px 20px;
+          grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+          padding: 8px 0; border-top: 1px solid var(--divider-color);
+        }
+        .bill-caveat, .bill-warnings {
+          margin: 8px 0 0; font-size: 12px; color: var(--secondary-text-color);
+        }
+        .bill-warnings { padding-left: 18px; }
+        .bill-warnings li { margin: 4px 0; }
+        .bill-assumed, .bill-excluded {
+          margin-top: 8px; padding: 7px 10px; border-radius: 4px; font-size: 12px;
+          background: var(--card-background-color);
+          border: 1px solid var(--divider-color);
+        }
+        .bill-assumed {
+          border-color: var(--warning-color, #ff9800);
+        }
+        .bill-assumed .nav-btn, .bill-excluded .nav-btn { margin-left: 8px; }
+        .bill-scenario, .source-control {
+          display: inline-flex; align-items: center; gap: 6px;
+          font-size: 12px; color: var(--secondary-text-color);
+        }
+        .bill-scenario select, .source-control select {
+          font: inherit; padding: 2px 4px;
+          background: var(--card-background-color); color: var(--primary-text-color);
+          border: 1px solid var(--divider-color); border-radius: 4px;
+        }
+        .bill-chip {
+          display: inline-block; padding: 1px 7px; border-radius: 10px;
+          font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+        }
+        .bill-chip-modelled { background: var(--info-color, #2196f3); color: #fff; }
+        .bill-chip-ok { background: var(--success-color, #43a047); color: #fff; }
+        .bill-chip-warn { background: var(--warning-color, #ff9800); color: #fff; }
+        .bill-chip-bad { background: var(--error-color, #e53935); color: #fff; }
+        .bill-sub { color: var(--secondary-text-color); font-size: 12px; }
+        .bill-active { background: var(--secondary-background-color); }
+        .bill-add { margin: 16px 0 0; }
+        .bill-add h4 { margin: 0 0 6px; }
+        .bill-add textarea {
+          width: 100%; box-sizing: border-box; font-family: monospace;
+          font-size: 12px; padding: 8px; border-radius: 4px;
+          background: var(--card-background-color); color: var(--primary-text-color);
+          border: 1px solid var(--divider-color);
+        }
+        .bill-fields {
+          display: flex; gap: 14px; flex-wrap: wrap; margin: 8px 0;
+        }
+        .bill-fields label {
+          display: flex; flex-direction: column; gap: 3px; font-size: 12px;
+          color: var(--secondary-text-color);
+        }
+        .bill-fields input, .bill-fields select {
+          font: inherit; padding: 4px 6px; border-radius: 4px;
+          background: var(--card-background-color); color: var(--primary-text-color);
+          border: 1px solid var(--divider-color);
+        }
+        .bill-err {
+          margin-top: 8px; padding: 8px 10px; border-radius: 4px; font-size: 12px;
+          background: var(--error-color, #e53935); color: #fff; white-space: pre-wrap;
         }
         /* Full-screen plan breakout — click a plan's cost banner (below) to expand
            just that one plan-card over the whole viewport, charts and all. */
@@ -1879,14 +2233,30 @@ class GridLensCard extends HTMLElement {
       (a, b) => a.localeCompare(b));
 
     const _busy = this._streamPhase !== null;
+
+    // A bill's model only covers the days the bill covers, so the date range is
+    // the bill's and the pickers are disabled rather than silently ignored.
+    const _onBill = this._source !== 'live';
+    const _dateDis = (_busy || _onBill) ? 'disabled' : '';
+    const _sourceHtml = (this._bills && this._bills.length) ? `
+      <label class="source-control" title="Compare this household's own metered data, or a household you only have a paper bill for.">
+        Source
+        <select id="epc-source" ${_busy ? 'disabled' : ''}>
+          <option value="live"${this._source === 'live' ? ' selected' : ''}>My data</option>
+          ${this._bills.map(b => `<option value="bill:${this._esc(b.id)}"${
+            this._source === `bill:${b.id}` ? ' selected' : ''}>${this._esc(b.label)}</option>`).join('')}
+        </select>
+      </label>` : '';
+
     const dateControlsHtml = `
       <div class="date-controls">
-        <button id="epc-prev" class="nav-btn" title="Back 1 month" ${_busy ? 'disabled' : ''}>&#8592; 1 mo</button>
+        ${_sourceHtml}
+        <button id="epc-prev" class="nav-btn" title="Back 1 month" ${_dateDis}>&#8592; 1 mo</button>
         <label>From</label>
-        <input type="date" id="epc-start" value="${this._startDate}" ${_busy ? 'disabled' : ''}>
+        <input type="date" id="epc-start" value="${this._startDate}" ${_dateDis}>
         <label>to</label>
-        <input type="date" id="epc-end" value="${this._endDate}" ${_busy ? 'disabled' : ''}>
-        <button id="epc-next" class="nav-btn" title="Forward 1 month" ${_busy ? 'disabled' : ''}>1 mo &#8594;</button>
+        <input type="date" id="epc-end" value="${this._endDate}" ${_dateDis}>
+        <button id="epc-next" class="nav-btn" title="Forward 1 month" ${_dateDis}>1 mo &#8594;</button>
         <button id="epc-calc" ${_busy ? 'disabled' : ''}>${_busy ? 'Calculating…' : 'Calculate'}</button>
         <span class="zoom-controls">
           <button id="epc-zoom-out" class="nav-btn" title="Shrink charts">&#8722;</button>
@@ -1919,6 +2289,8 @@ class GridLensCard extends HTMLElement {
           </select>
         </label>
         <button id="epc-history-btn" class="nav-btn${this._showHistory ? ' active' : ''}">History</button>
+        <button id="epc-bills-btn" class="nav-btn${this._showBills ? ' active' : ''}"
+                title="Compare a household you only have a paper bill for">Bills</button>
         <button id="epc-whatif-btn" class="nav-btn${(this._showWhatif || this._whatifApplied) ? ' active' : ''}"
                 title="Simulate a different battery/solar system size, including none at all">What if?</button>
         <a href="/api/grid_lens/diagnostic_export" download class="nav-btn" title="Download diagnostic zip for bug reporting" style="text-decoration:none;">&#8659; Diagnostic</a>
@@ -1987,9 +2359,9 @@ class GridLensCard extends HTMLElement {
       ? periodsArr.map(p => this._renderPeriodSection(p, topN, showBreakdown)).join('')
       : `<div class="plan-grid">${plansHtml}${skeletonsHtml}</div>`;
 
-    const bodyHtml = this._showHistory
-      ? this.renderHistoryPanel(planNames)
-      : periodsHtml;
+    const bodyHtml = this._showBills
+      ? this.renderBillsPanel()
+      : (this._showHistory ? this.renderHistoryPanel(planNames) : periodsHtml);
 
     this.shadowRoot.innerHTML = `
       ${styles}
@@ -1997,6 +2369,7 @@ class GridLensCard extends HTMLElement {
         ${dateControlsHtml}
         ${whatifPanelHtml}
         ${whatifBannerHtml}
+        ${this.renderBillBanner()}
         ${bodyHtml}
       </ha-card>`;
 
@@ -2100,11 +2473,177 @@ class GridLensCard extends HTMLElement {
 
     this.shadowRoot.getElementById('epc-history-btn')?.addEventListener('click', () => {
       this._showHistory = !this._showHistory;
+      this._showBills = false;
       this._editingId = null;
       this._addingNew = false;
       if (this._showHistory && this._history === null) this.fetchHistory();
       this.render();
     });
+
+    // ── Bill source ─────────────────────────────────────────────────────────
+
+    this.shadowRoot.getElementById('epc-bills-btn')?.addEventListener('click', async () => {
+      this._showBills = !this._showBills;
+      this._showHistory = false;
+      this._billError = '';
+      if (this._showBills) await this._loadBills();
+      this.render();
+    });
+
+    this.shadowRoot.getElementById('epc-source')?.addEventListener('change', (ev) => {
+      this._setSource(ev.target.value);
+    });
+
+    this.shadowRoot.getElementById('epc-bill-exit')?.addEventListener('click', () => {
+      this._setSource('live');
+    });
+
+    this.shadowRoot.getElementById('epc-bill-scenario')?.addEventListener('change', (ev) => {
+      this._billScenario = ev.target.value;
+      try { localStorage.setItem('epc-bill-scenario', this._billScenario); } catch (_) {}
+      this.fetchData(null, null, true);
+    });
+
+    this.shadowRoot.querySelectorAll('.epc-bill-use').forEach(btn => {
+      btn.addEventListener('click', () => {
+        this._showBills = false;
+        this._setSource(`bill:${btn.dataset.id}`);
+      });
+    });
+
+    this.shadowRoot.querySelectorAll('.epc-bill-del').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.id;
+        const bill = (this._bills || []).find(b => b.id === id);
+        if (!confirm(`Delete "${bill ? bill.label : id}"? The comparison for it goes with it.`)) return;
+        try {
+          await fetch(`/api/grid_lens/bills/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        } catch (_) {}
+        // Drop the deleted bill's cached comparisons, or switching back to a
+        // re-added bill with the same label could serve the old one's numbers.
+        for (const k of Object.keys(GridLensCard._cache)) {
+          if (k.includes(`src:bill:${id}`)) delete GridLensCard._cache[k];
+        }
+        await this._loadBills();
+        if (this._source === `bill:${id}`) this._setSource('live');
+        else this.render();
+      });
+    });
+
+    this.shadowRoot.getElementById('epc-bill-example')?.addEventListener('click', () => {
+      // Illustrative figures, not anyone's bill — round numbers so the shape is
+      // obvious, and they reconcile exactly: 233.30 + 450.60 = 683.90, so the
+      // arithmetic self-check passes as-is and a user editing one line can see
+      // it start to fail. Two contiguous periods because a mid-cycle price
+      // change is the common case on a quarterly bill, and the periods must
+      // join end-to-start (the model walks them by cumulative day offset).
+      this._billDraft = JSON.stringify({
+        state: 'NSW',
+        network: 'Endeavour Energy',
+        postcode: '2500',
+        latitude: -34.4,
+        retailer: 'Example Energy',
+        plan_name: 'Example Saver',
+        plan_id: '',
+        printed_energy_total: 683.90,
+        periods: [{
+          start: '2026-06-01', days: 30,
+          general_kwh: 400.0, general_rate: 0.3000,
+          cl_kwh: 500.0, cl_rate: 0.1600,
+          export_kwh: 200.0, fit_rate: 0.03,
+          supply_per_day: 1.2000, cl_supply_per_day: 0.1100,
+        }, {
+          start: '2026-07-01', days: 60,
+          general_kwh: 800.0, general_rate: 0.2800,
+          cl_kwh: 1000.0, cl_rate: 0.1600,
+          export_kwh: 500.0, fit_rate: 0.03,
+          supply_per_day: 1.2500, cl_supply_per_day: 0.1100,
+        }],
+      }, null, 2);
+      this._billError = '';
+      this.render();
+    });
+
+    const _draftBox = this.shadowRoot.getElementById('epc-bill-json');
+    if (_draftBox) {
+      // Keep the draft across the re-renders the streaming calculation causes,
+      // so a half-typed bill is not lost by a plan event landing mid-edit.
+      _draftBox.addEventListener('input', (ev) => { this._billDraft = ev.target.value; });
+    }
+
+    this.shadowRoot.getElementById('epc-bill-save')?.addEventListener('click', async () => {
+      const raw = this.shadowRoot.getElementById('epc-bill-json')?.value || '';
+      this._billDraft = raw;
+      let facts;
+      try {
+        facts = JSON.parse(raw);
+      } catch (err) {
+        this._billError = `That is not valid JSON: ${err.message}`;
+        this.render();
+        return;
+      }
+      const pv = parseFloat(this.shadowRoot.getElementById('epc-bill-pv')?.value);
+      const clkw = parseFloat(this.shadowRoot.getElementById('epc-bill-clkw')?.value);
+      const answers = {
+        pv_kw: Number.isFinite(pv) && pv > 0 ? pv : null,
+        archetype: this.shadowRoot.getElementById('epc-bill-arch')?.value || 'evening_peak',
+      };
+      if (Number.isFinite(clkw) && clkw > 0) answers.cl_max_kw = clkw;
+      try {
+        const resp = await fetch('/api/grid_lens/bills', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ facts, answers }),
+        });
+        const body = await resp.json();
+        if (!resp.ok) {
+          // A 422 is the arithmetic self-check refusing a parse that does not
+          // reconcile. Show exactly which figures disagree — that is the whole
+          // value of the check, and it is also the user's repair instructions.
+          const probs = ((body.self_check || {}).problems || []).join('\n');
+          this._billError = (body.error || `HTTP ${resp.status}`) +
+            (probs ? `:\n${probs}` : '');
+          this.render();
+          return;
+        }
+        this._billDraft = '';
+        this._billError = '';
+        this._showBills = false;
+        await this._loadBills();
+        this._setSource(`bill:${body.bill.id}`);
+      } catch (err) {
+        this._billError = String(err);
+        this.render();
+      }
+    });
+
+    // The assumed controlled-load rate: an explicit opt-in, stored on the
+    // bill's own intake answers so it survives a reload and is visible in the
+    // bills panel rather than being an invisible session flag.
+    const _setAssumedCl = async (on) => {
+      const bill = this._currentBill();
+      if (!bill) return;
+      const cl = ((this._data || {}).bill || {}).controlled_load || {};
+      const answers = { ...(bill.answers || {}) };
+      answers.assume_cl_rate = on ? cl.suggested_rate : null;
+      answers.assume_cl_supply = on ? (cl.suggested_supply || 0) : 0;
+      try {
+        await fetch(`/api/grid_lens/bills/${encodeURIComponent(bill.id)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ answers }),
+        });
+      } catch (_) {}
+      for (const k of Object.keys(GridLensCard._cache)) {
+        if (k.includes(`src:bill:${bill.id}`)) delete GridLensCard._cache[k];
+      }
+      await this._loadBills();
+      this.fetchData(null, null, true);
+    };
+    this.shadowRoot.getElementById('epc-bill-assume-cl')
+      ?.addEventListener('click', () => _setAssumedCl(true));
+    this.shadowRoot.getElementById('epc-bill-unassume-cl')
+      ?.addEventListener('click', () => _setAssumedCl(false));
 
     this.shadowRoot.getElementById('epc-whatif-btn')?.addEventListener('click', () => {
       this._showWhatif = !this._showWhatif;

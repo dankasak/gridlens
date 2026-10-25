@@ -4,6 +4,16 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import timedelta
+# ⚠ Do NOT add `datetime` or any other name here that matches a module file in
+# this package. This integration ships a HA platform file called `datetime.py`,
+# and importing a submodule binds it as an attribute of the package — which, for
+# __init__.py, IS the module global namespace. So `from datetime import datetime`
+# here works at import time and is then silently REPLACED by
+# custom_components.grid_lens.datetime once HA loads that platform, and every
+# later `datetime.now()` raises "module ... has no attribute 'now'". Import it
+# locally inside the function instead, as the handlers below do. (Found live
+# 2026-10-25; the same shadowing is why tools/bill_sandbox.py loads integration
+# modules by importlib spec rather than via sys.path.)
 
 from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
@@ -577,6 +587,60 @@ def _parse_optional_float(raw: str | None) -> float | None:
         return None
 
 
+async def _load_bills(hass: HomeAssistant) -> dict:
+    """Bills uploaded for comparison, from local HA storage.
+
+    Local only. A bill carries a quarter of the household's energy usage, and
+    the privacy stance is that usage never leaves the HA instance — so this is
+    a `Store`, not an API table, and the uploaded PDF is never persisted at
+    all. See BILL_UPLOAD_COMPARISON_DESIGN.md §8 and PRIVACY_DATA_INVENTORY.md.
+    """
+    from homeassistant.helpers.storage import Store
+    from .bill_source import STORAGE_KEY, STORAGE_VERSION
+    store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+    return await store.async_load() or {"bills": []}
+
+
+async def _save_bills(hass: HomeAssistant, data: dict) -> None:
+    from homeassistant.helpers.storage import Store
+    from .bill_source import STORAGE_KEY, STORAGE_VERSION
+    await Store(hass, STORAGE_VERSION, STORAGE_KEY).async_save(data)
+
+
+async def _build_bill_run(hass: HomeAssistant, real_entry, record: dict,
+                          scenario_id: str | None, tz):
+    """Assemble one bill scenario, caching the calibration per bill.
+
+    Calibration is a few thousand profile evaluations — fast, but not free, and
+    pure CPU, so it runs in an executor rather than blocking the event loop.
+    The result is cached in `hass.data` keyed on the bill id, because it depends
+    only on the bill and the intake answers and NOT on the scenario: controlled
+    load is held out of the solve entirely (on its overnight switching window it
+    cannot overlap solar, so it cannot move either residual). Switching
+    scenarios therefore re-synthesises but never re-fits. Editing the answers
+    drops the cache — see BillItemView.put.
+    """
+    from .bill_model import BillFacts, IntakeAnswers, calibrate
+    from .bill_source import build_bill_run
+
+    facts = BillFacts.from_dict(record["facts"])
+    answers = IntakeAnswers.from_dict(record.get("answers"))
+
+    cache_key = f"bill_model_{record['id']}"
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    model = domain_data.get(cache_key)
+    if model is None:
+        model = await hass.async_add_executor_job(calibrate, facts, answers)
+        domain_data[cache_key] = model
+
+    # synthesise() can append a physical-feasibility warning to the model (an
+    # element too small for the chosen window), so hand it a copy per run
+    # rather than letting one scenario's warning accumulate onto the next.
+    import copy
+    return build_bill_run(real_entry, facts, answers, scenario_id, tz,
+                          record["id"], model=copy.deepcopy(model))
+
+
 def _slim_stream_detail(detail):
     """Return a copy of a per-plan detail dict with the whole-period hourly arrays
     stripped from `optimization`. Everything the comparison card actually renders
@@ -661,7 +725,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20261024d"
+    _CARD_VERSION = "20261026a"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -1068,6 +1132,158 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             await store.async_save(data)
             return web.Response(text=json.dumps({"ok": True}), content_type='application/json')
 
+    class BillsView(HomeAssistantView):
+        """Bills uploaded for comparison — list, add, and the scenario axis.
+
+        A "bill" here is `BillFacts` (the parsed summary figures) plus
+        `IntakeAnswers` (the few parameters a bill cannot identify). Both are
+        validated by their own strict schemas, which have no field for a name,
+        supply address, NMI, account number or payment reference and REJECT any
+        key they do not recognise — so an over-eager extractor has nowhere to
+        put those values rather than us filtering them out afterwards. The PDF
+        itself is never stored; see BILL_UPLOAD_COMPARISON_DESIGN.md §8.
+
+        POST validates, runs the bill's own arithmetic self-check, and refuses
+        a parse that does not reconstruct the printed amounts. That check is
+        mechanical — every line is kWh x rate, every period the sum of its
+        lines, the bill the sum of its periods — which makes it a far better
+        gate than any confidence score: a parse that invents a feed-in rate is
+        indistinguishable from a correct one by eye, and every downstream
+        dollar depends on it.
+        """
+
+        url = "/api/grid_lens/bills"
+        name = "api:grid_lens:bills"
+        requires_auth = False
+
+        def __init__(self, hass_instance):
+            self.hass = hass_instance
+
+        async def get(self, request):
+            import json
+            from .bill_model import ARCHETYPES
+            data = await _load_bills(self.hass)
+            return web.Response(
+                text=json.dumps({
+                    "bills": data["bills"],
+                    "archetypes": [
+                        {"id": k, "label": v["label"], "question": v["question"]}
+                        for k, v in ARCHETYPES.items()
+                    ],
+                }),
+                content_type='application/json')
+
+        async def post(self, request):
+            import json, uuid
+            # Locally imported — see the warning on this file's own
+            # `from datetime import timedelta` at the top.
+            from datetime import datetime, timezone
+            from .bill_model import BillFacts, IntakeAnswers, scenarios_for
+            try:
+                body = await request.json()
+            except Exception:
+                return web.Response(text=json.dumps({'error': 'Invalid JSON'}),
+                                    content_type='application/json', status=400)
+            try:
+                facts = BillFacts.from_dict(body.get('facts') or {})
+                answers = IntakeAnswers.from_dict(body.get('answers'))
+            except (ValueError, TypeError) as exc:
+                return web.Response(text=json.dumps({'error': str(exc)}),
+                                    content_type='application/json', status=400)
+
+            check = facts.self_check()
+            if not check.ok and not body.get('accept_unchecked'):
+                # Hand the problems back rather than storing a bill we know
+                # does not add up. `accept_unchecked` exists for the case where
+                # the user has read the discrepancies and confirms the bill
+                # really is printed that way (retailers do occasionally itemise
+                # in ways arithmetic alone cannot reproduce) — it is an explicit
+                # override, never a default.
+                return web.Response(
+                    text=json.dumps({'error': 'bill does not reconcile',
+                                     'self_check': check.to_dict()}),
+                    content_type='application/json', status=422)
+
+            bill_id = str(uuid.uuid4())[:8]
+            record = {
+                "id": bill_id,
+                "label": (body.get('label')
+                          or f"{facts.retailer} {facts.start_date.isoformat()}").strip(),
+                "added": datetime.now(timezone.utc).isoformat(),
+                "facts": facts.to_dict(),
+                "answers": answers.to_dict(),
+                "self_check": check.to_dict(),
+                "scenarios": [
+                    {"id": s.id, "label": s.label, "note": s.note}
+                    for s in scenarios_for(facts)
+                ],
+            }
+            data = await _load_bills(self.hass)
+            data["bills"].append(record)
+            await _save_bills(self.hass, data)
+            _LOGGER.info("Stored bill %s (%s, %d days, self-check %s)",
+                         bill_id, facts.retailer, facts.days,
+                         "ok" if check.ok else "FAILED")
+            return web.Response(text=json.dumps({"bill": record}),
+                                content_type='application/json')
+
+    class BillItemView(HomeAssistantView):
+        """Update the intake answers on a stored bill, or delete it."""
+
+        url = "/api/grid_lens/bills/{bill_id}"
+        name = "api:grid_lens:bill_item"
+        requires_auth = False
+
+        def __init__(self, hass_instance):
+            self.hass = hass_instance
+
+        async def put(self, request, bill_id):
+            """Change the intake answers (nameplate, archetype, CL window).
+
+            The bill's facts are immutable once stored — they are what the
+            retailer printed. Only the answers, which are the household's own
+            statements about itself, are editable. Changing them invalidates
+            the cached calibration, so it is dropped here.
+            """
+            import json
+            from .bill_model import IntakeAnswers
+            try:
+                body = await request.json()
+            except Exception:
+                return web.Response(text=json.dumps({'error': 'Invalid JSON'}),
+                                    content_type='application/json', status=400)
+            try:
+                answers = IntakeAnswers.from_dict(body.get('answers'))
+            except (ValueError, TypeError) as exc:
+                return web.Response(text=json.dumps({'error': str(exc)}),
+                                    content_type='application/json', status=400)
+            data = await _load_bills(self.hass)
+            for rec in data["bills"]:
+                if rec["id"] == bill_id:
+                    rec["answers"] = answers.to_dict()
+                    if body.get('label'):
+                        rec["label"] = str(body['label']).strip()
+                    await _save_bills(self.hass, data)
+                    self.hass.data.setdefault(DOMAIN, {}).pop(
+                        f"bill_model_{bill_id}", None)
+                    return web.Response(text=json.dumps({"bill": rec}),
+                                        content_type='application/json')
+            return web.Response(text=json.dumps({'error': 'Not found'}),
+                                content_type='application/json', status=404)
+
+        async def delete(self, request, bill_id):
+            import json
+            data = await _load_bills(self.hass)
+            before = len(data["bills"])
+            data["bills"] = [b for b in data["bills"] if b["id"] != bill_id]
+            if len(data["bills"]) == before:
+                return web.Response(text=json.dumps({'error': 'Not found'}),
+                                    content_type='application/json', status=404)
+            await _save_bills(self.hass, data)
+            self.hass.data.setdefault(DOMAIN, {}).pop(f"bill_model_{bill_id}", None)
+            return web.Response(text=json.dumps({"ok": True}),
+                                content_type='application/json')
+
     class DiagnosticExportView(HomeAssistantView):
         """Export all calculation inputs and outputs as a zip for bug reporting."""
 
@@ -1254,10 +1470,37 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             whatif_battery_kwh = _parse_optional_float(request.query.get('battery_kwh'))
             whatif_solar_pct = _parse_optional_float(request.query.get('solar_pct'))
 
+            # Data source. 'live' (the default, and today's behaviour unchanged)
+            # reads this household's recorder. 'bill:<id>' instead drives the
+            # whole comparison from an uploaded bill's reconstructed model — see
+            # bill_source.py. Everything else about this view, and everything in
+            # the comparison downstream of it, is identical either way.
+            source = (request.query.get('source') or 'live').strip()
+            bill_id = source[5:] if source.startswith('bill:') else None
+            scenario_id = request.query.get('scenario') or None
+
             entries = self.hass.config_entries.async_entries(DOMAIN)
             if not entries:
                 return web.json_response({'error': 'Integration not loaded'}, status=404)
             entry_obj = entries[0]
+
+            bill_record = None
+            if bill_id:
+                _store = await _load_bills(self.hass)
+                bill_record = next(
+                    (b for b in _store["bills"] if b["id"] == bill_id), None)
+                if bill_record is None:
+                    return web.json_response(
+                        {'error': f'No stored bill {bill_id}'}, status=404)
+                # The model only covers the billed days, so the card's date
+                # pickers cannot widen it. Override rather than silently
+                # returning a short period for a range the user chose.
+                from .bill_model import BillFacts
+                _facts = BillFacts.from_dict(bill_record["facts"])
+                start_date = datetime.combine(
+                    _facts.start_date, datetime.min.time(), tzinfo=ha_tz)
+                end_date = datetime.combine(
+                    _facts.end_date, datetime.min.time(), tzinfo=ha_tz)
 
             domain_data = self.hass.data.setdefault(DOMAIN, {})
             state_key = f"{entry_obj.entry_id}_calc_state"
@@ -1289,13 +1532,39 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     # call). Stays silent on 402 — the background coordinator owns
                     # the "subscription ended" notification so this on-demand view
                     # doesn't double-notify.
-                    _LOGGER.info("Fetching plans for calc (entry=%s)", entry_obj.entry_id)
-                    _fetch = await async_fetch_plans(self.hass, entry_obj, notify_on_402=False)
+                    # A bill-sourced run is assembled first, because the plan
+                    # catalogue has to be fetched for the BILLED household's
+                    # state and distributor, not this one's. /plans filters on
+                    # exactly those two parameters, so fetching with the real
+                    # entry served 211 Ausgrid plans for an Endeavour bill and
+                    # every single one was then correctly refused as "other
+                    # distributor" — an empty comparison (found 2026-10-25).
+                    # Fetching with the synthetic entry also keys the on-disk
+                    # fallback cache separately, so a bill's plan set can never
+                    # overwrite the household's own.
+                    bill_run = None
+                    if bill_record is not None:
+                        bill_run = await _build_bill_run(
+                            self.hass, entry_obj, bill_record, scenario_id, ha_tz)
+
+                    _fetch_entry = bill_run.entry if bill_run else entry_obj
+                    _LOGGER.info("Fetching plans for calc (entry=%s)", _fetch_entry.entry_id)
+                    _fetch = await async_fetch_plans(self.hass, _fetch_entry, notify_on_402=False)
                     plan_data = _fetch.plans
                     network_operators = _fetch.network_operators
                     _LOGGER.info(
                         "Calc using %d plan(s) (source=%s)", len(plan_data), _fetch.source
                     )
+                    if bill_run is not None and not plan_data:
+                        # /plans matches `network` exactly, so a bill naming its
+                        # distributor differently from our plan data ("Endeavour"
+                        # vs "Endeavour Energy") gets nothing back. Say that,
+                        # rather than rendering an empty comparison.
+                        raise RuntimeError(
+                            f"No plans available for {bill_run.facts.state} / "
+                            f"{bill_run.facts.network!r}. The distributor name on "
+                            f"the bill has to match our plan data exactly — check "
+                            f"the spelling (e.g. 'Endeavour Energy', not 'Endeavour').")
 
                     plans_total = len(plan_data) or 1
                     state['plans_total'] = plans_total
@@ -1319,13 +1588,34 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     # fallback for a plain request the way PlanDataView does, so
                     # every call here actually runs calculate_plan_costs and needs
                     # this to detect a switch regardless of whether dates were picked.
-                    calculator = PlanCalculator(self.hass, entry_obj)
+                    if bill_run is not None:
+                        # The synthetic entry describes the BILLED household,
+                        # not this one — different sensors, no battery, its own
+                        # postcode and distributor. Only the API credentials
+                        # come across, so the plan catalogue and plan-version
+                        # history fetch exactly as they do on the live path.
+                        calculator = PlanCalculator(self.hass, bill_run.entry)
+                        from .bill_source import attach_to_calculator
+                        attach_to_calculator(calculator, bill_run)
+                        state['events'].append({
+                            'event': 'status',
+                            'data': {'phase': 'fetching',
+                                     'message': 'Reconstructing usage from the bill…',
+                                     'plans_total': plans_total},
+                        })
+                    else:
+                        calculator = PlanCalculator(self.hass, entry_obj)
                     calculator.plan_data = plan_data
                     calculator.network_operators = network_operators
 
                     hist_store = Store(self.hass, _HISTORY_STORAGE_VERSION, _HISTORY_STORAGE_KEY)
                     hist_data  = await hist_store.async_load() or {"entries": []}
-                    calculator.plan_history_entries = hist_data["entries"]
+                    # A bill-sourced run must NOT inherit this household's
+                    # plan-switch log: those dates belong to the owner's own
+                    # account and would re-price the billed household's usage
+                    # against whatever plan the owner happened to be on.
+                    calculator.plan_history_entries = (
+                        [] if bill_run is not None else hist_data["entries"])
 
                     async def on_plan_ready(plan_key, detail, meta):
                         nonlocal plans_done, plans_total
@@ -1395,6 +1685,15 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                         # (see this view's own docstring — the 2026-09-28 fix for
                         # the old SSE endpoint).
                         result = {**result, 'plan_details': {}}
+                    if bill_run is not None and isinstance(result, dict):
+                        # What the household told us, what we assumed, how well
+                        # the model reproduces the bill, and the one-season
+                        # caveat. The card renders this as a banner so no dollar
+                        # figure from a bill-sourced run appears without the
+                        # assumptions that produced it visible beside it.
+                        result = {**result, 'bill': bill_run.banner(),
+                                  'bill_id': bill_record['id'],
+                                  'scenarios': bill_record.get('scenarios', [])}
                     state['result'] = result
                     state['status'] = 'complete'
                 except Exception as exc:
@@ -1765,6 +2064,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.http.register_view(PlanDataView(hass))
     hass.http.register_view(PlanHistoryView(hass))
     hass.http.register_view(PlanHistoryItemView(hass))
+    hass.http.register_view(BillsView(hass))
+    hass.http.register_view(BillItemView(hass))
     hass.http.register_view(DiagnosticExportView(hass))
     hass.http.register_view(PlanCalcStartView(hass))
     hass.http.register_view(PlanCalcPollView(hass))
