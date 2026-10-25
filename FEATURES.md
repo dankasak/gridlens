@@ -600,8 +600,11 @@ is untouched and does not know the difference. Nothing else in the comparison ch
   itself a demand bill, which prints the peak), and plans holding no controlled-load rate
   for a controlled-load household.
 - **The baseline is the printed bill**, not a re-derivation of it
-  (`PlanCalculator.baseline_total_override`). Necessary as well as better: the bill's own
-  plan is usually one of the plans we hold no CL rate for, so it gets refused too.
+  (`PlanCalculator.baseline_total_override`). Better on principle, and it was once
+  necessary: before the CL data landed, the bill's own plan was usually one of the plans
+  we held no CL rate for, so it got refused along with the rest. Note that the bill's own
+  plan re-priced on *today's* rates is not the billed total — it came out $131 higher on
+  the Endeavour test bill, because the supply charge rose after the billed period.
 - **Everything is tagged MODELLED** and the banner carries the assumptions in force, the
   model's residual against both registers, and the one-season caveat (a single bill is
   one season; a battery sized on a winter quarter is wrong for summer).
@@ -623,14 +626,22 @@ charge, and gains the ability to soak up solar — all three are in the delta, a
 element's kW rating caps how fast the energy can be absorbed (a window too short is
 widened, with a warning).
 
-**The controlled-load data gap, and the opt-in that works around it.** 153 of 178
-Endeavour plans hold no controlled-load rate, so for a CL household almost nothing is
-comparable — the household's own plan included. The banner offers to carry **one assumed
-CL rate** (pre-filled with the rate the household is already paying, which they can
-check on their own bill) onto plans that have none: 1 priceable becomes 154. **Off by
-default.** Every bill line it touches is labelled "(assumed rate)" and carries
-`rate_assumed: true`; the plans involved are listed in `cl_assumed_plans`. It is a
-labelled workaround — the plan data is the fix (OPEN_ITEMS.md).
+**The controlled-load data gap, and the opt-in that works around it.** A plan we hold no
+controlled-load rate for cannot price a CL household, so it is refused rather than priced
+wrongly. On Endeavour that used to mean **1 comparable plan out of 178** — the
+household's own plan among the refused.
+
+Mostly fixed in the plan data as of 2026-10-26: retailers submit controlled load as a
+*separate* offer of the same name, and that rate is now carried onto the plan we serve,
+which took Endeavour from 4 plans holding a CL rate to 93, and the same bill from **1
+comparable plan to 90 with no assumption at all**. Ausgrid, Essential and Energex are
+still to come (`gridlens-api` OPEN_ITEMS.md).
+
+Where a rate still isn't available, the banner offers to carry **one assumed CL rate**
+(pre-filled with the rate the household is already paying, which they can check on their
+own bill) onto plans that have none. **Off by default.** Every bill line it touches is
+labelled "(assumed rate)" and carries `rate_assumed: true`; the plans involved are listed
+in `cl_assumed_plans`. It is a labelled workaround, not a substitute for the data.
 
 **Privacy.** Bills live in a local HA `Store`, never the API. The uploaded document is
 never persisted. `BillFacts` has **no field** for a name, supply address, NMI, account
