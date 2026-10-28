@@ -17,7 +17,6 @@
  *   control_switch_entity: switch.roof_grid_lens_nsw_battery_control (optional)
  *   compact: true                                          (optional)
  *   title: "Optimiser & Plan"                               (optional, compact mode only)
- *   show_current_rates: true                                (optional)
  *   layout_toggles:                                         (optional)
  *     - entity: switch.<...>_show_scene_power_flow
  *       label: Scene
@@ -29,9 +28,10 @@
  * it — a slim status bar for surfacing "when did the optimiser last run" on a page
  * that isn't the full Battery Plan view (e.g. at the top of the Power Flow page).
  *
- * `show_current_rates: true` adds a one-line buy/sell readout ("Buy 22c/kWh · Sell 3c/kWh")
- * under the plan-status line — the rate in effect for the slot covering now, read from the
- * same `trajectory` attribute. Just the numbers; the rate *graph* is the standalone
+ * The second header row (always on when a plan is loaded) carries a one-line buy/sell
+ * readout ("Buy 22c/kWh · Sell 3c/kWh") — the rate in effect for the slot covering now,
+ * read from the same `trajectory` attribute — alongside the battery status pill and the
+ * two changelog tickers. Just the numbers; the rate *graph* is the standalone
  * `grid-lens-price-chart-card` (placed under the power chart on the Power Flow view).
  * Independent of `compact` — works in the full card too.
  *
@@ -139,8 +139,9 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._dtRepaintPending = false;
     this._dtPointerUpHandler = () => this._onDtSliderPointerUp();
     // Second header row (see _hd2Html). _statusSig lets the hass setter refresh just the
-    // status pills in place when nothing else in the header changed (device power moves
-    // every few seconds; rebuilding the whole header that often would fight the sliders).
+    // rates readout + status pills in place when nothing else in the header changed (the
+    // rate and the battery pill both move every few seconds; rebuilding the whole header
+    // that often would fight the sliders).
     this._statusSig = '';
     this._cl = { app: { entries: [], idx: 0 }, plans: { entries: [], idx: 0 } };
     this._clOpen = null;     // which feed's full list is open, if any
@@ -330,10 +331,10 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._refreshStatus();
   }
 
-  // In-place refresh of the status pills only (see _statusSig in the constructor). Falls
-  // back to a full repaint when the row has to appear or disappear.
+  // In-place refresh of the rates readout + status pills only (see _statusSig in the
+  // constructor). Falls back to a full repaint when the row has to appear or disappear.
   _refreshStatus() {
-    const html = this._statusHtml();
+    const html = this._currentRatesHtml() + this._statusHtml();
     if (html === this._statusSig) return;
     const st = this.shadowRoot && this.shadowRoot.querySelector('.hd2 .st');
     if (st) { st.innerHTML = html; this._statusSig = html; } else this._paint();
@@ -476,10 +477,12 @@ class GridLensAdvisoryCard extends HTMLElement {
   }
 
   // One-line buy/sell readout for the slot covering now — the rate the plan is pricing
-  // against this instant. Empty string unless show_current_rates is set and a plan is
-  // available, so it drops cleanly out of both the compact and full layouts.
+  // against this instant. Lives in the second header row (_hd2Html), alongside the
+  // battery pill and the changelog tickers (moved there 2026-10-28, user request — it
+  // used to sit under the plan-status line, gated behind a now-removed
+  // `show_current_rates` option). Empty string unless a plan is actually available, so
+  // it drops cleanly out of both the compact and full layouts.
   _currentRatesHtml() {
-    if (!this._config.show_current_rates) return '';
     const t = this._traj;
     if (!t || !t.length || (this._summary && this._summary.status !== 'ok')) return '';
     const nowMs = Date.now();
@@ -498,28 +501,14 @@ class GridLensAdvisoryCard extends HTMLElement {
 
   // ------------------------------------------------- Second header row (status + news)
   //
-  // A slim row under the header (user request 2026-10-04): live status pills on the
-  // left, a rotating "What's new" ticker on the right. Both are summaries of state that
-  // already exists elsewhere — the battery control switch's applied action, each
-  // deferrable load's control switch (DeferrableLoadController.status()) and its power
-  // sensor — so nothing here is install-specific: devices come from the same
-  // `deferrable_loads` auto-discovery the per-device panel uses, and an install with no
-  // battery control / no deferrable loads just shows fewer (or no) pills.
-
-  // Whether a deferrable load is actually drawing power right now. Prefers the measured
-  // power sensor (an AC that is "commanded on" but idling at setpoint shouldn't read as
-  // running); falls back to the controller's own commanded state when there's no sensor.
-  _deviceDrawKw(d, ctlAttrs) {
-    const st = d.power_entity && this._hass.states[d.power_entity];
-    const v = st ? parseFloat(st.state) : NaN;
-    if (Number.isFinite(v)) {
-      const unit = String((st.attributes || {}).unit_of_measurement || 'W').toLowerCase();
-      const kw = unit === 'kw' ? v : v / 1000;
-      const floor = Math.max(0.05, 0.02 * (+d.max_kw || 0));
-      return kw >= floor ? kw : 0;
-    }
-    return ctlAttrs && ctlAttrs.commanded === 'on' ? null : 0;  // null = on, power unknown
-  }
+  // A slim row under the header (user request 2026-10-04): a live battery-status pill on
+  // the left, a rotating "What's new" ticker on the right. The battery pill is a summary
+  // of state that already exists elsewhere — the battery control switch's applied action
+  // — so nothing here is install-specific: an install with no battery control just shows
+  // no pill. Per-device (deferrable-load) pills — running/greedy, SOC-limit, unplugged,
+  // overrides — lived here too until 2026-10-28, when they were removed (user request:
+  // too cluttered for this row) in favour of the per-device panel's own live status line,
+  // which already shows the same thing per row.
 
   _statusPills() {
     const hass = this._hass;
@@ -549,56 +538,6 @@ class GridLensAdvisoryCard extends HTMLElement {
       }
     }
 
-    const greedyRunning = [];
-    let greedyArmed = 0;
-    const overrides = [];
-    for (const r of this._dtRows || []) {
-      const d = r.device;
-      const ctl = r.controlEid && hass.states[r.controlEid];
-      const a = ctl ? (ctl.attributes || {}) : null;
-      const name = d.name || d.energy_entity;
-      if (a && (a.override === 'on' || a.override === 'off')) overrides.push(`${name}: forced ${a.override}`);
-      if (a && a.soc_cutoff) {
-        pills.push({ cls: 'dim', icon: 'mdi:battery-check', text: `${name} at SOC limit`,
-          tip: `${name} reached its configured SOC cutoff and has been stopped.` });
-        continue;
-      }
-      if (a && d.control_type === 'modulating' && a.plugged_in === false) {
-        pills.push({ cls: 'dim', icon: 'mdi:power-plug-off-outline', text: `${name} unplugged` });
-        continue;
-      }
-      const kw = this._deviceDrawKw(d, a);
-      if (kw === 0) {
-        if (a && a.greedy && !a.greedy_reason) greedyArmed += 1;
-        continue;
-      }
-      const soc = d.soc_entity && hass.states[d.soc_entity];
-      const socV = soc ? parseFloat(soc.state) : NaN;
-      const greedy = !!(a && a.greedy && a.greedy_reason);
-      if (greedy) greedyRunning.push(name);
-      const why = greedy ? {
-        import_free: 'Greedy Consumption — import is free right now',
-        export_surplus: 'Greedy Consumption — running on solar that would otherwise be exported',
-        forecast_surplus: 'Greedy Consumption — soaking forecast solar surplus',
-      }[a.greedy_reason] || `Greedy Consumption (${a.greedy_reason})` : (a ? friendlyNote(a.note) : '');
-      pills.push({
-        cls: greedy ? 'greedy' : 'run',
-        icon: greedy ? 'mdi:leaf' : (d.soc_entity ? 'mdi:ev-station' : 'mdi:flash'),
-        text: `${name}${kw ? ` ${kw.toFixed(1)} kW` : ' on'}${Number.isFinite(socV) ? ` · ${Math.round(socV)}%` : ''}`,
-        tip: `${name} is running${why ? ` — ${why}` : ''}.`,
-      });
-    }
-    // Greedy summary — only when greedy is armed somewhere but nothing is soaking yet;
-    // when it IS running, the leaf-marked device pills above already say so.
-    if (!greedyRunning.length && greedyArmed) {
-      pills.push({ cls: 'dim', icon: 'mdi:leaf', text: `Greedy armed · ${greedyArmed}`,
-        tip: `Greedy Consumption is enabled on ${greedyArmed} device(s), waiting for free or surplus energy.` });
-    }
-    if (overrides.length) {
-      pills.push({ cls: 'dim', icon: 'mdi:hand-back-right-outline',
-        text: `${overrides.length} override${overrides.length > 1 ? 's' : ''}`,
-        tip: `Manual overrides: ${overrides.join('; ')}.` });
-    }
     return pills;
   }
 
@@ -673,11 +612,11 @@ class GridLensAdvisoryCard extends HTMLElement {
   }
 
   _hd2Html() {
-    const status = this._statusHtml();
-    this._statusSig = status;
+    const left = this._currentRatesHtml() + this._statusHtml();
+    this._statusSig = left;
     const tickers = Object.keys(CL_FEEDS).map((k) => this._tickerHtml(k)).join('');
-    if (!status && !tickers) return '';
-    return `<div class="hd2"><div class="st">${status}</div>`
+    if (!left && !tickers) return '';
+    return `<div class="hd2"><div class="st">${left}</div>`
       + (tickers ? `<div class="cls">${tickers}</div>` : '') + `</div>`;
   }
 
@@ -1096,10 +1035,6 @@ class GridLensAdvisoryCard extends HTMLElement {
         .badge.bad { color:var(--buy); font-weight:700;
                      border-color:color-mix(in srgb,var(--buy) 55%,transparent);
                      background:color-mix(in srgb,var(--buy) 12%,transparent); }
-        .rates-now { display:flex; gap:14px; margin-top:4px; font-size:12px;
-                     color:var(--ink2); font-variant-numeric:tabular-nums; }
-        .rates-now .rk { font-weight:650; }
-        .rates-now b { color:var(--ink); font-weight:650; }
         .chips { display:flex; gap:6px; flex-wrap:wrap; }
         .chip { display:inline-flex; align-items:center; gap:6px; cursor:pointer;
                 font:inherit; font-size:11px; font-weight:600; line-height:1;
@@ -1117,7 +1052,14 @@ class GridLensAdvisoryCard extends HTMLElement {
            No backtick characters in this comment: it sits inside a template literal. */
         .hd2 { display:flex; align-items:center; gap:10px; margin-top:8px; padding-top:8px;
                border-top:1px solid var(--border); flex-wrap:wrap; }
-        .hd2 .st { display:flex; gap:6px; flex-wrap:wrap; flex:1 1 260px; min-width:0; }
+        .hd2 .st { display:flex; align-items:center; gap:10px; flex-wrap:wrap; flex:1 1 260px; min-width:0; }
+        /* Buy/sell readout — a plain text pair, not a pill, so it reads as "the number"
+           rather than another status chip (moved into this row 2026-10-28, see
+           _currentRatesHtml). */
+        .rates-now { display:flex; gap:10px; font-size:11.5px;
+                     color:var(--ink2); font-variant-numeric:tabular-nums; }
+        .rates-now .rk { font-weight:650; }
+        .rates-now b { color:var(--ink); font-weight:650; }
         .sp { display:inline-flex; align-items:center; gap:5px; font-size:11.5px; font-weight:600;
               line-height:1; padding:4px 9px 4px 7px; border-radius:20px; white-space:nowrap;
               color:var(--ink); background:color-mix(in srgb,var(--ink) 6%,transparent);
@@ -1412,7 +1354,6 @@ class GridLensAdvisoryCard extends HTMLElement {
         <div class="hd-plan">
           <div class="title">${title}</div>
           <div class="sub">${s.plan_name ? esc(s.plan_name) : 'Grid Lens advisory'}${s.solver ? ' · ' + esc(s.solver) : ''}${s.generated_at ? ' · ' + fmtTime(s.generated_at) : ''}</div>
-          ${this._currentRatesHtml()}
         </div>
         ${this._dtInlineHtml()}
         <div class="hd-right">
