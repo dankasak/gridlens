@@ -501,8 +501,13 @@ def test_assumed_cl_rate_unblocks_with_a_label() -> None:
     check("the assumption unblocks the controlled-load refusals",
           len(keep_on) > len(plans) - len(refused_off) + 100,
           f"{len(keep_on)} priceable, was {len(plans) - len(refused_off)}")
+    # The bill's own plan is excepted: it is refused for a different and
+    # unrelated reason (our rates for it disagree with the bill — see
+    # test_own_plan_rates_are_checked_against_the_bill), which no controlled-load
+    # assumption can or should unblock.
     check("but it does NOT unblock demand or market-linked plans",
-          all("Demand" in r or "Market" in r for r in refused_on.values()),
+          all("Demand" in r or "Market" in r
+              for pid, r in refused_on.items() if pid != facts.plan_id),
           "; ".join(sorted({r.split(':')[0] for r in refused_on.values()})))
 
     fb = on.cl_fallback()
@@ -578,6 +583,119 @@ def test_cl_move_is_priced_as_a_package() -> None:
           midday > status, f"${midday - status:+,.2f} over {facts.days} days")
 
 
+def test_own_plan_rates_are_checked_against_the_bill() -> None:
+    """A bill is our only external check on our own plan data — spend it.
+
+    For every other plan in a ranking our rates are only ever verified against
+    PRD, which is to say against themselves. For the one plan the household
+    actually holds, the bill prints the rates the retailer really applied, so
+    the two can be compared directly — and if they disagree, the row labelled
+    "your current plan" is wrong and every saving measured against it inherits
+    that error.
+
+    Found 2026-10-26 on the first real bill run: our rates for
+    `origin_go_variable_ongoing_single_endeavour` priced this household's own
+    92 days at $807.81 against a printed $676.78, and the comparison reported
+    that as "+$131.02 vs current" — the plan they are on, shown as $131 worse
+    than itself. Nothing in the output said so.
+    """
+    print("\nOur plan data against the rates the bill was charged at")
+    facts = bm.BillFacts.from_dict(ORIGIN_BILL)
+
+    # Synthetic first, so the check is pinned independently of plan data on disk.
+    avg = facts.own_rates()
+    check("the household's effective rates are kWh- and day-weighted",
+          abs(avg["general_rate"] - (310.356 * 0.300410 + 896.517 * 0.268070)
+              / (310.356 + 896.517)) < 1e-9
+          and abs(avg["supply_per_day"] - (25 * 0.722260 + 67 * 1.462560) / 92) < 1e-9,
+          f"{avg['general_rate']:.5f} $/kWh, {avg['supply_per_day']:.5f} $/day")
+
+    # But drift is measured against the LAST rate period, because our plan data
+    # holds one current rate set. On this bill the day-weighted supply charge is
+    # $1.26/day and neither period charged anything near it.
+    own = facts.latest_rates()
+    check("but drift compares against the bill's latest rate period",
+          own["general_rate"] == 0.26807 and own["supply_per_day"] == 1.46256
+          and own["cl_rate"] == 0.15895 and own["fit_rate"] == 0.03,
+          f"{own['general_rate']:.5f} $/kWh, {own['supply_per_day']:.5f} $/day")
+    check("and that is not the blended average it would otherwise use",
+          abs(own["supply_per_day"] - avg["supply_per_day"]) > 0.15,
+          f"latest {own['supply_per_day']:.5f} vs blended "
+          f"{avg['supply_per_day']:.5f} $/day")
+
+    class _Plan:
+        plan_id = ORIGIN_BILL["plan_id"]
+        def __init__(self, rate, supply):
+            self.daily_supply_charge = supply
+            self._r = rate
+        def get_import_rate_defs(self): return [{"rate": self._r}]
+        def get_export_rate_defs(self): return [{"rate": 0.03}]
+        def get_controlled_load_rate(self, _): return None
+
+    agree = _Plan(own["general_rate"], own["supply_per_day"])
+    check("rates that match the bill produce no drift",
+          bs.plan_data_drift(agree, facts) == {})
+    check("and rounding at the fifth decimal is not drift",
+          bs.plan_data_drift(_Plan(round(own["general_rate"], 5),
+                                   round(own["supply_per_day"], 5)), facts) == {})
+
+    # The real shape of the Origin finding: our stored figure is the PRD rate
+    # times 1.1, and the bill is already GST-inclusive, so the gap is ~16%.
+    off = _Plan(0.31020, 1.70324)
+    drift = bs.plan_data_drift(off, facts)
+    check("a 16% gap on the same plan IS drift", bool(drift),
+          bs.describe_drift(drift))
+    check("both figures are reported, not just a verdict",
+          drift["supply_per_day"]["ours"] == 1.70324
+          and drift["supply_per_day"]["billed"] == 1.46256
+          and drift["supply_per_day"]["pct"] == 16.5)
+    check("the worst component is named first",
+          next(iter(drift)) in ("supply_per_day", "general_rate"),
+          next(iter(drift)))
+
+    gates = bs.BillGates(facts=facts)
+    why = gates.reason(off)
+    check("the gate refuses the household's own plan rather than pricing it",
+          why is not None and why.startswith("Plan data disagrees"), (why or "")[:60])
+    check("and records the comparison for the banner",
+          gates.own_plan_checked and gates.own_plan_drift == drift)
+    check("a plan that is not the bill's own plan is not drift-checked",
+          bs.BillGates(facts=facts).reason(_other_plan(off)) is None
+          or "Plan data disagrees" not in
+             (bs.BillGates(facts=facts).reason(_other_plan(off)) or ""))
+
+    # And the banner carries it either way, so an agreement is visible too:
+    # it is the product's only external evidence that its plan data is right.
+    _, run = _run()
+    pdc = run.banner()["plan_data_check"]
+    check("the banner exposes the check and the billed rates",
+          pdc["plan_id"] == ORIGIN_BILL["plan_id"]
+          and set(pdc) >= {"checked", "agrees", "drift", "billed_rates"}
+          and pdc["billed_rates"]["cl_rate"] == 0.15895,
+          f"checked={pdc['checked']} agrees={pdc['agrees']}")
+
+    if not os.path.exists(_PLANS):
+        print(f"  SKIP  no plan data at {_PLANS} — live check not run")
+        SKIPPED.append("own-plan-live")
+        return
+    live = {p.plan_id: p for p in _real_plans()}.get(ORIGIN_BILL["plan_id"])
+    if live is None:
+        print(f"  SKIP  {ORIGIN_BILL['plan_id']} not in the saved plan data")
+        SKIPPED.append("own-plan-live-plan")
+        return
+    live_drift = bs.plan_data_drift(live, facts)
+    print(f"        saved plan data: {bs.describe_drift(live_drift) or 'agrees'}")
+    check("the saved plan data is flagged against this bill (the live finding)",
+          bool(live_drift), bs.describe_drift(live_drift))
+
+
+def _other_plan(template):
+    """The same rates on a different plan_id, to prove the check is targeted."""
+    class _Other(type(template)):
+        plan_id = "some_other_plan"
+    return _Other(0.31020, 1.70324)
+
+
 def main() -> int:
     print("=" * 72)
     print("  bill_source.py — bill-sourced comparison path")
@@ -589,6 +707,7 @@ def main() -> int:
     test_network_gate()
     test_reproduces_the_issued_bill()
     test_plan_rate_drift_is_visible()
+    test_own_plan_rates_are_checked_against_the_bill()
     test_assumed_cl_rate_unblocks_with_a_label()
     test_cl_move_is_priced_as_a_package()
     print("\n" + "=" * 72)

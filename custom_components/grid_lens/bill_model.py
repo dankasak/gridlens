@@ -244,6 +244,76 @@ class BillFacts:
             return 0.0
         return sum(p.days * p.cl_supply_per_day for p in self.periods) / self.days
 
+    def own_rates(self) -> dict:
+        """Every rate this household is actually charged, per component.
+
+        Usage rates are kWh-weighted and daily charges day-weighted across the
+        bill's rate periods, so a mid-cycle price change averages the way the
+        money actually did. `None` means the bill carries nothing to compare.
+
+        This is the household's *effective* price over the bill — the right
+        figure to quote back to them, and the wrong one to compare against a
+        single current rate set. Use `latest_rates()` for that; see its
+        docstring.
+
+        These figures are **GST-inclusive**, because a retail bill is: the
+        bill's own "GST included in total" line reconciles against the sum of
+        its charges divided by eleven. That matters because our plan data is
+        stored GST-inclusive too (`prd_sync.py` multiplies CDR PRD's ex-GST
+        tariffs by 1.1), so the two are directly comparable — which is the
+        whole point of `bill_source.plan_data_drift`.
+        """
+        days = self.days
+        gen_kwh = sum(p.general_kwh for p in self.periods if p.general_rate)
+        exp_kwh = sum(p.export_kwh for p in self.periods if p.fit_rate)
+        return {
+            "general_rate": (
+                None if gen_kwh <= 0 else
+                sum(p.general_kwh * p.general_rate
+                    for p in self.periods if p.general_rate) / gen_kwh),
+            "cl_rate": self.own_cl_rate(),
+            "supply_per_day": (
+                None if not days else
+                sum(p.days * p.supply_per_day for p in self.periods) / days),
+            "cl_supply_per_day": (
+                self.own_cl_supply() if self.has_controlled_load else None),
+            "fit_rate": (
+                None if exp_kwh <= 0 else
+                sum(p.export_kwh * p.fit_rate
+                    for p in self.periods if p.fit_rate) / exp_kwh),
+        }
+
+    def latest_rates(self) -> dict:
+        """The rate set in force at the END of the bill, per component.
+
+        The one comparable against our stored plan data, which holds a single
+        current rate set rather than a history. A bill that straddles a price
+        change prints both, and averaging them compares a current rate against
+        a blend of old and new: on a Jun–Sep NSW bill spanning the 1 July
+        reset, the day-weighted supply charge is $1.26/day when neither period
+        charged anything near that ($0.72 then $1.46), which would inflate an
+        apparent drift by half again.
+
+        Each component is taken from the most recent period that actually
+        carries it, so a register absent from the final slice still resolves.
+        GST-inclusive, as `own_rates()`.
+        """
+        def latest(attr, guard=None):
+            for p in sorted(self.periods, key=lambda p: p.start, reverse=True):
+                v = getattr(p, attr)
+                if v and (guard is None or getattr(p, guard)):
+                    return v
+            return None
+
+        return {
+            "general_rate": latest("general_rate", "general_kwh"),
+            "cl_rate": latest("cl_rate", "cl_kwh"),
+            "supply_per_day": latest("supply_per_day"),
+            "cl_supply_per_day": (
+                latest("cl_supply_per_day") if self.has_controlled_load else None),
+            "fit_rate": latest("fit_rate", "export_kwh"),
+        }
+
     # -- serialisation ------------------------------------------------------
 
     def to_dict(self) -> dict:

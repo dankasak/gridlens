@@ -255,6 +255,96 @@ def build_synthetic_entry(real_entry, facts: BillFacts, answers: IntakeAnswers,
 # Gates — plans a bill cannot price, and why
 # ---------------------------------------------------------------------------
 
+# A bill prints its rates to five or six decimals and our plan data is stored
+# the same way, so these tolerances cover genuine rounding only — not "close
+# enough". Whichever allowance is larger applies, so a tiny rate (a 3c feed-in)
+# is not failed by a relative test and a large one (a $1.85/day supply charge)
+# is not passed by an absolute one.
+DRIFT_REL_TOL = 0.015       # 1.5% of the billed figure
+DRIFT_ABS_TOL = 0.0015      # $/kWh or $/day
+
+_DRIFT_LABELS = {
+    "general_rate": ("general usage", "$/kWh"),
+    "cl_rate": ("controlled load", "$/kWh"),
+    "supply_per_day": ("daily supply", "$/day"),
+    "cl_supply_per_day": ("controlled-load supply", "$/day"),
+    "fit_rate": ("feed-in tariff", "$/kWh"),
+}
+
+
+def _plan_own_rates(plan, facts: BillFacts) -> dict:
+    """Our stored rates for `plan`, in the shape `BillFacts.own_rates` returns.
+
+    `general_rate` is only filled for a single-rate plan. A bill from a flat
+    tariff prints one anytime rate, and comparing that against a TOU plan's
+    peak/shoulder/off-peak tiers would be comparing a scalar with a schedule —
+    the time-independent components (supply, controlled load, feed-in) are
+    still directly comparable either way, so those are always returned.
+    """
+    imports = plan.get_import_rate_defs() or []
+    exports = plan.get_export_rate_defs() or []
+    cl = plan.get_controlled_load_rate(facts.cl_register) or {}
+    single = len(imports) == 1
+    return {
+        "general_rate": (imports[0].get("rate") if single else None),
+        "cl_rate": cl.get("rate"),
+        "supply_per_day": getattr(plan, "daily_supply_charge", None),
+        "cl_supply_per_day": cl.get("daily_supply_charge"),
+        "fit_rate": (exports[0].get("rate") if len(exports) == 1 else None),
+    }
+
+
+def plan_data_drift(plan, facts: BillFacts) -> dict:
+    """Our rates for the plan a bill is held on, against what it was charged.
+
+    An uploaded bill is the only independent check we have on our own plan
+    data. For every other plan in the ranking our rates are compared against
+    nothing but themselves — PRD ingestion verifies them against PRD — but for
+    the one plan the household actually holds, the bill prints the rates the
+    retailer really applied. Spending that check is free and it is the only
+    thing standing between a plan-data error and a confidently wrong ranking.
+
+    Both sides are GST-inclusive: a retail bill is, and our plan data is
+    stored that way too (see `BillFacts.own_rates`). The bill side is its
+    *latest* rate period, not an average over the bill — our plan data holds
+    one current rate set, and a bill spanning a price change prints two (see
+    `BillFacts.latest_rates`).
+
+    Returns `{}` when the two agree, or when there is nothing to compare.
+    Otherwise `{component: {"ours", "billed", "pct"}}`, worst first.
+    """
+    billed = facts.latest_rates()
+    ours = _plan_own_rates(plan, facts)
+    out = {}
+    for key, b in billed.items():
+        o = ours.get(key)
+        if b is None or o is None:
+            continue
+        # A zero on either side is a real difference in kind (a plan with no
+        # feed-in vs a bill that was paid one), not a rounding question, so it
+        # is reported rather than skipped — but it cannot be a percentage.
+        allowed = max(abs(b) * DRIFT_REL_TOL, DRIFT_ABS_TOL)
+        if abs(o - b) <= allowed:
+            continue
+        out[key] = {
+            "ours": round(o, 6),
+            "billed": round(b, 6),
+            "pct": (None if not b else round((o - b) / b * 100.0, 1)),
+        }
+    return dict(sorted(out.items(),
+                       key=lambda kv: -abs(kv[1]["pct"] or 0.0)))
+
+
+def describe_drift(drift: dict) -> str:
+    """One human sentence naming the worst components and both figures."""
+    bits = []
+    for key, d in list(drift.items())[:3]:
+        label, unit = _DRIFT_LABELS.get(key, (key, ""))
+        pct = "" if d["pct"] is None else f", {d['pct']:+.1f}%"
+        bits.append(f"{label} {d['ours']:.5f} vs {d['billed']:.5f} {unit}{pct}")
+    return "; ".join(bits)
+
+
 @dataclass
 class BillGates:
     """Decides which plans a bill-sourced comparison may rank.
@@ -268,6 +358,13 @@ class BillGates:
     allow_market_linked: bool = False
     assumed_cl_rate: float | None = None
     assumed_cl_supply: float = 0.0
+
+    # Filled by `reason()` when the bill's own plan is checked, so the banner
+    # can show the comparison whatever the outcome — an agreement is worth
+    # stating too, because it is the product's only external evidence that its
+    # plan data is right.
+    own_plan_drift: dict = field(default_factory=dict)
+    own_plan_checked: bool = False
 
     def reason(self, plan) -> str | None:
         """None = priceable. A string = refused, with this reason.
@@ -306,6 +403,30 @@ class BillGates:
                 or getattr(plan, "demand_charge_per_kw_per_day", 0.0)):
             return ("Demand tariff: priced on peak kW, which this bill does "
                     "not print and kWh totals cannot recover.")
+
+        # The plan the household actually holds, priced from plan data that
+        # contradicts the bill in their hand. Refused rather than shown,
+        # because this row is the one the user checks first and the one they
+        # can least afford to be wrong: it is labelled as the plan they are on,
+        # so a bad figure here reads as "Grid Lens thinks I pay $X" and silently
+        # mis-states every saving measured against it. Which side is wrong is
+        # genuinely open — our data may be a newer price set than the bill, or
+        # the household may hold a legacy discount the retailer no longer
+        # publishes under this plan's name — so the reason reports the
+        # discrepancy and does not adjudicate it.
+        if self.facts.plan_id and getattr(plan, "plan_id", "") == self.facts.plan_id:
+            self.own_plan_checked = True
+            drift = plan_data_drift(plan, self.facts)
+            if drift:
+                self.own_plan_drift = drift
+                return ("Plan data disagrees with this bill: our rates for "
+                        f"{self.facts.plan_name or 'this plan'} are not the "
+                        "rates it was charged at — "
+                        f"{describe_drift(drift)}. Both figures are GST-"
+                        "inclusive, so this is a real difference and not a "
+                        "tax or rounding artefact. Until it is resolved we "
+                        "cannot price your current plan, and the baseline "
+                        "below is the bill's own printed total instead.")
 
         if self.facts.has_controlled_load and self.assumed_cl_rate is None:
             if plan.get_controlled_load_rate(self.facts.cl_register) is None:
@@ -429,6 +550,27 @@ class BillRun:
                 "assumed_supply": self.answers.assume_cl_supply,
                 "suggested_rate": self.facts.own_cl_rate(),
                 "suggested_supply": round(self.facts.own_cl_supply(), 6),
+            },
+            # Our plan data against the rates this bill was actually charged
+            # at — the one external check the product gets on its own plan
+            # data. `checked` is False when the bill carries no plan_id (we
+            # never identified which of our plans they hold) or when that plan
+            # was not among the candidates, in which case no check happened and
+            # the UI must not imply one passed.
+            "plan_data_check": {
+                "plan_id": self.facts.plan_id,
+                "checked": self.gates.own_plan_checked,
+                "agrees": (self.gates.own_plan_checked
+                           and not self.gates.own_plan_drift),
+                "drift": self.gates.own_plan_drift,
+                # The bill's latest rate period — the basis `drift` is
+                # measured on, so the two always agree. `own_rates()` is the
+                # household's effective average over the whole bill and is a
+                # different question; it is offered under controlled_load
+                # above, where a suggested assumption genuinely wants it.
+                "billed_rates": {k: (None if v is None else round(v, 6))
+                                 for k, v in self.facts.latest_rates().items()},
+                "basis": "latest rate period on the bill",
             },
             "one_season_caveat": (
                 "This is one billing period, so every annual figure is that "

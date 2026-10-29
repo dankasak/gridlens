@@ -70,6 +70,13 @@ class GridLensCard extends HTMLElement {
     this._fetchStep = 0;
     this._fetchTotal = 0;
     this._fetchMessage = '';
+    // The period-ranking phase's own progress message, kept separate from
+    // _fetchMessage (which belongs to the data-fetch phase) — see _pollCalc.
+    this._periodMessage = '';
+    // A bill run's window, for display only. Deliberately NOT _startDate/_endDate:
+    // see _updateDatesFromData for what went wrong when the two shared one slot.
+    this._billStart = '';
+    this._billEnd = '';
     this._pollGeneration = 0;   // bumped on every _streamCalc call to cancel a stale poll loop
   }
 
@@ -218,6 +225,7 @@ class GridLensCard extends HTMLElement {
     this._fetchStep = 0;
     this._fetchTotal = 0;
     this._fetchMessage = '';
+    this._periodMessage = '';
     this._data = null;   // clear stale data so we render from the poll loop only
     if (startDate) this._startDate = startDate.substring(0, 10);
     if (endDate)   this._endDate   = endDate.substring(0, 10);
@@ -285,7 +293,17 @@ class GridLensCard extends HTMLElement {
             this._plansTotal    = s.plans_total || this._plansTotal;
             this._fetchStep     = s.fetch_step  || this._fetchStep;
             this._fetchTotal    = s.fetch_total || this._fetchTotal;
-            this._fetchMessage  = s.message || this._fetchMessage;
+            // Two different phases report through this one event. 'fetching' is
+            // the recorder/statistics pull; 'optimising' here is the per-period
+            // re-ranking that runs AFTER the whole-window loop has already hit
+            // N/N plans (calculate_plan_costs's on_period_progress). Keeping
+            // them in one slot made the second one invisible — see
+            // _showStreamProgress for what the user saw instead.
+            if (s.phase === 'optimising') {
+              this._periodMessage = s.message || this._periodMessage;
+            } else {
+              this._fetchMessage = s.message || this._fetchMessage;
+            }
             gotStatus = true;
           } else if (ev.event === 'plan') {
             const p = ev.data;
@@ -317,7 +335,14 @@ class GridLensCard extends HTMLElement {
         // One render/progress-update per poll batch (not per event) — cheaper
         // than the old one-render-per-SSE-event behaviour with no loss of
         // freshness, since a poll batch is already at most ~1s of events.
-        if (gotPlan) this.render();
+        //
+        // Once any plan has arrived, keep rendering the card rather than
+        // dropping back to the bare progress panel: the period-ranking phase
+        // emits nothing but 'status' events, and on a long window that is
+        // minutes of _showStreamProgress() wiping a page full of results back
+        // to a spinner. The inline progress strip in the date controls carries
+        // the same message.
+        if (gotPlan || (gotStatus && this._data)) this.render();
         else if (gotStatus) this._showStreamProgress();
         since = d.next_since;
 
@@ -333,6 +358,7 @@ class GridLensCard extends HTMLElement {
           const cacheKey = this._cacheKey(startDate, endDate);
           GridLensCard._cache[cacheKey] = full;
           this._streamPhase = null;
+          this._periodMessage = '';   // or the toolbar keeps showing the last ranking message
           this._fetching = false;
           this._updateDatesFromData(startDate);
           this.render();
@@ -340,6 +366,7 @@ class GridLensCard extends HTMLElement {
         }
         if (d.status === 'error' || d.status === 'not_found' || d.status === 'stale') {
           this._streamPhase = null;
+          this._periodMessage = '';
           this._fetching = false;
           this.renderError('Calculation failed — check HA logs.');
           return;
@@ -349,6 +376,7 @@ class GridLensCard extends HTMLElement {
     } catch (err) {
       if (this._pollGeneration !== generation) return;  // superseded, not a real failure
       this._streamPhase = null;
+      this._periodMessage = '';
       this._fetching = false;
       this.renderError('Calculation failed — check HA logs.');
     }
@@ -357,12 +385,21 @@ class GridLensCard extends HTMLElement {
   _showStreamProgress() {
     const phase = this._streamPhase;
     const isFetching = phase === 'fetching';
+    // ⚠ The period-ranking phase (one extra LP solve per candidate plan per
+    // period, after the whole-window loop) reports 'optimising' too — by which
+    // point plansDone === plansTotal. Showing the plans counter there pinned the
+    // text at "Optimising plans… 207 / 207" and the bar at 100% for the whole
+    // phase: on a 93-day two-period window that is ~130 seconds of a page that
+    // reads as hung, which is exactly how it was reported (2026-10-26). The
+    // backend was given a per-plan progress callback precisely so this wouldn't
+    // happen; the card was throwing the message away. Its own step/total
+    // (plans ranked within the current period) drive the bar.
     const msg = isFetching
       ? (this._fetchMessage
           ? `${this._fetchMessage} (${this._fetchStep} / ${this._fetchTotal || '?'})`
           : 'Fetching energy data…')
-      : `Optimising plans… ${this._plansDone} / ${this._plansTotal}`;
-    const pct = isFetching
+      : (this._periodMessage || `Optimising plans… ${this._plansDone} / ${this._plansTotal}`);
+    const pct = (isFetching || this._periodMessage)
       ? (this._fetchTotal > 0 ? Math.round(this._fetchStep / this._fetchTotal * 100) : 0)
       : (this._plansTotal > 0 ? Math.round(this._plansDone / this._plansTotal * 100) : 0);
     this.shadowRoot.innerHTML = `
@@ -386,6 +423,21 @@ class GridLensCard extends HTMLElement {
     // set the date inputs so they reflect what's actually displayed.
     // When custom dates were requested, the inputs are already correct.
     if (!startDate) {
+      // ⚠ A bill run also arrives here with no dates — _setSource sends none
+      // deliberately, because the backend forces the bill's own period. But
+      // that period is the BILL's, not a range this household ever picked, and
+      // it is typically a 92-day quarter. Writing it into _startDate/_endDate
+      // (and into the SAME localStorage keys the live source reads back) meant
+      // selecting a bill silently replaced the household's own saved range,
+      // so switching back to "My data" kicked off a 3-month live comparison
+      // nobody asked for: ~620 LP solves, ~4 minutes, and a page that looks
+      // hung for most of it (found live 2026-10-26). Keep the bill's window
+      // display-only — the pickers are disabled in bill mode anyway.
+      if (this._source !== 'live') {
+        this._billStart = (this._data.start_date || '').substring(0, 10);
+        this._billEnd   = (this._data.end_date   || '').substring(0, 10);
+        return;
+      }
       if (this._data.start_date) {
         this._startDate = this._data.start_date.substring(0, 10);
         try { localStorage.setItem('epc-date-start', this._startDate); } catch (_) {}
@@ -1405,6 +1457,53 @@ class GridLensCard extends HTMLElement {
         <button id="epc-bill-unassume-cl" class="nav-btn" ${_busy ? 'disabled' : ''}>Stop assuming</button>
       </div>` : '';
 
+    // Our plan data against the rates this bill was actually charged at. The
+    // only external check the product gets on its own plan data — everywhere
+    // else our rates are verified against PRD, which is to say against
+    // themselves. Shown with both figures because the numbers ARE the finding:
+    // grouped into the excluded-plans counts line it reads as "1 x Plan data
+    // disagrees", which is true and useless. Which side is wrong is genuinely
+    // open, so this states the discrepancy and does not adjudicate it.
+    const pdc = b.plan_data_check || {};
+    const PD_LABELS = {
+      general_rate: ['General usage', 'c/kWh'],
+      cl_rate: ['Controlled load', 'c/kWh'],
+      supply_per_day: ['Daily supply', 'c/day'],
+      cl_supply_per_day: ['Controlled-load supply', 'c/day'],
+      fit_rate: ['Feed-in tariff', 'c/kWh'],
+    };
+    const pdDrift = pdc.drift || {};
+    const pdKeys = Object.keys(pdDrift);
+    const planDataHtml = pdKeys.length ? `
+      <div class="bill-plandata">
+        <strong>Our rates for ${_e(b.plan_name)} are not the rates this bill was
+        charged at.</strong>
+        <table class="bill-pd-table">
+          <tr><th></th><th>We hold</th><th>Bill charged</th><th></th></tr>
+          ${pdKeys.map(k => {
+            const d = pdDrift[k];
+            const [label, unit] = PD_LABELS[k] || [k, ''];
+            return `<tr>
+              <td>${_e(label)}</td>
+              <td>${(d.ours * 100).toFixed(3)}${_e(unit)}</td>
+              <td>${(d.billed * 100).toFixed(3)}${_e(unit)}</td>
+              <td class="bill-pd-pct">${d.pct == null ? '' : (d.pct >= 0 ? '+' : '') + d.pct.toFixed(1) + '%'}</td>
+            </tr>`;
+          }).join('')}
+        </table>
+        Both sides are GST-inclusive and the bill figure is its most recent rate
+        period, so this is a real difference — not GST and not a mid-bill price
+        change. Until it is resolved <strong>this plan is excluded from the
+        ranking rather than priced</strong>: the row would be labelled as the
+        plan you are on, and a wrong figure there mis-states every saving
+        measured against it. The baseline above is the bill's own printed
+        total, which is unaffected.
+      </div>` : (pdc.checked ? `
+      <div class="bill-assumed">
+        Our rates for ${_e(b.plan_name)} match what this bill was charged — the
+        bill independently confirms the plan data behind this comparison.
+      </div>` : '');
+
     const warnings = (m.warnings || []).map(w => `<li>${_e(w)}</li>`).join('');
 
     return `
@@ -1425,6 +1524,7 @@ class GridLensCard extends HTMLElement {
         </div>
         <div class="bill-caveat">${_e(b.one_season_caveat)}</div>
         ${warnings ? `<ul class="bill-warnings">${warnings}</ul>` : ''}
+        ${planDataHtml}
         ${assumedHtml}
         ${excludedHtml}
       </div>`;
@@ -1799,6 +1899,29 @@ class GridLensCard extends HTMLElement {
           border-color: var(--warning-color, #ff9800);
         }
         .bill-assumed .nav-btn, .bill-excluded .nav-btn { margin-left: 8px; }
+        /* Louder than .bill-assumed on purpose: this one says a figure the
+           user can check against the paper in their hand is wrong. */
+        .bill-plandata {
+          margin-top: 10px;
+          padding: 10px 12px;
+          border-radius: 6px;
+          border-left: 4px solid var(--error-color, #db4437);
+          background: rgba(219, 68, 55, 0.08);
+          font-size: 0.9em;
+          line-height: 1.45;
+        }
+        .bill-pd-table {
+          border-collapse: collapse;
+          margin: 8px 0;
+          font-variant-numeric: tabular-nums;
+        }
+        .bill-pd-table th, .bill-pd-table td {
+          padding: 2px 14px 2px 0;
+          text-align: right;
+        }
+        .bill-pd-table th { font-weight: 500; color: var(--secondary-text-color); }
+        .bill-pd-table th:first-child, .bill-pd-table td:first-child { text-align: left; }
+        .bill-pd-pct { color: var(--error-color, #db4437); }
         .bill-scenario, .source-control {
           display: inline-flex; align-items: center; gap: 6px;
           font-size: 12px; color: var(--secondary-text-color);
@@ -2238,6 +2361,11 @@ class GridLensCard extends HTMLElement {
     // the bill's and the pickers are disabled rather than silently ignored.
     const _onBill = this._source !== 'live';
     const _dateDis = (_busy || _onBill) ? 'disabled' : '';
+    // In bill mode the pickers show the bill's own period, but from a separate
+    // slot — the household's saved range must survive a trip through a bill and
+    // still be there when they switch back (see _updateDatesFromData).
+    const _startVal = _onBill ? this._billStart : this._startDate;
+    const _endVal   = _onBill ? this._billEnd   : this._endDate;
     const _sourceHtml = (this._bills && this._bills.length) ? `
       <label class="source-control" title="Compare this household's own metered data, or a household you only have a paper bill for.">
         Source
@@ -2253,9 +2381,9 @@ class GridLensCard extends HTMLElement {
         ${_sourceHtml}
         <button id="epc-prev" class="nav-btn" title="Back 1 month" ${_dateDis}>&#8592; 1 mo</button>
         <label>From</label>
-        <input type="date" id="epc-start" value="${this._startDate}" ${_dateDis}>
+        <input type="date" id="epc-start" value="${_startVal}" ${_dateDis}>
         <label>to</label>
-        <input type="date" id="epc-end" value="${this._endDate}" ${_dateDis}>
+        <input type="date" id="epc-end" value="${_endVal}" ${_dateDis}>
         <button id="epc-next" class="nav-btn" title="Forward 1 month" ${_dateDis}>1 mo &#8594;</button>
         <button id="epc-calc" ${_busy ? 'disabled' : ''}>${_busy ? 'Calculating…' : 'Calculate'}</button>
         <span class="zoom-controls">
@@ -2264,7 +2392,11 @@ class GridLensCard extends HTMLElement {
           <button id="epc-zoom-in" class="nav-btn" title="Grow charts">&#43;</button>
         </span>
         ${calcDate ? `<span class="date-meta">${usageDays} days &nbsp;·&nbsp; updated ${calcDate}</span>` : ''}
-        ${(this._plansDone > 0 && this._plansTotal > 0) ? `
+        ${this._periodMessage ? `
+          <span class="stream-label">${_esc(this._periodMessage)}</span>
+          <span class="stream-track"><span class="stream-bar" style="width:${
+            this._fetchTotal > 0 ? Math.round(this._fetchStep/this._fetchTotal*100) : 0}%"></span></span>`
+        : (this._plansDone > 0 && this._plansTotal > 0) ? `
           <span class="stream-label">${this._plansDone}/${this._plansTotal} plans</span>
           <span class="stream-track"><span class="stream-bar" style="width:${Math.round(this._plansDone/this._plansTotal*100)}%"></span></span>` : ''}
         <span class="retailer-filter">

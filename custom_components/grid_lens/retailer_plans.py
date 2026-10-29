@@ -142,6 +142,29 @@ def rate_time_ranges(rate_defs: list) -> dict:
     return out
 
 
+def blended_hour_rate(getter, local_dt: datetime) -> float:
+    """A plan's rate for one LP hour, blended across a :30 window boundary that
+    falls inside it — no real AU retail window in this product's data splits
+    finer than the half-hour (the same assumption the historical pro-rated-
+    hourly fallback in `plan_calculator._compute_bill_items` already makes).
+
+    `getter` is `plan.get_import_rate`/`get_export_rate`; a single point sample
+    at the hour's start (what every LP hourly-rate array built before this
+    silently did) prices the WHOLE hour at whichever side of a mid-hour window
+    boundary that instant happens to land on — e.g. a plan with a 17:30-19:30
+    FiT window would see its LP-simulated 17:00 hour priced entirely off-peak,
+    even though half of it is really inside the window. That's the same bug
+    class `subhourly_energy_archive.py` fixes for real historical data; here
+    there is no real data to recover — the LP's hour is a SIMULATED dispatch
+    decision, not something that happened — so the best an hourly-timestep
+    solver can do is average the two half-hour rates, same as the historical
+    fallback's own "split each bucket across its two half-hours" heuristic.
+    """
+    r0 = getter(local_dt)
+    r30 = getter(local_dt + timedelta(minutes=30))
+    return r0 if r0 == r30 else (r0 + r30) / 2.0
+
+
 class RetailerPlan(ABC):
     """Base class for electricity retailer plans."""
 

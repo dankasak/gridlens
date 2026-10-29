@@ -14,10 +14,11 @@ from homeassistant.helpers.entity_registry import async_get as async_get_entity_
 
 from .battery_optimizer import BatteryOptimizer
 from .cap_periods import CAP_PERIOD_DAYS, cap_allowance, cap_bucket
+from .subhourly_energy_archive import SLOT_MINUTES as _ARCHIVE_SLOT_MINUTES
 from .retailer_plans import (
     plans_from_api_data, versioned_plans_from_history, build_rate_caps,
     build_conditional_credits, slot_calendar_day_index, RetailerPlan, PlanFromData,
-    rate_time_ranges, format_window_range, cap_label_base, local_tz,
+    rate_time_ranges, format_window_range, cap_label_base, local_tz, blended_hour_rate,
 )
 from .const import (
     DOMAIN,
@@ -704,6 +705,13 @@ class PlanCalculator:
                 f"export: {sum(d['value'] for d in grid_export_data):.2f} kWh"
             )
 
+        # GridLens's own durable archive of per-day rate-window kWh splits
+        # (subhourly_archive.py) — covers the current-plan import/export window
+        # attribution above for days whose 5-minute recorder data has since been
+        # purged, so a bill checked long after the billing period still gets
+        # window-accurate kWh instead of the even pro-rated approximation.
+        subhourly_archive = await self._get_subhourly_archive_days(start_date, end_date)
+
         # Fetch actual battery charge/discharge history once — this is the most
         # expensive query in the whole calculation (raw state_changes over the
         # full period for a high-frequency power sensor, then integrated in
@@ -1277,6 +1285,7 @@ class PlanCalculator:
                         current_plan_segments, usage_data, grid_export_data,
                         export_fine_data, cl_devices, _dup_keys,
                         aemo_price_cache=_aemo_price_cache,
+                        subhourly_archive=subhourly_archive,
                     )
                 if bi is None:
                     export_actual = None
@@ -1293,6 +1302,7 @@ class PlanCalculator:
                         pea_result=pea_results.get(plan_key),
                         export_fine_data=export_fine_data,
                         cl_devices=cl_devices,
+                        subhourly_archive=subhourly_archive,
                     )
                 bd = plan_optimization_results[plan_key]['breakdown']
                 bd['bill_items'] = bi
@@ -1910,6 +1920,57 @@ class PlanCalculator:
                                   f"{base} (after {cap:g} {unit}{pooled_note})")
         return parts
 
+    def _archived_fine_records(
+        self, day_iso: str, direction: str, subhourly_archive: dict | None, tz,
+    ) -> list | None:
+        """Synthetic 5-minute-equivalent records for one local day, reconstructed
+        from GridLens's own plan-agnostic sub-hourly archive
+        (subhourly_energy_archive.py) — or None if that day isn't archived.
+
+        Returned in the same shape `_get_usage_data` gives (`timestamp`/`value`),
+        so callers can feed them through the exact per-record cap/window
+        resolution (`_split_capped_kwh`) a live 5-minute reading would get. Unlike
+        the first version of this archive, there is no plan check here: the
+        archive stores raw energy per 30-minute slot, not a rate-bucketed split,
+        so it's equally valid for pricing the plan actually held that day, a
+        later version of the same plan, or a different plan being ranked as an
+        alternative — see that module's docstring for why the redesign happened.
+        """
+        if not subhourly_archive:
+            return None
+        entry = subhourly_archive.get(day_iso)
+        if not entry:
+            return None
+        slots = entry.get(direction)
+        if not slots:
+            return None
+        try:
+            y, m, d = (int(x) for x in day_iso.split('-'))
+            day_start = datetime(y, m, d, tzinfo=tz)
+        except ValueError:
+            return None
+        out = []
+        for i, kwh in enumerate(slots):
+            if kwh <= 1e-9:
+                continue
+            local_dt = day_start + timedelta(minutes=_ARCHIVE_SLOT_MINUTES * i)
+            out.append({"timestamp": local_dt.astimezone(timezone.utc), "value": kwh})
+        return out
+
+    async def _get_subhourly_archive_days(self, start_date: datetime, end_date: datetime) -> dict:
+        """Archived per-day sub-hourly kWh (subhourly_energy_archive.py) covering
+        [start_date, end_date), keyed by ISO date. Best-effort: any failure (archive
+        not wired for this entry, storage error) returns {} and callers fall back to
+        deriving the split from recorder data exactly as before this existed."""
+        archive = self.hass.data.get(DOMAIN, {}).get(f"{self.entry.entry_id}_subhourly_energy_archive")
+        if archive is None:
+            return {}
+        try:
+            return await archive.async_get_range(start_date.date(), end_date.date())
+        except Exception as exc:  # noqa: BLE001 — a broken archive must not kill the calc
+            _LOGGER.debug("Sub-hourly energy archive lookup failed: %s", exc)
+            return {}
+
     def _calculate_actual_conditional_credits(
         self, plan, usage_data: list[dict], actual_days: int,
     ) -> tuple[float, dict]:
@@ -2009,6 +2070,7 @@ class PlanCalculator:
         cl_devices: list[dict],
         dup_keys: set[str],
         aemo_price_cache: dict[str, list[dict]] | None = None,
+        subhourly_archive: dict | None = None,
     ) -> dict | None:
         """Actual-usage bill items for a window that spans one or more plan
         switches: each segment is priced against its OWN real usage slice and
@@ -2066,6 +2128,7 @@ class PlanCalculator:
                 pea_result=seg_pea,
                 export_fine_data=seg_export_fine,
                 cl_devices=cl_devices,
+                subhourly_archive=subhourly_archive,
             )
             seg_details.append({
                 'plan_name': plan_name,
@@ -2241,6 +2304,7 @@ class PlanCalculator:
         export_fine_data: list[dict] = None,
         cl_devices: list[dict] = None,
         is_spot_priced: bool = False,
+        subhourly_archive: dict | None = None,
     ) -> dict:
         """Return itemised bill breakdown matching Australian electricity bill format.
 
@@ -2298,17 +2362,47 @@ class PlanCalculator:
             total_import_kwh = 0.0
             total_export_kwh = sum(d["value"] for d in export_data) if export_data else 0.0
             tier_data: dict = defaultdict(lambda: {'kwh': 0.0, 'cost': 0.0})
+            # GridLens's own sub-hourly archive (subhourly_energy_archive.py): a day
+            # it covers is priced from real 30-minute-resolution energy instead of
+            # this hourly loop — window-accurate for ANY plan (not just whichever
+            # plan was actually held that day), since the archive stores raw
+            # energy, not a rate-bucketed split. covered_hours then lets the
+            # hourly loop below skip exactly the hours already priced this way.
+            covered_hours: set = set()
+            if subhourly_archive:
+                for day_iso in subhourly_archive:
+                    recs = self._archived_fine_records(day_iso, "import", subhourly_archive, tz)
+                    if not recs:
+                        continue
+                    for d in recs:
+                        local_dt = d['timestamp'].astimezone(tz)
+                        hour_key = local_dt.replace(minute=0, second=0, microsecond=0)
+                        if hour_key in covered_hours:
+                            continue
+                        covered_hours.add(hour_key)
+                        kwh = d['value']
+                        total_import_kwh += kwh
+                        for rate, part_kwh in self._split_capped_kwh(
+                                plan, "import", local_dt, kwh, daily_used, cap_labels,
+                                actual_days):
+                            rk = round(rate, 4)
+                            tier_data[rk]['kwh'] += part_kwh
+                            tier_data[rk]['cost'] += part_kwh * rk
+
             for d in (usage_data or []):
+                local_dt = d['timestamp'].astimezone(tz)
+                if local_dt.replace(minute=0, second=0, microsecond=0) in covered_hours:
+                    continue  # already priced from the sub-hourly archive above
                 kwh = d['value']
                 total_import_kwh += kwh
-                if kwh > 1e-6:
-                    local_dt = d['timestamp'].astimezone(tz)
-                    for rate, part_kwh in self._split_capped_kwh(
-                            plan, "import", local_dt, kwh, daily_used, cap_labels,
-                            actual_days):
-                        rk = round(rate, 4)
-                        tier_data[rk]['kwh'] += part_kwh
-                        tier_data[rk]['cost'] += part_kwh * rk
+                if kwh <= 1e-6:
+                    continue
+                for rate, part_kwh in self._split_capped_kwh(
+                        plan, "import", local_dt, kwh, daily_used, cap_labels,
+                        actual_days):
+                    rk = round(rate, 4)
+                    tier_data[rk]['kwh'] += part_kwh
+                    tier_data[rk]['cost'] += part_kwh * rk
             dummy_slots = [{'hour': h, 'import_kwh': 0.0, 'import_cost': 0.0,
                             'export_kwh': 0.0, 'export_credit': 0.0} for h in range(48)]
             dummy_sections = plan.get_display_breakdown({'schedule': dummy_slots}).get('sections', [])
@@ -2622,12 +2716,39 @@ class PlanCalculator:
                         rk = round(rate, 4)
                         fit_tier_data[rk]['kwh']  += part_kwh
                         fit_tier_data[rk]['cost'] += part_kwh * rate
-            # Hourly fallback for hours outside short-term retention: split each
-            # bucket across its two half-hours (windows never split finer than :30),
-            # assuming export is spread evenly within the bucket. Not cap-aware
-            # (only fires for data beyond 5-minute short-term retention, i.e. old
-            # historical gaps) — a capped export window here is priced at its free
-            # rate regardless of how much was already exported that day.
+            # GridLens's own sub-hourly archive (subhourly_energy_archive.py): for a
+            # day whose hours aren't (fully) covered by 5-minute data above, splice
+            # in its archived reconstruction — real per-30-minute-slot energy, not
+            # a pro-rated guess — before falling back to the even-split heuristic
+            # below. Unlike the live loop above this works for a day archived
+            # under ANY plan (the raw energy isn't rate-bucketed), so it benefits
+            # ranking an alternative plan against this household's own history,
+            # not just re-pricing whichever plan was actually held that day.
+            if subhourly_archive:
+                for day_iso in subhourly_archive:
+                    recs = self._archived_fine_records(day_iso, "export", subhourly_archive, tz)
+                    if not recs:
+                        continue
+                    for d in recs:
+                        local_dt = d['timestamp'].astimezone(tz)
+                        hour_key = local_dt.replace(minute=0, second=0, microsecond=0)
+                        if hour_key in covered_hours:
+                            continue
+                        covered_hours.add(hour_key)
+                        for rate, part_kwh in self._split_capped_kwh(
+                                plan, "export", local_dt, d['value'], daily_used,
+                                export_cap_labels, actual_days):
+                            if rate > 0:
+                                rk = round(rate, 4)
+                                fit_tier_data[rk]['kwh']  += part_kwh
+                                fit_tier_data[rk]['cost'] += part_kwh * rate
+
+            # Hourly fallback for hours covered by neither 5-minute data nor the
+            # archive above: split each bucket across its two half-hours (windows
+            # never split finer than :30), assuming export is spread evenly within
+            # the bucket. Not cap-aware — only fires for a day with no 5-minute
+            # data AND no archive entry (old historical gap predating the archive,
+            # or the archive not yet wired for this entry).
             for d in export_data:
                 local_dt = d['timestamp'].astimezone(tz)
                 if local_dt.replace(minute=0, second=0, microsecond=0) in covered_hours:
@@ -4024,13 +4145,18 @@ class PlanCalculator:
             if _spot_imp is not None:
                 _hk = (start_time + timedelta(hours=hour_idx)).astimezone(timezone.utc).replace(
                     minute=0, second=0, microsecond=0)
+                # Spot (AEMO RRP-derived) rates are continuously variable, not
+                # window-based, so no blending applies there; only the fallback
+                # for a gap in the spot series needs it.
                 hourly_import_rates.append(
-                    _spot_imp[_hk] if _hk in _spot_imp else plan.get_import_rate(local_dt))
+                    _spot_imp[_hk] if _hk in _spot_imp
+                    else blended_hour_rate(plan.get_import_rate, local_dt))
                 hourly_export_rates.append(
-                    _spot_exp[_hk] if _hk in _spot_exp else plan.get_export_rate(local_dt))
+                    _spot_exp[_hk] if _hk in _spot_exp
+                    else blended_hour_rate(plan.get_export_rate, local_dt))
             else:
-                hourly_import_rates.append(plan.get_import_rate(local_dt))
-                hourly_export_rates.append(plan.get_export_rate(local_dt))
+                hourly_import_rates.append(blended_hour_rate(plan.get_import_rate, local_dt))
+                hourly_export_rates.append(blended_hour_rate(plan.get_export_rate, local_dt))
             local_hods.append(local_dt.hour)
             local_dows.append(local_dt.weekday())
             if demand_predicate:

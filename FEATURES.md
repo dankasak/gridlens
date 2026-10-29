@@ -242,6 +242,57 @@ import/export, e.g. Amber SmartShift — a different mechanism PEA-slicing doesn
 still isn't split-priced — the whole window falls back to the old single-plan pricing for
 that case. See `docs/GRIDLENS_CHECKLIST.md`, 2026-09-15.
 
+**A narrow TOU/FiT window's kWh split survives recorder purges via its own plan-agnostic
+archive** (`subhourly_energy_archive.py`, 2026-10-27). `_compute_bill_items` attributes
+import/export kWh to a plan's declared rate windows using 5-minute short-term statistics
+when available (a window with a sub-hourly boundary, e.g. Flow Power's 17:30-19:30 FiT
+window, needs sub-hourly resolution — an hourly bucket spanning the boundary has to guess
+how much of its total falls on each side). That 5-minute data is purged after
+`purge_keep_days` (90 on this install, HA default 10), after which the fallback is an even
+pro-rated split across the boundary hour — wrong whenever real usage/export concentrates at
+the window's edges rather than spreading evenly (e.g. a battery-discharge automation timed
+to start exactly on the window boundary). `SubHourlyEnergyArchive` closes that gap the way
+`daily_archive.py` closes it for daily PV/import/export totals: a nightly tick (and a
+bounded one-shot backfill on setup) captures each day's **raw** kWh per 30-minute slot
+into its own HA Store *while the 5-minute data is still fresh* — no real AU retail window
+splits finer than that. Deliberately plan-agnostic: the first cut of this archive stored
+kWh already bucketed by whichever plan's rate windows were held that day, which turned out
+to be the wrong layer — a kWh collapsed into "Flow Power's 17:30-19:30 bucket" carries no
+information a *different* plan's window could use, so it was useless for Plan Comparison's
+actual job of ranking alternative plans against real historical usage (caught in review,
+2026-10-27). Storing raw per-slot energy instead means `_compute_bill_items` re-runs
+`get_import_rate_info`/`get_export_rate_info` for whichever plan is actually being priced at
+read time — the plan held that day, a later version of it, or a different candidate — so an
+archived day stays useful no matter which plan asks. Cap/tier resolution (`_split_capped_kwh`)
+still happens downstream of the archive, not inside it, so pooled/weekly/monthly caps stay
+correct. Confirmed live 2026-10-27: backfill captured 90 days (bounded by this install's
+actual 5-minute retention) on first restart. Does not recover kWh for a day whose 5-minute
+data had already been purged before the archive existed — see `docs/GRIDLENS_CHECKLIST.md`,
+2026-10-27, for the Flow Power bill that surfaced this. **Not wired into the LP-based
+alternative-plan path, and structurally can't be** — that path derives export/import tiers
+from the optimiser's own SIMULATED hourly dispatch for a hypothetical plan, not something
+that actually happened, so there's no real archived shape to substitute in; see the next
+paragraph for the LP's own, separate fix for the same class of window-boundary problem.
+
+**The LP's own hourly rate lookup is now window-boundary-aware** (`retailer_plans.blended_hour_rate`,
+2026-10-27). `_calculate_plan_cost_with_battery_optimization` builds one `import_rate`/
+`export_rate` per simulated LP hour by sampling a plan's rate at a single instant — the
+hour's start. For a plan whose window boundary falls at :30 (e.g. Flow Power's 17:30-19:30
+FiT window), that silently priced the LP's whole simulated 17:00 hour at whichever side of
+the boundary the hour's start happened to land on (off-peak), even though half the hour is
+really inside the window — the same bug class the sub-hourly archive above fixes for real
+historical data, just at the LP's rate-ASSIGNMENT stage instead of the bill-reporting stage.
+There's no real data to recover here (the LP's hour is a modelled decision, not a metered
+one), so `blended_hour_rate` does the best an hourly-timestep solver can: average the rate
+at the hour's start and at :30, same "split each bucket across its two half-hours" logic the
+historical pro-rated fallback already uses. Applies to every plan the LP prices — current or
+a ranked alternative — via the one rate-array construction site both share. Does not change
+dispatch TIMING resolution (the LP still decides charge/discharge once per hour, not once per
+half-hour) — that's a separate, larger limitation (see `OPEN_ITEMS.md`/battery_optimizer.py's
+hourly timestep structure) this change doesn't touch; it only fixes which rate a simulated
+hour is priced at. New `tests/test_blended_hour_rate.py` (5 checks, pure — no HA import
+needed, mirrors `test_pooled_caps.py`'s pattern).
+
 **The Plan Comparison card is organised around these bill-boundary periods, not around a
 flat list of every plan** (`periods` field on `calculate_plan_costs`'s result, and
 `_rank_plans_for_period`/`_price_plan_for_period` in `plan_calculator.py`, 2026-09-15). One
@@ -279,6 +330,24 @@ landing while the previous request is still running server-side) is closed by `_
 in `__init__.py` — one `asyncio.Lock` per config entry shared by every
 `calculate_plan_costs()` call site, so a second caller waits (with its own "waiting" status
 on the stream) rather than running concurrently and starving both.
+
+⚠ **The periods phase must show its own progress, and must not blank the page**
+(`grid-lens-card.js`, fixed 2026-10-26). It reports through the same `'status'` SSE/poll
+event as the fetch phase but with `phase: 'optimising'` — which is also the phase the
+whole-window loop is in, by which point `plans_done == plans_total`. The card was
+showing the plans counter for both, so for the entire periods phase it read
+**"Optimising plans… 207 / 207" with the bar pinned at 100%**: on a 93-day two-period
+window that is ~130 of ~228 seconds looking exactly like a hung page, and it was reported
+as one. The per-plan `on_period_progress` callback exists precisely to prevent that; the
+message was being routed into `_fetchMessage` (the fetch phase's slot, only ever rendered
+when `phase === 'fetching'`) and discarded. It now has its own `_periodMessage`, and its
+`fetch_step`/`fetch_total` (plans ranked *within the current period*) drive the bar.
+Second half of the same fix: the periods phase emits **nothing but** `'status'` events, so
+`_pollCalc`'s `else if (gotStatus) _showStreamProgress()` was replacing an already-rendered
+page of results with the bare spinner panel for the whole phase. Once any plan has
+arrived the card keeps rendering, and the inline progress strip in the date controls
+carries the ranking message instead. Covered by
+`tests/test_bill_date_isolation.mjs` (drives the real `_pollCalc` over a stubbed fetch).
 
 **"Show best N" declutter filter** (`_topN`, default 5, `grid-lens-card.js`, 2026-09-15). A
 `<select id="epc-topn">` next to the date controls, persisted like the date range. Purely a
@@ -602,9 +671,43 @@ is untouched and does not know the difference. Nothing else in the comparison ch
 - **The baseline is the printed bill**, not a re-derivation of it
   (`PlanCalculator.baseline_total_override`). Better on principle, and it was once
   necessary: before the CL data landed, the bill's own plan was usually one of the plans
-  we held no CL rate for, so it got refused along with the rest. Note that the bill's own
-  plan re-priced on *today's* rates is not the billed total — it came out $131 higher on
-  the Endeavour test bill, because the supply charge rose after the billed period.
+  we held no CL rate for, so it got refused along with the rest.
+- **The bill cross-checks our plan data, and a disagreement excludes the plan**
+  (`bill_source.plan_data_drift`, surfaced as `bill.plan_data_check`). An uploaded bill
+  is the *only* external check this product ever gets on its own plan data: everywhere
+  else our rates are verified against CDR PRD, which is to say against themselves. But
+  for the one plan the household actually holds, the bill prints the rates the retailer
+  really applied. So we compare them — our stored rate against the bill's **latest** rate
+  period (our data holds one current rate set; a bill spanning a 1 July reset prints two,
+  and averaging them compares a current rate against a blend of old and new). Beyond
+  1.5% / $0.0015 the plan is **excluded with both figures named**, because that row is
+  labelled as the plan you are on: a wrong number there reads as "Grid Lens thinks I pay
+  $X" and mis-states every saving measured against it. Which side is wrong is not
+  adjudicated — our data may be newer than the bill, or the household may hold a legacy
+  discount the retailer no longer publishes under that plan name. **Live finding
+  2026-10-26:** on the Endeavour test bill our rates for
+  `origin_go_variable_ongoing_single_endeavour` priced the household's own 92 days at
+  $807.81 against a printed $676.78, reported as "+$131.02 vs current" with nothing in
+  the output saying so. An earlier revision of this bullet explained that gap away as
+  "the supply charge rose after the billed period" — **that was wrong**, and believing it
+  is what let the discrepancy ship: the PRD record for that plan carries product code
+  `E_GOVAROG_8PC_VAR_ENDEAVOUR_CP_260701`, i.e. the *same* 1 July 2026 price set the bill
+  was charged under, and the gap is not confined to supply (+16.5% supply, +15.7%
+  general usage, +19.5% controlled load, both sides GST-inclusive). Unresolved — see
+  `gridlens-api/docs/OPEN_ITEMS.md`.
+- ⚠ **A bill's window is display-only — it must never become the household's own date
+  range** (fixed 2026-10-26). `_setSource` deliberately sends no dates for a bill run,
+  because the backend forces the bill's period; the response's `start_date`/`end_date`
+  then landed in `_updateDatesFromData`'s "no dates requested, adopt what came back"
+  branch, which writes `_startDate`/`_endDate` **and the `epc-date-start`/`epc-date-end`
+  localStorage keys the live source reads back**. So looking at one uploaded bill
+  silently replaced the household's saved range with the bill's quarter, and switching
+  the selector back to `My data` kicked off a 93-day live comparison nobody asked for —
+  ~620 LP solves, 228s measured end-to-end, which with the progress bug above (see §1's
+  periods section) presented as "the dashboard is not loading". The bill's window now
+  goes to its own `_billStart`/`_billEnd`, which only the (disabled) pickers read while a
+  bill is selected. Note this persists per browser: an install that hit the old behaviour
+  keeps the bill's dates in localStorage until the range is changed in the UI once.
 - **Everything is tagged MODELLED** and the banner carries the assumptions in force, the
   model's residual against both registers, and the one-season caveat (a single bill is
   one season; a battery sized on a winter quarter is wrong for summer).
@@ -3719,6 +3822,12 @@ custom_components/grid_lens/
 ├── ev_charger_vendors.py    per-brand EV-charger entity patterns for the optional
 │                            load_ev_brand wizard step — §6a
 ├── plan_calculator.py       plan cost engine
+├── daily_archive.py         durable per-day PV/import/export kWh totals (HA Store),
+│                            survives recorder purges/renames — feeds shade_correction.py's
+│                            climatology
+├── subhourly_energy_archive.py  durable per-day, per-30-minute-slot RAW import/export
+│                            kWh (HA Store), captured while 5-minute recorder data is
+│                            fresh, plan-agnostic — see "survives recorder purges" above
 ├── cap_periods.py           capped-tier bucketing / pooled-allowance sizing / period start —
 │                            shared by plan_calculator.py (the bill) and advisory/today_cash.py
 │                            (the price chart's bars), which must not disagree
@@ -3728,7 +3837,9 @@ custom_components/grid_lens/
 │                            solar geometry, calibration, CL-placement scenarios
 ├── bill_source.py           feeds bill_model into PlanCalculator through the
 │                            _get_usage_data seam — BillUsageSource, SyntheticEntry,
-│                            BillGates (which plans a bill may not price, and why) — §1h
+│                            BillGates (which plans a bill may not price, and why),
+│                            plan_data_drift (our rates vs what the bill was actually
+│                            charged — the only external check on plan data) — §1h
 ├── battery_optimizer.py     the LP/MILP
 ├── sensor.py                comparison sensors + deferrable_loads attribute
 ├── plan_sensors.py          per-plan metric sensors

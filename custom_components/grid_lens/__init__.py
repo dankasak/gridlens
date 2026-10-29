@@ -741,7 +741,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20261028a"
+    _CARD_VERSION = "20261029a"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -2749,6 +2749,49 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     except Exception as _arch_err:  # noqa: BLE001
         _LOGGER.warning("Daily energy archive setup failed: %s", _arch_err)
+
+    # GridLens-owned sub-hourly energy archive: captures raw per-30-minute-slot
+    # import/export kWh while 5-minute recorder data is still fresh. See
+    # subhourly_energy_archive.py — short version: once that data is purged,
+    # _compute_bill_items falls back to an even pro-rated split across a window's
+    # boundary hour, which can badly misattribute kWh for a narrow TOU/FiT window
+    # (e.g. Flow Power's 17:30-19:30) when real usage/export is concentrated at the
+    # window's edges rather than spread evenly through the hour. Deliberately
+    # plan-agnostic (raw energy, not a rate-bucketed split) — rebucketing happens at
+    # read time in plan_calculator.py, so a day this archives stays useful for
+    # pricing ANY plan later, not just whichever one was actually held that day.
+    try:
+        from homeassistant.helpers.event import async_track_time_change
+
+        from .plan_calculator import PlanCalculator
+        from .subhourly_energy_archive import SubHourlyEnergyArchive
+
+        _sh_archive = SubHourlyEnergyArchive(hass, entry)
+        hass.data[DOMAIN][f"{entry.entry_id}_subhourly_energy_archive"] = _sh_archive
+
+        entry.async_create_background_task(
+            hass,
+            _sh_archive.async_backfill(PlanCalculator(hass, entry)),
+            name="grid_lens_subhourly_energy_archive_backfill",
+        )
+
+        # 00:35 local: after the daily archive's 00:20 tick above, same reasoning —
+        # late enough that the recorder has settled yesterday's last 5-minute bucket.
+        entry.async_on_unload(
+            async_track_time_change(
+                hass,
+                lambda now: entry.async_create_background_task(
+                    hass,
+                    _sh_archive.async_daily_tick(PlanCalculator(hass, entry), now),
+                    name="grid_lens_subhourly_energy_archive_tick",
+                ),
+                hour=0,
+                minute=35,
+                second=0,
+            )
+        )
+    except Exception as _sha_err:  # noqa: BLE001
+        _LOGGER.warning("Sub-hourly energy archive setup failed: %s", _sha_err)
 
     # Shade correction (see shade_correction.py) — opt-in, and needs CONF_SOLAR_SENSOR
     # (actual production) configured before there's anything to learn from. The forecast
