@@ -54,6 +54,10 @@ async def async_setup_entry(
             for index, controller in load_mgr.controllers.items()
         )
 
+    battery_mgr = hass.data[DOMAIN].get(f"{entry.entry_id}_control")
+    if battery_mgr is not None:
+        entities.append(GridLensBatteryControlOverrideSelect(battery_mgr, entry))
+
     # One "charge timing preference" per SOC-tracked deferrable device — same
     # gating as number.py's ad-hoc charge-target percent entity (needs a live
     # SOC reading + capacity for the floor this preference is tie-breaking to
@@ -210,4 +214,105 @@ class GridLensChargeTimingPreferenceSelect(SelectEntity):
         if self._store is not None:
             await self._store.async_set(self._sensor_id, preference)
         self._attr_current_option = ctp.LABELS[preference]
+        self.async_write_ha_state()
+
+
+OPTION_BATTERY_AUTO = "Auto"
+OPTION_BATTERY_PAUSE_30M = "Pause 30 min"
+OPTION_BATTERY_PAUSE_1H = "Pause 1 hour"
+OPTION_BATTERY_PAUSE_2H = "Pause 2 hours"
+OPTION_BATTERY_PAUSE_4H = "Pause 4 hours"
+OPTION_BATTERY_PAUSE_CUSTOM = "Pause custom duration"
+
+# Minutes for each fixed preset. "Pause custom duration" isn't here — it reads
+# ControlManager.custom_override_minutes (number.py's GridLensBatteryOverrideMinutesNumber)
+# at selection time instead of a fixed value.
+_BATTERY_PAUSE_PRESET_MINUTES = {
+    OPTION_BATTERY_PAUSE_30M: 30,
+    OPTION_BATTERY_PAUSE_1H: 60,
+    OPTION_BATTERY_PAUSE_2H: 120,
+    OPTION_BATTERY_PAUSE_4H: 240,
+}
+
+
+class GridLensBatteryControlOverrideSelect(SelectEntity):
+    """Pause GridLens's battery actuation for a fixed or custom duration, then resume
+    automatically — the timed counterpart to the indefinite Battery Control switch.
+    That switch's OFF has no natural end and once sat off for a full day with nobody
+    noticing (see control/manager.py's async_initialize() docstring for the 2026-08-01
+    incident); this gives a one-tap way to say "hands off for the next N hours" without
+    having to remember to flip it back.
+
+    Not RestoreEntity — ControlManager's own Store is the source of truth for
+    override_until/override_label (so it survives a restart with the real remaining
+    time, not whatever label happened to be selected last — see
+    ControlManager.async_initialize()). This entity just mirrors it, same relationship
+    as the switch has with `enabled`.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Battery Control Override"
+    _attr_icon = "mdi:timer-pause-outline"
+    _attr_options = [
+        OPTION_BATTERY_AUTO,
+        OPTION_BATTERY_PAUSE_30M,
+        OPTION_BATTERY_PAUSE_1H,
+        OPTION_BATTERY_PAUSE_2H,
+        OPTION_BATTERY_PAUSE_4H,
+        OPTION_BATTERY_PAUSE_CUSTOM,
+    ]
+
+    def __init__(self, manager, entry: ConfigEntry) -> None:
+        self._manager = manager
+        self._attr_unique_id = f"{entry.entry_id}_battery_control_override"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_current_option = OPTION_BATTERY_AUTO
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._manager.set_override_listener(self._on_manager_change)
+        self._sync_from_manager()
+        self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._manager.set_override_listener(None)
+        await super().async_will_remove_from_hass()
+
+    def _on_manager_change(self) -> None:
+        self._sync_from_manager()
+        self.async_write_ha_state()
+
+    def _sync_from_manager(self) -> None:
+        if self._manager.override_until is None:
+            self._attr_current_option = OPTION_BATTERY_AUTO
+            return
+        label = self._manager.override_label
+        self._attr_current_option = label if label in self._attr_options else OPTION_BATTERY_PAUSE_CUSTOM
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        until = self._manager.override_until
+        return {
+            "override_until": until.isoformat() if until else None,
+            "battery_control_override_role": "select",
+        }
+
+    async def async_select_option(self, option: str) -> None:
+        if option == OPTION_BATTERY_AUTO:
+            await self._manager.cancel_override()
+        elif option == OPTION_BATTERY_PAUSE_CUSTOM:
+            await self._manager.override_pause(
+                self._manager.custom_override_minutes, label=option
+            )
+        elif option in _BATTERY_PAUSE_PRESET_MINUTES:
+            await self._manager.override_pause(
+                _BATTERY_PAUSE_PRESET_MINUTES[option], label=option
+            )
+        else:
+            return
+        self._attr_current_option = option
         self.async_write_ha_state()

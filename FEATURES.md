@@ -961,7 +961,27 @@ cycles / a season boundary.
 **What it does.** Actuates the battery to follow the plan, through a brand-agnostic
 inverter HAL.
 
-**Entity:** `switch.*_battery_control` — master on/off.
+**Entity:** `switch.*_battery_control` — master on/off (indefinite; see Gotchas below for
+the failure mode this caused).
+
+**Entities (timed override, added 2026-10-29):** `select.*_battery_control_override` —
+"Auto" / "Pause 30 min" / "Pause 1 hour" / "Pause 2 hours" / "Pause 4 hours" / "Pause
+custom duration", plus `number.*_battery_override_minutes` backing the custom option.
+Unlike the switch above, a pause **auto-resumes** — it suspends actuation for the chosen
+duration (immediately disengaging, same as the switch's OFF) without touching the
+switch's own persisted on/off intent, then re-enables itself when the timer expires,
+*if* that underlying intent is still "on". Explicitly flipping the switch either way
+cancels any pending pause. The deadline (`override_until`) is persisted in the same
+Store as the switch's intent, so a restart mid-pause either keeps it paused for the
+correct remaining time or — if the pause already expired while HA was down — resumes
+immediately, never stuck paused forever. This is the fix for the switch's own
+indefinite-off failure mode for the common case (someone wants control hands-off for a
+known window, not forever): reach for the override select first; the switch itself is
+still there for "off until I say otherwise". Files: `control/manager.py`
+(`override_pause`/`cancel_override`), `select.py`
+(`GridLensBatteryControlOverrideSelect`), `number.py`
+(`GridLensBatteryOverrideMinutesNumber`). Seeded on the dashboard next to the Battery
+control tile in `__init__.py`'s `control_tiles`.
 
 **Files:** `control/manager.py` (lifecycle, entitlement, persistence), `control/executor.py`
 (the 5-minute tick + `DispatchInterval`), `control/battery_controller.py` (SOC guardrails),
@@ -1000,7 +1020,9 @@ right):
 
 **Gotchas**
 - `switch.*_battery_control` can sit **off for a full day with no log or error trail**.
-  Check its state and history *first* when exports aren't happening.
+  Check its state and history *first* when exports aren't happening. The override select
+  above (2026-10-29) doesn't retrofit this for existing offs — it only helps when the
+  *next* off is done via "Pause" instead of the switch.
 - **Never restore control intent from an entity a deadman forces off on every reload.** The
   manager persists intent in its own `Store` and restores itself *before* the switch entity
   is created; the switch just displays it. (RestoreEntity was tried and dropped — 2026-08-01.)

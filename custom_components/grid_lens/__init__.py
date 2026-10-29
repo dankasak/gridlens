@@ -398,6 +398,22 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
                 "type": "tile", "entity": min_export, "name": "Min export price",
                 "features": [{"type": "numeric-input"}],
             })
+    # Timed pause for the battery-control switch above — "Pause 1 hour" etc, auto-
+    # resumes, unlike the switch's own indefinite off (see select.py's
+    # GridLensBatteryControlOverrideSelect docstring for why that distinction exists).
+    # Seeded right next to the switch it pauses, same reasoning as min_export above.
+    battery_override = eid(f"{entry.entry_id}_battery_control_override")
+    if battery_override:
+        control_tiles.append({
+            "type": "tile", "entity": battery_override, "name": "Battery override",
+            "features": [{"type": "select-options"}],
+        })
+        override_minutes = eid(f"{entry.entry_id}_battery_override_minutes")
+        if override_minutes:
+            control_tiles.append({
+                "type": "tile", "entity": override_minutes, "name": "Custom override minutes",
+                "features": [{"type": "numeric-input"}],
+            })
     # Today Boost tiles used to live here as their own "Tuning" section — merged into
     # grid-lens-load-control-card's per-device rows 2026-07-31 (user request: "move the
     # boost control into this same settings area"), so nothing further is seeded for it.
