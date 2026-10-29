@@ -1105,6 +1105,25 @@ still there for "off until I say otherwise". Files: `control/manager.py`
 (`GridLensBatteryOverrideMinutesNumber`). Seeded on the dashboard next to the Battery
 control tile in `__init__.py`'s `control_tiles`.
 
+**UI (popover on the status pill, added 2026-10-29):** the dashboard tile above is no
+longer the only way to reach this — clicking the battery status pill in
+`grid-lens-advisory-card.js`'s second header row (§6c) opens a popover with the same
+Auto/Pause 30m/1h/2h/4h/custom controls inline, right where the pill a user is already
+reading lives. The pill itself also grows a dedicated "Paused" variant
+(`sp.paused`, `mdi:timer-pause-outline`) when the override select's state isn't "Auto",
+with the `override_until` time in its text — without this, the pill would keep showing
+the last-applied charge/discharge action while actuation is actually suspended. Both
+entities are auto-discovered by a shared `battery_control_override_role` attribute
+("select"/"minutes") rather than a hardcoded entity_id — the same marker-attribute scan
+pattern as `_resolveDeferLoads()` — so this works on any install with no card config
+needed. Popover is a floating element positioned like the changelog tickers' `.cl-pop`
+(a sibling of `.body`, not inside it), but — unlike that inert ticker list — has live
+buttons wired to `select.select_option`/`number.set_value`, so it also closes on an
+outside click (`_onBattOutsideClick`, bound in `connectedCallback`), which `.cl-pop` never
+needed. Files: `grid-lens-advisory-card.js` (`_statusPills`, `_battPopHtml`,
+`_syncBattPop`, `_onBattToggleClick`, `_onBattOptionClick`, `_onBattOutsideClick`),
+`number.py` (new `extra_state_attributes` marker).
+
 **Files:** `control/manager.py` (lifecycle, entitlement, persistence), `control/executor.py`
 (the 5-minute tick + `DispatchInterval`), `control/battery_controller.py` (SOC guardrails),
 `inverters/base.py` (the HAL contract), `inverters/sigenergy_mqtt.py` (the one shipped
