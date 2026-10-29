@@ -751,27 +751,46 @@ never persisted. `BillFacts` has **no field** for a name, supply address, NMI, a
 number or payment reference and **rejects** any key it does not recognise, so an
 over-eager extractor has nowhere to put them rather than us filtering afterwards.
 
-**Not built yet:** PDF → figures. That needs the fact-sheet pipeline (`pdftotext`/OCR on
-the GPU box plus the local LLM and its grounding guards), which lives in `gridlens-api`
-and arrives with the cloud parser. Today the panel takes the parsed figures as JSON and
-is already shaped for that parser's output.
+**PDF → figures (built 2026-10-29).** The "Add a bill" panel has a file picker ahead of
+the JSON textarea: upload a PDF and `BillPdfExtractView` forwards it (multipart, in
+memory, never written to disk at either end) to `gridlens-api`'s `POST /bills/extract`
+(`app/bill_extract.py`), which runs `pdftotext`/`tesseract` **in-container** (unlike the
+retailer-fact-sheet pipeline this mirrors, which SSHes to a GPU box only because *that*
+tool's own container has no PDF tooling — this API container is glibc-based and installs
+`poppler-utils`/`tesseract-ocr` directly) and then a handful of grounded LLM calls against
+the same idle-GPU-box Ollama the fact-sheet pipeline uses (local model only, never a
+third-party AI API — see `PRIVACY_DATA_INVENTORY.md`). Every numeric field must carry a
+quote that literally appears in the extracted text, and for a number, the number must
+appear inside that quote (`_grounded`/`_grounded_numeric`, ported from
+`verification/prd_sync.py` — the same hallucination guard that's already caught two real
+fabricated-rate incidents on fact sheets). A field that fails this is left blank in the
+pre-filled JSON, with the quote it couldn't verify shown separately so the user can check
+the bill and fill it in by hand — never guessed. Capped at 2 rate periods per bill (the
+common case); a bill with more mid-cycle price changes needs manual JSON entry. The "paste
+JSON" box and "Insert example" button are unchanged and still work standalone — PDF upload
+is additive, not a replacement. No new entitlement: same `require_api_key` as every other
+`/plans*` endpoint.
 
 **Entities:** none. **Config:** none — nothing to configure, the selector appears once a
 bill is stored, so the dashboard seed is unaffected.
 
 **Endpoints:** `GET/POST /api/grid_lens/bills`, `PUT/DELETE
-/api/grid_lens/bills/{bill_id}`, and `?source=bill:<id>&scenario=<id>` on
+/api/grid_lens/bills/{bill_id}`, `POST /api/grid_lens/bills/extract_pdf` (proxies to
+`gridlens-api`'s `POST /bills/extract`), and `?source=bill:<id>&scenario=<id>` on
 `/api/grid_lens/plan_calc/start`.
 
 **Files:** `bill_model.py` (pure stdlib — schema, self-check, archetypes, solar geometry,
 calibration, scenario synthesis), `bill_source.py` (`BillUsageSource`, `SyntheticEntry`,
 `BillGates`), `plan_calculator.py` (`_usage_source`, `plan_filter`, `cl_rate_fallback`,
-`baseline_total_override`), `__init__.py` (`BillsView`, `BillItemView`, the `?source=`
-branch of `PlanCalcStartView`), `retailer_plans.py` (`PlanFromData.network`),
-`www/cards/grid-lens-card.js` (`renderBillsPanel`, `renderBillBanner`).
+`baseline_total_override`), `__init__.py` (`BillsView`, `BillItemView`,
+`BillPdfExtractView`, the `?source=` branch of `PlanCalcStartView`), `retailer_plans.py`
+(`PlanFromData.network`), `www/cards/grid-lens-card.js` (`renderBillsPanel`,
+`renderBillBanner`). API side (private repo): `gridlens-api/app/bill_extract.py` (text
+extraction, LLM client, grounding guard), `app/bills.py` (the endpoint).
 Design: `gridlens-api/docs/BILL_UPLOAD_COMPARISON_DESIGN.md`.
 Tests: `tests/test_bill_model.py`, `tests/test_bill_source.py` (the latter reproduces a
-real issued bill to $0.00 from the reconstruction).
+real issued bill to $0.00 from the reconstruction), `gridlens-api/tests/test_bill_extract.py`
+(grounding guard + extraction assembly, mocked LLM).
 
 ---
 

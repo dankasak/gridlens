@@ -741,7 +741,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20261029a"
+    _CARD_VERSION = "20261029b"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",
@@ -1299,6 +1299,100 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             self.hass.data.setdefault(DOMAIN, {}).pop(f"bill_model_{bill_id}", None)
             return web.Response(text=json.dumps({"ok": True}),
                                 content_type='application/json')
+
+    class BillPdfExtractView(HomeAssistantView):
+        """Proxies an uploaded PDF bill to the API's `/bills/extract` endpoint and
+        returns the parsed `BillFacts`-shaped result for the Bills panel to pre-fill.
+
+        The first view in this integration that accepts a multipart upload rather
+        than JSON — `request.multipart()` the normal aiohttp way, no precedent to
+        match here beyond this file's general error-handling idiom (try/except ->
+        400 JSON). Stateless both ends: the PDF bytes are read into memory here,
+        forwarded, and discarded — never written to disk, never cached — same
+        constraint the API endpoint itself is built to
+        (BILL_UPLOAD_COMPARISON_DESIGN.md §8). Nothing downstream changes: the
+        result is handed to the exact same `BillFacts.from_dict`/`self_check` gate
+        in `BillsView.post` above when the user reviews and clicks Save — this
+        view's only job is getting a first draft of that JSON in front of them.
+        """
+
+        url = "/api/grid_lens/bills/extract_pdf"
+        name = "api:grid_lens:bills_extract_pdf"
+        requires_auth = False
+
+        _MAX_BYTES = 15 * 1024 * 1024  # mirrors the API's own limit
+
+        def __init__(self, hass_instance):
+            self.hass = hass_instance
+
+        async def post(self, request):
+            import json
+
+            try:
+                reader = await request.multipart()
+                field = await reader.next()
+                if field is None or field.name != "file":
+                    return web.Response(
+                        text=json.dumps({'error': 'expected a file upload'}),
+                        content_type='application/json', status=400)
+                chunks = []
+                total = 0
+                while True:
+                    chunk = await field.read_chunk()
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > self._MAX_BYTES:
+                        return web.Response(
+                            text=json.dumps({'error': 'PDF too large (15 MB limit)'}),
+                            content_type='application/json', status=413)
+                    chunks.append(chunk)
+                pdf_bytes = b"".join(chunks)
+            except Exception as exc:  # noqa: BLE001 — a malformed multipart body
+                                       # must come back as a clear error, not a 500
+                return web.Response(
+                    text=json.dumps({'error': f'could not read upload: {exc}'}),
+                    content_type='application/json', status=400)
+
+            if not pdf_bytes:
+                return web.Response(text=json.dumps({'error': 'empty upload'}),
+                                     content_type='application/json', status=400)
+
+            from .const import CONF_GRIDLENS_API_KEY, CONF_GRIDLENS_API_URL
+            entries = self.hass.config_entries.async_entries(DOMAIN)
+            entry = entries[0] if entries else None
+            if not entry:
+                return web.Response(
+                    text=json.dumps({'error': 'Grid Lens is not configured'}),
+                    content_type='application/json', status=500)
+            api_key = entry.data.get(CONF_GRIDLENS_API_KEY, "")
+            api_url = entry.data.get(CONF_GRIDLENS_API_URL, "https://api.gridlens.au")
+
+            form = aiohttp.FormData()
+            form.add_field('file', pdf_bytes, filename='bill.pdf',
+                            content_type='application/pdf')
+            try:
+                session = async_get_clientsession(self.hass)
+                async with session.post(
+                    f"{api_url}/bills/extract", data=form,
+                    headers={"X-API-Key": api_key,
+                             "User-Agent": "GridLens-HA-Integration/1.0"},
+                    # Generous: up to ~9 sequential grounded LLM calls per bill, and
+                    # a cold model load alone can take up to two minutes (see
+                    # bill_extract.py / llm_client.py's own resolve_llm_endpoint
+                    # docstring on the GPU box).
+                    timeout=aiohttp.ClientTimeout(total=300),
+                ) as resp:
+                    body = await resp.text()
+                    return web.Response(
+                        text=body, content_type='application/json', status=resp.status)
+            except Exception as err:  # noqa: BLE001 — network is best-effort; the
+                                       # card falls back to manual JSON entry on error
+                _LOGGER.warning("Bill PDF extraction: could not reach API (%s)", err)
+                return web.Response(
+                    text=json.dumps(
+                        {'error': f'could not reach extraction service: {err}'}),
+                    content_type='application/json', status=502)
 
     class DiagnosticExportView(HomeAssistantView):
         """Export all calculation inputs and outputs as a zip for bug reporting."""
@@ -2082,6 +2176,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.http.register_view(PlanHistoryItemView(hass))
     hass.http.register_view(BillsView(hass))
     hass.http.register_view(BillItemView(hass))
+    hass.http.register_view(BillPdfExtractView(hass))
     hass.http.register_view(DiagnosticExportView(hass))
     hass.http.register_view(PlanCalcStartView(hass))
     hass.http.register_view(PlanCalcPollView(hass))

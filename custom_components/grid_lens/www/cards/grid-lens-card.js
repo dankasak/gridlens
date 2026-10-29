@@ -59,6 +59,12 @@ class GridLensCard extends HTMLElement {
     this._showBills = false;
     this._billDraft = '';        // the paste-a-bill textarea's contents
     this._billError = '';
+    this._billExtracting = false;   // busy state while a PDF is being parsed
+    // [{field, quote}] for every field the extractor found a plausible value for
+    // but could not verify actually appears (with that value) in the document —
+    // see BillPdfExtractView / bill_extract.py. Never auto-inserted into the
+    // draft JSON; shown so the user can check the source and fill it in by hand.
+    this._billUngrounded = [];
 
     this._history = null;
     this._editingId = null;
@@ -1362,6 +1368,23 @@ class GridLensCard extends HTMLElement {
       <div class="bill-add">
         <h4>Add a bill</h4>
         <p class="bill-sub">
+          Upload a PDF and the figures below are filled in automatically — every
+          number is checked against the document's own text before it's trusted;
+          anything that can't be verified is left blank for you to confirm rather
+          than guessed. Scanned/photographed bills parse less reliably than a
+          digital PDF. Prefer to type it yourself? Use the JSON box directly.
+        </p>
+        <div class="bill-pdf-upload">
+          <input type="file" id="epc-bill-pdf" accept="application/pdf"
+                 ${this._billExtracting ? 'disabled' : ''}>
+          ${this._billExtracting ? '<span class="bill-sub">Reading the bill… this can take a minute or two.</span>' : ''}
+        </div>
+        ${this._billUngrounded.length ? `
+        <div class="bill-ungrounded">
+          <p class="bill-sub">Found but could not verify — check these against the bill and fill in by hand:</p>
+          <ul>${this._billUngrounded.map(u => `<li><code>${_e(u.field)}</code>${u.quote ? `: "${_e(u.quote)}"` : ' (no supporting text found)'}</li>`).join('')}</ul>
+        </div>` : ''}
+        <p class="bill-sub">
           Paste the bill's figures as JSON — one entry in <code>periods</code> per rate
           period the bill prints (retailers split a bill whenever rates change
           mid-cycle, and each slice carries its own rates and day count).
@@ -1965,6 +1988,15 @@ class GridLensCard extends HTMLElement {
           margin-top: 8px; padding: 8px 10px; border-radius: 4px; font-size: 12px;
           background: var(--error-color, #e53935); color: #fff; white-space: pre-wrap;
         }
+        .bill-pdf-upload {
+          display: flex; align-items: center; gap: 10px; margin: 8px 0;
+        }
+        .bill-ungrounded {
+          margin: 8px 0; padding: 8px 10px; border-radius: 4px; font-size: 12px;
+          background: var(--warning-color, #ff9800); color: #fff;
+        }
+        .bill-ungrounded p { margin: 0 0 4px; }
+        .bill-ungrounded ul { margin: 0; padding-left: 18px; }
         /* Full-screen plan breakout — click a plan's cost banner (below) to expand
            just that one plan-card over the whole viewport, charts and all. */
         .cost-display {
@@ -2694,6 +2726,39 @@ class GridLensCard extends HTMLElement {
       }, null, 2);
       this._billError = '';
       this.render();
+    });
+
+    this.shadowRoot.getElementById('epc-bill-pdf')?.addEventListener('change', async (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (!file) return;
+      this._billExtracting = true;
+      this._billError = '';
+      this._billUngrounded = [];
+      this.render();
+      try {
+        const formData = new FormData();
+        formData.append('file', file, file.name || 'bill.pdf');
+        const resp = await fetch('/api/grid_lens/bills/extract_pdf', {
+          method: 'POST', body: formData,
+        });
+        const body = await resp.json().catch(() => ({}));
+        if (!resp.ok || body.error) {
+          this._billError = body.error || `Could not read that PDF (HTTP ${resp.status})`;
+        } else {
+          this._billDraft = JSON.stringify(body.facts || {}, null, 2);
+          const grounding = body.grounding || {};
+          const quotes = body.quotes || {};
+          this._billUngrounded = Object.keys(grounding)
+            .filter((k) => !grounding[k])
+            .map((k) => ({ field: k, quote: quotes[k] || '' }));
+        }
+      } catch (err) {
+        this._billError = `Could not reach the extraction service: ${err}`;
+      } finally {
+        this._billExtracting = false;
+        ev.target.value = '';  // allow re-selecting the same file after a retry
+        this.render();
+      }
     });
 
     const _draftBox = this.shadowRoot.getElementById('epc-bill-json');

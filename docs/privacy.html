@@ -55,7 +55,11 @@
         of charge, EV charging history, or any other telemetry from your Home
         Assistant instance or connected hardware. We don't store your name, home
         address, or IP address. We don't store payment card details — that's handled
-        entirely by Stripe.
+        entirely by Stripe. If you upload a paper bill to compare a household that
+        hasn't installed Grid Lens yet, the PDF is read entirely in memory — on our
+        server and on our own locally-run AI model, never a third-party AI service —
+        to pull out the usage and rate figures, then discarded; we never save the PDF
+        itself or anything extracted from it.
       </p>
 
       <h2>Who we share data with</h2>
