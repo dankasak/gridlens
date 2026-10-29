@@ -150,17 +150,30 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._clFetchedAt = 0;
     this._clPending = false;
     this._clTimer = null;
+    // Battery Control Override popover (2026-10-29) — anchored off the battery
+    // status pill in the second header row, same floating-popup shape as .cl-pop
+    // above. _battSel/_battMins are re-resolved every hass tick (see
+    // _resolveBatteryOverrideEntities) rather than cached, matching
+    // _resolveDeferLoads()'s own un-cached hass.states scan elsewhere in this
+    // codebase — cheap relative to a repaint, and never goes stale across an
+    // entity_id change.
+    this._battPopOpen = false;
+    this._battSel = null;
+    this._battMins = null;
+    this._battOutsideClickHandler = (ev) => this._onBattOutsideClick(ev);
   }
 
   connectedCallback() {
     window.addEventListener('pointerup', this._dtPointerUpHandler);
     window.addEventListener('pointercancel', this._dtPointerUpHandler);
+    window.addEventListener('click', this._battOutsideClickHandler, true);
     if (!this._clTimer) this._clTimer = setInterval(() => this._clTick(), CL_ROTATE_MS / 2);
   }
 
   disconnectedCallback() {
     window.removeEventListener('pointerup', this._dtPointerUpHandler);
     window.removeEventListener('pointercancel', this._dtPointerUpHandler);
+    window.removeEventListener('click', this._battOutsideClickHandler, true);
     if (this._clTimer) { clearInterval(this._clTimer); this._clTimer = null; }
   }
 
@@ -335,9 +348,11 @@ class GridLensAdvisoryCard extends HTMLElement {
   // constructor). Falls back to a full repaint when the row has to appear or disappear.
   _refreshStatus() {
     const html = this._currentRatesHtml() + this._statusHtml();
-    if (html === this._statusSig) return;
-    const st = this.shadowRoot && this.shadowRoot.querySelector('.hd2 .st');
-    if (st) { st.innerHTML = html; this._statusSig = html; } else this._paint();
+    if (html !== this._statusSig) {
+      const st = this.shadowRoot && this.shadowRoot.querySelector('.hd2 .st');
+      if (st) { st.innerHTML = html; this._statusSig = html; } else { this._paint(); return; }
+    }
+    this._syncBattPop();
   }
 
   // The header badge — the one at-a-glance "is Grid Lens actually working" signal on
@@ -510,22 +525,58 @@ class GridLensAdvisoryCard extends HTMLElement {
   // too cluttered for this row) in favour of the per-device panel's own live status line,
   // which already shows the same thing per row.
 
+  // Auto-discovers the Battery Control Override select/number pair by the
+  // "battery_control_override_role" marker both carry (select.py, number.py) —
+  // same scan-based pattern as _resolveDeferLoads() elsewhere, so an install with
+  // an older integration build (no override entities yet) just resolves nulls and
+  // the battery pill stays non-interactive, same as it always has been.
+  _resolveBatteryOverrideEntities() {
+    const hass = this._hass;
+    if (!hass) return { sel: null, mins: null };
+    let sel = null;
+    let mins = null;
+    for (const eid of Object.keys(hass.states)) {
+      if (sel && mins) break;
+      const a = hass.states[eid].attributes || {};
+      if (!sel && eid.startsWith('select.') && a.battery_control_override_role === 'select') sel = eid;
+      else if (!mins && eid.startsWith('number.') && a.battery_control_override_role === 'minutes') mins = eid;
+    }
+    return { sel, mins };
+  }
+
   _statusPills() {
     const hass = this._hass;
     if (!hass) return [];
     const pills = [];
 
-    // Battery — what the executor is commanding right now, or a warning when control is
-    // off/failing (it can sit off for a day with no other visible trace).
+    const ovr = this._resolveBatteryOverrideEntities();
+    this._battSel = ovr.sel;
+    this._battMins = ovr.mins;
+    const ovrSt = ovr.sel ? hass.states[ovr.sel] : null;
+    const paused = !!(ovrSt && ovrSt.state && ovrSt.state !== 'Auto');
+
+    // Battery — what the executor is commanding right now, a timed manual pause, or a
+    // warning when control is off/failing (it can sit off for a day with no other
+    // visible trace). Clickable (battToggle) whenever the override select resolved,
+    // regardless of which branch renders, so "pause for a bit" and "resume now" are
+    // both reachable from the same pill.
     const bsw = hass.states[this._config.control_switch_entity];
     if (bsw) {
       const a = bsw.attributes || {};
-      if (bsw.state !== 'on') {
+      if (paused) {
+        const until = ovrSt.attributes && ovrSt.attributes.override_until;
+        pills.push({ cls: 'paused', icon: 'mdi:timer-pause-outline',
+          text: `Paused${until ? ` until ${fmtTime(until)}` : ''}`,
+          tip: 'Manual override — Grid Lens is not actuating the battery. Resumes automatically, or click to resume now.',
+          battToggle: true });
+      } else if (bsw.state !== 'on') {
         pills.push({ cls: 'warn', icon: 'mdi:battery-off-outline', text: 'Battery control off',
-          tip: 'Grid Lens is not controlling the battery — the inverter is running on its own settings.' });
+          tip: 'Grid Lens is not controlling the battery — the inverter is running on its own settings.',
+          battToggle: !!ovr.sel });
       } else if (+a.consecutive_apply_failures > 0 || a.degraded === true) {
         pills.push({ cls: 'warn', icon: 'mdi:battery-alert-variant-outline', text: 'Battery commands failing',
-          tip: `The inverter has not accepted the last ${a.consecutive_apply_failures || ''} battery command(s).` });
+          tip: `The inverter has not accepted the last ${a.consecutive_apply_failures || ''} battery command(s).`,
+          battToggle: !!ovr.sel });
       } else {
         const act = a.current_action || a.applied_action;
         const kw = (+a.current_power_w || +a.applied_power_w || 0) / 1000;
@@ -533,7 +584,8 @@ class GridLensAdvisoryCard extends HTMLElement {
         if (act) {
           pills.push({ cls: act === 'charge' || act === 'discharge' ? `mode-${act}` : '', icon,
             text: `${modeLabel(act)}${kw >= 0.05 ? ` ${kw.toFixed(1)} kW` : ''}`,
-            tip: `Battery: the command currently applied by Grid Lens${a.applied_at ? ` (since ${fmtTime(a.applied_at)})` : ''}.` });
+            tip: `Battery: the command currently applied by Grid Lens${a.applied_at ? ` (since ${fmtTime(a.applied_at)})` : ''}.${ovr.sel ? ' Click to pause.' : ''}`,
+            battToggle: !!ovr.sel });
         }
       }
     }
@@ -542,9 +594,127 @@ class GridLensAdvisoryCard extends HTMLElement {
   }
 
   _statusHtml() {
-    return this._statusPills().map((p) => `
-      <span class="sp ${p.cls || ''}"${p.tip ? ` data-tip="${esc(p.tip)}" tabindex="0"` : ''}>
-        <ha-icon icon="${p.icon}"></ha-icon>${esc(p.text)}</span>`).join('');
+    return this._statusPills().map((p) => {
+      const tag = p.battToggle ? 'button' : 'span';
+      const attrs = p.battToggle
+        ? ` type="button" data-batt-toggle aria-expanded="${this._battPopOpen}"`
+        : ' tabindex="0"';
+      return `
+      <${tag} class="sp ${p.cls || ''}"${p.tip ? ` data-tip="${esc(p.tip)}"` : ''}${attrs}>
+        <ha-icon icon="${p.icon}"></ha-icon>${esc(p.text)}</${tag}>`;
+    }).join('');
+  }
+
+  // --------------------------------------------- Battery Control Override popover
+  //
+  // Clicking the battery pill above opens this (2026-10-29) — the override select
+  // and custom-minutes number already existed as plain HA entities (a dashboard
+  // tile), but nothing surfaced them where a user's eyes actually are: the status
+  // pill they're already reading to see what the battery is doing. Same floating-
+  // popup shape as .cl-pop (a sibling of .body, positioned with offsetLeft/Top so
+  // the per-minute header repaint doesn't fight it), but unlike .cl-pop this one
+  // has clickable contents, so its listeners are bound directly to the .batt-pop
+  // element itself once in _renderShell (see the body.addEventListener block there
+  // for why delegation has to live on the element whose innerHTML persists).
+
+  _battPopHtml() {
+    const hass = this._hass;
+    const sel = this._battSel;
+    if (!hass || !sel) return '';
+    const selSt = hass.states[sel];
+    const cur = selSt ? selSt.state : 'Auto';
+    const until = selSt && selSt.attributes && selSt.attributes.override_until;
+    const statusLine = cur !== 'Auto'
+      ? `Paused${until ? ` until ${fmtTime(until)}` : ''} — resumes automatically.`
+      : 'Grid Lens is controlling the battery normally.';
+    const opt = (o, label) => `<button type="button" class="batt-opt${cur === o ? ' active' : ''}" data-batt-opt="${esc(o)}">${esc(label)}</button>`;
+    const minsSt = this._battMins ? hass.states[this._battMins] : null;
+    const minsVal = minsSt ? minsSt.state : 60;
+    const customRow = this._battMins ? `
+      <div class="batt-custom">
+        <input type="number" class="batt-custom-mins" min="5" max="1440" step="5" value="${esc(minsVal)}">
+        <span class="batt-custom-lbl">min</span>
+        ${opt('Pause custom duration', 'Pause')}
+      </div>` : '';
+    return `
+      <div class="batt-pop-hd">Battery control override</div>
+      <div class="batt-pop-status">${esc(statusLine)}</div>
+      <div class="batt-opts">
+        ${opt('Auto', cur === 'Auto' ? 'Auto' : 'Resume now')}
+        ${opt('Pause 30 min', '30 min')}
+        ${opt('Pause 1 hour', '1 hour')}
+        ${opt('Pause 2 hours', '2 hours')}
+        ${opt('Pause 4 hours', '4 hours')}
+      </div>
+      ${customRow}`;
+  }
+
+  // Anchored under the battery pill, same math as _syncClPop(). Called after every
+  // repaint (both the full _paint() and the in-place _refreshStatus()) so it tracks
+  // the pill if the header reflows, and so its "active"/countdown content stays
+  // live while open without needing its own poll loop.
+  _syncBattPop() {
+    const root = this.shadowRoot;
+    const pop = root && root.querySelector('.batt-pop');
+    if (!pop) return;
+    const btn = root.querySelector('[data-batt-toggle]');
+    if (!this._battPopOpen || !btn || !this._battSel) {
+      pop.classList.remove('show');
+      return;
+    }
+    pop.innerHTML = this._battPopHtml();
+    const card = root.querySelector('.card');
+    const cardW = card ? card.clientWidth : 600;
+    const w = Math.min(300, cardW - 32);
+    pop.style.width = `${w}px`;
+    pop.style.left = `${Math.max(16, Math.min(btn.offsetLeft, cardW - 16 - w))}px`;
+    pop.style.top = `${btn.offsetTop + btn.offsetHeight + 4}px`;
+    pop.classList.add('show');
+  }
+
+  _onBattToggleClick(ev) {
+    const btn = ev.target && ev.target.closest && ev.target.closest('[data-batt-toggle]');
+    if (!btn) return;
+    ev.stopPropagation();
+    this._battPopOpen = !this._battPopOpen;
+    this._syncBattPop();
+    btn.setAttribute('aria-expanded', String(this._battPopOpen));
+  }
+
+  _onBattOptionClick(ev) {
+    const btn = ev.target && ev.target.closest && ev.target.closest('.batt-opt');
+    if (!btn || !this._hass || !this._battSel) return;
+    ev.stopPropagation();
+    const opt = btn.getAttribute('data-batt-opt');
+    if (opt === 'Pause custom duration' && this._battMins) {
+      const input = this.shadowRoot.querySelector('.batt-custom-mins');
+      const v = input ? parseFloat(input.value) : NaN;
+      if (Number.isFinite(v) && v >= 5) {
+        this._hass.callService('number', 'set_value', { entity_id: this._battMins, value: v });
+      }
+    }
+    this._hass.callService('select', 'select_option', { entity_id: this._battSel, option: opt });
+    this._battPopOpen = false;
+    this._syncBattPop();
+    const toggleBtn = this.shadowRoot.querySelector('[data-batt-toggle]');
+    if (toggleBtn) toggleBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  // Dismiss on a click outside the pill/popover — unlike .cl-pop (inert content,
+  // no harm left open), this popover's buttons issue real commands, so leaving it
+  // open after the user has moved on is worse than the extra listener. Bound once
+  // in connectedCallback (same lifecycle as the pointerup/pointercancel pair above).
+  _onBattOutsideClick(ev) {
+    if (!this._battPopOpen) return;
+    const root = this.shadowRoot;
+    if (!root) return;
+    const path = ev.composedPath ? ev.composedPath() : [];
+    const pop = root.querySelector('.batt-pop');
+    const btn = root.querySelector('[data-batt-toggle]');
+    if ((pop && path.includes(pop)) || (btn && path.includes(btn))) return;
+    this._battPopOpen = false;
+    this._syncBattPop();
+    if (btn) btn.setAttribute('aria-expanded', 'false');
   }
 
   // Both tickers are fed by one call to the integration's own proxy (ChangelogView in
@@ -1064,6 +1234,12 @@ class GridLensAdvisoryCard extends HTMLElement {
               line-height:1; padding:4px 9px 4px 7px; border-radius:20px; white-space:nowrap;
               color:var(--ink); background:color-mix(in srgb,var(--ink) 6%,transparent);
               font-variant-numeric:tabular-nums; }
+        /* The battery pill renders as a <button> (not <span>) whenever the override
+           select resolved (_statusPills' battToggle) — reset button chrome back to
+           looking identical to the plain <span> pills either side of it. */
+        button.sp { font:inherit; border:none; cursor:pointer; -webkit-appearance:none; }
+        button.sp:hover { background:color-mix(in srgb,var(--ink) 11%,transparent); }
+        button.sp:focus-visible { outline:2px solid var(--good); outline-offset:1px; }
         .sp ha-icon { --mdc-icon-size:14px; color:var(--ink2); }
         .sp.dim { color:var(--ink2); background:transparent; border:1px dashed var(--border); }
         .sp.run ha-icon { color:var(--solar); }
@@ -1073,7 +1249,34 @@ class GridLensAdvisoryCard extends HTMLElement {
         .sp.mode-discharge ha-icon { color:var(--discharge); }
         .sp.warn { color:var(--buy); background:color-mix(in srgb,var(--buy) 12%,transparent); }
         .sp.warn ha-icon { color:var(--buy); }
+        .sp.paused { color:var(--gridflow); background:color-mix(in srgb,var(--gridflow) 13%,transparent); }
+        .sp.paused ha-icon { color:var(--gridflow); }
         @keyframes sp-breathe { 50% { opacity:.45; } }
+
+        /* Battery Control Override popover — same floating shape as .cl-pop (see
+           that rule for the positioning rationale) but with real buttons inside it. */
+        .batt-pop { position:absolute; z-index:20; padding:10px 12px; border-radius:12px;
+                    background:var(--surface); border:1px solid var(--border);
+                    box-shadow:0 10px 30px rgba(0,0,0,.25); display:none; }
+        .batt-pop.show { display:block; animation:cl-pop-in .18s ease-out; }
+        .batt-pop-hd { font-size:11px; font-weight:700; color:var(--ink2); text-transform:uppercase;
+                       letter-spacing:.03em; margin-bottom:4px; }
+        .batt-pop-status { font-size:11.5px; color:var(--ink); margin-bottom:9px; }
+        .batt-opts { display:flex; flex-wrap:wrap; gap:1px; border:1px solid var(--border);
+                     border-radius:9px; overflow:hidden; }
+        .batt-opts .batt-opt { flex:1 1 auto; font-size:10.5px; font-weight:600; padding:6px 8px;
+                     border:none; border-left:1px solid var(--border); background:transparent;
+                     color:var(--ink2); cursor:pointer; font-family:inherit; }
+        .batt-opts .batt-opt:first-child { border-left:none; }
+        .batt-opt.active { background:var(--good); color:#fff; }
+        .batt-custom { display:flex; align-items:center; gap:6px; margin-top:8px; }
+        .batt-custom-mins { width:64px; font:inherit; font-size:12px; padding:5px 7px;
+                     border:1px solid var(--border); border-radius:7px;
+                     background:var(--surface); color:var(--ink); }
+        .batt-custom-lbl { font-size:11px; color:var(--ink2); }
+        .batt-custom .batt-opt { border:1px solid var(--border); border-radius:7px;
+                     padding:6px 10px; margin-left:auto; }
+        .batt-custom .batt-opt.active { border-color:var(--good); }
 
         /* Two tickers side by side (What's new, Plan updates); they wrap as a pair below
            the pills when the card is narrow, and stack when narrower still. */
@@ -1310,7 +1513,7 @@ class GridLensAdvisoryCard extends HTMLElement {
                box-shadow: 0 4px 14px rgba(0,0,0,.28); z-index: 30; transition: opacity .08s ease; }
         .dt-tt-pop.show { opacity: 1; visibility: visible; }
       </style>
-      <div class="card"><div class="body"></div><div class="cl-pop"></div><div class="dt-tt-pop"></div></div>
+      <div class="card"><div class="body"></div><div class="cl-pop"></div><div class="batt-pop"></div><div class="dt-tt-pop"></div></div>
     `;
     // Delegated: _paint() replaces .body's innerHTML on every repaint, so per-element
     // listeners would be torn off. The listeners live on .body, which survives.
@@ -1318,6 +1521,7 @@ class GridLensAdvisoryCard extends HTMLElement {
     if (body) {
       body.addEventListener('click', (ev) => this._onChipClick(ev));
       body.addEventListener('click', (ev) => this._onClToggleClick(ev));
+      body.addEventListener('click', (ev) => this._onBattToggleClick(ev));
       body.addEventListener('click', (ev) => this._onDtExpandClick(ev));
       body.addEventListener('click', (ev) => this._onDtResetClick(ev));
       body.addEventListener('pointerdown', (ev) => this._onDtSliderPointerDown(ev));
@@ -1332,6 +1536,11 @@ class GridLensAdvisoryCard extends HTMLElement {
       body.addEventListener('change', (ev) => this._onDtMaxCurInputChange(ev));
       body.addEventListener('keydown', (ev) => this._onDtMaxCurInputKeydown(ev));
     }
+    // .batt-pop sits outside .body (see the block comment above _battPopHtml) so its
+    // own listener has to be bound directly to it, once, here — unlike .cl-pop it has
+    // clickable contents (the override buttons + custom-minutes field).
+    const battPop = this.shadowRoot.querySelector('.batt-pop');
+    if (battPop) battPop.addEventListener('click', (ev) => this._onBattOptionClick(ev));
     attachTooltip(this.shadowRoot, { popupClass: 'dt-tt-pop' });
   }
 
@@ -1368,6 +1577,7 @@ class GridLensAdvisoryCard extends HTMLElement {
     if (this._config.compact) {
       body.innerHTML = header;
       this._syncClPop();
+      this._syncBattPop();
       return;
     }
 
@@ -1375,6 +1585,7 @@ class GridLensAdvisoryCard extends HTMLElement {
       body.innerHTML = header +
         `<div class="waiting">Advisory plan not available yet${s.reason ? '<br><span class="sub">' + esc(s.reason) + '</span>' : ''}</div>`;
       this._syncClPop();
+      this._syncBattPop();
       return;
     }
 
@@ -1408,6 +1619,7 @@ class GridLensAdvisoryCard extends HTMLElement {
       </div>` : ''}
       <div class="note">See the SOC/Power chart cards for the solar/load/price forecast validation. All series are the forecast for the current plan (${s.plan_name ? esc(s.plan_name) : '—'}).</div>`;
     this._syncClPop();
+    this._syncBattPop();
   }
 
   _modeTransitions() {

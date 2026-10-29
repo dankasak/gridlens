@@ -297,6 +297,14 @@ class GridLensBatteryOverrideMinutesNumber(RestoreEntity, NumberEntity):
                 self._attr_native_value = value
         self.async_write_ha_state()
 
+    @property
+    def extra_state_attributes(self) -> dict:
+        # Mirrors select.py's GridLensBatteryControlOverrideSelect own
+        # "battery_control_override_role" marker so a card can auto-discover both
+        # entities by scanning for the role, the same pattern _resolveDeferLoads()
+        # and friends use elsewhere — no hardcoded entity_id, works on any install.
+        return {"battery_control_override_role": "minutes"}
+
     async def async_set_native_value(self, value: float) -> None:
         self._manager.custom_override_minutes = value
         self._attr_native_value = value
