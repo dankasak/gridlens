@@ -160,6 +160,7 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._battPopOpen = false;
     this._battSel = null;
     this._battMins = null;
+    this._battPowerW = null;
     this._battOutsideClickHandler = (ev) => this._onBattOutsideClick(ev);
   }
 
@@ -348,11 +349,9 @@ class GridLensAdvisoryCard extends HTMLElement {
   // constructor). Falls back to a full repaint when the row has to appear or disappear.
   _refreshStatus() {
     const html = this._currentRatesHtml() + this._statusHtml();
-    if (html !== this._statusSig) {
-      const st = this.shadowRoot && this.shadowRoot.querySelector('.hd2 .st');
-      if (st) { st.innerHTML = html; this._statusSig = html; } else { this._paint(); return; }
-    }
-    this._syncBattPop();
+    if (html === this._statusSig) return;
+    const st = this.shadowRoot && this.shadowRoot.querySelector('.hd2 .st');
+    if (st) { st.innerHTML = html; this._statusSig = html; } else this._paint();
   }
 
   // The header badge — the one at-a-glance "is Grid Lens actually working" signal on
@@ -532,16 +531,18 @@ class GridLensAdvisoryCard extends HTMLElement {
   // the battery pill stays non-interactive, same as it always has been.
   _resolveBatteryOverrideEntities() {
     const hass = this._hass;
-    if (!hass) return { sel: null, mins: null };
+    if (!hass) return { sel: null, mins: null, power: null };
     let sel = null;
     let mins = null;
+    let power = null;
     for (const eid of Object.keys(hass.states)) {
-      if (sel && mins) break;
+      if (sel && mins && power) break;
       const a = hass.states[eid].attributes || {};
       if (!sel && eid.startsWith('select.') && a.battery_control_override_role === 'select') sel = eid;
       else if (!mins && eid.startsWith('number.') && a.battery_control_override_role === 'minutes') mins = eid;
+      else if (!power && eid.startsWith('number.') && a.battery_control_override_role === 'power') power = eid;
     }
-    return { sel, mins };
+    return { sel, mins, power };
   }
 
   _statusPills() {
@@ -552,23 +553,46 @@ class GridLensAdvisoryCard extends HTMLElement {
     const ovr = this._resolveBatteryOverrideEntities();
     this._battSel = ovr.sel;
     this._battMins = ovr.mins;
+    this._battPowerW = ovr.power;
     const ovrSt = ovr.sel ? hass.states[ovr.sel] : null;
-    const paused = !!(ovrSt && ovrSt.state && ovrSt.state !== 'Auto');
+    const overridden = !!(ovrSt && ovrSt.state && ovrSt.state !== 'Auto');
 
-    // Battery — what the executor is commanding right now, a timed manual pause, or a
-    // warning when control is off/failing (it can sit off for a day with no other
+    // Battery — what the executor is commanding right now, a timed manual override, or
+    // a warning when control is off/failing (it can sit off for a day with no other
     // visible trace). Clickable (battToggle) whenever the override select resolved,
-    // regardless of which branch renders, so "pause for a bit" and "resume now" are
-    // both reachable from the same pill.
+    // regardless of which branch renders, so "override for a bit" and "resume Auto now"
+    // are both reachable from the same pill.
     const bsw = hass.states[this._config.control_switch_entity];
     if (bsw) {
       const a = bsw.attributes || {};
-      if (paused) {
-        const until = ovrSt.attributes && ovrSt.attributes.override_until;
-        pills.push({ cls: 'paused', icon: 'mdi:timer-pause-outline',
-          text: `Paused${until ? ` until ${fmtTime(until)}` : ''}`,
-          tip: 'Manual override — Grid Lens is not actuating the battery. Resumes automatically, or click to resume now.',
+      if (overridden) {
+        const oa = ovrSt.attributes || {};
+        const until = oa.override_until;
+        // oa.override_action is None for a hands-off Pause (restore_normal — the native
+        // EMS is driving, not GridLens) vs set for a forced action (GridLens itself is
+        // still actively commanding it) — see control/manager.py's override_pause() vs
+        // override_force(). The pill text/icon distinguishes them so "Pause" doesn't
+        // read as "GridLens is doing something" when it's actually handed off.
+        const forceIcon = { self_use: 'mdi:battery-sync', idle: 'mdi:battery-outline',
+          charge: 'mdi:battery-arrow-up', discharge: 'mdi:battery-arrow-down' }[oa.override_action];
+        const w = (+oa.override_power_w || 0) / 1000;
+        const text = oa.override_action
+          ? `${ovrSt.state}${(oa.override_action === 'charge' || oa.override_action === 'discharge') && w >= 0.05 ? ` ${w.toFixed(1)}kW` : ''}${until ? ` until ${fmtTime(until)}` : ''}`
+          : `Paused${until ? ` until ${fmtTime(until)}` : ''}`;
+        pills.push({ cls: oa.override_action ? `mode-${oa.override_action}` : 'paused',
+          icon: forceIcon || 'mdi:timer-pause-outline',
+          text,
+          tip: oa.override_action
+            ? `Manual override — Grid Lens is forcing ${ovrSt.state} regardless of the plan. Resumes Auto automatically, or click to change it.`
+            : 'Manual override — Grid Lens is not actuating the battery. Resumes automatically, or click to resume now.',
           battToggle: true });
+      } else if (a.entitled === false) {
+        pills.push({ cls: 'warn', icon: 'mdi:lock-alert-outline', text: 'Subscription inactive',
+          tip: 'Your GridLens battery control add-on isn\'t active, so Grid Lens stopped '
+            + 'controlling the battery — the inverter is running on its own settings. '
+            + 'Resubscribe in your account to resume; this is not something toggling the '
+            + 'switch can fix.',
+          battToggle: false });
       } else if (bsw.state !== 'on') {
         pills.push({ cls: 'warn', icon: 'mdi:battery-off-outline', text: 'Battery control off',
           tip: 'Grid Lens is not controlling the battery — the inverter is running on its own settings.',
@@ -584,7 +608,7 @@ class GridLensAdvisoryCard extends HTMLElement {
         if (act) {
           pills.push({ cls: act === 'charge' || act === 'discharge' ? `mode-${act}` : '', icon,
             text: `${modeLabel(act)}${kw >= 0.05 ? ` ${kw.toFixed(1)} kW` : ''}`,
-            tip: `Battery: the command currently applied by Grid Lens${a.applied_at ? ` (since ${fmtTime(a.applied_at)})` : ''}.${ovr.sel ? ' Click to pause.' : ''}`,
+            tip: `Battery: the command currently applied by Grid Lens${a.applied_at ? ` (since ${fmtTime(a.applied_at)})` : ''}.${ovr.sel ? ' Click to override.' : ''}`,
             battToggle: !!ovr.sel });
         }
       }
@@ -617,36 +641,64 @@ class GridLensAdvisoryCard extends HTMLElement {
   // element itself once in _renderShell (see the body.addEventListener block there
   // for why delegation has to live on the element whose innerHTML persists).
 
+  // Duration is picked ONCE (a shared value backing number.py's
+  // GridLensBatteryOverrideMinutesNumber), then any action button below fires
+  // immediately using whatever duration is currently set — same two-step shape as
+  // the original "set the custom-minutes field, then click Pause" interaction this
+  // replaces, just generalized to 5 actions instead of 1. The preset buttons
+  // (30m/1h/2h/4h) are NOT themselves actions here (unlike the single-action design
+  // this replaced) — they just set the shared number, same as typing into the custom
+  // field does; Auto fires immediately regardless of duration, since there's nothing
+  // to time.
   _battPopHtml() {
     const hass = this._hass;
     const sel = this._battSel;
     if (!hass || !sel) return '';
     const selSt = hass.states[sel];
     const cur = selSt ? selSt.state : 'Auto';
-    const until = selSt && selSt.attributes && selSt.attributes.override_until;
+    const oa = (selSt && selSt.attributes) || {};
+    const until = oa.override_until;
     const statusLine = cur !== 'Auto'
-      ? `Paused${until ? ` until ${fmtTime(until)}` : ''} — resumes automatically.`
+      ? `${esc(cur)}${until ? ` until ${fmtTime(until)}` : ''} — resumes Auto automatically.`
       : 'Grid Lens is controlling the battery normally.';
-    const opt = (o, label) => `<button type="button" class="batt-opt${cur === o ? ' active' : ''}" data-batt-opt="${esc(o)}">${esc(label)}</button>`;
+    const actBtn = (o, label) => `<button type="button" class="batt-opt${cur === o ? ' active' : ''}" data-batt-opt="${esc(o)}">${esc(label)}</button>`;
+
     const minsSt = this._battMins ? hass.states[this._battMins] : null;
-    const minsVal = minsSt ? minsSt.state : 60;
-    const customRow = this._battMins ? `
-      <div class="batt-custom">
-        <input type="number" class="batt-custom-mins" min="5" max="1440" step="5" value="${esc(minsVal)}">
-        <span class="batt-custom-lbl">min</span>
-        ${opt('Pause custom duration', 'Pause')}
+    const minsVal = minsSt ? Math.round(+minsSt.state) : 60;
+    const durBtn = (m, label) => `<button type="button" class="batt-dur${minsVal === m ? ' active' : ''}" data-batt-mins="${m}">${esc(label)}</button>`;
+    const durRow = this._battMins ? `
+      <div class="batt-dur-row">
+        <span class="batt-row-lbl">Duration</span>
+        ${durBtn(30, '30m')}${durBtn(60, '1h')}${durBtn(120, '2h')}${durBtn(240, '4h')}
+        <input type="number" class="batt-dur-custom" min="5" max="1440" step="5" value="${esc(minsVal)}" title="Custom duration (minutes)">
       </div>` : '';
+
+    const wSt = this._battPowerW ? hass.states[this._battPowerW] : null;
+    const wVal = wSt ? Math.round(+wSt.state) : 0;
+    const forceRow = this._battPowerW ? `
+      <div class="batt-force-row">
+        <span class="batt-row-lbl">Rate</span>
+        <input type="number" class="batt-force-w" min="0" max="20000" step="100" value="${esc(wVal)}">
+        <span class="batt-row-unit">W</span>
+      </div>
+      <div class="batt-opts">
+        ${actBtn('Force Charge', 'Force Charge')}
+        ${actBtn('Force Discharge', 'Force Discharge')}
+      </div>` : '';
+
     return `
       <div class="batt-pop-hd">Battery control override</div>
       <div class="batt-pop-status">${esc(statusLine)}</div>
+      ${durRow}
       <div class="batt-opts">
-        ${opt('Auto', cur === 'Auto' ? 'Auto' : 'Resume now')}
-        ${opt('Pause 30 min', '30 min')}
-        ${opt('Pause 1 hour', '1 hour')}
-        ${opt('Pause 2 hours', '2 hours')}
-        ${opt('Pause 4 hours', '4 hours')}
+        ${actBtn('Auto', 'Auto')}
+        ${actBtn('Pause', 'Pause')}
       </div>
-      ${customRow}`;
+      <div class="batt-opts">
+        ${actBtn('Maximum Self-consumption', 'Max Self-Consumption')}
+        ${actBtn('Standby', 'Standby')}
+      </div>
+      ${forceRow}`;
   }
 
   // Anchored under the battery pill, same math as _syncClPop(). Called after every
@@ -665,7 +717,7 @@ class GridLensAdvisoryCard extends HTMLElement {
     pop.innerHTML = this._battPopHtml();
     const card = root.querySelector('.card');
     const cardW = card ? card.clientWidth : 600;
-    const w = Math.min(300, cardW - 32);
+    const w = Math.min(320, cardW - 32);
     pop.style.width = `${w}px`;
     pop.style.left = `${Math.max(16, Math.min(btn.offsetLeft, cardW - 16 - w))}px`;
     pop.style.top = `${btn.offsetTop + btn.offsetHeight + 4}px`;
@@ -682,15 +734,39 @@ class GridLensAdvisoryCard extends HTMLElement {
   }
 
   _onBattOptionClick(ev) {
-    const btn = ev.target && ev.target.closest && ev.target.closest('.batt-opt');
-    if (!btn || !this._hass || !this._battSel) return;
-    ev.stopPropagation();
-    const opt = btn.getAttribute('data-batt-opt');
-    if (opt === 'Pause custom duration' && this._battMins) {
-      const input = this.shadowRoot.querySelector('.batt-custom-mins');
-      const v = input ? parseFloat(input.value) : NaN;
-      if (Number.isFinite(v) && v >= 5) {
+    if (!this._hass || !this._battSel) return;
+
+    // Duration preset — sets the shared minutes number (optimistic highlight via the
+    // next _syncBattPop(), which re-reads minsVal from hass once the service call
+    // round-trips); does NOT fire an action itself. See _battPopHtml's header comment.
+    const durBtn = ev.target && ev.target.closest && ev.target.closest('.batt-dur[data-batt-mins]');
+    if (durBtn) {
+      ev.stopPropagation();
+      const v = parseFloat(durBtn.getAttribute('data-batt-mins'));
+      if (this._battMins) {
         this._hass.callService('number', 'set_value', { entity_id: this._battMins, value: v });
+      }
+      // Optimistic paint (same reasoning as _onChipClick) — the real hass round-trip
+      // that would otherwise drive this is async, and nothing else repaints the
+      // popover on its own just because a number entity ticked.
+      const pop = this.shadowRoot.querySelector('.batt-pop');
+      if (pop) {
+        pop.querySelectorAll('.batt-dur').forEach((b) => b.classList.toggle('active', b === durBtn));
+        const custom = pop.querySelector('.batt-dur-custom');
+        if (custom) custom.value = v;
+      }
+      return;
+    }
+
+    const optBtn = ev.target && ev.target.closest && ev.target.closest('.batt-opt[data-batt-opt]');
+    if (!optBtn) return;
+    ev.stopPropagation();
+    const opt = optBtn.getAttribute('data-batt-opt');
+    if ((opt === 'Force Charge' || opt === 'Force Discharge') && this._battPowerW) {
+      const input = this.shadowRoot.querySelector('.batt-force-w');
+      const w = input ? parseFloat(input.value) : NaN;
+      if (Number.isFinite(w) && w >= 0) {
+        this._hass.callService('number', 'set_value', { entity_id: this._battPowerW, value: w });
       }
     }
     this._hass.callService('select', 'select_option', { entity_id: this._battSel, option: opt });
@@ -698,6 +774,22 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._syncBattPop();
     const toggleBtn = this.shadowRoot.querySelector('[data-batt-toggle]');
     if (toggleBtn) toggleBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  // The custom-minutes/rate text inputs fire `change`, not `click` — a separate
+  // listener (bound once on .batt-pop alongside the click one, see _renderShell).
+  _onBattCustomChange(ev) {
+    const el = ev.target;
+    if (!el || !this._hass) return;
+    if (el.matches && el.matches('.batt-dur-custom') && this._battMins) {
+      let v = parseFloat(el.value);
+      if (!Number.isFinite(v) || v < 5) v = 5;
+      this._hass.callService('number', 'set_value', { entity_id: this._battMins, value: v });
+    } else if (el.matches && el.matches('.batt-force-w') && this._battPowerW) {
+      let v = parseFloat(el.value);
+      if (!Number.isFinite(v) || v < 0) v = 0;
+      this._hass.callService('number', 'set_value', { entity_id: this._battPowerW, value: v });
+    }
   }
 
   // Dismiss on a click outside the pill/popover — unlike .cl-pop (inert content,
@@ -1247,6 +1339,10 @@ class GridLensAdvisoryCard extends HTMLElement {
         .sp.greedy ha-icon { color:var(--good); animation:sp-breathe 2.4s ease-in-out infinite; }
         .sp.mode-charge ha-icon { color:var(--charge); }
         .sp.mode-discharge ha-icon { color:var(--discharge); }
+        .sp.mode-self_use { color:var(--good); background:color-mix(in srgb,var(--good) 12%,transparent); }
+        .sp.mode-self_use ha-icon { color:var(--good); }
+        .sp.mode-idle { color:var(--idle); background:color-mix(in srgb,var(--idle) 16%,transparent); }
+        .sp.mode-idle ha-icon { color:var(--idle); }
         .sp.warn { color:var(--buy); background:color-mix(in srgb,var(--buy) 12%,transparent); }
         .sp.warn ha-icon { color:var(--buy); }
         .sp.paused { color:var(--gridflow); background:color-mix(in srgb,var(--gridflow) 13%,transparent); }
@@ -1262,21 +1358,25 @@ class GridLensAdvisoryCard extends HTMLElement {
         .batt-pop-hd { font-size:11px; font-weight:700; color:var(--ink2); text-transform:uppercase;
                        letter-spacing:.03em; margin-bottom:4px; }
         .batt-pop-status { font-size:11.5px; color:var(--ink); margin-bottom:9px; }
+        .batt-row-lbl { font-size:10px; font-weight:700; color:var(--ink2); text-transform:uppercase;
+                     letter-spacing:.02em; flex:0 0 auto; margin-right:2px; }
+        .batt-row-unit { font-size:11px; color:var(--ink2); }
+        .batt-dur-row, .batt-force-row { display:flex; align-items:center; gap:5px; margin-bottom:8px; }
+        .batt-dur { font-size:10.5px; font-weight:600; padding:5px 8px; border:1px solid var(--border);
+                     border-radius:7px; background:transparent; color:var(--ink2); cursor:pointer;
+                     font-family:inherit; }
+        .batt-dur.active { background:var(--good); color:#fff; border-color:var(--good); }
+        .batt-dur-custom, .batt-force-w { width:60px; font:inherit; font-size:12px; padding:5px 7px;
+                     border:1px solid var(--border); border-radius:7px; margin-left:auto;
+                     background:var(--surface); color:var(--ink); }
+        .batt-force-w { margin-left:0; }
         .batt-opts { display:flex; flex-wrap:wrap; gap:1px; border:1px solid var(--border);
-                     border-radius:9px; overflow:hidden; }
+                     border-radius:9px; overflow:hidden; margin-bottom:6px; }
         .batt-opts .batt-opt { flex:1 1 auto; font-size:10.5px; font-weight:600; padding:6px 8px;
                      border:none; border-left:1px solid var(--border); background:transparent;
                      color:var(--ink2); cursor:pointer; font-family:inherit; }
         .batt-opts .batt-opt:first-child { border-left:none; }
         .batt-opt.active { background:var(--good); color:#fff; }
-        .batt-custom { display:flex; align-items:center; gap:6px; margin-top:8px; }
-        .batt-custom-mins { width:64px; font:inherit; font-size:12px; padding:5px 7px;
-                     border:1px solid var(--border); border-radius:7px;
-                     background:var(--surface); color:var(--ink); }
-        .batt-custom-lbl { font-size:11px; color:var(--ink2); }
-        .batt-custom .batt-opt { border:1px solid var(--border); border-radius:7px;
-                     padding:6px 10px; margin-left:auto; }
-        .batt-custom .batt-opt.active { border-color:var(--good); }
 
         /* Two tickers side by side (What's new, Plan updates); they wrap as a pair below
            the pills when the card is narrow, and stack when narrower still. */
@@ -1540,7 +1640,10 @@ class GridLensAdvisoryCard extends HTMLElement {
     // own listener has to be bound directly to it, once, here — unlike .cl-pop it has
     // clickable contents (the override buttons + custom-minutes field).
     const battPop = this.shadowRoot.querySelector('.batt-pop');
-    if (battPop) battPop.addEventListener('click', (ev) => this._onBattOptionClick(ev));
+    if (battPop) {
+      battPop.addEventListener('click', (ev) => this._onBattOptionClick(ev));
+      battPop.addEventListener('change', (ev) => this._onBattCustomChange(ev));
+    }
     attachTooltip(this.shadowRoot, { popupClass: 'dt-tt-pop' });
   }
 

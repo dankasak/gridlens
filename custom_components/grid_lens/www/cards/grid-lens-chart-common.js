@@ -1271,6 +1271,7 @@ export function resolveLoadControlRows(hass, devices) {
 export function friendlyNote(note) {
   if (!note) return '';
   if (note.startsWith('command_error')) return 'Command error';
+  if (note === 'not_entitled') return 'Subscription inactive — resubscribe to resume control';
   return note.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase());
 }
 

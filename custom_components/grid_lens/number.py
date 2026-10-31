@@ -104,12 +104,13 @@ async def async_setup_entry(
     if entry.data.get(CONF_HAS_BATTERY, False) or entry.data.get(CONF_DEFERRABLE_LOAD_SENSORS):
         entities.append(GridLensMinExportPriceNumber(entry))
 
-    # Custom pause duration backing select.py's "Pause custom duration" option on the
-    # Battery Control Override select — only meaningful alongside that select, so gated
-    # on the same battery control manager it shares.
+    # Override duration + forced-charge/discharge rate backing the Battery Control
+    # Override select's options — only meaningful alongside that select, so gated on
+    # the same battery control manager it shares.
     battery_mgr = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_control")
     if battery_mgr is not None:
         entities.append(GridLensBatteryOverrideMinutesNumber(battery_mgr, entry))
+        entities.append(GridLensBatteryOverridePowerNumber(battery_mgr, entry))
 
     # One-off export/discharge floor on the main battery ("keep at least 50% in
     # reserve until 7am Tuesday" ahead of a planned outage) — paired with
@@ -253,16 +254,18 @@ class GridLensMinExportPriceNumber(RestoreEntity, NumberEntity):
 
 
 class GridLensBatteryOverrideMinutesNumber(RestoreEntity, NumberEntity):
-    """Custom pause duration (minutes) for the Battery Control Override select's "Pause
-    custom duration" option (select.py's GridLensBatteryControlOverrideSelect) — lets
-    the user dial in an exact duration instead of picking one of the fixed presets
-    (30 min/1h/2h/4h).
+    """Override duration (minutes) for the Battery Control Override select
+    (select.py's GridLensBatteryControlOverrideSelect) — how long a chosen Pause or
+    forced action (Maximum Self-consumption / Standby / Force Charge / Force
+    Discharge) holds before GridLens reverts to Auto. Read at selection time by
+    whichever option fires (override_pause()/override_force()), not baked into the
+    option strings themselves, so one duration control serves all of them.
 
     Purely a UI preference restored via RestoreEntity, not persisted in
     ControlManager's own Store: losing it on a cold update just resets the default to
-    60 minutes, not a safety-relevant regression the way losing an in-progress pause's
-    own deadline would be (that's why *that* lives in the Store instead — see
-    control/manager.py's override_pause()).
+    60 minutes, not a safety-relevant regression the way losing an in-progress
+    override's own deadline would be (that's why *that* lives in the Store instead —
+    see control/manager.py's override_pause()/override_force()).
     """
 
     _attr_has_entity_name = True
@@ -307,6 +310,62 @@ class GridLensBatteryOverrideMinutesNumber(RestoreEntity, NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         self._manager.custom_override_minutes = value
+        self._attr_native_value = value
+        self.async_write_ha_state()
+
+
+class GridLensBatteryOverridePowerNumber(RestoreEntity, NumberEntity):
+    """Rate (W) for the Battery Control Override select's "Force Charge" / "Force
+    Discharge" options — the one knob shared by both directions, since a user picks
+    one action at a time anyway. Pre-filled from the configured max charge rate (the
+    same ceiling the LP plan itself uses) as a sensible starting point, not a limit:
+    BatteryController._clamp_power() enforces the real max_charge_w/max_discharge_w
+    ceiling server-side regardless of what this is set to, so the range here is
+    deliberately generous rather than hand-matched to any one install's hardware.
+
+    Purely a UI preference restored via RestoreEntity, not persisted in
+    ControlManager's own Store — same reasoning as GridLensBatteryOverrideMinutesNumber
+    above.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Battery Override Power"
+    _attr_icon = "mdi:lightning-bolt"
+    _attr_native_min_value = 0.0
+    _attr_native_max_value = 20000.0
+    _attr_native_step = 100.0
+    _attr_native_unit_of_measurement = "W"
+    _attr_mode = NumberMode.BOX
+
+    def __init__(self, manager, entry: ConfigEntry) -> None:
+        self._manager = manager
+        self._attr_unique_id = f"{entry.entry_id}_battery_override_power_w"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Grid Lens",
+            "manufacturer": "Grid Lens",
+        }
+        self._attr_native_value = manager.custom_override_power_w
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last is not None:
+            try:
+                value = max(0.0, float(last.state))
+            except (TypeError, ValueError):
+                value = None
+            if value is not None:
+                self._manager.custom_override_power_w = value
+                self._attr_native_value = value
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {"battery_control_override_role": "power"}
+
+    async def async_set_native_value(self, value: float) -> None:
+        self._manager.custom_override_power_w = value
         self._attr_native_value = value
         self.async_write_ha_state()
 

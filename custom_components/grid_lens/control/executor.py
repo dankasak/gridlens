@@ -165,6 +165,15 @@ class ScheduleExecutor:
         self._plan_updated_at: Optional[datetime] = None
         self._cancel_timer: Optional[Callable] = None
         self._status = _ExecStatus()
+        # Manual forced-action override (ControlManager.override_force) — when set,
+        # _tick() commands this (action, power_w) pair every tick INSTEAD of consulting
+        # the plan, until ControlManager clears it (user cancelled, or the override's own
+        # duration expired). Re-issuing every tick — same cadence the automatic plan path
+        # already relies on (see module docstring's "active modes ... re-issued each
+        # tick") — is what keeps BatteryController's own auto-expiry timer (10 min
+        # default) armed for the override's full, possibly much longer, chosen duration;
+        # ControlManager never has to run a second timer of its own for that.
+        self._forced_override: Optional[tuple[BatteryAction, float]] = None
 
     # ------------------------------------------------------------------ plan feed
     def set_plan(
@@ -178,6 +187,21 @@ class ScheduleExecutor:
         if self._status.degraded:
             _LOGGER.info("Fresh plan received — clearing degraded state")
         self._status.degraded = False
+
+    def set_forced_override(self, override: Optional[tuple[BatteryAction, float]]) -> None:
+        """Arm or clear a manual forced action (see ``_forced_override`` above). Takes
+        effect on the next tick — pair with :meth:`apply_now` when the caller wants it
+        to also take effect immediately rather than waiting for the next interval
+        boundary (ControlManager.override_force/cancel_override)."""
+        self._forced_override = override
+
+    async def apply_now(self) -> None:
+        """Run one tick immediately, outside the usual interval boundary. Used when
+        ControlManager arms or clears a forced override on an executor that's already
+        running — start() only ticks immediately on its own transition into "running",
+        so a caller changing state while already running has to ask for this
+        explicitly."""
+        await self._tick()
 
     # ------------------------------------------------------------------ lifecycle
     async def start(self) -> None:
@@ -215,6 +239,35 @@ class ScheduleExecutor:
         now = now or dt_util.now()
         self._status.last_tick = now
         try:
+            if self._forced_override is not None:
+                # A manual override wins outright — the plan isn't even consulted (same
+                # precedence FEATURES.md documents for the per-device Force On/Off/Auto
+                # override). Always re-applied, skipping the self-use "don't re-spam"
+                # transition economy below: that optimization exists to cut command
+                # traffic for the common steady-state case, not to limit how often a
+                # user's own explicit override gets reasserted.
+                action, power_w = self._forced_override
+                if await self._apply(action, power_w):
+                    if self._status.consecutive_apply_failures >= _APPLY_FAILURE_NOTIFY_THRESHOLD:
+                        await self._dismiss_apply_failure_notice()
+                    self._status.consecutive_apply_failures = 0
+                    self._status.applied_action = action
+                    self._status.applied_power_w = power_w
+                    self._status.applied_at = dt_util.now()
+                    self._status.degraded = False
+                    self._status.note = f"forced_{action.value}"
+                else:
+                    self._status.consecutive_apply_failures += 1
+                    self._status.note = f"forced_apply_failed_{action.value}"
+                    _LOGGER.error(
+                        "Forced battery override command (%s @ %.0fW) failed to apply "
+                        "(%d consecutive failure(s))",
+                        action.value, power_w, self._status.consecutive_apply_failures,
+                    )
+                    if self._status.consecutive_apply_failures == _APPLY_FAILURE_NOTIFY_THRESHOLD:
+                        await self._raise_apply_failure_notice(action, power_w)
+                return
+
             if self._plan is None:
                 self._status.note = "no_plan"
                 return  # nothing to execute yet — leave the battery as-is
@@ -448,4 +501,8 @@ class ScheduleExecutor:
             "last_tick": s.last_tick.isoformat() if s.last_tick else None,
             "interval_minutes": self.interval_minutes,
             "consecutive_apply_failures": s.consecutive_apply_failures,
+            "forced_override": (
+                {"action": self._forced_override[0].value, "power_w": self._forced_override[1]}
+                if self._forced_override is not None else None
+            ),
         }

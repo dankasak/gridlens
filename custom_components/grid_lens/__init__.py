@@ -398,10 +398,14 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
                 "type": "tile", "entity": min_export, "name": "Min export price",
                 "features": [{"type": "numeric-input"}],
             })
-    # Timed pause for the battery-control switch above — "Pause 1 hour" etc, auto-
-    # resumes, unlike the switch's own indefinite off (see select.py's
+    # Timed override for the battery-control switch above — Pause, or a forced action
+    # (Maximum Self-consumption/Standby/Force Charge/Force Discharge) — auto-resumes,
+    # unlike the switch's own indefinite off (see select.py's
     # GridLensBatteryControlOverrideSelect docstring for why that distinction exists).
-    # Seeded right next to the switch it pauses, same reasoning as min_export above.
+    # Seeded right next to the switch it overrides, same reasoning as min_export above.
+    # The Power Flow header's battery-status pill is the primary way to reach this now
+    # (clicking it opens a popover with the same controls); these tiles stay as the
+    # fallback path for a dashboard/view that doesn't carry that card.
     battery_override = eid(f"{entry.entry_id}_battery_control_override")
     if battery_override:
         control_tiles.append({
@@ -411,7 +415,13 @@ def _build_seed_views(hass: HomeAssistant) -> list[dict]:
         override_minutes = eid(f"{entry.entry_id}_battery_override_minutes")
         if override_minutes:
             control_tiles.append({
-                "type": "tile", "entity": override_minutes, "name": "Custom override minutes",
+                "type": "tile", "entity": override_minutes, "name": "Override duration",
+                "features": [{"type": "numeric-input"}],
+            })
+        override_power = eid(f"{entry.entry_id}_battery_override_power_w")
+        if override_power:
+            control_tiles.append({
+                "type": "tile", "entity": override_power, "name": "Force charge/discharge rate",
                 "features": [{"type": "numeric-input"}],
             })
     # Today Boost tiles used to live here as their own "Tuning" section — merged into
@@ -741,7 +751,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # already-imported ES module for the tab's lifetime — bumping the query string
     # forces a genuinely new URL so a plain restart (without this) can silently
     # leave users on stale card JS even after a hard-refresh.
-    _CARD_VERSION = "20261029c"
+    _CARD_VERSION = "20261030b"
     card_urls = [
         f"/grid_lens/cards/grid-lens-card.js?v={_CARD_VERSION}",
         f"/grid_lens/cards/grid-lens-flow-card.js?v={_CARD_VERSION}",

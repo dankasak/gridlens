@@ -29,6 +29,7 @@ from homeassistant.util import dt as dt_util
 
 from ..const import CONF_INVERTER_BRAND, CONF_INVERTER_TRANSPORT, DOMAIN
 from ..inverters import get_inverter_controller
+from ..inverters.base import BatteryAction
 from .battery_controller import BatteryController, GuardrailConfig
 from .executor import ScheduleExecutor
 
@@ -39,6 +40,13 @@ _DEFAULT_BRAND = "sigenergy"
 _DEFAULT_TRANSPORT = "mqtt"
 
 _INTENT_STORE_VERSION = 1
+
+_ENTITLEMENT_NOTIFICATION_ID = "grid_lens_battery_control_not_entitled"
+
+# select.py's forced-action options map to these BatteryAction values 1:1 (see
+# override_force()). Kept here, not in select.py, so this module can validate
+# without importing the select platform.
+_VALID_FORCE_ACTIONS = {"self_use", "idle", "charge", "discharge"}
 
 
 class ControlManager:
@@ -63,6 +71,12 @@ class ControlManager:
         self._enabled = False
         # Fail closed: no entitlement until the API confirms one. See module docstring.
         self._entitled = False
+        # Tracks whether _raise_entitlement_notice() currently has a notification up, so
+        # _dismiss_entitlement_notice() only issues a dismiss call when there is actually
+        # something to dismiss (the "never yet confirmed at startup" fail-closed window
+        # must stay silent — see set_entitled()'s docstring and tests/*.py's
+        # fail_closed_entitlement-style assertions of zero service calls).
+        self._entitlement_notice_active = False
         # User/switch intent, independent of whether enable() actually succeeded — lets
         # set_entitled() auto-retry enable() once entitlement arrives without the switch
         # having to be toggled again. Seeded from _store by async_initialize(), not from
@@ -84,10 +98,22 @@ class ControlManager:
         self._override_label: str | None = None
         self._override_cancel = None
         self._on_override_change = None
-        # Default custom-duration knob for number.py's GridLensBatteryOverrideMinutesNumber
-        # — a plain UI preference (restored via that entity's own RestoreEntity), not
-        # safety-relevant, so it isn't persisted in this manager's Store.
+        # Default custom-duration/rate knobs for number.py's GridLensBatteryOverrideMinutesNumber
+        # and GridLensBatteryOverridePowerNumber — plain UI preferences (each restored via
+        # its own entity's RestoreEntity), not safety-relevant, so neither is persisted in
+        # this manager's Store.
         self.custom_override_minutes: float = 60.0
+        # Pre-filled with the config's own charge ceiling (the same rate the LP plan
+        # would use) — a sensible starting point to dial up/down, not a safety limit:
+        # BatteryController._clamp_power() enforces the real max_charge_w/max_discharge_w
+        # ceiling server-side regardless of what this is set to.
+        self.custom_override_power_w: float = cfg.max_charge_w or 5000.0
+        # Which forced action (if any) the current override is holding — "self_use",
+        # "idle", "charge" or "discharge" — distinct from an override_label like "Pause",
+        # which suspends actuation entirely rather than commanding a specific action (see
+        # override_force() vs override_pause()). None while Auto or genuinely paused.
+        self._override_action: str | None = None
+        self._override_power_w: float = 0.0
 
         # Deadman: restore native control if HA shuts down while control is active.
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self._on_hass_stop)
@@ -103,9 +129,22 @@ class ControlManager:
 
     @property
     def override_label(self) -> str | None:
-        """The select option label that armed the current pause (e.g. "Pause 1 hour"),
-        or None if not paused — see select.py's GridLensBatteryControlOverrideSelect."""
+        """The select option that armed the current override (e.g. "Pause" or "Force
+        Charge"), or None if not overridden — see select.py's
+        GridLensBatteryControlOverrideSelect."""
         return self._override_label
+
+    @property
+    def override_action(self) -> str | None:
+        """"self_use"/"idle"/"charge"/"discharge" while a forced action is active, or
+        None while Auto or genuinely paused (hands-off to the native EMS)."""
+        return self._override_action
+
+    @property
+    def override_power_w(self) -> float:
+        """The commanded rate for the current forced charge/discharge override. Only
+        meaningful when override_action is "charge" or "discharge"."""
+        return self._override_power_w
 
     async def async_initialize(self) -> None:
         """Restore user intent from the dedicated Store and (re-)enable if it was on.
@@ -151,13 +190,47 @@ class ControlManager:
             if until is not None and until > now:
                 self._override_until = until
                 self._override_label = stored.get("override_label")
+                self._override_action = stored.get("override_action")
+                self._override_power_w = float(stored.get("override_power_w") or 0.0)
                 self._arm_override_timer((until - now).total_seconds())
-                _LOGGER.warning(
-                    "GridLens battery control override active until %s — staying "
-                    "paused across restart", until.isoformat(),
-                )
+                if self._override_action:
+                    # A forced action (not a hands-off pause) needs the executor
+                    # actually ticking again — unlike the pause branch below, which
+                    # deliberately stays stopped. Gated on entitlement the same as
+                    # enable(): if that hasn't been confirmed yet this tick, leave the
+                    # battery on native EMS (where the shutdown deadman already left
+                    # it) rather than re-arming a paid actuation speculatively — it
+                    # just rides out the remaining timer doing nothing and expires to
+                    # Auto, same as a pause would.
+                    if self._entitled:
+                        self.executor.set_forced_override(
+                            (BatteryAction(self._override_action), self._override_power_w)
+                        )
+                        self._enabled = True
+                        await self.executor.start()
+                        if self._on_change:
+                            self._on_change()
+                        _LOGGER.warning(
+                            "GridLens battery control force-override (%s) active until "
+                            "%s — staying forced across restart",
+                            self._override_action, until.isoformat(),
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "GridLens battery force-override (%s) was active until %s "
+                            "but entitlement isn't confirmed yet this restart — leaving "
+                            "the battery on native EMS until it resumes or the override "
+                            "expires", self._override_action, until.isoformat(),
+                        )
+                else:
+                    _LOGGER.warning(
+                        "GridLens battery control override active until %s — staying "
+                        "paused across restart", until.isoformat(),
+                    )
                 return
             # Expired (or unparsable) while HA was down — clear it before proceeding.
+            self._override_action = None
+            self._override_power_w = 0.0
             await self._persist_intent()
 
         if want_on:
@@ -173,14 +246,19 @@ class ControlManager:
         """Suspend actuation for `duration_minutes`, then resume automatically if the
         user's underlying intent (_want_enabled) is still on. Deliberately does NOT touch
         _want_enabled — see the _override_until field comment in __init__ for why that
-        matters across a crash/restart. `label` (e.g. "Pause 1 hour") is persisted purely
-        so the override select can redisplay the right option across a restart; it has no
-        effect on the actual pause/resume behaviour."""
+        matters across a crash/restart. `label` (e.g. "Pause") is persisted purely so the
+        override select can redisplay the right option across a restart; it has no effect
+        on the actual pause/resume behaviour. Hands off to the native EMS entirely — see
+        override_force() for the alternative that keeps GridLens actively commanding a
+        specific action instead."""
         duration_minutes = max(1.0, float(duration_minutes))
         self._cancel_override_timer()
         self._override_until = dt_util.utcnow() + timedelta(minutes=duration_minutes)
         self._override_label = label
+        self._override_action = None
+        self._override_power_w = 0.0
         await self._persist_intent()
+        self.executor.set_forced_override(None)
         await self._stop(restore_normal=True)
         self._arm_override_timer(duration_minutes * 60.0)
         _LOGGER.warning(
@@ -190,15 +268,76 @@ class ControlManager:
         self._notify_override_change()
         return True
 
+    async def override_force(
+        self,
+        action: str,
+        duration_minutes: float,
+        power_w: float = 0.0,
+        label: str | None = None,
+    ) -> bool:
+        """Command a specific battery action — "self_use", "idle", "charge" or
+        "discharge", the same four BatteryAction primitives the automatic plan executor
+        itself uses — for `duration_minutes`, then resume the plan automatically. Unlike
+        override_pause() (hands off to the native EMS), GridLens stays actively in
+        control throughout: the executor keeps ticking on its normal interval, re-issuing
+        the forced command each time (see ScheduleExecutor._tick's forced-override
+        branch), which is what keeps BatteryController's own auto-expiry timer armed for
+        the FULL chosen duration rather than its own short internal default.
+
+        `power_w` only matters for "charge"/"discharge" (ignored, but harmless, for
+        "self_use"/"idle"); BatteryController._clamp_power() still enforces the
+        configured max_charge_w/max_discharge_w ceiling regardless of what's asked for
+        here. Requires entitlement, same as enable() — a forced command is still a paid
+        actuation, not a free read."""
+        if action not in _VALID_FORCE_ACTIONS:
+            raise ValueError(f"Unknown forced battery action: {action!r}")
+        if not self._entitled:
+            _LOGGER.warning(
+                "GridLens battery force-override (%s) requested but this account isn't "
+                "entitled — refusing", action,
+            )
+            return False
+        duration_minutes = max(1.0, float(duration_minutes))
+        self._cancel_override_timer()
+        self._override_until = dt_util.utcnow() + timedelta(minutes=duration_minutes)
+        self._override_label = label
+        self._override_action = action
+        self._override_power_w = max(0.0, float(power_w))
+        await self._persist_intent()
+        self.executor.set_forced_override((BatteryAction(action), self._override_power_w))
+        if self._enabled:
+            await self.executor.apply_now()  # take effect now, not at the next 5-min boundary
+        else:
+            self._enabled = True
+            await self.executor.start()  # start() does its own immediate tick
+            if self._on_change:
+                self._on_change()
+        self._arm_override_timer(duration_minutes * 60.0)
+        _LOGGER.warning(
+            "GridLens battery control forced to %s%s until %s (user override)",
+            action, f" @ {self._override_power_w:.0f}W" if action in ("charge", "discharge") else "",
+            self._override_until.isoformat(),
+        )
+        self._notify_override_change()
+        return True
+
     async def cancel_override(self) -> bool:
-        """Resume now — clears a pending pause and re-enables immediately if the user's
-        underlying intent is still on. A no-op if nothing is currently paused."""
+        """Resume now — clears a pending pause/forced-action and re-enables immediately
+        if the user's underlying intent is still on. A no-op if nothing is currently
+        overridden."""
         if self._override_until is None:
             return False
         self._cancel_override_timer()
         self._override_until = None
         self._override_label = None
+        was_forced = self._override_action is not None
+        self._override_action = None
+        self._override_power_w = 0.0
         await self._persist_intent()
+        if was_forced:
+            self.executor.set_forced_override(None)
+            if self._enabled:
+                await self.executor.apply_now()  # resume the plan now, not at the next boundary
         if self._want_enabled:
             await self.enable()
         self._notify_override_change()
@@ -220,7 +359,14 @@ class ControlManager:
         self.hass.async_create_task(self._resume_after_override())
 
     async def _resume_after_override(self) -> None:
+        was_forced = self._override_action is not None
+        self._override_action = None
+        self._override_power_w = 0.0
         await self._persist_intent()
+        if was_forced:
+            self.executor.set_forced_override(None)
+            if self._enabled:
+                await self.executor.apply_now()  # resume the plan now, not at the next boundary
         if self._want_enabled:
             _LOGGER.warning("GridLens battery control override expired — resuming")
             await self.enable()
@@ -235,6 +381,8 @@ class ControlManager:
             "want_enabled": self._want_enabled,
             "override_until": self._override_until.isoformat() if self._override_until else None,
             "override_label": self._override_label,
+            "override_action": self._override_action,
+            "override_power_w": self._override_power_w,
         })
 
     async def async_push_safety_floor(self) -> bool:
@@ -265,19 +413,72 @@ class ControlManager:
         if not entitled and self._enabled:
             _LOGGER.warning("GridLens battery control entitlement revoked — disabling")
             await self._stop(restore_normal=True)
-        elif entitled and not was_entitled and self._want_enabled and not self._enabled:
-            await self.enable()
+            await self._raise_entitlement_notice()
+        elif entitled and not was_entitled:
+            await self._dismiss_entitlement_notice()
+            if self._want_enabled and not self._enabled:
+                await self.enable()
+
+    async def _raise_entitlement_notice(self) -> None:
+        """Surface a revoked/missing entitlement where the user will actually see it —
+        the switch's own attributes (entitled=false) are silent unless something reads
+        them; see grid-lens-advisory-card.js's status pill for the other half of this,
+        and control/executor.py's apply-failure notice for the precedent this follows.
+        Only called from a confirmed revoke transition (set_entitled), never from
+        enable()'s refusal — the "never yet confirmed" fail-closed window at startup is
+        normal and must stay silent, not read as a revoked subscription."""
+        self._entitlement_notice_active = True
+        try:
+            await self.hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "notification_id": _ENTITLEMENT_NOTIFICATION_ID,
+                    "title": "Grid Lens: battery control disabled",
+                    "message": (
+                        "Your Grid Lens battery control add-on isn't active, so Grid Lens "
+                        "has stopped actuating the battery — the inverter is running on its "
+                        "own settings until this is resolved. Check your subscription/billing "
+                        "status in your Grid Lens account and resubscribe if needed; control "
+                        "resumes automatically once entitlement is confirmed again."
+                    ),
+                },
+                blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001 — a failed notification must not break control
+            _LOGGER.error("Failed to raise battery-control entitlement notification: %s", err)
+
+    async def _dismiss_entitlement_notice(self) -> None:
+        if not self._entitlement_notice_active:
+            return
+        self._entitlement_notice_active = False
+        try:
+            await self.hass.services.async_call(
+                "persistent_notification",
+                "dismiss",
+                {"notification_id": _ENTITLEMENT_NOTIFICATION_ID},
+                blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001 — a failed dismiss must not break control
+            _LOGGER.debug("Could not dismiss battery-control entitlement notification: %s", err)
 
     async def enable(self) -> bool:
         self._want_enabled = True
-        # An explicit enable (switch ON, or a pause expiring) always wins over a
-        # pending timed pause — clear it rather than leaving a stale timer that would
-        # otherwise fire later and find nothing to do.
+        # An explicit enable (switch ON, or a pause/forced-action expiring) always wins
+        # over a pending override — clear it rather than leaving a stale timer that
+        # would otherwise fire later and find nothing to do.
         override_was_active = self._override_until is not None
+        was_forced = self._override_action is not None
         self._cancel_override_timer()
         self._override_until = None
         self._override_label = None
+        self._override_action = None
+        self._override_power_w = 0.0
         await self._persist_intent()
+        if was_forced:
+            self.executor.set_forced_override(None)
+            if self._enabled:
+                await self.executor.apply_now()  # resume the plan now, not at the next boundary
         if override_was_active:
             self._notify_override_change()
         if self._enabled:
@@ -299,7 +500,7 @@ class ControlManager:
         intent — unlike async_prepare_for_reload() below, which must NOT persist
         anything since it fires on every reload regardless of user intent."""
         self._want_enabled = False
-        # An explicit disable also cancels any pending timed pause — it's already
+        # An explicit disable also cancels any pending override — it's already
         # redundant (control is going off indefinitely either way), and leaving it
         # armed would otherwise fire later and silently flip control back on, undoing
         # the user's actual intent here.
@@ -307,7 +508,10 @@ class ControlManager:
         self._cancel_override_timer()
         self._override_until = None
         self._override_label = None
+        self._override_action = None
+        self._override_power_w = 0.0
         await self._persist_intent()
+        self.executor.set_forced_override(None)
         if override_was_active:
             self._notify_override_change()
         await self._stop(restore_normal=True)
@@ -335,11 +539,19 @@ class ControlManager:
             await self.executor.stop(restore_normal=True)
 
     def status(self) -> dict:
-        return {
+        s = {
             "enabled": self._enabled,
             "entitled": self._entitled,
             "override_until": self._override_until.isoformat() if self._override_until else None,
             "override_label": self._override_label,
+            "override_action": self._override_action,
+            "override_power_w": self._override_power_w,
             **self.executor.status(),
             **self.controller.status(),
         }
+        if not self._entitled:
+            # Overrides whatever generic note the executor left behind (e.g. "stopped")
+            # with the actual, actionable reason — see friendlyNote() in
+            # grid-lens-chart-common.js for how this renders.
+            s["note"] = "not_entitled"
+        return s

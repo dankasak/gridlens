@@ -3568,6 +3568,22 @@ existing install serving it ungated. Covered by `tests/test_withdrawn_www_prune.
   entitlement column. It **fails closed**: no actuation until the API confirms. Revoking it
   stops actuation immediately but *keeps user intent*, so a re-grant auto-resumes without
   the user re-toggling every switch.
+  **A revoke is surfaced, not silent** (fixed 2026-10-31 — found via a real Stripe
+  `customer.subscription.deleted` test-mode event that revoked the dev rig's own
+  entitlement with zero visible cause beyond a raw `entitled: false` attribute nobody was
+  reading): `control/manager.py` and `control/load_control_manager.py` each raise a
+  `persistent_notification` (`grid_lens_battery_control_not_entitled` /
+  `grid_lens_load_control_not_entitled`) on a confirmed revoke transition — never from
+  `enable()`'s refusal path, since the "never yet confirmed" fail-closed window right
+  after a restart is normal and must not read as a revoked subscription — and dismiss it
+  on re-grant. `status()`'s `note` is overridden to `"not_entitled"` whenever entitled is
+  false, which `friendlyNote()` (`grid-lens-chart-common.js`) renders as "Subscription
+  inactive — resubscribe to resume control"; `grid-lens-advisory-card.js`'s battery status
+  pill shows a distinct "Subscription inactive" warning (icon `mdi:lock-alert-outline`,
+  `battToggle: false` — toggling the switch cannot fix this) instead of the generic
+  "Battery control off" it used to show for every off-reason alike. Deferrable-load
+  devices get `entitled`/`note` published per-device in `LoadControlManager.status()`'s
+  `devices[i]` dict for the same reason.
 - **Battery Control + Power Flow add-on** (`ApiKey.battery_control` / `ApiKey.powerflow_card`,
   granted/revoked together by one Stripe Price — `gridlens-api/app/billing.py`) — an optional
   paid add-on on top of either the free or Pro plan-comparison tier; see `subscribe.html`.

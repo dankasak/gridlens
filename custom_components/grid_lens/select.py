@@ -218,34 +218,47 @@ class GridLensChargeTimingPreferenceSelect(SelectEntity):
 
 
 OPTION_BATTERY_AUTO = "Auto"
-OPTION_BATTERY_PAUSE_30M = "Pause 30 min"
-OPTION_BATTERY_PAUSE_1H = "Pause 1 hour"
-OPTION_BATTERY_PAUSE_2H = "Pause 2 hours"
-OPTION_BATTERY_PAUSE_4H = "Pause 4 hours"
-OPTION_BATTERY_PAUSE_CUSTOM = "Pause custom duration"
+OPTION_BATTERY_PAUSE = "Pause"
+OPTION_BATTERY_FORCE_SELF_USE = "Maximum Self-consumption"
+OPTION_BATTERY_FORCE_IDLE = "Standby"
+OPTION_BATTERY_FORCE_CHARGE = "Force Charge"
+OPTION_BATTERY_FORCE_DISCHARGE = "Force Discharge"
 
-# Minutes for each fixed preset. "Pause custom duration" isn't here — it reads
-# ControlManager.custom_override_minutes (number.py's GridLensBatteryOverrideMinutesNumber)
-# at selection time instead of a fixed value.
-_BATTERY_PAUSE_PRESET_MINUTES = {
-    OPTION_BATTERY_PAUSE_30M: 30,
-    OPTION_BATTERY_PAUSE_1H: 60,
-    OPTION_BATTERY_PAUSE_2H: 120,
-    OPTION_BATTERY_PAUSE_4H: 240,
+# Maps a forced-action option directly to the BatteryAction value ControlManager/
+# BatteryController use — see control/manager.py's override_force() and
+# ../inverters/base.py's BatteryAction enum, whose values are these exact strings.
+_FORCE_ACTION_BY_OPTION = {
+    OPTION_BATTERY_FORCE_SELF_USE: "self_use",
+    OPTION_BATTERY_FORCE_IDLE: "idle",
+    OPTION_BATTERY_FORCE_CHARGE: "charge",
+    OPTION_BATTERY_FORCE_DISCHARGE: "discharge",
 }
 
 
 class GridLensBatteryControlOverrideSelect(SelectEntity):
-    """Pause GridLens's battery actuation for a fixed or custom duration, then resume
-    automatically — the timed counterpart to the indefinite Battery Control switch.
-    That switch's OFF has no natural end and once sat off for a full day with nobody
-    noticing (see control/manager.py's async_initialize() docstring for the 2026-08-01
-    incident); this gives a one-tap way to say "hands off for the next N hours" without
-    having to remember to flip it back.
+    """Override GridLens's battery actuation for a duration, then resume Auto (the
+    plan) automatically — the timed counterpart to the indefinite Battery Control
+    switch. That switch's OFF has no natural end and once sat off for a full day with
+    nobody noticing (see control/manager.py's async_initialize() docstring for the
+    2026-08-01 incident); this gives a one-tap way to say "something else for the next
+    N hours" without having to remember to flip it back.
+
+    Two different kinds of override share this one entity (distinguished by
+    ControlManager.override_action — None for the first, set for the second):
+
+    * **Pause** — hands actuation off to the native EMS entirely, same as flipping the
+      switch off, just timed (control/manager.py's override_pause()).
+    * **Maximum Self-consumption / Standby / Force Charge / Force Discharge** — GridLens
+      stays in control and actively commands that specific action
+      (control/manager.py's override_force()), the same four guardrailed
+      BatteryController primitives the automatic plan executor itself uses. Force
+      Charge/Discharge read their rate from number.py's
+      GridLensBatteryOverridePowerNumber; every option reads its duration from
+      GridLensBatteryOverrideMinutesNumber.
 
     Not RestoreEntity — ControlManager's own Store is the source of truth for
-    override_until/override_label (so it survives a restart with the real remaining
-    time, not whatever label happened to be selected last — see
+    override_until/override_label/override_action (so it survives a restart with the
+    real remaining time, not whatever label happened to be selected last — see
     ControlManager.async_initialize()). This entity just mirrors it, same relationship
     as the switch has with `enabled`.
     """
@@ -255,11 +268,11 @@ class GridLensBatteryControlOverrideSelect(SelectEntity):
     _attr_icon = "mdi:timer-pause-outline"
     _attr_options = [
         OPTION_BATTERY_AUTO,
-        OPTION_BATTERY_PAUSE_30M,
-        OPTION_BATTERY_PAUSE_1H,
-        OPTION_BATTERY_PAUSE_2H,
-        OPTION_BATTERY_PAUSE_4H,
-        OPTION_BATTERY_PAUSE_CUSTOM,
+        OPTION_BATTERY_PAUSE,
+        OPTION_BATTERY_FORCE_SELF_USE,
+        OPTION_BATTERY_FORCE_IDLE,
+        OPTION_BATTERY_FORCE_CHARGE,
+        OPTION_BATTERY_FORCE_DISCHARGE,
     ]
 
     def __init__(self, manager, entry: ConfigEntry) -> None:
@@ -291,26 +304,31 @@ class GridLensBatteryControlOverrideSelect(SelectEntity):
             self._attr_current_option = OPTION_BATTERY_AUTO
             return
         label = self._manager.override_label
-        self._attr_current_option = label if label in self._attr_options else OPTION_BATTERY_PAUSE_CUSTOM
+        self._attr_current_option = label if label in self._attr_options else OPTION_BATTERY_PAUSE
 
     @property
     def extra_state_attributes(self) -> dict:
         until = self._manager.override_until
         return {
             "override_until": until.isoformat() if until else None,
+            "override_action": self._manager.override_action,
+            "override_power_w": self._manager.override_power_w,
             "battery_control_override_role": "select",
         }
 
     async def async_select_option(self, option: str) -> None:
         if option == OPTION_BATTERY_AUTO:
             await self._manager.cancel_override()
-        elif option == OPTION_BATTERY_PAUSE_CUSTOM:
+        elif option == OPTION_BATTERY_PAUSE:
             await self._manager.override_pause(
                 self._manager.custom_override_minutes, label=option
             )
-        elif option in _BATTERY_PAUSE_PRESET_MINUTES:
-            await self._manager.override_pause(
-                _BATTERY_PAUSE_PRESET_MINUTES[option], label=option
+        elif option in _FORCE_ACTION_BY_OPTION:
+            await self._manager.override_force(
+                _FORCE_ACTION_BY_OPTION[option],
+                self._manager.custom_override_minutes,
+                power_w=self._manager.custom_override_power_w,
+                label=option,
             )
         else:
             return

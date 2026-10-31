@@ -75,6 +75,8 @@ from .load_controller import DeferrableLoadController, _EXPORT_BIAS_W
 
 _LOGGER = logging.getLogger(__name__)
 
+_ENTITLEMENT_NOTIFICATION_ID = "grid_lens_load_control_not_entitled"
+
 # How far ahead Greedy Consumption's forecast-surplus condition looks for energy the plan
 # expects to waste (export at or below the Minimum Export Price — see
 # DeferrableLoadController's module docstring). Spans most of a solar day so a mid-morning
@@ -382,6 +384,8 @@ class LoadControlManager:
         self._want_enabled: dict[int, bool] = {i: False for i in self.controllers}
         self._enabled: dict[int, bool] = {i: False for i in self.controllers}
         self._entitled = False  # fail closed until the API confirms
+        # See control/manager.py's identical flag for why this guards the dismiss call.
+        self._entitlement_notice_active = False
 
         self._plan: Optional[list[DispatchInterval]] = None
         self._plan_updated_at: Optional[datetime] = None
@@ -459,6 +463,7 @@ class LoadControlManager:
             # later re-grant auto-resumes without the user re-toggling each switch.
             if any(self._enabled.values()):
                 _LOGGER.warning("Load control entitlement revoked — stopping actuation")
+                await self._raise_entitlement_notice()
             for i in list(self._enabled):
                 if self._enabled[i]:
                     self._enabled[i] = False
@@ -466,10 +471,52 @@ class LoadControlManager:
                     self._notify(i)
             self._stop_timer_if_idle()
         elif entitled and not was:
+            await self._dismiss_entitlement_notice()
             # Granted: resume any device the user still wants enabled.
             for i in list(self._want_enabled):
                 if self._want_enabled[i] and not self._enabled[i]:
                     await self.enable(i)
+
+    async def _raise_entitlement_notice(self) -> None:
+        """Surface a revoked/missing entitlement where the user will actually see it —
+        shares the account's battery_control column (module docstring) but uses its own
+        notification_id so dismissing one doesn't dismiss the other. See
+        control/manager.py's identical helper, which this mirrors — only called from a
+        confirmed revoke transition (set_entitled), never from enable()'s refusal."""
+        self._entitlement_notice_active = True
+        try:
+            await self.hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "notification_id": _ENTITLEMENT_NOTIFICATION_ID,
+                    "title": "Grid Lens: deferrable load control disabled",
+                    "message": (
+                        "Your Grid Lens battery control add-on isn't active, so Grid Lens "
+                        "has stopped actuating your deferrable loads — each device is left "
+                        "in its last commanded state. Check your subscription/billing status "
+                        "in your Grid Lens account and resubscribe if needed; control resumes "
+                        "automatically once entitlement is confirmed again."
+                    ),
+                },
+                blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001 — a failed notification must not break control
+            _LOGGER.error("Failed to raise load-control entitlement notification: %s", err)
+
+    async def _dismiss_entitlement_notice(self) -> None:
+        if not self._entitlement_notice_active:
+            return
+        self._entitlement_notice_active = False
+        try:
+            await self.hass.services.async_call(
+                "persistent_notification",
+                "dismiss",
+                {"notification_id": _ENTITLEMENT_NOTIFICATION_ID},
+                blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001 — a failed dismiss must not break control
+            _LOGGER.debug("Could not dismiss load-control entitlement notification: %s", err)
 
     # ------------------------------------------------------------------ per-device lifecycle
     async def enable(self, index: int) -> bool:
@@ -1668,6 +1715,14 @@ class LoadControlManager:
                 "enabled": self._enabled.get(i, False),
                 "want_enabled": self._want_enabled.get(i, False),
                 **c.status(),
+                # Overrides whatever generic note the controller left behind (e.g.
+                # "not_started") with the actual, actionable reason once entitlement is
+                # gone — mirrors control/manager.py's status() for the battery switch.
+                # "entitled" is manager-wide but published per-device too so each load's
+                # own switch entity (switch.py's extra_state_attributes) can see it
+                # without reading a sibling entity.
+                **({"note": "not_entitled", "entitled": False} if not self._entitled
+                   else {"entitled": True}),
                 # Shadow mode (2026-10-16): the LP's own answer to condition #3's question.
                 "lp_bonus_w": round(bonus_w, 1) if bonus_w is not None else None,
                 "lp_bonus_kwh_ahead": round(bonus_kwh, 2) if bonus_kwh is not None else None,
