@@ -1374,29 +1374,11 @@ export function greedyLine(a, opts = {}) {
     }
     return `<div class="${p('greedy-line')} active">Greedy: ${label}${nums}${bar}</div>`;
   }
-  if (a.greedy_blocked === 'no_battery_headroom') {
-    const have = a.forecast_free_kwh != null ? +a.forecast_free_kwh : null;
-    const need = a.forecast_needed_kwh != null ? +a.forecast_needed_kwh : null;
-    const nums = have != null && need ? ` (${have.toFixed(1)} of ${need.toFixed(1)} kWh)` : '';
-    return `<div class="${p('greedy-line')}" data-tip="${esc('The forecast-surplus bar has cleared, but '
-      + 'this condition also needs the battery to have enough SOC and free discharge rate to '
-      + 'cover this device right now — otherwise turning it on would draw straight from the '
-      + 'grid. Configure a Battery SOC sensor and a signed Battery charge power sensor in '
-      + 'Grid Lens > Reconfigure > Battery, or wait for the battery to have headroom.')}" tabindex="0">`
-      + `Greedy: forecast surplus reached, but no battery headroom${nums}</div>`;
-  }
   if (a.greedy_blocked === 'no_grid_power') {
     return `<div class="${p('greedy-line')}" data-tip="${esc('Greedy\'s export-surplus condition needs a live '
       + 'grid power sensor (positive = importing, negative = exporting). Set the optional Grid Power '
       + 'sensor in Grid Lens > Reconfigure > Energy sensors.')}" tabindex="0">`
       + `Greedy: export is being wasted, but no grid power sensor is set</div>`;
-  }
-  if (a.greedy_blocked === 'no_ac_output_headroom') {
-    // The real explanation here is the inverter's AC output ceiling, not a schedule window
-    // — rendered as its own icon+tooltip line by acCeilingHtml (same call site as
-    // socCapHtml). Falling through to the generic branch below would wrongly say "outside
-    // this load's availability window", which has nothing to do with why this is blocked.
-    return '';
   }
   if (a.greedy_blocked) {
     const why = a.greedy_blocked === 'override'

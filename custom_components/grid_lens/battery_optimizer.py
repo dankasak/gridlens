@@ -178,12 +178,23 @@ def _reprice_slot(row: Dict, delta_kwh: float) -> tuple:
 
 
 def _slot_marginal_tiers(schedule: List[Dict], dev_idx: int, slots: List[int], cap_kwh: float) -> list:
-    """Split each slot's [0, cap_kwh] deferrable capacity into a cheap tier —
+    """Split each slot's [0, avail_kwh] deferrable capacity into a cheap tier —
     the amount absorbable without inducing any grid import at all, i.e. the
     solar/export headroom already sitting in that slot, priced at its
     opportunity cost (export_rate) — and an expensive tier for any remainder,
     priced at import_rate. This mirrors the LP's own capped-rate tranche
     trick (free tranche + over-cap tranche) at the level of a single slot.
+
+    ``avail_kwh = cap_kwh - bonus_per_device[dev_idx][t]`` — the device's rated
+    per-slot capacity, LESS whatever the LP's own bonus solve already committed
+    to this slot. The raw solve enforces ``def_i[t] + bon_i[t] <= cap_kwh``
+    directly (see ``_lp_scipy``'s "Bonus shares the device's rating with its
+    planned draw" constraint); this reshuffle only ever touches ``def_i``, so
+    it must respect the SAME joint ceiling or it can silently re-violate a
+    constraint the solver itself already enforced (push a device's def+bonus
+    total past its rating by packing more def_i into a slot bonus already
+    occupies). A device with no bonus solve has ``bonus_per_device[dev_idx]``
+    all zero, so this is a no-op there — identical to the pre-bonus behaviour.
 
     Returns a flat list of ``(unit_cost, slot, tier_capacity)`` so a caller can
     sort by cost and fill greedily — that greedy fill finds the true
@@ -195,15 +206,17 @@ def _slot_marginal_tiers(schedule: List[Dict], dev_idx: int, slots: List[int], c
     for t in slots:
         row = schedule[t]
         old_def = row['deferrable_per_device'][dev_idx]
+        bonus = row.get('bonus_per_device') or []
+        avail = max(0.0, cap_kwh - (bonus[dev_idx] if dev_idx < len(bonus) else 0.0))
         # s = the deferrable level at which this slot's net import/export
-        # would sit at exactly zero — i.e. how much of [0, cap_kwh] is
+        # would sit at exactly zero — i.e. how much of [0, avail_kwh] is
         # "free" (comes from otherwise-exported solar) rather than grid.
         s = old_def + row['export_kwh'] - row['import_kwh']
-        s = max(0.0, min(cap_kwh, s))
+        s = max(0.0, min(avail, s))
         if s > 1e-9:
             tiers.append((row['export_rate'], t, s))
-        if cap_kwh - s > 1e-9:
-            tiers.append((row['import_rate'], t, cap_kwh - s))
+        if avail - s > 1e-9:
+            tiers.append((row['import_rate'], t, avail - s))
     return tiers
 
 
@@ -414,6 +427,15 @@ def consolidate_deferrable_schedule(
     ties (the common case) are accepted, anything that would raise the bill
     is rejected outright. Hard guarantee: net_cost from the returned schedule
     can only stay the same or improve, never regress.
+
+    Bonus energy (``bonus_per_device``, see the LP-bonus mechanism in
+    ``_lp_scipy``) is never itself moved by this pass — it's priced because it
+    happens exactly when the plan's forecast spill occurs, so reshuffling it
+    across slots the way def_i's cost-tied slack is reshuffled would defeat
+    the whole point. It is only ever treated as capacity already spoken for
+    in whichever slot the solver placed it (see ``_slot_marginal_tiers``), so
+    this pass can never relocate def_i energy into a slot in a way that would
+    push that slot's def+bonus total past the device's rating.
 
     Demand-window hours, capped-rate hours, and conditional-credit masked
     hours are passed in as ``protected_hours`` and left untouched entirely —
@@ -1969,11 +1991,12 @@ class BatteryOptimizer:
                 'export_cap_free_rate': exp_free_rate, 'export_cap_over_rate': exp_over_rate,
             })
 
-        # Consolidation moves def_i between slots without knowing about bon_i, so it could
-        # push def_i + bon_i past the device's rating. Skipped for a bonus solve (today
-        # only the shadow solve — AdvisoryPlanner._shadow_bonus), which publishes nothing
-        # but the bonus itself. Must be made bonus-aware before bonus drives control.
-        if N and not bonus_idx:
+        # Consolidation moves def_i between slots. It used to be skipped outright whenever
+        # any device had a bonus solve active (def_i could be reshuffled into a slot bon_i
+        # already occupied, pushing the pair past the device's rating) — fixed 2026-11-01
+        # by making _slot_marginal_tiers treat each slot's bonus as capacity already
+        # spoken for (see its docstring), so this can now run unconditionally.
+        if N:
             protected_hours = (
                 set(demand_hours)
                 | {t for cb in cap_blocks for t in cb["hours"]}

@@ -35,7 +35,8 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         _FAILURES.append(name)
 
 
-def _row(import_kwh=0.0, export_kwh=0.0, import_rate=0.0, export_rate=0.0, defer=None):
+def _row(import_kwh=0.0, export_kwh=0.0, import_rate=0.0, export_rate=0.0, defer=None,
+         bonus=None):
     defer = defer or [0.0]
     return {
         'import_kwh': import_kwh, 'export_kwh': export_kwh,
@@ -43,6 +44,11 @@ def _row(import_kwh=0.0, export_kwh=0.0, import_rate=0.0, export_rate=0.0, defer
         'import_cost': import_kwh * import_rate, 'export_credit': export_kwh * export_rate,
         'deferrable_per_device': list(defer),
         'deferrable_kwh': sum(defer),
+        # LP-bonus energy (battery_optimizer's bon_i[t]) already committed to this slot —
+        # defaults to all-zero (same shape as defer) so every pre-existing fixture that
+        # never mentions bonus is unaffected; see _slot_marginal_tiers for how this
+        # shrinks the capacity left for def_i reshuffling (2026-11-01 fix).
+        'bonus_per_device': list(bonus) if bonus is not None else [0.0] * len(defer),
     }
 
 
@@ -413,6 +419,43 @@ def test_deferrable_kwh_field_kept_in_sync():
               for r in schedule))
 
 
+def test_bonus_is_treated_as_already_occupied_capacity():
+    """2026-11-01 fix: consolidation used to be skipped entirely whenever any device had
+    an active LP-bonus solve, specifically because reshuffling def_i with no knowledge of
+    bon_i could push a slot's def+bonus total past the device's rating. Now it runs
+    unconditionally, with _slot_marginal_tiers treating each slot's existing bonus as
+    capacity already spoken for (``avail = cap_kwh - bonus``).
+
+    1.8 kW device at 0.5 h slots -> cap_kwh = 0.9 kWh/slot. Slot 0 already carries 0.6 kWh
+    of bonus (only 0.3 kWh of real room left); slots 1-2 are empty (0.9 kWh of room each).
+    All three slots are cost-tied at $0, and the device's 1.5 kWh daily total is
+    fragmented as 0.0/0.9/0.6 — the shape this pass exists to collapse. Filling
+    earliest-first against the BONUS-AWARE capacities (0.3, 0.9, 0.9) must land
+    0.3/0.9/0.3, never spilling past 0.3 into slot 0's already-reduced room."""
+    dev = [{'max_kw': 1.8, 'daily_kwh': 1.5, 'hour_mask': None}]
+    schedule = [
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.0], bonus=[0.6]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.9], bonus=[0.0]),
+        _row(export_kwh=0.0, export_rate=0.0, defer=[0.6], bonus=[0.0]),
+    ]
+    before_total = sum(r['deferrable_per_device'][0] for r in schedule)
+
+    consolidate_deferrable_schedule(schedule, dev, dt=0.5, slots_per_day=48)
+
+    totals = [r['deferrable_per_device'][0] + r['bonus_per_device'][0] for r in schedule]
+    after_total = sum(r['deferrable_per_device'][0] for r in schedule)
+    check("daily total energy is preserved", abs(after_total - before_total) < 1e-6,
+          f"before={before_total} after={after_total}")
+    check("no slot's def+bonus exceeds the device's per-slot rating",
+          all(t <= 0.9 + 1e-6 for t in totals), f"totals={totals}")
+    check("slot 0's def is capped to its reduced (bonus-aware) room",
+          schedule[0]['deferrable_per_device'][0] <= 0.3 + 1e-6,
+          f"slot0 def={schedule[0]['deferrable_per_device'][0]}")
+    check("the exact bonus-aware packing is 0.3/0.9/0.3",
+          [round(r['deferrable_per_device'][0], 6) for r in schedule] == [0.3, 0.9, 0.3],
+          f"got {[r['deferrable_per_device'][0] for r in schedule]}")
+
+
 if __name__ == "__main__":
     test_fragmented_zero_cost_slots_get_consolidated()
     test_never_increases_cost_across_different_priced_slots()
@@ -430,6 +473,7 @@ if __name__ == "__main__":
     test_missing_preference_field_is_scoped_to_early_not_late()
     test_prefer_just_in_time_still_respects_its_own_charge_target_deadline()
     test_deferrable_kwh_field_kept_in_sync()
+    test_bonus_is_treated_as_already_occupied_capacity()
     if _FAILURES:
         print(f"\nFAIL — {len(_FAILURES)} failure(s): {_FAILURES}")
         sys.exit(1)

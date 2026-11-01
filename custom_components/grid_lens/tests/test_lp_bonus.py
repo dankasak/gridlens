@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Tests for the LP's opportunistic "bonus" energy (battery_optimizer ``bonus_value``),
-the LP-native form of Greedy Consumption's forecast-surplus condition, currently run
-in SHADOW mode only (advisory/planner.py ``_shadow_bonus``).
+the LP-native mechanism that replaced Greedy Consumption's old forecast-surplus
+condition (#3) on 2026-11-01 — see GRIDLENS_CHECKLIST.md. Live now: coordinator.py
+sets ``bonus_value`` straight on the device dict it hands to the real solve
+(``advisory/coordinator.py``'s ``_device_bonus_eligible`` gate), and planner.py folds
+the result directly into ``DispatchInterval.deferrable_w`` — there is no separate
+shadow solve any more. These tests call ``BatteryOptimizer.optimize_hourly_schedule``
+directly, the same call the live solve makes, so they were never shadow-specific.
 
 These need a REAL scipy solve. scipy isn't installable in the Claude add-on container,
 so every solve test skips there; run on the LXC (GRIDLENS_CHECKLIST.md):

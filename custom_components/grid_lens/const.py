@@ -314,12 +314,6 @@ MODULATION_CROSSING_DWELL_SECONDS = 300
 # purpose: the battery absorbs a 30-60 s dip at the floor rate trivially, while a stop costs
 # a re-handshake plus a full dwell. Hard interlocks (soc_cutoff, unplugged) never wait on it.
 MODULATION_OFF_CONFIRM_TICKS = 3
-# Percentage points the battery's live SOC must sit above its configured minimum before
-# Greedy Forecast Surplus is allowed to draw it down at all. Below this, the headroom
-# calculation is too marginal to size a stable draw from — found 2026-09-25: the Wattpilot's
-# start/stop buttons flapped every ~30s for 17 minutes with the battery at 16-17% against a
-# 10% configured minimum (only ~6-7 points of real margin). See GRIDLENS_CHECKLIST.md.
-GREEDY_FORECAST_SURPLUS_MIN_SOC_MARGIN_PCT = 10.0
 # Charger status strings that mean "nothing is connected / can't deliver". Matched
 # case-insensitively against a CONF_DEFERRABLE_LOAD_PLUG_SENSOR state. Everything else —
 # including any state we don't recognise — counts as plugged, per the fail-open rule above.

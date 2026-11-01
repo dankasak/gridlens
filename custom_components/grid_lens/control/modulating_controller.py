@@ -451,13 +451,6 @@ class ModulatingLoadController(DeferrableLoadController):
         inherited unchanged."""
         return self.min_w
 
-    def _forecast_surplus_snap_w(self, target_w: float) -> float:
-        """A modulating load takes exactly the proportional forecast-surplus rate, capped
-        at its own ``cap_w``. The caller has already checked it clears ``min_w`` (this
-        class's ``_export_surplus_threshold_w``). The on/off parent instead runs fully
-        on."""
-        return min(target_w, self.cap_w) if self.cap_w > 0.0 else target_w
-
     # ------------------------------------------------------------------ 5-minute tick
     async def apply(
         self,
@@ -468,14 +461,8 @@ class ModulatingLoadController(DeferrableLoadController):
         export_rate: Optional[float] = None,
         grid_power_w: Optional[float] = None,
         schedule_allows: Optional[bool] = None,
-        forecast_spill_kwh: Optional[float] = None,
-        forecast_hours: Optional[float] = None,
-        battery_headroom_w: Optional[float] = None,
-        battery_headroom_kwh: Optional[float] = None,
-        ac_output_headroom_w: Optional[float] = None,
         min_export_price: float = 0.0,
         soc_cutoff: bool = False,
-        battery_safe_window_h: Optional[float] = None,
         device_w: float = 0.0,
         discharge_w: float = 0.0,
     ) -> None:
@@ -490,21 +477,14 @@ class ModulatingLoadController(DeferrableLoadController):
 
         ``soc_cutoff`` is only *recorded* here (into ``self._soc_cutoff``) — this method
         never writes the setpoint. ``modulate()`` is the actual actuator for this class and
-        reads the stashed flag directly, same pattern as ``_greedy_forecast_target_w``
-        (computed here by ``_greedy_wants_on``, consumed a moment later by the manager's
-        ``_modulation_target_w``)."""
+        reads ``self._planned_w``/``self._want_on`` directly, set by this method a moment
+        earlier on the manager's 5-minute tick."""
         if self._override is not None:
             self._note = f"override_{'on' if self._override else 'off'}"
             # Mirror the parent exactly: greedy is not evaluated under an override, so its
             # published reason must be cleared rather than left stale on the UI.
             self._greedy_reason = None
             self._greedy_blocked = "override"
-            self._greedy_free_kwh = None
-            self._greedy_needed_kwh = None
-            self._greedy_battery_headroom_w = None
-            self._greedy_battery_headroom_kwh = None
-            self._greedy_ac_output_headroom_w = None
-            self._greedy_forecast_target_w = 0.0
             return
 
         if soc_cutoff != self._soc_cutoff:
@@ -517,12 +497,6 @@ class ModulatingLoadController(DeferrableLoadController):
         if soc_cutoff:
             self._greedy_reason = None
             self._greedy_blocked = "soc_cutoff"
-            self._greedy_free_kwh = None
-            self._greedy_needed_kwh = None
-            self._greedy_battery_headroom_w = None
-            self._greedy_battery_headroom_kwh = None
-            self._greedy_ac_output_headroom_w = None
-            self._greedy_forecast_target_w = 0.0
             self._planned_w = 0.0
             self._want_on = False
             self._note = "soc_cutoff"
@@ -530,9 +504,7 @@ class ModulatingLoadController(DeferrableLoadController):
 
         greedy_on = self._greedy_wants_on(
             import_rate, export_rate, grid_power_w, schedule_allows,
-            forecast_spill_kwh, forecast_hours, battery_headroom_w,
-            battery_headroom_kwh, ac_output_headroom_w, min_export_price,
-            battery_safe_window_h, device_w, discharge_w,
+            min_export_price, device_w, discharge_w,
         )
         self._planned_w = max(0.0, float(planned_w))
         self._want_on = greedy_on or self._planned_w > 0.0

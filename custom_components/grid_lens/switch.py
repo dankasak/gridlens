@@ -345,19 +345,18 @@ class GridLensDeferrableGreedyScheduleSwitch(RestoreEntity, SwitchEntity):
 
 
 class GridLensDeferrableGreedySurplusSwitch(RestoreEntity, SwitchEntity):
-    """ON = Greedy Consumption may ALSO fire on forecast surplus: start this device now
-    when the plan says more free energy will be thrown away over the next few hours than
-    the device could consume running flat out for that whole window.
+    """ON = this device is eligible for the LP's own opportunistic "bonus" energy: the
+    optimizer may schedule it extra draw, on top of its normal target, when the plan sees
+    more free energy ahead than the device could otherwise use.
 
-    Separate from the master Greedy switch (and requires it) because this is the one
-    greedy condition that fires ahead of any live signal — the other two only fire on
-    energy that is already free right now, this one starts early to catch a spill that
-    hasn't arrived yet. It is additionally gated on live battery headroom (see
-    LoadControlManager._battery_headroom_w / DeferrableLoadController's module docstring)
-    so it can only actually fire when the battery has enough SOC and free discharge rate to
-    supply the device right now — running now draws the battery down, not the grid, and the
-    forecast spill this bets on refills it later. No battery configured means no buffer, so
-    it never fires there. Defaults OFF, like every other load-control opt-in.
+    Separate from the master Greedy switch (and requires it) — see
+    ``advisory/coordinator.py``'s ``_device_bonus_eligible`` for the exact gate. Until
+    2026-11-01 this armed a controller-side forecast-surplus heuristic with its own
+    live-battery-headroom gating (see ``DeferrableLoadController``'s module docstring for
+    that history); it now instead opts the device into ``battery_optimizer.py``'s native
+    ``bon_i[t]`` mechanism, which reasons about the real solved battery trajectory and SOC
+    directly rather than approximating it here. The toggle's user-facing meaning is
+    unchanged. Defaults OFF, like every other load-control opt-in.
 
     Same deliberate simplification as the two greedy switches above: no manager
     state-listener wiring (that slot is owned by GridLensDeferrableLoadSwitch).

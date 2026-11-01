@@ -1124,49 +1124,6 @@ async def _run_export_surplus_bar_is_min_for_modulating():
     assert onoff.status()["greedy_reason"] is None
 
 
-async def _run_forecast_surplus_pins_to_battery_safe_rate():
-    """Fixed 2026-09-20: a modulating load can take a PARTIAL draw, so a battery that can't
-    fund the *ideal* forecast-surplus rate for the whole window must pin the device to
-    whatever rate it CAN safely sustain — not block the condition outright the way an
-    on/off load's all-or-nothing bar has to.
-
-    12 kWh spill over 4 h = an ideal 3000 W rate (well above the 1380 W floor). The battery
-    has plenty of instantaneous rate (5000 W) but only 8 kWh of headroom to its min SOC —
-    not enough to fund the full 12 kWh ideal budget, so the OLD all-or-nothing check
-    (``battery_headroom_kwh >= forecast_spill_kwh``) would have blocked this entirely
-    (``no_battery_headroom``, target 0). The fix pins the draw to
-    ``battery_headroom_kwh / forecast_hours`` = 2000 W instead — still funded safely for
-    the whole window in the worst case the spill never arrives, and still well above the
-    floor, so the device runs at 2000 W rather than not at all."""
-    hass = FakeHass()
-    _evse(hass, mx=32)
-    mod = _mk(hass)  # 7.4 kW nominal, 7360 W cap, 1380 W floor
-    mod.set_greedy(True)
-    mod.set_greedy_forecast_surplus(True)
-    await mod.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
-                    forecast_spill_kwh=12.0, forecast_hours=4.0,
-                    battery_headroom_w=5000.0, battery_headroom_kwh=8.0)
-    st = mod.status()
-    assert st["greedy_reason"] == "forecast_surplus"
-    assert st["greedy_blocked"] is None
-    assert st["forecast_target_w"] == 2000.0
-
-    # Headroom too thin even for the pinned rate to clear the floor -> still blocked, same
-    # as before (this isn't "always fire at SOME rate", it's "fire at a safe rate or not
-    # at all", the floor still applies).
-    hass2 = FakeHass()
-    _evse(hass2, mx=32)
-    mod2 = _mk(hass2)
-    mod2.set_greedy(True)
-    mod2.set_greedy_forecast_surplus(True)
-    await mod2.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
-                     forecast_spill_kwh=12.0, forecast_hours=4.0,
-                     battery_headroom_w=5000.0, battery_headroom_kwh=1.0)
-    st2 = mod2.status()
-    assert st2["greedy_reason"] is None
-    assert st2["greedy_blocked"] == "no_battery_headroom"
-    assert st2["forecast_target_w"] == 0.0
-
 
 async def _run_apply_records_but_never_writes():
     """The 5-minute tick decides; only the fast loop writes (one writer = unbypassable
@@ -1380,69 +1337,24 @@ async def _run_manager_target_surplus_below_floor():
     assert await m3._modulation_target_w(0, _T0) == (1000.0, "plan")
 
 
-async def _run_manager_target_forecast_surplus():
-    """Greedy condition #3 must actually reach the setpoint on a modulating device.
-
-    It is the one greedy condition with no live figure to meter against — it is
-    forward-looking, evaluated once per 5-minute tick by apply(), which stashes the
-    proportional power it wants in ``_greedy_forecast_target_w`` (already clamped into
-    this device's envelope by ``_forecast_surplus_snap_w``). Before 2026-08-03
-    ``_modulation_target_w`` implemented only conditions #1 and #2, so #3 was silently
-    inert here: the card's badge would light up while the charger stayed at plan_w."""
-    m, _hass = _mod_mgr()
-    m.set_plan(_plan(dev_w=0.0), updated_at=_T0)     # plan wants nothing this slot
-    await m.set_greedy(0, True)
-    await m.set_greedy_forecast_surplus(0, True)
-    c = m.controllers[0]
-    c._greedy_reason = "forecast_surplus"            # as apply() would have set it
-    c._greedy_forecast_target_w = c.cap_w            # ...alongside the target power
-    target, source = await m._modulation_target_w(0, _T0)
-    assert target == c.cap_w and source == "surplus", (target, source, c.cap_w)
-
-    # A target below cap_w (a smaller forecast rate) reaches the setpoint proportionally,
-    # not rounded up to the full envelope.
-    c._greedy_forecast_target_w = c.cap_w / 2.0
-    target2, source2 = await m._modulation_target_w(0, _T0)
-    assert target2 == c.cap_w / 2.0 and source2 == "surplus"
-
-    # Opt-in: the master greedy switch still gates it, even with a target stashed.
-    m2, _h2 = _mod_mgr()
-    m2.set_plan(_plan(dev_w=0.0), updated_at=_T0)
-    await m2.set_greedy(0, False)
-    m2.controllers[0]._greedy_reason = "forecast_surplus"
-    m2.controllers[0]._greedy_forecast_target_w = m2.controllers[0].cap_w
-    assert await m2._modulation_target_w(0, _T0) == (0.0, "off")
-
-    # And Greedy Respects Schedule still confines it to the device's allowed window.
-    m3, _h3 = _mod_mgr()
-    m3.set_plan(_plan(dev_w=0.0), updated_at=_T0)
-    await m3.set_greedy(0, True)
-    await m3.set_greedy_respects_schedule(0, True)
-    m3.controllers[0]._greedy_reason = "forecast_surplus"
-    m3.controllers[0]._greedy_forecast_target_w = m3.controllers[0].cap_w
-    m3._schedule_allows_now = _never_allowed
-    assert await m3._modulation_target_w(0, _T0) == (0.0, "off")
-
-
 async def _run_manager_target_ac_output_cap():
     """Live inverter AC output ceiling clamp (found 2026-09-12 against the household's
     own Sigenergy + Wattpilot — GRIDLENS_CHECKLIST.md): applied LAST, after plan/surplus/
     battery-priority, regardless of which term produced the pre-clamp target — and
-    re-evaluated every 30s here, unlike ``fc_target_w`` which is only refreshed on the
-    5-minute ``apply()`` tick. Numbers mirror the actual incident: PV alone had the
-    ~10kW plant at its ceiling, the Wattpilot was already drawing 6.6kW, and the
-    forecast-surplus condition (unaware of any of this) wanted the full envelope."""
+    re-evaluated every 30s here, independent of the 5-minute ``apply()`` tick. The plan
+    alone asking for the device's full envelope stands in for "whichever term produced
+    the pre-clamp target" (2026-11-01: used to be Greedy's forecast-surplus condition,
+    cut over to the LP's own bonus — see DeferrableLoadController's module docstring;
+    this clamp doesn't care which term it was then either, so the plan is just the
+    simplest way to drive a high target_w here now). Numbers mirror the actual incident:
+    PV alone had the ~10kW plant at its ceiling, the Wattpilot was already drawing 6.6kW."""
     m, hass = _mod_mgr(
         grid_power_sensor="sensor.grid",
         load_power_sensor="sensor.load",
         max_ac_output_kw=10.0,
     )
-    m.set_plan(_plan(dev_w=1000.0), updated_at=_T0)
-    await m.set_greedy(0, True)
-    await m.set_greedy_forecast_surplus(0, True)
     c = m.controllers[0]
-    c._greedy_reason = "forecast_surplus"
-    c._greedy_forecast_target_w = c.cap_w          # forecast wants the full envelope
+    m.set_plan(_plan(dev_w=c.cap_w), updated_at=_T0)   # plan alone wants the full envelope
     hass.states.set("sensor.load", "13500")        # whole-house consumption
     hass.states.set("sensor.grid", "3500")         # importing 3.5 kW
     hass.states.set("sensor.evse_power", "6600")   # this device's OWN current draw
@@ -1456,17 +1368,13 @@ async def _run_manager_target_ac_output_cap():
 
     # No ceiling configured (the default) -> a pure no-op, unaffected by any of this.
     m2, hass2 = _mod_mgr(grid_power_sensor="sensor.grid", load_power_sensor="sensor.load")
-    m2.set_plan(_plan(dev_w=1000.0), updated_at=_T0)
-    await m2.set_greedy(0, True)
-    await m2.set_greedy_forecast_surplus(0, True)
     c2 = m2.controllers[0]
-    c2._greedy_reason = "forecast_surplus"
-    c2._greedy_forecast_target_w = c2.cap_w
+    m2.set_plan(_plan(dev_w=c2.cap_w), updated_at=_T0)
     hass2.states.set("sensor.load", "13500")
     hass2.states.set("sensor.grid", "3500")
     hass2.states.set("sensor.evse_power", "6600")
     target2, source2 = await m2._modulation_target_w(0, _T0)
-    assert target2 == c2.cap_w and source2 == "surplus"
+    assert target2 == c2.cap_w and source2 == "plan"
 
 
 async def _run_manager_target_ac_output_cap_credits_current_export():
@@ -1482,12 +1390,8 @@ async def _run_manager_target_ac_output_cap_credits_current_export():
         load_power_sensor="sensor.load",
         max_ac_output_kw=10.0,
     )
-    m.set_plan(_plan(dev_w=1000.0), updated_at=_T0)
-    await m.set_greedy(0, True)
-    await m.set_greedy_forecast_surplus(0, True)
     c = m.controllers[0]
-    c._greedy_reason = "forecast_surplus"
-    c._greedy_forecast_target_w = c.cap_w          # forecast wants the full envelope
+    m.set_plan(_plan(dev_w=c.cap_w), updated_at=_T0)   # plan alone wants the full envelope
     hass.states.set("sensor.load", "6540")         # whole-house consumption
     hass.states.set("sensor.grid", "-3385")        # EXPORTING 3.385 kW
     hass.states.set("sensor.evse_power", "5932")   # this device's own current draw
@@ -1495,8 +1399,8 @@ async def _run_manager_target_ac_output_cap_credits_current_export():
     # Plant is producing 9925W (load - grid = 6540 - -3385), just 75W under the 10kW
     # ceiling — but 3385W of that is being wasted as export, all of it redirectable.
     # allowed = device_w + (cap - plant_output) + export = 5932 + 75 + 3385 = 9392,
-    # comfortably above the forecast's full-envelope ask — so no clamping at all.
-    assert target == c.cap_w and source == "surplus", (target, source, c.cap_w)
+    # comfortably above the plan's full-envelope ask — so no clamping at all.
+    assert target == c.cap_w and source == "plan", (target, source, c.cap_w)
 
 
 def test_greedy_reason_exposed_on_onoff_controller():
@@ -1509,10 +1413,6 @@ def test_greedy_reason_exposed_on_onoff_controller():
     assert c._greedy_wants_on(0.0, None, None, None) is True   # free import
     assert c.greedy_reason == "import_free"
     assert c.status()["greedy_reason"] == "import_free"
-
-
-async def _never_allowed(_index, _now):
-    return False
 
 
 async def _run_manager_target_free_import_takes_cap():
@@ -1726,59 +1626,6 @@ async def _run_manager_target_surplus_battery_charging_not_credited():
     assert target == 1500.0 and source == "plan", (target, source)
 
 
-async def _run_manager_target_forecast_frontload_displaces_battery_charge():
-    """Forecast front-loading (2026-10-04, household instruction). Once the forecast
-    condition has fired, the plan has already said the battery will fill and spill, so
-    the live-surplus asymmetry (battery gets first claim — test above) no longer protects
-    anything: the device takes the solar currently going INTO the battery too. Numbers are
-    the live morning that prompted it: ~22 kWh of afternoon spill forecast, proportional
-    rate 2.4 kW, battery soaking up 8 kW, Wattpilot sat at 2.25 kW."""
-    m, hass = _mod_mgr(
-        grid_power_sensor="sensor.grid",
-        battery_charge_power_sensor="sensor.batt_charge",
-        battery_discharge_power_sensor="sensor.batt_discharge",
-    )
-    m.set_plan(_plan(export_rate=0.03, dev_w=0.0), updated_at=_T0)
-    await m.set_greedy(0, True)
-    await m.set_greedy_forecast_surplus(0, True)
-    c = m.controllers[0]
-    c._greedy_reason = "forecast_surplus"
-    c._greedy_forecast_target_w = 2400.0
-    m._forecast_spill_kwh[0] = 22.24
-    hass.states.set("sensor.grid", "-50")
-    hass.states.set("sensor.batt_charge", "8000")
-    hass.states.set("sensor.batt_discharge", "0")
-    hass.states.set("sensor.evse_power", "2245")
-    target, source = await m._modulation_target_w(0, _T0)
-    # device(2245) - grid(-50) + battery(8000) - _EXPORT_BIAS_W(150) = 10145, well inside
-    # the 22.24 kWh / 1h budget cap; modulate() clamps it into the envelope.
-    assert target == 10145.0 and source == "surplus", (target, source)
-
-    # Budget taper: a nearly-spent spill caps the displaced draw — never below the
-    # proportional rate the 5-minute tick already approved.
-    m._forecast_spill_kwh[0] = 1.5
-    target, _ = await m._modulation_target_w(0, _T0)
-    assert target == 2400.0, target
-    m._forecast_spill_kwh[0] = 4.0
-    target, _ = await m._modulation_target_w(0, _T0)
-    assert target == 4000.0, target
-
-    # Live import means the battery is being grid-charged on purpose — displacing that
-    # charge would buy the device's energy from the grid. Falls back to the proportional rate.
-    m._forecast_spill_kwh[0] = 22.24
-    hass.states.set("sensor.grid", "3000")
-    target, _ = await m._modulation_target_w(0, _T0)
-    assert target == 2400.0, target
-
-    # Not firing (no forecast target) — the battery keeps first claim, exactly as before.
-    hass.states.set("sensor.grid", "-50")
-    c._greedy_forecast_target_w = 0.0
-    target, source = await m._modulation_target_w(0, _T0)
-    # 3c export is above this test's (unset, $0) Minimum Export Price, so the live-surplus
-    # term doesn't apply either — the battery's 8 kW stays the battery's.
-    assert target == 0.0 and source == "off", (target, source)
-
-
 async def _run_manager_target_surplus_no_battery_configured_unchanged():
     """No battery sensors configured must skip only the discharge correction — the
     export-bias margin still applies, it isn't battery-specific."""
@@ -1789,36 +1636,6 @@ async def _run_manager_target_surplus_no_battery_configured_unchanged():
     hass.states.set("sensor.evse_power", "5000")
     target, source = await m._modulation_target_w(0, _T0)
     assert target == 4850.0 and source == "surplus"  # 5000 - 0 - _EXPORT_BIAS_W(150)
-
-
-async def _run_battery_headroom_unipolar_discharge_sensor():
-    """_battery_headroom_w() must see a live discharge even when it's split onto a second,
-    always-positive sensor rather than going negative on the charge sensor."""
-    m, hass = _mod_mgr(
-        battery_soc_sensor="sensor.soc",
-        battery_charge_power_sensor="sensor.batt_charge",
-        battery_discharge_power_sensor="sensor.batt_discharge",
-        battery_max_discharge_rate=5.0,
-    )
-    hass.states.set("sensor.soc", "50")
-    hass.states.set("sensor.batt_charge", "0")
-    hass.states.set("sensor.batt_discharge", "1000")
-    # Without the discharge sensor netted in, this would misread as "not discharging at
-    # all" and report the full 5000 W rated rate as headroom.
-    assert m._battery_headroom_w() == 4000.0
-
-
-async def _run_battery_headroom_signed_single_sensor_unchanged():
-    """A battery with one genuinely signed sensor (no discharge sensor configured) —
-    the original, still-common shape — must behave exactly as before this fix."""
-    m, hass = _mod_mgr(
-        battery_soc_sensor="sensor.soc",
-        battery_charge_power_sensor="sensor.batt_charge",
-        battery_max_discharge_rate=5.0,
-    )
-    hass.states.set("sensor.soc", "50")
-    hass.states.set("sensor.batt_charge", "-1000")  # signed: discharging 1 kW
-    assert m._battery_headroom_w() == 4000.0
 
 
 async def _run_manager_target_fails_closed():
@@ -2093,6 +1910,148 @@ async def _run_manager_bad_device_does_not_kill_timer():
     await m._fast_tick(_NOW[0])
 
 
+# ================================================================= bonus attribution
+# LoadControlManager._bonus_attribution / _bonus_now_and_ahead — the display-only
+# replacement (2026-11-01, see GRIDLENS_CHECKLIST.md) for what Greedy Consumption's old
+# forecast-surplus condition (#3) used to publish about itself
+# (greedy_reason="forecast_surplus" / forecast_target_w / forecast_free_kwh /
+# forecast_needed_kwh), now derived from the live LP's own bonus component
+# (DispatchInterval.bonus_w) instead of a controller-side heuristic.
+def _bonus_plan(dev_w=0.0, bonus_w=0.0, start=None):
+    return [DispatchInterval(
+        start=(start or _T0) - timedelta(minutes=1), action=BatteryAction.SELF_USE,
+        import_rate=0.30, export_rate=0.10, deferrable_w=[dev_w], bonus_w=[bonus_w],
+    )]
+
+
+def test_bonus_attribution_empty_when_not_armed():
+    m, _hass = _mod_mgr()
+    m.set_plan(_bonus_plan(dev_w=500.0, bonus_w=500.0), updated_at=_T0)
+    # Greedy off entirely -> no attribution, even with a real bonus sitting in the plan.
+    assert m._bonus_attribution(0, _T0) == {}
+
+    async def go():
+        await m.set_greedy(0, True)   # Forecast Surplus toggle still off
+    _run_async(go)
+    assert m._bonus_attribution(0, _T0) == {}
+
+
+def test_bonus_attribution_not_suppressed_when_plug_state_unknown():
+    """plugged_in() is None ('can't tell' — no plug sensor configured) must NOT suppress
+    attribution, same assume-connected rule as plugged_in()'s own docstring. Only a KNOWN
+    unplugged device (plugged_in() is False) is zeroed out."""
+    m, _hass = _mod_mgr()
+    m.set_plan(_bonus_plan(dev_w=500.0, bonus_w=500.0), updated_at=_T0)
+
+    async def go():
+        await m.set_greedy(0, True)
+        await m.set_greedy_forecast_surplus(0, True)
+    _run_async(go)
+    assert m._bonus_attribution(0, _T0) != {}
+
+
+def test_bonus_attribution_empty_when_known_unplugged():
+    m, hass = _mod_mgr(deferrable_load_plug_sensor=["sensor.evse_status"])
+    hass.states.set("sensor.evse_status", "disconnected")
+    m.set_plan(_bonus_plan(dev_w=500.0, bonus_w=500.0), updated_at=_T0)
+
+    async def go():
+        await m.set_greedy(0, True)
+        await m.set_greedy_forecast_surplus(0, True)
+    _run_async(go)
+    assert m.controllers[0].plugged_in() is False
+    assert m._bonus_attribution(0, _T0) == {}
+
+
+def test_bonus_attribution_empty_when_plan_carries_no_bonus_series():
+    """No bonus series for this device at all (e.g. mid-restart with no fresh plan yet,
+    or simply never opted in by coordinator.py) -> empty, distinct from "armed and
+    tracking a real-but-zero bonus" (next test), which must still publish the tracking
+    figures."""
+    m, _hass = _mod_mgr()
+    m.set_plan(_plan(dev_w=500.0), updated_at=_T0)   # plain _plan(): bonus_w defaults to []
+
+    async def go():
+        await m.set_greedy(0, True)
+        await m.set_greedy_forecast_surplus(0, True)
+    _run_async(go)
+    assert m._bonus_attribution(0, _T0) == {}
+
+
+def test_bonus_attribution_tracks_without_firing_when_bonus_is_zero():
+    """A real bonus series that happens to be 0 right now (but the device is opted in and
+    the plan carries the series) still publishes the "armed and tracking" figures — same
+    as the old condition published progress toward its own bar before clearing it — but
+    must NOT claim greedy_reason, since nothing is actually firing."""
+    m, _hass = _mod_mgr()
+    m.set_plan(_bonus_plan(dev_w=500.0, bonus_w=0.0), updated_at=_T0)
+
+    async def go():
+        await m.set_greedy(0, True)
+        await m.set_greedy_forecast_surplus(0, True)
+    _run_async(go)
+    attrib = m._bonus_attribution(0, _T0)
+    assert "greedy_reason" not in attrib, attrib
+    assert attrib["forecast_target_w"] == 0.0
+    assert attrib["forecast_free_kwh"] == 0.0
+
+
+def test_bonus_attribution_tracks_without_firing_when_base_plan_already_on():
+    """The base plan (without the bonus) already clears the device's own on-threshold ->
+    the plan, not the bonus, explains it being on — mirrors
+    DeferrableLoadController.apply()'s own "don't attribute to greedy what the plan alone
+    already wanted" rule. The tracking figures still publish (the bonus is real), only
+    greedy_reason is withheld."""
+    m, _hass = _mod_mgr()
+    c = m.controllers[0]
+    base_w = c.on_threshold_w() + 100.0   # already over threshold with no bonus at all
+    m.set_plan(_bonus_plan(dev_w=base_w + 400.0, bonus_w=400.0), updated_at=_T0)
+
+    async def go():
+        await m.set_greedy(0, True)
+        await m.set_greedy_forecast_surplus(0, True)
+    _run_async(go)
+    attrib = m._bonus_attribution(0, _T0)
+    assert "greedy_reason" not in attrib, attrib
+    assert attrib["forecast_target_w"] == 400.0
+
+
+def test_bonus_attribution_populated_when_bonus_is_why_its_on():
+    m, _hass = _mod_mgr()
+    c = m.controllers[0]
+    base_w = max(0.0, c.on_threshold_w() - 500.0)   # base ALONE would not clear threshold
+    bonus_w = 600.0
+    m.set_plan(_bonus_plan(dev_w=base_w + bonus_w, bonus_w=bonus_w), updated_at=_T0)
+
+    async def go():
+        await m.set_greedy(0, True)
+        await m.set_greedy_forecast_surplus(0, True)
+    _run_async(go)
+    attrib = m._bonus_attribution(0, _T0)
+    assert attrib["greedy_reason"] == "forecast_surplus"
+    assert attrib["forecast_target_w"] == round(bonus_w, 1)
+    assert attrib["forecast_free_kwh"] is not None
+    assert attrib["forecast_needed_kwh"] is not None
+    # status() merges this straight into the per-device dict for real.
+    st = m.status()
+    assert st["devices"][0]["greedy_reason"] == "forecast_surplus"
+    assert st["devices"][0]["forecast_target_w"] == round(bonus_w, 1)
+
+
+def test_bonus_now_and_ahead_reads_bonus_series():
+    m, _hass = _mod_mgr()
+    m.set_plan(_bonus_plan(dev_w=500.0, bonus_w=777.0), updated_at=_T0)
+    now_w, ahead_kwh = m._bonus_now_and_ahead(0, _T0)
+    assert now_w == 777.0
+    assert ahead_kwh is not None and ahead_kwh > 0.0
+
+
+def test_bonus_now_and_ahead_none_when_no_device_carries_bonus():
+    m, _hass = _mod_mgr()
+    m.set_plan(_plan(dev_w=500.0), updated_at=_T0)   # plain _plan(): bonus_w defaults to []
+    assert m._bonus_now_and_ahead(0, _T0) == (None, None)
+
+
 # ================================================================= KNOWN BUGS
 # These assert MODULATING_CONTRACT.md, not current behaviour. See the report.
 async def _bug_enable_writes_on_missing_plan():
@@ -2207,7 +2166,6 @@ if __name__ == "__main__":
         # readback / greedy / identity
         ("actual_state_reads_setpoint", test_actual_state_reads_setpoint_not_switch),
         ("export_bar_min_vs_max", lambda: _run_async(_run_export_surplus_bar_is_min_for_modulating)),
-        ("forecast_surplus_pins_to_battery_safe_rate", lambda: _run_async(_run_forecast_surplus_pins_to_battery_safe_rate)),
         ("apply_records_never_writes", lambda: _run_async(_run_apply_records_but_never_writes)),
         ("join_key_falls_back_to_setpoint", test_join_key_falls_back_to_setpoint),
         ("status_publishes_modulating", test_status_publishes_modulating_fields),
@@ -2228,11 +2186,7 @@ if __name__ == "__main__":
         ("battery_priority_smoothing_damps_oscillation", lambda: _run_async(_run_manager_target_battery_priority_smoothing_damps_oscillation)),
         ("no_discharge_no_correction", lambda: _run_async(_run_manager_target_no_discharge_no_correction)),
         ("surplus_battery_charging_not_credited", lambda: _run_async(_run_manager_target_surplus_battery_charging_not_credited)),
-        ("forecast_frontload_displaces_battery_charge", lambda: _run_async(_run_manager_target_forecast_frontload_displaces_battery_charge)),
         ("surplus_no_battery_unchanged", lambda: _run_async(_run_manager_target_surplus_no_battery_configured_unchanged)),
-        ("battery_headroom_unipolar_discharge", lambda: _run_async(_run_battery_headroom_unipolar_discharge_sensor)),
-        ("battery_headroom_signed_unchanged", lambda: _run_async(_run_battery_headroom_signed_single_sensor_unchanged)),
-        ("manager_target_forecast_surplus", lambda: _run_async(_run_manager_target_forecast_surplus)),
         ("manager_target_ac_output_cap", lambda: _run_async(_run_manager_target_ac_output_cap)),
         ("manager_target_ac_output_cap_credits_current_export", lambda: _run_async(_run_manager_target_ac_output_cap_credits_current_export)),
         ("greedy_reason_on_onoff_controller", test_greedy_reason_exposed_on_onoff_controller),
@@ -2248,6 +2202,16 @@ if __name__ == "__main__":
         ("manager_stale_plan_no_writes", lambda: _run_async(_run_manager_fast_tick_stale_plan_no_writes)),
         ("manager_hass_stop_leaves_as_is", lambda: _run_async(_run_manager_hass_stop_leaves_setpoint_as_is)),
         ("manager_bad_device_survives", lambda: _run_async(_run_manager_bad_device_does_not_kill_timer)),
+        # bonus attribution
+        ("bonus_attribution_empty_when_not_armed", test_bonus_attribution_empty_when_not_armed),
+        ("bonus_attribution_not_suppressed_when_plug_state_unknown", test_bonus_attribution_not_suppressed_when_plug_state_unknown),
+        ("bonus_attribution_empty_when_known_unplugged", test_bonus_attribution_empty_when_known_unplugged),
+        ("bonus_attribution_empty_when_plan_carries_no_bonus_series", test_bonus_attribution_empty_when_plan_carries_no_bonus_series),
+        ("bonus_attribution_tracks_without_firing_when_bonus_is_zero", test_bonus_attribution_tracks_without_firing_when_bonus_is_zero),
+        ("bonus_attribution_tracks_without_firing_when_base_plan_already_on", test_bonus_attribution_tracks_without_firing_when_base_plan_already_on),
+        ("bonus_attribution_populated_when_bonus_is_why_its_on", test_bonus_attribution_populated_when_bonus_is_why_its_on),
+        ("bonus_now_and_ahead_reads_bonus_series", test_bonus_now_and_ahead_reads_bonus_series),
+        ("bonus_now_and_ahead_none_when_no_device_carries_bonus", test_bonus_now_and_ahead_none_when_no_device_carries_bonus),
     ]
     # Regression tests for three bugs this suite found on 2026-08-03, all since fixed.
     # They stay first-class checks, not a "known bugs" annex — each one is a silent,

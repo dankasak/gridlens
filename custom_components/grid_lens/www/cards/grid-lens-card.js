@@ -1,4 +1,4 @@
-import { smoothPath, gradDef } from './grid-lens-chart-common.js?v=20261018b';
+import { smoothPath, gradDef } from './grid-lens-chart-common.js?v=20261101a';
 
 class GridLensCard extends HTMLElement {
   constructor() {

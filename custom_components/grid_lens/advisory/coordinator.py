@@ -40,7 +40,7 @@ from .demand import (
 )
 from .forecast import FlatLoadForecaster, ForecastProvider, HourOfDayLoadForecaster
 from .load_history import build_hour_of_day_load
-from .planner import AdvisoryPlanner
+from .planner import AdvisoryPlanner, _BONUS_VALUE_PER_KWH
 from .rates import PlanRateForecaster
 from .today_cash import async_attach_actual_cash
 from ..retailer_plans import build_rate_caps, build_conditional_credits
@@ -708,18 +708,27 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
                         "min_kw": dev.get("min_kw", 0.0),
                         "name": dev.get("name"), "sensor_id": dev.get("sensor_id"),
                         "consumed_today_kwh": dev.get("consumed_today_kwh"),
-                        # Shadow-mode only: the planner runs a second solve with bonus
-                        # energy enabled for these devices (AdvisoryPlanner._shadow_bonus).
-                        # The live plan's optimizer ignores this key.
-                        "bonus_eligible": self._device_bonus_eligible(dev.get("sensor_id", "")),
+                        # LP-native opportunistic "bonus" energy (cut over from Greedy
+                        # Consumption's forecast-surplus condition #3, 2026-11-01 — see
+                        # GRIDLENS_CHECKLIST.md). Devices the user has armed (Greedy +
+                        # Forecast Surplus, no manual override — see
+                        # _device_bonus_eligible) get a real bonus_value in the LIVE
+                        # solve, not a side comparison: battery_optimizer.py's bon_i[t]
+                        # variable then prices extra deferrable energy directly into the
+                        # plan this device is actually commanded against.
+                        "bonus_value": (
+                            _BONUS_VALUE_PER_KWH
+                            if self._device_bonus_eligible(dev.get("sensor_id", ""))
+                            else 0.0
+                        ),
                         **soc_kwargs})
         return out
 
     def _device_bonus_eligible(self, sensor_id: str) -> bool:
         """True when the device's own Greedy and Forecast Surplus switches are both on
-        and it isn't under a manual override — i.e. exactly the devices Greedy
-        Consumption's forecast-surplus condition (#3) could drive today, which the
-        shadow bonus solve is being compared against. Looked up by sensor_id, same
+        and it isn't under a manual override — the same opt-in gate Greedy Consumption's
+        old forecast-surplus condition (#3) used, reused unchanged as the gate for the
+        LP-native bonus that replaced it (2026-11-01). Looked up by sensor_id, same
         reasoning as _device_override."""
         if not sensor_id:
             return False

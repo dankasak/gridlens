@@ -111,11 +111,10 @@ def _bootstrap():
     ex = sys.modules["gl.control.executor"]
     const = sys.modules["gl.const"]
     return (lc.DeferrableLoadController, lcm.LoadControlManager, ex.DispatchInterval,
-            const.DOMAIN, lcm.GREEDY_SURPLUS_LOOKAHEAD_HOURS)
+            const.DOMAIN)
 
 
-DeferrableLoadController, LoadControlManager, DispatchInterval, DOMAIN, LOOKAHEAD_H = _bootstrap()
-_LOOKAHEAD_SLOTS = int(round(LOOKAHEAD_H * 2))  # 30-min slots that exactly fill the window
+DeferrableLoadController, LoadControlManager, DispatchInterval, DOMAIN = _bootstrap()
 from gl.inverters.base import BatteryAction  # noqa: E402  (loaded above)
 
 
@@ -213,25 +212,6 @@ async def _run_greedy_export_surplus_turns_on():
     # Exporting 3000W (>= 2000W device draw) at a $0 export price -> free to run.
     await c.apply(0.0, _T0, import_rate=0.5, export_rate=0.0, grid_power_w=-3000.0)
     assert len(_turn_ons(hass)) == 1
-
-
-async def _run_greedy_export_surplus_keeps_forecast_target():
-    """Regression 2026-10-04: a modulating device front-loading on the forecast makes its
-    own draw read as live export surplus on the next tick. Condition #2 then fired and
-    returned before #3 ran, zeroing _greedy_forecast_target_w, which switched the
-    front-load off (and on again the tick after). Both now publish: reason stays
-    export_surplus, but the forecast target survives."""
-    hass = FakeHass()
-    hass.states.set("switch.x", "off")
-    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
-    c.set_greedy(True)
-    c.set_greedy_forecast_surplus(True)
-    await c.apply(0.0, _T0, import_rate=0.5, export_rate=0.0, grid_power_w=-3000.0,
-                  forecast_spill_kwh=20.0, forecast_hours=8.0,
-                  battery_headroom_w=10000.0, battery_headroom_kwh=20.0,
-                  battery_safe_window_h=8.0)
-    assert c.status()["greedy_reason"] == "export_surplus"
-    assert c._greedy_forecast_target_w == 2000.0, c._greedy_forecast_target_w
 
 
 async def _run_greedy_export_insufficient_no_effect():
@@ -372,177 +352,18 @@ def test_status_reports_greedy_state():
 
 
 # --------------------------------------------------- forecast-surplus (controller level)
-async def _run_surplus_turns_on_when_rate_covers_draw():
-    """Proportional forecast-surplus (2026-09-11). Nothing is free right now (import
-    priced, export priced, importing), but the plan wastes 10 kWh over the 4 h budget
-    window = a 2.5 kW average rate, which clears an on/off 2 kW device's all-or-nothing
-    bar. Battery can supply the rate now (2 kW free) and absorb the whole 10 kWh budget
-    (12 kWh to min SOC), so it runs fully on."""
-    hass = FakeHass()
-    hass.states.set("switch.x", "off")
-    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
-    c.set_greedy(True)
-    c.set_greedy_forecast_surplus(True)
-    await c.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
-                  forecast_spill_kwh=10.0, forecast_hours=4.0,
-                  battery_headroom_w=2000.0, battery_headroom_kwh=12.0)
-    assert len(_turn_ons(hass)) == 1
-    assert c._note.endswith("_greedy")
-    assert c.status()["forecast_target_w"] == 2000.0
-
-
-async def _run_surplus_needs_battery_headroom():
-    """The spill clearing the rate bar is necessary but not sufficient — without a battery
-    behind it, firing is just unbuffered grid import. Three ways the battery gate fails:
-    no headroom known at all; the discharge *rate* can't reach the device's draw; the
-    energy to min SOC can't cover the whole (possibly back-loaded) budget."""
-    hass = FakeHass()
-    hass.states.set("switch.x", "off")
-    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
-    c.set_greedy(True)
-    c.set_greedy_forecast_surplus(True)
-    # (a) no battery headroom known at all (no battery / unreadable sensors).
-    await c.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
-                  forecast_spill_kwh=10.0, forecast_hours=4.0)
-    assert len(_turn_ons(hass)) == 0
-    assert c.status()["greedy_blocked"] == "no_battery_headroom"
-    # (b) plenty of energy to min SOC, but the live discharge rate can't reach 2 kW.
-    await c.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
-                  forecast_spill_kwh=10.0, forecast_hours=4.0,
-                  battery_headroom_w=500.0, battery_headroom_kwh=12.0)
-    assert len(_turn_ons(hass)) == 0
-    assert c.status()["greedy_blocked"] == "no_battery_headroom"
-    # (c) rate is fine, but only 5 kWh to min SOC vs a 10 kWh budget that could all land
-    # at the far end of the window -> the transient dip would breach min SOC.
-    await c.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
-                  forecast_spill_kwh=10.0, forecast_hours=4.0,
-                  battery_headroom_w=3000.0, battery_headroom_kwh=5.0)
-    assert len(_turn_ons(hass)) == 0
-    assert c.status()["greedy_blocked"] == "no_battery_headroom"
-
-
-async def _run_surplus_ac_output_headroom_clamps_and_blocks():
-    """CONF_MAX_AC_OUTPUT_KW's live headroom (LoadControlManager._ac_output_headroom_w)
-    is a third, OPTIONAL gate alongside the two battery ones — None (no ceiling
-    configured, the default) is a pure no-op, unlike a missing battery headroom which
-    always blocks. A fresh FakeHass per case: _turn_ons() counts cumulative calls, and
-    each case's outcome must be judged in isolation."""
-    # ac_output_headroom_w=None (unconfigured) behaves exactly like before this feature
-    # existed — battery headroom alone decides.
-    hass = FakeHass()
-    hass.states.set("switch.x", "off")
-    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
-    c.set_greedy(True)
-    c.set_greedy_forecast_surplus(True)
-    await c.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
-                  forecast_spill_kwh=10.0, forecast_hours=4.0,
-                  battery_headroom_w=2000.0, battery_headroom_kwh=12.0,
-                  ac_output_headroom_w=None)
-    assert len(_turn_ons(hass)) == 1
-    assert c.status()["forecast_target_w"] == 2000.0
-
-    # Battery headroom would allow the full 2 kW, but the plant's own AC output ceiling
-    # (found 2026-09-12: PV alone was already at the inverter's rating) leaves nothing ->
-    # blocked, distinctly from a battery-headroom block.
-    hass2 = FakeHass()
-    hass2.states.set("switch.x", "off")
-    c2 = DeferrableLoadController(hass2, name="X2", switch_entity_id="switch.x", max_w=2000.0)
-    c2.set_greedy(True)
-    c2.set_greedy_forecast_surplus(True)
-    await c2.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
-                   forecast_spill_kwh=10.0, forecast_hours=4.0,
-                   battery_headroom_w=2000.0, battery_headroom_kwh=12.0,
-                   ac_output_headroom_w=0.0)
-    assert len(_turn_ons(hass2)) == 0
-    assert c2.status()["greedy_blocked"] == "no_ac_output_headroom"
-
-    # AC headroom exactly clearing this on/off device's all-or-nothing bar -> still fires
-    # (an on/off load has no partial state to clamp INTO — see
-    # test_modulating_load_control.py's _run_forecast_surplus_pins_to_battery_safe_rate
-    # for the proportional case a modulating load gets instead).
-    hass3 = FakeHass()
-    hass3.states.set("switch.x", "off")
-    c3 = DeferrableLoadController(hass3, name="X3", switch_entity_id="switch.x", max_w=2000.0)
-    c3.set_greedy(True)
-    c3.set_greedy_forecast_surplus(True)
-    await c3.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
-                   forecast_spill_kwh=10.0, forecast_hours=4.0,
-                   battery_headroom_w=2000.0, battery_headroom_kwh=12.0,
-                   ac_output_headroom_w=2000.0)
-    assert len(_turn_ons(hass3)) == 1
-    assert c3.status()["greedy_blocked"] is None
-    assert c3.status()["forecast_ac_output_headroom_w"] == 2000.0
-
-
-async def _run_surplus_insufficient_no_effect():
-    hass = FakeHass()
-    hass.states.set("switch.x", "off")
-    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
-    c.set_greedy(True)
-    c.set_greedy_forecast_surplus(True)
-    # 7 kWh over the 4 h window = 1.75 kW average, below the on/off device's 2 kW bar ->
-    # the spill itself isn't enough; no fire and (unlike a battery limit) no block reason.
-    await c.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
-                  forecast_spill_kwh=7.0, forecast_hours=4.0,
-                  battery_headroom_w=5000.0, battery_headroom_kwh=20.0)
-    assert len(_turn_ons(hass)) == 0
-    assert c.status()["greedy_blocked"] is None
-
-
-async def _run_surplus_needs_its_own_toggle():
-    hass = FakeHass()
-    hass.states.set("switch.x", "off")
-    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
-    c.set_greedy(True)  # master greedy on, forecast-surplus left OFF (default)
-    await c.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
-                  forecast_spill_kwh=100.0, forecast_hours=4.0)
-    assert len(_turn_ons(hass)) == 0
-
-
-async def _run_surplus_needs_master_greedy():
-    hass = FakeHass()
-    hass.states.set("switch.x", "off")
-    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
-    c.set_greedy_forecast_surplus(True)  # but master greedy stays OFF
-    await c.apply(0.0, _T0, import_rate=0.35, export_rate=0.05, grid_power_w=500.0,
-                  forecast_spill_kwh=100.0, forecast_hours=4.0)
-    assert len(_turn_ons(hass)) == 0
-
-
-async def _run_surplus_missing_forecast_fails_closed():
-    hass = FakeHass()
-    hass.states.set("switch.x", "off")
-    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
-    c.set_greedy(True)
-    c.set_greedy_forecast_surplus(True)
-    await c.apply(0.0, _T0, import_rate=0.35, forecast_spill_kwh=None, forecast_hours=4.0)
-    assert len(_turn_ons(hass)) == 0
-    # A covered span of 0 h can't justify anything either (bar would be 0 kWh).
-    await c.apply(0.0, _T0, import_rate=0.35, forecast_spill_kwh=5.0, forecast_hours=0.0)
-    assert len(_turn_ons(hass)) == 0
-
-
-async def _run_surplus_respects_schedule():
-    hass = FakeHass()
-    hass.states.set("switch.x", "off")
-    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
-    c.set_greedy(True)
-    c.set_greedy_forecast_surplus(True)
-    c.set_greedy_respects_schedule(True)
-    await c.apply(0.0, _T0, import_rate=0.35, schedule_allows=False,
-                  forecast_spill_kwh=100.0, forecast_hours=4.0)
-    assert len(_turn_ons(hass)) == 0
-
-
 async def _run_status_reports_greedy_reason():
     """status() names WHICH condition fired — the whole point of the observability
-    layer, since a greedy "on" is otherwise indistinguishable from a plan-driven one."""
+    layer, since a greedy "on" is otherwise indistinguishable from a plan-driven one.
+    (A third condition, forecast-surplus, used to report itself here too; it was cut
+    over to the LP's own bonus mechanism 2026-11-01 — see
+    LoadControlManager._bonus_attribution, tested in test_modulating_load_control.py /
+    test_greedy_energy.py's manager-level coverage instead of here.)"""
     hass = FakeHass()
     hass.states.set("switch.x", "off")
     c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0,
                                  min_on_seconds=0, min_off_seconds=0)
     c.set_greedy(True)
-    c.set_greedy_forecast_surplus(True)
     assert c.status()["greedy_reason"] is None
 
     await c.apply(0.0, _T0, import_rate=0.0)
@@ -551,25 +372,11 @@ async def _run_status_reports_greedy_reason():
     await c.apply(0.0, _T0, import_rate=0.5, export_rate=0.0, grid_power_w=-3000.0)
     assert c.status()["greedy_reason"] == "export_surplus"
 
-    await c.apply(0.0, _T0, import_rate=0.5, export_rate=0.05, grid_power_w=500.0,
-                  forecast_spill_kwh=10.0, forecast_hours=4.0,
-                  battery_headroom_w=2000.0, battery_headroom_kwh=12.0)
-    st = c.status()
-    assert st["greedy_reason"] == "forecast_surplus"
-    assert st["forecast_free_kwh"] == 10.0
-    assert st["forecast_needed_kwh"] == 8.0
-    assert st["forecast_target_w"] == 2000.0
-    assert st["forecast_battery_headroom_w"] == 2000.0
-    assert st["forecast_battery_headroom_kwh"] == 12.0
-
-    # Nothing free and nothing forecast -> reason clears, but the figures still publish
-    # so the UI can show progress toward the bar.
-    await c.apply(0.0, _T0, import_rate=0.5, export_rate=0.05, grid_power_w=500.0,
-                  forecast_spill_kwh=3.0, forecast_hours=4.0)
+    # Nothing free -> reason clears.
+    await c.apply(0.0, _T0, import_rate=0.5, export_rate=0.05, grid_power_w=500.0)
     st = c.status()
     assert st["greedy_reason"] is None
     assert st["greedy_blocked"] is None
-    assert st["forecast_free_kwh"] == 3.0
 
 
 async def _run_greedy_reason_cleared_when_plan_already_wants_on():
@@ -653,27 +460,6 @@ async def _run_status_reports_no_grid_power_block():
     assert len(_turn_ons(hass)) == 1
 
 
-async def _run_no_grid_power_block_yields_to_forecast_surplus():
-    """A missing grid reading must not leave a stale "blocked" alongside a greedy that
-    did fire on the forward-looking condition — status() would then report the device as
-    both running-on-greedy and greedy-blocked."""
-    hass = FakeHass()
-    hass.states.set("switch.x", "off")
-    c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0,
-                                 min_on_seconds=0, min_off_seconds=0)
-    c.set_greedy(True)
-    c.set_greedy_forecast_surplus(True)
-    # No grid reading (would record no_grid_power), but the forecast condition fires:
-    # 10 kWh wasted over 4 h = a 2.5 kW rate that clears the 2 kW device, and the battery
-    # can both supply the rate and absorb the whole budget.
-    await c.apply(0.0, _T0, export_rate=0.0, grid_power_w=None,
-                  forecast_spill_kwh=10.0, forecast_hours=4.0,
-                  battery_headroom_w=2000.0, battery_headroom_kwh=12.0)
-    assert c.status()["greedy_reason"] == "forecast_surplus"
-    assert c.status()["greedy_blocked"] is None
-    assert len(_turn_ons(hass)) == 1
-
-
 def test_surplus_bar_scales_with_covered_span():
     hass = FakeHass()
     c = DeferrableLoadController(hass, name="X", switch_entity_id="switch.x", max_w=2000.0)
@@ -743,75 +529,6 @@ def test_manager_min_export_price():
     # registered yet".)
     m2, _hass2 = _mgr(extra_data={"min_export_price": 5.0})
     assert abs(m2._min_export_price() - 0.05) < 1e-9
-
-
-def test_manager_battery_headroom_no_battery_configured():
-    # No battery_soc_sensor / battery_charge_power_sensor at all -> the forecast-surplus
-    # gate must fail closed, not silently read as "unlimited headroom".
-    m, _hass = _mgr()
-    assert m._battery_headroom_w() is None
-
-
-def test_manager_battery_headroom_reads_soc_and_charge_sensors():
-    m, hass = _mgr(extra_data={
-        "battery_soc_sensor": "sensor.battery_soc",
-        "battery_charge_power_sensor": "sensor.battery_power",
-        "battery_min_soc": 10.0,
-        "battery_max_discharge_rate": 5.0,  # kW
-    })
-    # Unreadable SOC -> unknown, not a guess.
-    assert m._battery_headroom_w() is None
-    # SOC healthy, battery idle (0 W) -> full 5 kW rated discharge is free.
-    hass.states.set("sensor.battery_soc", "60")
-    hass.states.set("sensor.battery_power", "0")
-    assert m._battery_headroom_w() == 5000.0
-    # SOC healthy, battery already discharging 2000 W (house load) -> only the remainder
-    # is free (signed sensor: positive = charging, negative = discharging).
-    hass.states.set("sensor.battery_power", "-2000")
-    assert m._battery_headroom_w() == 3000.0
-    # SOC healthy, battery charging -> nothing is being drawn from it, full rate is free.
-    hass.states.set("sensor.battery_power", "1500")
-    assert m._battery_headroom_w() == 5000.0
-    # SOC at/below the configured minimum -> a real, measured zero, not "unknown".
-    hass.states.set("sensor.battery_soc", "10")
-    assert m._battery_headroom_w() == 0.0
-    hass.states.set("sensor.battery_soc", "5")
-    assert m._battery_headroom_w() == 0.0
-    # SOC above the true minimum but still inside the 10-point safety margin (found
-    # 2026-09-25: this is exactly the zone that let the Wattpilot flap — 16-17% SOC against
-    # a 10% minimum used to read as a small-but-real headroom instead of "not enough margin
-    # to run from") -> still a hard zero, same as at/below the true minimum.
-    hass.states.set("sensor.battery_power", "0")
-    hass.states.set("sensor.battery_soc", "15")
-    assert m._battery_headroom_w() == 0.0
-    hass.states.set("sensor.battery_soc", "19.9")
-    assert m._battery_headroom_w() == 0.0
-    # Just clear of the margin (min_soc + 10) -> headroom resumes.
-    hass.states.set("sensor.battery_soc", "20.1")
-    assert m._battery_headroom_w() == 5000.0
-    # SOC healthy again but the charge-power sensor is unavailable -> unknown, fails closed.
-    hass.states.set("sensor.battery_soc", "60")
-    hass.states.set("sensor.battery_power", "unavailable")
-    assert m._battery_headroom_w() is None
-
-
-def test_manager_battery_headroom_kwh_respects_soc_margin():
-    # The energy-headroom gate mirrors _battery_headroom_w's margin exactly (see
-    # _forecast_surplus_target_w's docstring: a matched pair) so a marginal SOC can't slip
-    # through this path once the other is gated.
-    m, hass = _mgr(extra_data={
-        "battery_soc_sensor": "sensor.battery_soc",
-        "battery_capacity": 20.0,  # kWh
-        "battery_min_soc": 10.0,
-    })
-    hass.states.set("sensor.battery_soc", "10")
-    assert m._battery_headroom_kwh() == 0.0
-    hass.states.set("sensor.battery_soc", "18")
-    assert m._battery_headroom_kwh() == 0.0  # inside the margin -> still gated
-    hass.states.set("sensor.battery_soc", "20.1")
-    assert abs(m._battery_headroom_kwh() - (20.1 - 10.0) / 100.0 * 20.0) < 1e-6
-    hass.states.set("sensor.battery_soc", "60")
-    assert abs(m._battery_headroom_kwh() - (60.0 - 10.0) / 100.0 * 20.0) < 1e-6
 
 
 def test_manager_ac_output_headroom_unconfigured():
@@ -930,120 +647,6 @@ def _slots(specs, start=None, minutes=30):
     return out
 
 
-def test_manager_forecast_surplus_budget_counts_spilled_export():
-    """A plan that fills the whole look-ahead window exporting 5 kW at a $0 export price
-    -> 5 kW * LOOKAHEAD_H kWh wasted."""
-    m, _hass = _mgr()
-    m.set_plan(_slots([(0.3, 0.0, 5000.0)] * _LOOKAHEAD_SLOTS), updated_at=_T0)
-    kwh, hours = m._forecast_surplus_budget(0, _T0)
-    assert abs(hours - LOOKAHEAD_H) < 1e-6
-    assert abs(kwh - 5.0 * LOOKAHEAD_H) < 1e-6
-
-
-def test_manager_forecast_surplus_budget_ignores_paid_export():
-    """Same spill, but the export actually earns money -> nothing is being wasted."""
-    m, _hass = _mgr()
-    m.set_plan(_slots([(0.3, 0.08, 5000.0)] * _LOOKAHEAD_SLOTS), updated_at=_T0)
-    kwh, hours = m._forecast_surplus_budget(0, _T0)
-    assert abs(hours - LOOKAHEAD_H) < 1e-6
-    assert kwh == 0.0
-
-
-def test_manager_forecast_surplus_budget_counts_below_floor_export():
-    """With a Minimum Export Price set, forecast export priced at or below it is "wasted"
-    too (2026-09-11) — condition #3's numerator matches condition #2's live bar. A full
-    window exporting 5 kW at 3c with a 5c floor -> 5 kW * LOOKAHEAD_H kWh; the same spill
-    at 8c (above the floor) still earns money and counts for nothing."""
-    m, _hass = _mgr(extra_data={"min_export_price": 5.0})  # c/kWh -> $0.05/kWh
-    m.set_plan(_slots([(0.3, 0.03, 5000.0)] * _LOOKAHEAD_SLOTS), updated_at=_T0)
-    kwh, hours = m._forecast_surplus_budget(0, _T0)
-    assert abs(hours - LOOKAHEAD_H) < 1e-6
-    assert abs(kwh - 5.0 * LOOKAHEAD_H) < 1e-6
-
-    m2, _h2 = _mgr(extra_data={"min_export_price": 5.0})
-    m2.set_plan(_slots([(0.3, 0.08, 5000.0)] * _LOOKAHEAD_SLOTS), updated_at=_T0)
-    kwh2, _ = m2._forecast_surplus_budget(0, _T0)
-    assert kwh2 == 0.0
-
-
-def test_manager_forecast_surplus_budget_counts_unused_free_import():
-    """A free-import window the plan doesn't already use for this device counts as free
-    energy on the table; the half-hour it DOES schedule the device (2 kW = full draw)
-    contributes nothing."""
-    m, _hass = _mgr()  # device max_kw = 2.0
-    plan = _slots([(0.0, 0.4, 0.0)] * (_LOOKAHEAD_SLOTS - 1) + [(0.0, 0.4, 0.0, 2000.0)])
-    m.set_plan(plan, updated_at=_T0)
-    kwh, hours = m._forecast_surplus_budget(0, _T0)
-    assert abs(hours - LOOKAHEAD_H) < 1e-6
-    assert abs(kwh - 2.0 * 0.5 * (_LOOKAHEAD_SLOTS - 1)) < 1e-6  # n-1 slots * 0.5 h * 2 kW
-
-
-def test_manager_forecast_surplus_budget_clips_to_lookahead_and_now():
-    """Only the part of the plan inside [now, now+LOOKAHEAD_H) counts — earlier slots and
-    slots past the window are excluded, and the current slot counts only its remainder."""
-    m, _hass = _mgr()
-    # (LOOKAHEAD_SLOTS + 4) slots starting 1 h before "now": (LOOKAHEAD_H + 1) h remain,
-    # the window clips it back to LOOKAHEAD_H.
-    m.set_plan(_slots([(0.3, 0.0, 4000.0)] * (_LOOKAHEAD_SLOTS + 4),
-                      start=_T0 - timedelta(hours=1)), updated_at=_T0)
-    kwh, hours = m._forecast_surplus_budget(0, _T0)
-    assert abs(hours - LOOKAHEAD_H) < 1e-6
-    assert abs(kwh - 4.0 * LOOKAHEAD_H) < 1e-6
-
-
-def test_manager_forecast_surplus_budget_short_plan_fails_closed():
-    """Less than _MIN_BUDGET_WINDOW_H of plan left at all -> no judgement (None), rather
-    than average a sliver into a rate that looks more trustworthy than it is."""
-    m, _hass = _mgr()
-    m.set_plan(_slots([(0.3, 0.0, 9000.0)] * 1), updated_at=_T0)  # one 30-min slot
-    # Query 15 min into it -> only 15 min (< _MIN_BUDGET_WINDOW_H) of plan remains.
-    assert m._forecast_surplus_budget(0, _T0 + timedelta(minutes=15)) == (None, 0.0)
-
-
-def test_manager_forecast_surplus_budget_reservation_clips_the_window():
-    """The budget window ends at the plan's first *material* planned discharge — past
-    there the plan is spending the battery on something it values (2026-09-11's
-    reservation clip), and the forecast-surplus condition must not borrow across it.
-    4 slots (2 h) exporting 5 kW at $0, then a material discharge -> only those 2 h count,
-    even though the nominal look-ahead is much longer."""
-    m, _hass = _mgr()
-    plan = (_slots([(0.3, 0.0, 5000.0)] * 4)
-            + _slots([(0.3, 0.28, 0.0, 0.0, BatteryAction.DISCHARGE, 5000.0)] * 4,
-                     start=_T0 + timedelta(hours=2)))
-    m.set_plan(plan, updated_at=_T0)
-    kwh, hours = m._forecast_surplus_budget(0, _T0)
-    assert abs(hours - 2.0) < 1e-6
-    assert abs(kwh - 10.0) < 1e-6  # 5 kW * 2 h, none of the post-reservation export counted
-
-
-def test_manager_forecast_surplus_budget_small_discharge_is_not_a_reservation():
-    """A tiny discharge (below _RESERVED_DISCHARGE_MIN_W — e.g. topping up house load) is
-    not the plan "spending the battery on something it values" and must not clip the
-    window; only a material one does."""
-    m, _hass = _mgr()
-    plan = (_slots([(0.3, 0.0, 5000.0)] * 4)
-            + _slots([(0.3, 0.0, 5000.0, 0.0, BatteryAction.DISCHARGE, 50.0)] * 4,
-                     start=_T0 + timedelta(hours=2)))
-    m.set_plan(plan, updated_at=_T0)
-    kwh, hours = m._forecast_surplus_budget(0, _T0)
-    assert abs(hours - 4.0) < 1e-6
-    assert abs(kwh - 20.0) < 1e-6  # all 8 slots counted
-
-
-def test_manager_forecast_surplus_budget_reservation_at_now_fails_closed():
-    """The plan is already materially discharging the battery THIS slot -> the safe
-    window is empty; the condition must fail closed, not silently judge nothing wasted."""
-    m, _hass = _mgr()
-    plan = _slots([(0.3, 0.28, 0.0, 0.0, BatteryAction.DISCHARGE, 5000.0)] * 4)
-    m.set_plan(plan, updated_at=_T0)
-    assert m._forecast_surplus_budget(0, _T0) == (None, 0.0)
-
-
-def test_manager_forecast_surplus_budget_no_plan():
-    m, _hass = _mgr()
-    assert m._forecast_surplus_budget(0, _T0) == (None, 0.0)
-
-
 def test_manager_greedy_forecast_surplus_roundtrip():
     m, _hass = _mgr()
 
@@ -1055,195 +658,6 @@ def test_manager_greedy_forecast_surplus_roundtrip():
         assert m.is_greedy_forecast_surplus(99) is False
 
     _run_async(go)
-
-
-def _forecast_battery_data(**over):
-    """Battery config that gives the forecast-surplus condition a real, but not
-    unlimited, buffer: 30 kWh pack at 60% SOC / 10% min -> 15 kWh headroom, 5 kW rated
-    discharge -> plenty of rate for a 2 kW test device."""
-    data = {
-        "battery_soc_sensor": "sensor.battery_soc",
-        "battery_charge_power_sensor": "sensor.battery_power",
-        "battery_max_discharge_rate": 5.0,  # kW
-        "battery_capacity": 30.0,  # kWh
-    }
-    data.update(over)
-    return data
-
-
-async def _run_manager_end_to_end_surplus_tick():
-    """Full integration: nothing is free right now (priced import, priced export, house
-    importing) and the plan wants the device off, but a forecast spill whose average rate
-    covers the device's full draw still starts it — the battery has both the discharge
-    rate and the energy-to-min-SOC to actually supply it without creating new grid
-    import. 4 slots (2 h) at 6 kW $0 export -> 12 kWh over 2 h = a 6 kW rate."""
-    m, hass = _mgr(grid_power_sensor="sensor.grid_power", extra_data=_forecast_battery_data())
-    hass.states.set("sensor.grid_power", "500")  # importing
-    hass.states.set("sensor.battery_soc", "60")
-    hass.states.set("sensor.battery_power", "0")
-    _NOW[0] = _T0
-    m.set_plan(_slots([(0.3, 0.0, 6000.0)] * 4, start=_T0 - timedelta(minutes=1)),
-               updated_at=_T0)
-    await m.set_entitled(True)
-    await m.enable(0)  # first tick establishes "off" (plan wants off, no greedy yet)
-    assert len(_turn_ons(hass)) == 0
-    await m.set_greedy(0, True)
-    await m.set_greedy_forecast_surplus(0, True)
-    later = _T0 + timedelta(minutes=16)  # past the 15-min min-off debounce
-    await m._tick_device(0, later)
-    assert len(_turn_ons(hass)) == 1
-
-
-async def _run_manager_end_to_end_forecast_below_floor_tick():
-    """Same shape as the surplus tick, but the forecast export is priced at 3c, not $0 —
-    below the user's 5c Minimum Export Price (2026-09-11). Condition #3 now treats that
-    as wasted and starts the device early off the battery, where before it saw nothing to
-    chase."""
-    m, hass = _mgr(grid_power_sensor="sensor.grid_power",
-                   extra_data=_forecast_battery_data(min_export_price=5.0))  # c/kWh
-    hass.states.set("sensor.grid_power", "500")   # importing right now — nothing live-free
-    hass.states.set("sensor.battery_soc", "60")
-    hass.states.set("sensor.battery_power", "0")
-    _NOW[0] = _T0
-    m.set_plan(_slots([(0.3, 0.03, 6000.0)] * 4, start=_T0 - timedelta(minutes=1)),
-               updated_at=_T0)
-    await m.set_entitled(True)
-    await m.enable(0)
-    assert len(_turn_ons(hass)) == 0
-    await m.set_greedy(0, True)
-    await m.set_greedy_forecast_surplus(0, True)
-    await m._tick_device(0, _T0 + timedelta(minutes=16))
-    assert len(_turn_ons(hass)) == 1
-
-    # Floor left at its 0 default -> 3c export is priced, condition #3 sees nothing.
-    m2, hass2 = _mgr(grid_power_sensor="sensor.grid_power", extra_data=_forecast_battery_data())
-    hass2.states.set("sensor.grid_power", "500")
-    hass2.states.set("sensor.battery_soc", "60")
-    hass2.states.set("sensor.battery_power", "0")
-    _NOW[0] = _T0
-    m2.set_plan(_slots([(0.3, 0.03, 6000.0)] * 4, start=_T0 - timedelta(minutes=1)),
-                updated_at=_T0)
-    await m2.set_entitled(True)
-    await m2.enable(0)
-    await m2.set_greedy(0, True)
-    await m2.set_greedy_forecast_surplus(0, True)
-    await m2._tick_device(0, _T0 + timedelta(minutes=16))
-    assert len(_turn_ons(hass2)) == 0
-
-
-async def _run_manager_end_to_end_reservation_does_not_inflate_safe_rate():
-    """Real incident, 2026-09-20/21 (GRIDLENS_CHECKLIST.md): a genuine spill inside a
-    RESERVATION-clipped window must not borrow the battery harder just because the
-    reservation happened to shrink the window. Same shape as
-    ``_run_manager_end_to_end_surplus_tick`` (6 kW export waste covering the whole
-    remaining slice), but here the window is clipped short by a real planned battery
-    discharge ~1.5h out — not by the plan simply running out of data.
-
-    22.8% SOC / 10% min SOC / 24 kWh capacity -> 3.072 kWh headroom. Honestly measured
-    against the full 9h look-ahead, that caps the safe rate at ~341 W — nowhere near the
-    2 kW this on/off device needs. But naively dividing by the ~1.23h reservation-clipped
-    window inflates the safe rate past 2 kW, which is exactly the mechanism that fired the
-    real aircon with the battery already low and no more sun for hours. Must stay off."""
-    m, hass = _mgr(grid_power_sensor="sensor.grid_power",
-                   extra_data=_forecast_battery_data(battery_capacity=24.0,
-                                                      battery_min_soc=10.0))
-    hass.states.set("sensor.grid_power", "500")    # importing right now — nothing live-free
-    hass.states.set("sensor.battery_soc", "22.8")  # the actual reading at incident time
-    hass.states.set("sensor.battery_power", "0")
-    _NOW[0] = _T0
-    # 3 slots (1.5h) of genuine $0 export waste (6 kW spilling), then a real 5 kW discharge
-    # reservation. import_rate stays priced throughout so this can only be condition #3
-    # (forecast surplus) — nothing is live-free, same as the real incident at 9pm.
-    plan = (_slots([(0.3, 0.0, 6000.0)] * 3, start=_T0 - timedelta(minutes=1))
-            + _slots([(0.3, 0.28, 0.0, 0.0, BatteryAction.DISCHARGE, 5000.0)] * 4,
-                     start=_T0 + timedelta(hours=1.5) - timedelta(minutes=1)))
-    m.set_plan(plan, updated_at=_T0)
-    await m.set_entitled(True)
-    await m.enable(0)  # first tick establishes "off" (plan wants off, no greedy yet)
-    assert len(_turn_ons(hass)) == 0
-    await m.set_greedy(0, True)
-    await m.set_greedy_forecast_surplus(0, True)
-    later = _T0 + timedelta(minutes=16)  # past the 15-min min-off debounce
-    await m._tick_device(0, later)
-    assert len(_turn_ons(hass)) == 0
-    assert m.controllers[0].status()["greedy_blocked"] == "no_battery_headroom"
-
-
-async def _run_manager_end_to_end_plan_aware_headroom_unblocks_recovered_battery():
-    """Real incident, 2026-09-24 (GRIDLENS_CHECKLIST.md): the live-snapshot safe-rate gate
-    blocked a genuine ~15 kWh afternoon export spill because SOC was only 49% mid
-    morning-charge, even though the plan's own trajectory showed it reaching 100% within
-    the hour and holding there for hours before the day's only real discharge reservation.
-    Same shape as the incident test above (a genuine spill inside a reservation-clipped
-    window), but this time the plan carries a forecasted SOC that genuinely recovers well
-    before the reservation — ``_plan_battery_headroom_kwh``'s widening must let this
-    through where the live snapshot alone would still block it.
-
-    49% SOC / 10% min SOC / 24 kWh capacity -> 9.36 kWh live headroom; against the fixed 9h
-    look-ahead that's ~1040 W, below the 2 kW this on/off device needs (the OLD behaviour
-    blocks). The plan forecasts SOC reaching 100% (21.6 kWh headroom) by the second waste
-    slot and holding there through a reservation 4h out -> plan-aware safe rate 2400 W,
-    clearing the 2 kW floor."""
-    m, hass = _mgr(grid_power_sensor="sensor.grid_power",
-                   extra_data=_forecast_battery_data(battery_capacity=24.0,
-                                                      battery_min_soc=10.0))
-    hass.states.set("sensor.grid_power", "500")    # importing right now — nothing live-free
-    hass.states.set("sensor.battery_soc", "49.0")  # mid morning-charge, matching the incident
-    hass.states.set("sensor.battery_power", "0")
-    _NOW[0] = _T0
-    # 8 slots (4h) of genuine $0 export waste (6 kW spilling), then a real 5 kW discharge
-    # reservation. import_rate stays priced throughout so this can only be condition #3,
-    # same as the paired incident test above.
-    plan = _slots([(0.3, 0.0, 6000.0)] * 8, start=_T0 - timedelta(minutes=1))
-    plan += _slots([(0.3, 0.28, 0.0, 0.0, BatteryAction.DISCHARGE, 5000.0)] * 4,
-                    start=_T0 + timedelta(hours=4) - timedelta(minutes=1))
-    # The plan's own forecast: SOC climbs from ~49% to 100% by the second waste slot and
-    # holds there right up to the reservation — the fact the live snapshot alone can't see.
-    plan[0].forecast_soc_percent = 62.0
-    for iv in plan[1:8]:
-        iv.forecast_soc_percent = 100.0
-    m.set_plan(plan, updated_at=_T0)
-    await m.set_entitled(True)
-    await m.enable(0)  # first tick establishes "off" (plan wants off, no greedy yet)
-    assert len(_turn_ons(hass)) == 0
-    await m.set_greedy(0, True)
-    await m.set_greedy_forecast_surplus(0, True)
-    later = _T0 + timedelta(minutes=16)  # past the 15-min min-off debounce
-    await m._tick_device(0, later)
-    assert len(_turn_ons(hass)) == 1
-    assert m.controllers[0].status()["greedy_reason"] == "forecast_surplus"
-
-
-async def _run_manager_end_to_end_plan_aware_headroom_no_help_when_flat():
-    """Companion to the fix above: a plan that forecasts SOC FLAT (no real recovery) must
-    stay exactly as conservative as the live snapshot alone — proving the widening in
-    ``_plan_battery_headroom_kwh`` is a genuine ``max()`` with the live reading, not a
-    rubber stamp. Same numbers as the 2026-09-21 incident test, but this time every slot in
-    the window explicitly carries a forecasted SOC (all at the live 22.8% reading) instead
-    of leaving the field unset — proving the new code path, not just its absence, still
-    blocks correctly."""
-    m, hass = _mgr(grid_power_sensor="sensor.grid_power",
-                   extra_data=_forecast_battery_data(battery_capacity=24.0,
-                                                      battery_min_soc=10.0))
-    hass.states.set("sensor.grid_power", "500")
-    hass.states.set("sensor.battery_soc", "22.8")
-    hass.states.set("sensor.battery_power", "0")
-    _NOW[0] = _T0
-    plan = (_slots([(0.3, 0.0, 6000.0)] * 3, start=_T0 - timedelta(minutes=1))
-            + _slots([(0.3, 0.28, 0.0, 0.0, BatteryAction.DISCHARGE, 5000.0)] * 4,
-                     start=_T0 + timedelta(hours=1.5) - timedelta(minutes=1)))
-    for iv in plan:
-        iv.forecast_soc_percent = 22.8  # the plan never shows recovery
-    m.set_plan(plan, updated_at=_T0)
-    await m.set_entitled(True)
-    await m.enable(0)
-    assert len(_turn_ons(hass)) == 0
-    await m.set_greedy(0, True)
-    await m.set_greedy_forecast_surplus(0, True)
-    later = _T0 + timedelta(minutes=16)
-    await m._tick_device(0, later)
-    assert len(_turn_ons(hass)) == 0
-    assert m.controllers[0].status()["greedy_blocked"] == "no_battery_headroom"
 
 
 def test_manager_notify_on_every_tick():
@@ -1323,7 +737,6 @@ if __name__ == "__main__":
     tests = [
         ("greedy_import_free_turns_on", lambda: _run_async(_run_greedy_import_free_turns_on)),
         ("greedy_export_surplus_turns_on", lambda: _run_async(_run_greedy_export_surplus_turns_on)),
-        ("greedy_export_surplus_keeps_forecast_target", lambda: _run_async(_run_greedy_export_surplus_keeps_forecast_target)),
         ("greedy_export_insufficient_no_effect", lambda: _run_async(_run_greedy_export_insufficient_no_effect)),
         ("greedy_export_below_floor_turns_on", lambda: _run_async(_run_greedy_export_below_floor_turns_on)),
         ("greedy_export_below_floor_disabled_by_default", lambda: _run_async(_run_greedy_export_below_floor_disabled_by_default)),
@@ -1336,51 +749,24 @@ if __name__ == "__main__":
         ("override_suppresses_greedy", lambda: _run_async(_run_override_suppresses_greedy)),
         ("greedy_honours_debounce", lambda: _run_async(_run_greedy_honours_debounce)),
         ("status_reports_greedy_state", test_status_reports_greedy_state),
-        ("surplus_turns_on_when_rate_covers_draw", lambda: _run_async(_run_surplus_turns_on_when_rate_covers_draw)),
-        ("surplus_needs_battery_headroom", lambda: _run_async(_run_surplus_needs_battery_headroom)),
-        ("surplus_ac_output_headroom_clamps_and_blocks", lambda: _run_async(_run_surplus_ac_output_headroom_clamps_and_blocks)),
-        ("surplus_insufficient_no_effect", lambda: _run_async(_run_surplus_insufficient_no_effect)),
-        ("surplus_needs_its_own_toggle", lambda: _run_async(_run_surplus_needs_its_own_toggle)),
-        ("surplus_needs_master_greedy", lambda: _run_async(_run_surplus_needs_master_greedy)),
-        ("surplus_missing_forecast_fails_closed", lambda: _run_async(_run_surplus_missing_forecast_fails_closed)),
-        ("surplus_respects_schedule", lambda: _run_async(_run_surplus_respects_schedule)),
         ("surplus_bar_scales_with_covered_span", test_surplus_bar_scales_with_covered_span),
         ("status_reports_greedy_reason", lambda: _run_async(_run_status_reports_greedy_reason)),
         ("greedy_reason_cleared_when_plan_already_wants_on", lambda: _run_async(_run_greedy_reason_cleared_when_plan_already_wants_on)),
         ("status_reports_greedy_blocked", lambda: _run_async(_run_status_reports_greedy_blocked)),
         ("status_reports_no_grid_power_block", lambda: _run_async(_run_status_reports_no_grid_power_block)),
-        ("no_grid_power_block_yields_to_forecast_surplus", lambda: _run_async(_run_no_grid_power_block_yields_to_forecast_surplus)),
         ("manager_set_greedy_roundtrip", test_manager_set_greedy_roundtrip),
         ("manager_reads_grid_power_sensor", test_manager_reads_grid_power_sensor),
         ("manager_no_grid_power_sensor_configured", test_manager_no_grid_power_sensor_configured),
         ("manager_min_export_price", test_manager_min_export_price),
-        ("manager_battery_headroom_no_battery_configured", test_manager_battery_headroom_no_battery_configured),
-        ("manager_battery_headroom_reads_soc_and_charge_sensors", test_manager_battery_headroom_reads_soc_and_charge_sensors),
-        ("manager_battery_headroom_kwh_respects_soc_margin", test_manager_battery_headroom_kwh_respects_soc_margin),
         ("manager_ac_output_headroom_unconfigured", test_manager_ac_output_headroom_unconfigured),
         ("manager_ac_output_headroom_reads_load_and_grid_sensors", test_manager_ac_output_headroom_reads_load_and_grid_sensors),
         ("manager_ac_output_headroom_no_sensors_configured", test_manager_ac_output_headroom_no_sensors_configured),
         ("manager_schedule_default_unrestricted", test_manager_schedule_default_unrestricted),
         ("manager_schedule_store_restricts_hours", test_manager_schedule_store_restricts_hours),
-        ("manager_forecast_surplus_budget_counts_spilled_export", test_manager_forecast_surplus_budget_counts_spilled_export),
-        ("manager_forecast_surplus_budget_ignores_paid_export", test_manager_forecast_surplus_budget_ignores_paid_export),
-        ("manager_forecast_surplus_budget_counts_below_floor_export", test_manager_forecast_surplus_budget_counts_below_floor_export),
-        ("manager_notify_on_every_tick", test_manager_notify_on_every_tick),
-        ("manager_forecast_surplus_budget_counts_unused_free_import", test_manager_forecast_surplus_budget_counts_unused_free_import),
-        ("manager_forecast_surplus_budget_clips_to_lookahead_and_now", test_manager_forecast_surplus_budget_clips_to_lookahead_and_now),
-        ("manager_forecast_surplus_budget_short_plan_fails_closed", test_manager_forecast_surplus_budget_short_plan_fails_closed),
-        ("manager_forecast_surplus_budget_reservation_clips_the_window", test_manager_forecast_surplus_budget_reservation_clips_the_window),
-        ("manager_forecast_surplus_budget_small_discharge_is_not_a_reservation", test_manager_forecast_surplus_budget_small_discharge_is_not_a_reservation),
-        ("manager_forecast_surplus_budget_reservation_at_now_fails_closed", test_manager_forecast_surplus_budget_reservation_at_now_fails_closed),
-        ("manager_forecast_surplus_budget_no_plan", test_manager_forecast_surplus_budget_no_plan),
         ("manager_greedy_forecast_surplus_roundtrip", test_manager_greedy_forecast_surplus_roundtrip),
+        ("manager_notify_on_every_tick", test_manager_notify_on_every_tick),
         ("manager_end_to_end_greedy_tick", lambda: _run_async(_run_manager_end_to_end_greedy_tick)),
         ("manager_end_to_end_below_floor_export_tick", lambda: _run_async(_run_manager_end_to_end_below_floor_export_tick)),
-        ("manager_end_to_end_surplus_tick", lambda: _run_async(_run_manager_end_to_end_surplus_tick)),
-        ("manager_end_to_end_forecast_below_floor_tick", lambda: _run_async(_run_manager_end_to_end_forecast_below_floor_tick)),
-        ("manager_end_to_end_reservation_does_not_inflate_safe_rate", lambda: _run_async(_run_manager_end_to_end_reservation_does_not_inflate_safe_rate)),
-        ("manager_end_to_end_plan_aware_headroom_unblocks_recovered_battery", lambda: _run_async(_run_manager_end_to_end_plan_aware_headroom_unblocks_recovered_battery)),
-        ("manager_end_to_end_plan_aware_headroom_no_help_when_flat", lambda: _run_async(_run_manager_end_to_end_plan_aware_headroom_no_help_when_flat)),
     ]
     passed = 0
     for name, fn in tests:

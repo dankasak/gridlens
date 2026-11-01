@@ -19,7 +19,8 @@ from .models import AdvisoryResult, ForecastBundle
 
 _LOGGER = logging.getLogger(__name__)
 
-# $/kWh the shadow solve credits for each kWh of bonus (beyond-target) deferrable draw.
+# $/kWh the live solve credits for each kWh of bonus (beyond-target) deferrable draw —
+# see coordinator.py's _device_bonus_eligible for who gets a non-zero bonus_value at all.
 # Must sit clearly above the LP's tie-breakers — soc_reward (0.0003 per slot held, so
 # lending battery charge to a device for a few hours and refilling it from spill costs
 # ~0.002-0.004) and the charge-timing nudge — or the LP would rather bank energy it is
@@ -124,7 +125,6 @@ class AdvisoryPlanner:
         )
 
         devs = deferrable_loads or []
-        shadow_bonus = self._shadow_bonus(bundle, devs, solve_kwargs)
         defer_names = [d.get("name") or f"Load {i + 1}" for i, d in enumerate(devs)]
         defer_max_kw = [float(d.get("max_kw") or 0.0) for d in devs]
         defer_sensor_ids = [d.get("sensor_id") or "" for d in devs]
@@ -139,9 +139,21 @@ class AdvisoryPlanner:
             action, power_w, grid_charge_w, export_w = self._classify(step, dt_h)
             # Per-device deferrable energy (kWh/slot) → average power (W) for the control
             # channel. Same device order as the config lists; missing entries → 0.
+            # INCLUDES bonus (bon_i[t]) — the LP's opportunistic forecast-surplus draw is
+            # folded straight into what this device is actually commanded to run at, not
+            # published as a side figure for comparison (cut over 2026-11-01). bonus_w
+            # below carries the bonus-only portion separately, purely for observability.
             per_dev = step.get("deferrable_per_device", []) or []
+            bonus_per_dev = step.get("bonus_per_device", []) or []
             deferrable_w = [
-                (float(per_dev[j]) / dt_h * 1000.0) if j < len(per_dev) else 0.0
+                (
+                    (float(per_dev[j]) if j < len(per_dev) else 0.0)
+                    + (float(bonus_per_dev[j]) if j < len(bonus_per_dev) else 0.0)
+                ) / dt_h * 1000.0
+                for j in range(len(defer_names))
+            ]
+            bonus_w = [
+                (float(bonus_per_dev[j]) if j < len(bonus_per_dev) else 0.0) / dt_h * 1000.0
                 for j in range(len(defer_names))
             ]
             plan.append(
@@ -167,10 +179,7 @@ class AdvisoryPlanner:
                         float(step["soc_percent"]) if step.get("soc_percent") is not None
                         else None
                     ),
-                    shadow_bonus_w=(
-                        [kwh / dt_h * 1000.0 for kwh in shadow_bonus[t]]
-                        if shadow_bonus and t < len(shadow_bonus) else []
-                    ),
+                    bonus_w=bonus_w,
                 )
             )
             row = {
@@ -212,13 +221,12 @@ class AdvisoryPlanner:
             for j, pct in soc_map.items():
                 if pct is not None and 0 <= j < len(defer_names):
                     row[f"defer_{j}_soc"] = round(pct, 1)
-            # Shadow-mode bonus kWh per device (see _shadow_bonus) — only written where
+            # Live bonus kWh per device (see bonus_per_dev above) — only written where
             # non-zero, so the (already large) trajectory attribute doesn't grow a key per
             # device per slot for a feature that is idle most of the day.
-            if shadow_bonus and t < len(shadow_bonus):
-                for j, kwh in enumerate(shadow_bonus[t]):
-                    if kwh > 0.001:
-                        row[f"bonus_{j}"] = round(kwh, 3)
+            for j, kwh in enumerate(bonus_per_dev):
+                if kwh > 0.001 and j < len(defer_names):
+                    row[f"bonus_{j}"] = round(float(kwh), 3)
             trajectory.append(row)
 
         demand_summary = None
@@ -254,49 +262,6 @@ class AdvisoryPlanner:
             ev_soc_status=result.get("ev_soc_status", []),
             demand=demand_summary,
         )
-
-    def _shadow_bonus(
-        self, bundle: ForecastBundle, devs: list[dict], solve_kwargs: dict
-    ) -> Optional[list[list[float]]]:
-        """Per-slot, per-device bonus kWh from a second, SHADOW solve — or None.
-
-        The shadow solve is the live plan's exact inputs plus ``bonus_value`` on every
-        device the coordinator marked ``bonus_eligible`` (Greedy + Forecast Surplus on).
-        It is solved separately rather than folded into the live plan so evaluating it
-        cannot move the battery schedule the executor is acting on: only its bonus column
-        is published, next to Greedy Consumption's own forecast-surplus target, to compare
-        the two before the LP version takes over (FEATURES.md §7). Any failure is logged
-        and swallowed — the live plan is already solved and must never depend on this.
-        """
-        if not any(d.get("bonus_eligible") for d in devs):
-            return None
-        shadow_devs = [
-            {**d, "bonus_value": _BONUS_VALUE_PER_KWH} if d.get("bonus_eligible") else d
-            for d in devs
-        ]
-        try:
-            shadow = self.optimizer.optimize_hourly_schedule(
-                bundle.solar_kwh, bundle.load_kwh, bundle.import_rate, bundle.export_rate,
-                deferrable_loads=shadow_devs, **solve_kwargs,
-            )
-        except Exception:  # noqa: BLE001 — shadow must never break the live plan
-            _LOGGER.exception("Shadow bonus solve failed")
-            return None
-        if not str(shadow.get("solver", "")).startswith("lp/"):
-            # The greedy fallback models no deferrable loads at all, so it has no bonus
-            # to report — publishing its zeros would read as "the LP saw no surplus".
-            return None
-        rows = shadow.get("schedule", [])
-        out = [
-            [float(v) for v in (row.get("bonus_per_device") or [0.0] * len(devs))]
-            for row in rows
-        ]
-        _LOGGER.debug(
-            "Shadow bonus solve: %s",
-            {d.get("name") or i: round(sum(r[i] for r in out if i < len(r)), 2)
-             for i, d in enumerate(devs) if d.get("bonus_eligible")},
-        )
-        return out
 
     @staticmethod
     def _terminal_soc_value(bundle: ForecastBundle) -> float:

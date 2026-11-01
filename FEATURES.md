@@ -1597,12 +1597,14 @@ spare solar contributes nothing to this device's claim, even though the same net
 reading would suggest real headroom exists. The household's stated priority: the battery gets
 first claim on genuine surplus; a modulating load only ever sees what's left over once the
 battery's own charging is satisfied, never a bonus for what the battery is currently
-absorbing. **Exception:** while Greedy condition #3 (forecast surplus) is firing, the device
-*does* take the battery's live charge. The plan says that battery will fill and spill
-anyway (§7, front-load). (The LP's own `plan_w` is unaffected by any of this — the live surplus term only
-ever *adds* to what the plan already allocated, so a plan that deliberately schedules this
-device from battery/grid for an unrelated economic reason, e.g. a cheap TOU window, still
-works exactly as planned.)
+absorbing. (A front-loading exception to this used to apply while the old condition #3
+forecast-surplus heuristic was firing — deleted with the 2026-11-01 cutover to the LP's own
+bonus mechanism, §7, since the LP now decides this question directly against the real
+battery trajectory rather than this live term needing to approximate it. The LP's own
+`plan_w` is unaffected by any of this either way — the live surplus term only ever *adds* to
+what the plan already allocated, so a plan that deliberately schedules this device from
+battery/grid for an unrelated economic reason, e.g. a cheap TOU window, still works exactly
+as planned.)
 
 **⚠ `_EXPORT_BIAS_W` (150 W default) — small deliberate export bias (household instruction,
 2026-09-11).** The household's own reasoning: their currently-configured Minimum Export Price
@@ -1684,9 +1686,10 @@ priority figure (see `_BATTERY_PRIORITY_BIAS_W` below) sits right at the boundar
 hold the current state at least this long since the last real transition before it's allowed
 to flip again (`ModulatingLoadController._write`'s `debounce` parameter). `soc_cutoff`,
 `unplugged`, and a just-connected reassert never pass `debounce=True` and so remain instant —
-this dwell only throttles the *ordinary* control decision, never a safety interlock. See
-also the new SOC-margin gate on Greedy Forecast Surplus itself, described where that feature
-is documented above.
+this dwell only throttles the *ordinary* control decision, never a safety interlock. (The
+marginal-SOC gate that used to sit on the old Greedy Forecast Surplus heuristic itself was
+deleted with the condition — §7 — since the LP's own bonus mechanism reasons about SOC
+headroom directly rather than needing a separate margin constant.)
 
 **⚠ A stop also needs `MODULATION_OFF_CONFIRM_TICKS` (3) consecutive "off" ticks — found live
 2026-10-04.** The dwell above throttles how *often* the load can flip, but the stop itself still
@@ -1943,62 +1946,60 @@ the card re-asks hourly via `hass.callApi`. An empty feed hides its bar.
 ## 7. Greedy Consumption
 
 **What it does.** A real-time safety net *on top of* the plan: turn a load on whenever
-energy is genuinely free, regardless of what the plan scheduled for this slot. Three
-conditions, any one is enough. All fold into the same `want_on` the plan produces, so a
-greedy "on" gets the identical debounce and transition-economy treatment — no separate code
-path, no separate chatter risk. All are suppressed entirely under a manual override.
+energy is genuinely free, regardless of what the plan scheduled for this slot. Two live
+conditions, either is enough, plus a forward-looking opportunistic allowance delegated to
+the LP itself (below). All fold into the same `want_on` the plan produces, so a greedy "on"
+gets the identical debounce and transition-economy treatment — no separate code path, no
+separate chatter risk. All are suppressed entirely under a manual override.
 
 | # | Condition | Fires when | Can it cost money? |
 |---|---|---|---|
 | 1 | **Free import** | This slot's import rate is $0 (a plan's free window). | No |
 | 2 | **Export surplus** | Export price is **at or below the user's Minimum Export Price** (§7a — $0 when that setting is 0/disabled) **and** the house is currently exporting at least as much as this device draws — so running it can't create new import. | No new import; forgoes only below-floor export revenue the user has said they don't want. |
-| 3 | **Forecast surplus** | Over a 9 h look-ahead (clipped at the plan's own next battery drawdown), the plan expects to waste energy at an average rate that clears this device's minimum-worthwhile draw — **and** the battery has both the discharge rate and the energy-to-min-SOC to actually supply it (see below). Runs the device **proportionally** to that rate, not all-or-nothing. | No new import; forgoes only below-floor export the plan would otherwise have made — see below |
 
-**⚠ Condition #3 is being moved into the LP — SHADOW MODE since 2026-10-16.** #3 asks an
-intertemporal battery question ("the plan will spill later, so lend from the battery now")
-that the LP answers natively, and its controller-side approximations (reservation clip,
-headroom gates, plan-peak SOC widening, SOC margin, front-load) accounted for most of this
-section's fixes. The LP now has an optional per-device **bonus** variable (`battery_optimizer`
-`bonus_value`, $/kWh): energy beyond the device's daily target, credited at
-`_BONUS_VALUE_PER_KWH` (1c) so the LP takes it only from spill at/below the Minimum Export
-Price or ~free import, scoped to day 0 (or out to an ad-hoc charge target), sharing the
-device's rating with its planned draw, and capped by an SOC-tracked device's ceiling.
-`AdvisoryPlanner._shadow_bonus` runs it as a **second solve** for devices with Greedy +
-Forecast Surplus on and no override (`coordinator._device_bonus_eligible`), so the live
-plan and battery schedule are untouched. Output: `DispatchInterval.shadow_bonus_w`, a sparse
-`bonus_<j>` kWh key on trajectory rows, and `lp_bonus_w` / `lp_bonus_kwh_ahead` on each
-device's control switch next to `forecast_target_w` / `forecast_free_kwh` — **nothing acts
-on it yet**. Plan comparison never sets `bonus_value`. Cutover plan, and what has to change
-first (bonus-aware consolidation, P10 sizing): `docs/OPEN_ITEMS.md`. Tests:
-`tests/test_lp_bonus.py` (needs real scipy — run on the LXC). Conditions #1/#2 and the 30 s
-modulation loop stay controller-side permanently: they correct forecast error live.
+**Forecast surplus is now the LP's own bonus mechanism, not a third live-evaluated
+condition (cut over 2026-11-01 — was SHADOW MODE from 2026-10-16, see
+`docs/GRIDLENS_CHECKLIST.md`).** The question it used to answer ("the plan will spill later,
+so lend from the battery now") is an intertemporal battery question the LP solves natively
+and more accurately than any controller-side approximation ever could — the old mechanism's
+history (reservation clip, proportional battery-headroom gating, plan-peak SOC widening, an
+SOC margin, front-loading) is preserved there, not here, since none of that code exists any
+more. Today:
 
-**Comparing the shadow bonus against condition #3 — use `lp_bonus_total_w`, not
-`lp_bonus_w`** (added 2026-10-17, after the first 26 h of shadow data). The two are
-different quantities: `forecast_target_w` is the rate #3 wants *now*, while `lp_bonus_w` is
-energy **on top of** the plan, so it reads 0 whenever the plan already covers the slot.
-Comparing them raw measures nothing — over that first window they were never both non-zero
-on the same tick (207 greedy-only, 7 shadow-only, 0 both), because of the units mismatch,
-not disagreement. So the manager also publishes:
-
-| Attribute | Meaning |
-|---|---|
-| `plan_w` | the plan's own rate for this device in the current slot |
-| `lp_bonus_total_w` | `plan_w + lp_bonus_w`, snapped to what the device can physically do — the LP's actual answer to #3's question, and the series to compare against `forecast_target_w` |
-| `plan_slot_start` | the current plan slot's start, so a history-only comparison can be reconstructed from the control switch alone (`sensor.*_planned_dispatch` is in `configuration.yaml`'s recorder `exclude` — its `trajectory` busts the 16 KB attribute limit — so nothing else in the recorder records what the plan was) |
-| `plugged_in` | now on **every** control switch (`None` = no plug signal configured, read as "assume connected"), not just modulating ones, so a comparison can discard samples where the device physically couldn't draw |
-
-`forecast_target_w` is also **zeroed when the device is known unplugged**. It used to keep
-advertising a target an absent car could not act on: 26% of that first shadow window was an
-unplugged EV still showing a mean 1627 W, every sample of it scored as the LP "disagreeing".
-The forecast-surplus *condition* still matches while unplugged (so `greedy_reason` reads
-`forecast_surplus`) — that lives in #3's controller code, which the cutover deletes anyway.
-
-**Analysing this from the recorder:** HA's history API drops attribute-only changes unless
-you pass `significant_changes_only=0`, and then silently truncates long windows (a 40 h
-request returned rows only to the 16 h mark, with no error) — query in chunks of ~4 h and
-stitch, or you will conclude there is no data. `tools/ha_peek.py why` prints all of the
-above.
+- Each device armed for it (`greedy_forecast_surplus` on, alongside the master Greedy
+  switch, no manual override — `coordinator.py::_device_bonus_eligible`) gets a non-zero
+  `bonus_value` ($/kWh, `advisory/planner.py::_BONUS_VALUE_PER_KWH`, 1c) in the **live**
+  solve. `battery_optimizer.py`'s `bon_i[t]` variable then lets that device draw energy on
+  top of its daily target wherever the marginal cost is at/below that value — spill priced
+  at or below the Minimum Export Price, or near-free import — deciding WHEN against the
+  real solved battery trajectory, SOC ceiling, and every other constraint the plan already
+  reasons about, not a reservation-clip/headroom-gate approximation of it. Scoped to day 0
+  (or out to an ad-hoc charge target), and it shares the device's per-slot rating with its
+  planned draw (`battery_optimizer.py`'s "Bonus shares the device's rating with its planned
+  draw" constraint; `consolidate_deferrable_schedule`'s slot-fragmentation cleanup treats a
+  slot's existing bonus as capacity already spoken for, so it can't push the total past the
+  rating either). Plan comparison never sets `bonus_value`.
+- The bonus is folded straight into `DispatchInterval.deferrable_w` — the device's real
+  commanded power already includes it, so `LoadControlManager` doesn't need to separately
+  add anything in for either the on/off path (`desired_on(planned_w)`) or the modulating
+  30 s loop (`_modulation_target_w`'s `plan_w`). `DispatchInterval.bonus_w` carries the
+  bonus-only portion separately, purely for observability.
+- `LoadControlManager._bonus_attribution()` derives display-only
+  `greedy_reason="forecast_surplus"` / `forecast_target_w` / `forecast_free_kwh` /
+  `forecast_needed_kwh` from the live bonus and republishes them under the SAME attribute
+  names the old condition used, so the Load Control / Advisory / Power Flow cards' existing
+  "soaking forecast surplus" badge and progress bar needed no changes for this cutover —
+  only where the numbers come from changed. It attributes a device's current draw to the
+  bonus only when the device's *base* plan (without the bonus) wouldn't have cleared its own
+  on-threshold — mirroring `apply()`'s existing "don't attribute to greedy what the plan
+  alone already wanted" rule — and returns nothing for a known-unplugged device, same
+  discipline the shadow-mode comparison needed (an unplugged car's published target used to
+  corrupt that comparison; see the checklist's 2026-10-17 entry).
+- The `greedy_forecast_surplus` toggle's user-facing meaning is unchanged: "let this device
+  soak forecast surplus". `greedy_blocked` can no longer read `"no_battery_headroom"` or
+  `"no_ac_output_headroom"` — those were this condition's own gates; a bonus-ineligible
+  reason now simply shows up as no bonus (the LP found no profitable extra energy for this
+  device), not a separately-recorded block.
 
 **Condition 2's bar is lower for a modulating load** (§6a). An on/off load has to clear
 `max_w` — all-or-nothing, so turning it on when only part of its draw is covered would create
@@ -2015,9 +2016,8 @@ must already be exporting at least the device's draw — so this never creates n
 it only redirects export the user has declared not worth selling. Applies to both the on/off
 path (`load_controller.py::_greedy_wants_on`) and the modulating fast-tick surplus term
 (`load_control_manager.py::_modulation_target_w`); `greedy_reason` stays `"export_surplus"`
-for both the $0 and below-floor cases. **Condition 3's budget uses the same
-`≤ min_export_price` bar** — so the forward-looking trigger and the live one agree on what
-counts as wasted.
+for both the $0 and below-floor cases. The LP's own bonus mechanism uses the same bar for
+what counts as spill worth taking, so the two agree on what's wasted.
 
 **Condition 2's two evaluations could disagree for a modulating load (fixed 2026-09-24).**
 `LoadControlManager._modulation_target_w` (the 30s loop that actually writes a modulating
@@ -2027,212 +2027,38 @@ visible export, so without netting the loop would wrongly conclude "no more surp
 instant it started drawing. But `_greedy_wants_on` (the 5-minute tick that's the ONLY place
 writing `greedy_reason`/`greedy_blocked` — everything the dashboard reads) compared the raw
 grid reading with no such netting, so a device that was genuinely running on surplus could
-show `greedy_blocked: "no_battery_headroom"` / `greedy_reason: null` right next to
-`modulation_source: "surplus"` on the same card. Fix: `_greedy_wants_on` now nets `device_w`
-and live battery discharge the same way `_modulation_target_w` does, both sourced from the
-manager and threaded through `apply()`. See `docs/GRIDLENS_CHECKLIST.md`, 2026-09-24.
+show a stale `greedy_blocked`/`greedy_reason: null` right next to `modulation_source:
+"surplus"` on the same card. Fix: `_greedy_wants_on` now nets `device_w` and live battery
+discharge the same way `_modulation_target_w` does, both sourced from the manager and
+threaded through `apply()`. See `docs/GRIDLENS_CHECKLIST.md`, 2026-09-24.
 
-**Condition 3 is proportional, not all-or-nothing (2026-09-11 rewrite).** It used to fire
-binary against a "could this device run flat out for the *whole* look-ahead and the plan
-still spill more" bar — deliberately conservative, but it meant widening the look-ahead
-(see the tuning-knob note below) raised the bar right along with it, and a modulating load
-always jumped straight to `cap_w` with no proportionality. It now:
-
-1. Computes the plan's forecast waste — `LoadControlManager._forecast_surplus_budget` — as
-   `(spill_kwh, covered_h)` over a window that starts now and ends at **the earlier of** the
-   nominal look-ahead or **the plan's own next material battery discharge**
-   (`BatteryAction.DISCHARGE` at ≥`_RESERVED_DISCHARGE_MIN_W`, default 300 W). Past that
-   point the plan is spending the battery on something it values (an evening export peak, a
-   high import rate to cover) and Greedy must not borrow charge across it — since a
-   `DispatchInterval` carries no per-slot SOC, "stop at the first planned drawdown" is the
-   available proxy for "don't discharge below the plan's own SOC trajectory".
-2. Runs the device at the average waste rate over that window, `spill_kwh / covered_h`,
-   clamped to what the device can do: an on/off load only takes it if the rate clears its
-   *full* draw (still all-or-nothing — it has no other setting) via
-   `DeferrableLoadController._forecast_surplus_snap_w`; a modulating load takes the rate
-   itself, capped at `cap_w`, via `ModulatingLoadController`'s override of the same hook. So
-   a spill that would only justify a fraction of a charger's rate now ramps it in
-   proportionally instead of demanding the full envelope or nothing.
-3. Publishes the resulting draw as `forecast_target_w` (status()/the card), alongside the
-   existing `forecast_free_kwh` (the budget) and `forecast_needed_kwh` (what the device would
-   use flat-out over the same window — still the progress-bar denominator: the bar hits 100%
-   exactly when an on/off device's rate clears its draw).
-4. **Front-loads on a modulating device (2026-10-04, household instruction).** Once #3 has
-   fired, the 30 s loop (`_modulation_target_w`) lifts the target from the average rate to
-   *all* the live solar that is going into the battery or the grid right now —
-   `LoadControlManager._frontload_available_w`: `device_w − grid_w + battery_net_w −
-   _EXPORT_BIAS_W`, i.e. PV minus every other load. That lifts the battery's usual first
-   claim on live surplus (the asymmetry noted in §6a), and only while #3 is firing, because
-   the plan has already said the battery will fill and spill: charge displaced now gets
-   refilled later from energy that would otherwise have been exported. It is capped at
-   `spill_kwh / _FRONTLOAD_MIN_BUDGET_H` (1 h), so it tapers as replans shrink the spill,
-   and never drops below the proportional rate. It is skipped (the proportional rate still
-   applies) if the grid or battery reading is unavailable, or the house is importing more
-   than `_STUCK_IMPORT_THRESHOLD_W`, because live import means the battery is being charged
-   from the grid on purpose. battery_priority still pulls back on any overshoot into
-   discharge. Prompted by a morning where the plan showed ~22 kWh of 3c afternoon spill:
-   the average rate (~2.4 kW over 8 h) left the Wattpilot at its floor while the battery
-   took ~8 kW, then sat at 100% exporting from noon. On/off loads are unchanged.
-
-**Why #3 exists.** #1 and #2 are strictly instantaneous — they only fire once free energy is
-already flowing. On a solar+battery house that fires late: mid-morning the battery soaks up
-every spare watt, so live export is ~0 and neither fires, yet the plan already knows the
-afternoon will spill far more than the device could eat. By the time export shows up, hours
-of run-time are gone.
-
-**Why #3 is safe.** Two battery gates, both backed by `LoadControlManager`'s battery config
-(`battery_soc_sensor`, `battery_charge_power_sensor`, `battery_min_soc`,
-`battery_max_discharge_rate`, and — new for the transient-dip check — `battery_capacity`, the
-same fields the LP optimiser already uses; not a control-specific duplicate):
-
-- **`battery_headroom_w`** (`_battery_headroom_w`) — free discharge rate right now (rated
-  max minus whatever's already discharging) — caps the draw so it never asks for more than
-  the battery can give this instant.
-- **`battery_headroom_kwh`** (`_battery_headroom_kwh`) — energy to the configured minimum
-  SOC (`(soc − min_soc)/100 × battery_capacity`) — caps the draw via
-  `battery_headroom_kwh / forecast_hours`, the steady rate that uses no more than that
-  energy over the *whole* window in the worst case a back-loaded spill (all the waste lands
-  right before the window's reservation point) never shows up to repay it.
-
-Both gates fold into one `min(rate_w, battery_headroom_w, battery_safe_rate_w)` clamp on the
-rate — a **proportional** pin for a modulating device (it runs at whatever rate the battery
-can safely fund, not the full ideal rate), reducing to pass/fail only for an on/off device
-(no partial state to pin to). **Fixed 2026-09-20:** `battery_headroom_kwh` used to have to
-cover the *entire* `forecast_spill_kwh` — the whole household's forecast waste, not what this
-one device would actually draw — which a modest battery can never clear on a big-spill day
-regardless of SOC or time of day (a 24 kWh battery, 10% min SOC, tops out at 21.6 kWh of
-headroom, so it permanently failed against any spill bigger than that) and left condition #3
-silently dead on exactly the days it exists for. See `docs/GRIDLENS_CHECKLIST.md`, 2026-09-20.
-
-**The gate only ever saw the LIVE SOC snapshot, never the plan's own forecast (fixed
-2026-09-24).** A battery mid-morning-charge (say 49% SOC) computed a small `battery_headroom_kwh`
-against the fixed look-ahead denominator, capping the safe rate below even a modulating
-device's floor and blocking condition #3 outright — even when the SAME plan's own trajectory
-showed SOC climbing to 100% and holding there for hours before the day's next real discharge,
-i.e. the live snapshot, taken mid-climb, understated the plan's own guarantee by more than
-double. A naive per-slot "headroom/elapsed-time" rate was considered and rejected before
-shipping — hand-traced against the 2026-09-21 regression incident's own numbers, it would have
-computed ~2525 W and incorrectly unblocked the exact flat/non-recovering trajectory that fix
-protects. Shipped fix: `LoadControlManager._plan_battery_headroom_kwh(now, window_end)` scans
-the plan for its PEAK forecasted SOC anywhere in the window (new `DispatchInterval.forecast_soc_percent`
-field, populated in `advisory/planner.py`) and widens `battery_headroom_kwh = max(live_snapshot,
-plan_peak)` before the gate runs — never narrows it. Only the NUMERATOR changes; the existing
-`battery_safe_window_h` denominator is untouched, so a flat trajectory's outcome is bit-for-bit
-unchanged and only a genuine forecasted climb raises the rate. See `docs/GRIDLENS_CHECKLIST.md`,
-2026-09-24.
-
-Only when both gates clear does running the device draw the battery down instead of the grid,
-with that hole refilled by the very spill being bet on. **No battery configured, no capacity
-configured, or an unreadable sensor means no buffer exists — the condition fails closed and
-never fires**, same discipline as conditions #1 and #2's missing-sensor handling. Recorded as
-`greedy_blocked = "no_battery_headroom"` whenever the spill rate alone would have driven a
-draw (see below) — distinguishing "the spill hasn't cleared the bar yet" from "it cleared,
-but the battery can't safely supply it right now".
-
-**⚠ A safety margin above `battery_min_soc` gates the condition entirely — added
-2026-09-25 after a live incident.** Both gates above used to switch on at `soc <=
-battery_min_soc` exactly — no margin. At 16-17% SOC against a 10% configured minimum
-(~6-7 points of real margin), that returned a small-but-positive headroom, and the
-household's Wattpilot (a modulating/button-actuated load — no stateful switch) flapped its
-start/stop buttons every ~30 s fast tick for 17 minutes straight before it was noticed and
-forced off by hand. `GREEDY_FORECAST_SURPLUS_MIN_SOC_MARGIN_PCT` (10 percentage points,
-household-set) widens the gate: both `_battery_headroom_w()` and `_battery_headroom_kwh()`
-now return `0.0` whenever `soc <= battery_min_soc + margin`, not just at/below the true
-minimum — condition #3 doesn't engage at all below that line, on *any* device, not just a
-modulating one. Once the margin is cleared, the energy figures are still measured against
-the true `battery_min_soc`, unchanged — the margin decides *whether* to run, not how much
-energy is actually available once running is allowed. See also the companion fix on the
-modulating-load write path itself, documented in this file's "Write economy" section above.
-
-**⚠ `battery_charge_power_sensor` isn't signed on every inverter (fixed 2026-09-11).** The
-original assumption — positive = charging, negative = discharging, one sensor — holds for
-Tesla Powerwall and most single-sensor integrations, but Sigenergy (and presumably others)
-splits charge and discharge across two always-*positive* sensors instead: "Battery Charging
-Power" reads a flat 0 during a real discharge, so read alone it's indistinguishable from "not
-touching the battery at all." `_battery_headroom_w()` (and `_modulation_target_w`'s live
-surplus term above) now read `_read_battery_net_power_w()` instead, which optionally nets a
-second `battery_discharge_power_sensor` (`CONF_BATTERY_DISCHARGE_POWER_SENSOR`) off the charge
-reading when configured — the same two-sensor convention `plan_calculator.py`'s historical
-battery-behaviour backtest already used for this exact config key, just not previously wired
-into the live control path. Before this fix, a discharging Sigenergy battery reported the
-*full* rated discharge rate as headroom (blind to the real, live draw), and the live-surplus
-term above had no way to see the discharge was happening at all. No `battery_discharge_power_sensor`
-configured reproduces the original signed-single-sensor behaviour exactly.
-
-**⚠ A third, optional gate: the inverter's own AC output ceiling (found 2026-09-12).**
-Both battery gates above reason about PV/battery *capability* — how much energy is there to
-give — never about whether the plant can physically deliver it. Many all-in-one battery/PV
+**The inverter's own AC output ceiling (found 2026-09-12) is still a live, independent
+clamp — unrelated to Greedy Consumption, never gated by it.** Many all-in-one battery/PV
 inverters cap total combined AC output well below what PV + battery could otherwise supply
-together: confirmed on the household's own Sigenergy plant, where 7 days of
-`sensor.sigen_0_plant_active_power` never exceeded ~10kW regardless of available PV or
-battery SOC. On a day PV alone is already near that ceiling, "the battery has 20kWh free" is
-true and irrelevant — none of it can reach the loads. This is what actually happened: Greedy
-Consumption sized the household's Wattpilot's charging current off PV+battery headroom that
-existed on paper but couldn't physically get through the inverter, and the car imported the
-difference from the grid.
-
-**`max_ac_output_kw` (Battery Configuration, options flow only — advanced/opt-in, 0 = unset,
-the default)** backs `LoadControlManager._ac_output_headroom_w`: `plant_output_w = load_w −
-grid_w` (whole-house consumption minus what the grid is contributing/absorbing) gives live
-combined AC output from the two general-purpose sensors every install already has a config
-slot for (`load_power_sensor`, `grid_power_sensor`) — no vendor-specific "total AC output"
-sensor needed. None (not configured) is a pure no-op — unlike the battery gates, its absence
-never blocks anything, since most installs' PV + battery genuinely can't reach their
-inverter's rating. Once configured, an unreadable sensor fails closed to 0.0 headroom
-(`greedy_blocked = "no_ac_output_headroom"` when that's what stopped condition #3 firing),
-same discipline as the battery gates.
-
-**Headroom credits back whatever's currently being exported (fixed same day, hours after
-the gate above first shipped).** Naively, headroom = `max_ac_output_kw × 1000 − plant_output_w`
-— but that alone conflates "the plant happens to be producing near its ceiling right now"
-with "there's no room for more load", which is backwards whenever most of that production is
-being wasted as export. Found live: household exporting ~3.4kW with PV near the plant's own
-cap, and the gate throttled a legitimately surplus-soaking Wattpilot **down** anyway.
-Redirecting power already flowing out as export to a load costs the plant nothing extra to
-produce — only genuinely NEW demand, beyond both spare production capacity and current
-export, can actually push total output past the ceiling. So the real headroom is
-`max(0, max_ac_output_kw × 1000 − plant_output_w) + export_w` (`export_w = max(0, −grid_w)`,
-0 while importing) — the export term is what makes hitting the ceiling harmless on a
-sunny, mostly-exporting day, and only bites when the shortfall genuinely can't be produced.
-
-Applied in two places: as a third clamp on condition #3's own target (`_forecast_surplus_target_w`,
-alongside the two battery gates), and — because `fc_target_w` only refreshes on the 5-minute
-`apply()` tick while the modulating fast loop runs every 30s — as a final live clamp in
-`_modulation_target_w` (`source = "ac_output_cap"`), applied *after* plan/surplus/battery-priority
-regardless of which term produced the pre-clamp target. The second one is the one that actually
-matters day to day: it re-evaluates live every 30s, so it catches an uncontrolled coincidental
-load (the household's own "Smart Load 01") or a stale forecast figure within one fast-tick,
-not just at the next 5-minute plan tick.
-
-**What counts as "energy the plan will waste"** (`LoadControlManager._forecast_surplus_budget`),
-summed only up to the reservation point described above:
-- **Spilled export** — a slot with `export_rate ≤ min_export_price` (i.e. `≤ 0` when the
-  Minimum Export Price is disabled) that the plan still exports into. Uses
-  `DispatchInterval.total_export_w` (whole-house export, PV spill included) — *not*
-  `export_w`, which is only the battery's share of a discharge slot and is 0 on a pure
-  solar-spill slot. Already net of every load the plan schedules, so nothing is subtracted.
-- **Unused free-import window** — a slot with `import_rate ≤ 0`; only the part the plan does
-  *not* already run this device counts (`max_w − planned_w`).
-
-**Fail-closed everywhere.** Unknown rate, unavailable sensor, a safe window shorter than
-`_MIN_BUDGET_WINDOW_H` (0.5 h — including when the plan is *already* discharging materially
-this slot), or (condition #3 only) missing/unreadable battery SOC/charge/capacity → the
-condition contributes nothing rather than guessing.
+together (confirmed on the household's own Sigenergy plant, ~10kW regardless of available PV
+or battery SOC). `max_ac_output_kw` (Battery Configuration, options flow, 0 = unset, the
+default) backs `LoadControlManager._ac_output_headroom_w`: `plant_output_w = load_w −
+grid_w` gives live combined AC output from sensors every install already configures
+(`load_power_sensor`, `grid_power_sensor`). Headroom credits back whatever's currently being
+exported (`max(0, max_ac_output_kw × 1000 − plant_output_w) + export_w`) — redirecting power
+already flowing out as export costs the plant nothing extra, so hitting the nominal ceiling
+is harmless on a sunny, mostly-exporting day; only genuinely new demand bites. Applied as a
+final live clamp in `_modulation_target_w` (`source = "ac_output_cap"`), re-evaluated every
+30s regardless of which term produced the pre-clamp target — this is what catches an
+uncontrolled coincidental load within one fast-tick. None (not configured) is a pure no-op.
+⚠ Until 2026-11-01 this clamp's live headroom figure was also republished as
+`forecast_ac_output_headroom_w` for the Power Flow/Load Control cards' "AC output capped"
+notice (`acCeilingHtml`); that field was removed with the forecast-surplus cutover above (it
+existed only for the deleted condition's own gate), so the notice's `modulation_source ===
+"ac_output_cap"` path — the one that actually matters day to day — now shows its generic
+"no spare capacity" text instead of a live W figure. Re-publishing a headroom figure from
+this clamp directly (rather than from the deleted condition) is a small open follow-up, not
+yet done — see `docs/OPEN_ITEMS.md`.
 
 **Config:** the export-surplus condition needs `grid_power_sensor` — a **signed live power**
 sensor, positive = importing, negative = exporting. Without it, condition #2 simply never
-fires; #1 still works, and #3 works only if its own battery gates can be satisfied (see
-above). Note this is a *power* sensor: the Energy-dashboard sensors (`energy_sensor`,
-`solar_sensor`, `grid_export_sensor`) are cumulative kWh and cannot serve.
-
-The forecast-surplus condition's battery gates need `battery_soc_sensor` (%),
-`battery_charge_power_sensor` (**signed live power**, positive = charging, negative =
-discharging), and `battery_capacity` (kWh) — the same battery config the LP optimiser
-already uses (`plan_calculator.py`), not a control-specific duplicate. `battery_min_soc`
-(default 10%) and `battery_max_discharge_rate` (kW, default 5.0) round it out. Without all
-of these configured and readable, condition #3 never fires at all — there's nothing wrong
-with running with it off, it just means the household hasn't given GridLens a way to confirm
-the bet is safe.
+fires; #1 still works. Note this is a *power* sensor: the Energy-dashboard sensors
+(`energy_sensor`, `solar_sensor`, `grid_export_sensor`) are cumulative kWh and cannot serve.
 
 ⚠ **`grid_power_sensor` could be silently DESTROYED by a reconfigure, and the loss was
 invisible.** Found 2026-08-28: ~5 kW exported for two hours at $0 with the 1.9 kW EV charger
@@ -2262,12 +2088,9 @@ import as "not exporting" forever. Silently wrong beats visibly absent. Note the
 dashboard cannot supply this field — it stores cumulative energy statistics only, never a live
 power entity — which is why it is the one energy field that starts blank.
 
-Three further changes make an empty field visible rather than silent:
+Two further changes make an empty field visible rather than silent:
 - `greedy_blocked = "no_grid_power"` is recorded whenever the export price is ≤ 0 and the
   grid reading is missing/unavailable, so the state is published, not inferred.
-- `greedy_blocked = "no_battery_headroom"` is recorded whenever condition #3's forecast bar
-  has cleared but the battery-headroom gate above blocks it — same "publish it, don't let it
-  read as silently inert" reasoning.
 - The Load Control card renders that case as *"Greedy: export is being wasted, but no grid
   power sensor is set"* instead of the misleading *"armed, waiting for free energy"*.
 - `LoadControlManager` logs a one-shot **warning** (not debug — a debug line is invisible on
@@ -2275,23 +2098,9 @@ Three further changes make an empty field visible rather than silent:
 
 **Observability** — see §11.
 
-**Tuning knobs (`load_control_manager.py`):**
-- `GREEDY_SURPLUS_LOOKAHEAD_HOURS = 9.0` (was 4.0 until 2026-09-11) — the nominal
-  look-ahead, widened to span most of a solar day so a mid-morning tick can see the
-  afternoon spill. Since the same-day proportional rewrite (below), widening this no
-  longer raises a bar — the condition runs the device at whatever rate the budget works
-  out to, not against a flat-out threshold — it just lets a further-out spill be seen
-  sooner; the reservation clip is what actually bounds it.
-- `_RESERVED_DISCHARGE_MIN_W = 300.0` — the planned-discharge power above which a slot
-  counts as "the plan is spending the battery on something it values" and clips the
-  budget window there. Lower it to make the clip trigger on smaller planned discharges
-  (more conservative, shorter windows on average); raise it to let the budget window
-  extend across small load-covering discharges.
-- `_MIN_BUDGET_WINDOW_H = 0.5` — the shortest safe window the condition will act on.
-
 **Greedy energy tracking (added 2026-08-30).** A per-device `sensor.*_<device>_greedy_consumption`
-entity — cumulative kWh the device drew while any of the three conditions above were
-actually driving it, as opposed to the plan or a manual command. Feeds §1's "exclude Greedy
+entity — cumulative kWh the device drew while condition #1 or #2 above was actually driving
+it, as opposed to the plan (which now includes any LP bonus) or a manual command. Feeds §1's "exclude Greedy
 Consumption" plan-comparison option: without this, the `daily_kwh` figure fed to the LP for
 every *alternative* plan is inflated by whatever a device opportunistically ran only because
 the *current* plan happened to offer a free window — biasing the comparison toward the plan
@@ -2445,11 +2254,11 @@ touching-interval merge still chains them into one long band.
 disabled, range 0–50, step 0.5). RestoreEntity — its state *is* the live setting, picked up
 without a reload: by the battery LP on its next run (§7's "Minimum export price" objective
 term — below this the LP values export at $0 and prefers a deferrable load or holding
-charge) and by Greedy Consumption on its next 5-minute tick — it widens both the live
-export-surplus bar (condition 2) and the forward-looking `_forecast_free_kwh` numerator
-(condition 3) from `≤ $0` to `≤ this`. Set it aggressively (e.g. 5c when the plan shows a
-day of 3c export) and a Greedy-enabled load with Forecast Surplus on will start early off
-the battery rather than wait for the spill; set it to 0 and every bar reverts to `≤ $0`.
+charge, including via its own bonus mechanism, §7) and by Greedy Consumption's live
+export-surplus bar (condition 2) on its next 5-minute tick — both widen from `≤ $0` to
+`≤ this`. Set it aggressively (e.g. 5c when the plan shows a day of 3c export) and a
+Greedy-enabled load with Forecast Surplus on will start early off the battery rather than
+wait for the spill; set it to 0 and every bar reverts to `≤ $0`.
 
 **When it's offered.** Created when the install has a battery **or** at least one deferrable
 load (`number.py::async_setup_entry`) — so a battery-less house with a Greedy-enabled pool
@@ -3524,8 +3333,8 @@ that?" has to be answerable from the dashboard alone.
 | Surface | Answers |
 |---|---|
 | `switch.*_battery_control` attributes | Applied action/power, last tick, plan age, degraded state, note. |
-| `switch.*_<device>_control` attributes | Commanded state, threshold, override, all three greedy toggles, **`greedy_reason`**, **`greedy_blocked`**, **`forecast_free_kwh` / `forecast_needed_kwh` / `forecast_target_w` / `forecast_battery_headroom_w` / `forecast_battery_headroom_kwh`**, note. `forecast_target_w` is the proportional power condition 3 is asking for right now (0 when it isn't firing, and 0 whenever `plugged_in` is `False` — see §7); the `_kwh` headroom figure backs the transient-dip check. Also `name` (the authoritative device label — an entity_id slug is **not**, see §11a), `plugged_in`, `plan_w`, `plan_slot_start`, and the shadow-bonus trio `lp_bonus_w` / `lp_bonus_kwh_ahead` / `lp_bonus_total_w`. Modulating devices add `control_type`, `setpoint_entity`, `min_w`/`cap_w`, `commanded_w`/`commanded_setpoint`, `last_write`, `modulation_source`. **Refreshed every tick** (`_tick_device` / `_fast_tick_device` call `_notify`, added 2026-09-11) — before, these froze at whatever the last `enable`/`disable`/override action produced, so the card could show `note: not_started` for hours while greedy was in fact evaluating every 5 min. |
-| **Load Control card** | Per row: control state, and a live greedy line — the firing reason (condition 3 shows the proportional draw, e.g. "soaking forecast surplus at ~840 W"), or why it's blocked (including **"export is being wasted, but no grid power sensor is set"**, §7 — the only blocked state that will *never* clear on its own, so it names the fix rather than reading as "not yet"), or the **forecast-surplus progress bar** (`6.2 / 8.0 kWh`, hover/focus tooltip explains it — the bar reaches 100% exactly when the rate would clear an on/off device's full draw). Shown both while armed and tracking toward the trigger, and after it's fired (condition 3 held it on) — the same bar, capped at 100%, rather than only appearing pre-trigger. For a modulating device (§6a): live amps + kW, the max-current ceiling input, and a one-line "why" — `modulation_source` (plan / surplus / override / off) and `plugged_in`. "Why is my car charging at 8 A right now?" must be answerable from the row. A device whose SOC ceiling is why today's scheduled charge falls short of its 14-day average (`ev_soc_status.soc_limited`) gets a **"SOC-limited · `<got>` of ~`<target>` kWh"** line next to that average, tooltip explaining the headroom maths and pointing at Max SOC % in Reconfigure (2026-09-07). |
+| `switch.*_<device>_control` attributes | Commanded state, threshold, override, all three greedy toggles, **`greedy_reason`**, **`greedy_blocked`**, **`forecast_free_kwh` / `forecast_needed_kwh` / `forecast_target_w`**, note. These three are now derived by `LoadControlManager._bonus_attribution` from the live LP bonus (cut over 2026-11-01, §7) rather than a condition this controller evaluates itself — same names, same meaning ("energy the plan expects to use opportunistically right now / over the rest of today"), new source. `forecast_target_w` is 0 whenever there's no live bonus for this device right now, and absent entirely (not just 0) whenever `plugged_in` is `False`, under override, or SOC-cut-off. Also `name` (the authoritative device label — an entity_id slug is **not**, see §11a), `plugged_in`, `plan_w` (already includes any bonus), `plan_slot_start`. Modulating devices add `control_type`, `setpoint_entity`, `min_w`/`cap_w`, `commanded_w`/`commanded_setpoint`, `last_write`, `modulation_source`. **Refreshed every tick** (`_tick_device` / `_fast_tick_device` call `_notify`, added 2026-09-11) — before, these froze at whatever the last `enable`/`disable`/override action produced, so the card could show `note: not_started` for hours while greedy was in fact evaluating every 5 min. |
+| **Load Control card** | Per row: control state, and a live greedy line — the firing reason (the bonus-attribution case shows the live draw, e.g. "soaking forecast surplus at ~840 W", §7), or why it's blocked (including **"export is being wasted, but no grid power sensor is set"**, §7 — the only blocked state that will *never* clear on its own, so it names the fix rather than reading as "not yet"), or the **forecast-surplus progress bar** (`6.2 / 8.0 kWh`, hover/focus tooltip explains it — the bar reaches 100% exactly when the rate would clear an on/off device's full draw). Shown both while armed and tracking toward the trigger, and after it's fired — the same bar, capped at 100%, rather than only appearing pre-trigger. For a modulating device (§6a): live amps + kW, the max-current ceiling input, and a one-line "why" — `modulation_source` (plan / surplus / override / off) and `plugged_in`. "Why is my car charging at 8 A right now?" must be answerable from the row. A device whose SOC ceiling is why today's scheduled charge falls short of its 14-day average (`ev_soc_status.soc_limited`) gets a **"SOC-limited · `<got>` of ~`<target>` kWh"** line next to that average, tooltip explaining the headroom maths and pointing at Max SOC % in Reconfigure (2026-09-07). |
 | **Load Control card → Estimator panel** | Per-device toggle (rows backed by a `LoadEstimator`, §5, only) expanding: current estimate/seed kW/sample count/calibration source, a convergence chart of the estimate over time, and the last 8 accept/reject decisions with why (`implausible`, `contaminated`, own-meter `too_short`/`counter_reset`). "Why does this estimate look wrong?" must be answerable without `ha core logs`. |
 | **Power Flow card** | A badge on a load node while *greedy*, not the plan, is holding it on — leaf for the two instantaneous reasons, sun-alert for forecast surplus, with the kWh figures in the tooltip. |
 | **Power Chart card** | Free-energy time bands: **orange = free energy being wasted** (plan exports into a ≤$0 export price), **teal = free import window**. Legend appears only when a band is in view; the crosshair tooltip names the band. |
