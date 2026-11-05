@@ -229,8 +229,16 @@ class DeferrableLoadController:
         min_export_price: float = 0.0,
         device_w: float = 0.0,
         discharge_w: float = 0.0,
+        battery_needs_priority: bool = False,
     ) -> bool:
         """True if Greedy Consumption says "on" right now, independent of the plan.
+
+        ``battery_needs_priority`` (``LoadControlManager._battery_needs_priority``, fixed
+        2026-11-05): True when the home battery is at/near its own floor and isn't
+        currently charging — no live evidence any solar surplus exists, because the one
+        thing with first claim on it isn't getting any. Gates condition #2 only (the
+        export-surplus term below); condition #1 (import genuinely free) is left alone —
+        if import costs nothing, there's no reason to prefer the battery over this device.
 
         ``min_export_price`` ($/kWh) is the user's Minimum Export Price preference: the
         export-surplus condition treats any export priced at or below it as not worth
@@ -279,7 +287,9 @@ class DeferrableLoadController:
         # bar below $0, and a 0.0 preference reproduces the old test byte-for-byte.
         export_waste_ceiling = max(0.0, min_export_price)
         if export_rate is not None and export_rate <= export_waste_ceiling:
-            if grid_power_w is None:
+            if battery_needs_priority:
+                self._greedy_blocked = "battery_priority"
+            elif grid_power_w is None:
                 # The export price is $0 — the one situation this condition exists for —
                 # but there is no live grid reading to measure the spill against, so it
                 # cannot fire. Record that, because it is otherwise INVISIBLE: the device
@@ -373,6 +383,7 @@ class DeferrableLoadController:
         soc_cutoff: bool = False,
         device_w: float = 0.0,
         discharge_w: float = 0.0,
+        battery_needs_priority: bool = False,
     ) -> None:
         """Reconcile the switch toward the plan (plus Greedy Consumption, if enabled)
         for this tick.
@@ -417,7 +428,7 @@ class DeferrableLoadController:
 
         greedy_on = self._greedy_wants_on(
             import_rate, export_rate, grid_power_w, schedule_allows,
-            min_export_price, device_w, discharge_w,
+            min_export_price, device_w, discharge_w, battery_needs_priority,
         )
         plan_on = self.desired_on(planned_w)
         if plan_on and self._greedy_reason is not None:

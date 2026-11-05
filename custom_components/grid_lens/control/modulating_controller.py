@@ -465,6 +465,7 @@ class ModulatingLoadController(DeferrableLoadController):
         soc_cutoff: bool = False,
         device_w: float = 0.0,
         discharge_w: float = 0.0,
+        battery_needs_priority: bool = False,
     ) -> None:
         """Evaluate the plan and the greedy conditions for this slot — and write nothing.
 
@@ -504,7 +505,7 @@ class ModulatingLoadController(DeferrableLoadController):
 
         greedy_on = self._greedy_wants_on(
             import_rate, export_rate, grid_power_w, schedule_allows,
-            min_export_price, device_w, discharge_w,
+            min_export_price, device_w, discharge_w, battery_needs_priority,
         )
         self._planned_w = max(0.0, float(planned_w))
         self._want_on = greedy_on or self._planned_w > 0.0

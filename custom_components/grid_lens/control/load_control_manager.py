@@ -41,6 +41,7 @@ from homeassistant.util import dt as dt_util
 from ..const import (
     CONF_BATTERY_CHARGE_POWER_SENSOR,
     CONF_BATTERY_DISCHARGE_POWER_SENSOR,
+    CONF_BATTERY_MIN_SOC,
     CONF_BATTERY_SOC_SENSOR,
     CONF_DEFERRABLE_LOAD_CLIMATE_ON_MODE,
     CONF_DEFERRABLE_LOAD_MAX_KW,
@@ -117,6 +118,23 @@ _BATTERY_PRIORITY_BIAS_W = 150.0
 # genuine sustained discharge — a real evening battery drawdown unfolds over minutes,
 # not one tick.
 _BATTERY_PRIORITY_SMOOTHING_TAU_S = 180.0
+
+# Battery-empty guard for Greedy's export-surplus term (see _battery_needs_priority).
+# Added 2026-11-05 after the home battery sat at ~10-15% SOC, untouched (0 W, neither
+# charging nor discharging), for two hours while Greedy Consumption's export-surplus
+# condition nonetheless kept ramping the Wattpilot up on real grid import (confirmed via
+# the plan's own actual buy_kwh and the charger's own power sensor — PV was a fraction of
+# the charger's draw the whole time). The existing battery_priority correction below only
+# reacts to live DISCHARGE; a battery sitting idle at its floor (nothing left to
+# discharge) looks identical to "all fine" to that correction, so nothing caught it.
+# Margin above the configured floor (CONF_BATTERY_MIN_SOC) that still counts as "the
+# battery needs this first" — avoids flapping right at the exact floor value, and
+# matches the magnitude of SOC the household actually saw sit unrefilled (10% -> 15.3%
+# over the two hours in question).
+_BATTERY_PRIORITY_SOC_MARGIN_PCT = 5.0
+# Net battery charge (W) below which it counts as "not meaningfully charging" for the
+# same guard — ordinary CT/meter noise around 0 must not look like "charging fine".
+_BATTERY_PRIORITY_CHARGE_THRESHOLD_W = 100.0
 
 # Stuck-setpoint-while-importing watchdog (see _check_stuck_import) — added 2026-09-13
 # after the ac_output_cap headroom bug (GRIDLENS_CHECKLIST.md, same date) let a modulating
@@ -209,6 +227,10 @@ class LoadControlManager:
         # sensor configured either, so checking them directly is enough and avoids a
         # second flag to keep in sync.
         self._battery_soc_sensor: str = d.get(CONF_BATTERY_SOC_SENSOR) or ""
+        # The battery's own configured floor (ControlManager's guardrail — see
+        # control/manager.py's identical read of the same key) — reused here so
+        # _battery_needs_priority knows what "empty" means without a second setting.
+        self._battery_min_soc_percent: float = float(d.get(CONF_BATTERY_MIN_SOC, 10.0) or 10.0)
         self._battery_charge_power_sensor: str = d.get(CONF_BATTERY_CHARGE_POWER_SENSOR) or ""
         # Optional second sensor for a battery whose charge-power reading is unipolar
         # (0 while discharging, e.g. Sigenergy's own "Battery Charging Power" — the
@@ -657,6 +679,7 @@ class LoadControlManager:
                 # device's setpoint, instead of judging the same surplus two different ways.
                 device_w=self._read_device_power_w(index) or 0.0,
                 discharge_w=max(0.0, -(self._read_battery_net_power_w() or 0.0)),
+                battery_needs_priority=self._battery_needs_priority(),
             )
             # Bonus attribution's write-back (see _bonus_attribution's docstring):
             # conditions #1/#2 above may already have claimed greedy_reason, in which case
@@ -881,7 +904,8 @@ class LoadControlManager:
             # Export Price. max(0.0, ...) keeps a 0 preference reproducing the old bar.
             export_waste_ceiling = max(0.0, self._min_export_price())
             if (export_rate is not None and export_rate <= export_waste_ceiling
-                    and self._grid_power_sensor):
+                    and self._grid_power_sensor
+                    and not self._battery_needs_priority()):
                 grid_w = self._read_grid_power_w()
                 if grid_w is not None:
                     device_w = self._read_device_power_w(index) or 0.0
@@ -1108,6 +1132,40 @@ class LoadControlManager:
         if soc is None:
             return False
         return soc >= max_pct
+
+    def _battery_needs_priority(self) -> bool:
+        """True when the home battery itself is at/near its configured floor AND isn't
+        currently being charged — i.e. there is no live evidence any solar surplus
+        actually exists, because the one thing with first claim on it isn't getting any.
+
+        Gates Greedy Consumption's export-surplus term (both here and
+        ``DeferrableLoadController._greedy_wants_on``'s condition #2) — see
+        ``_BATTERY_PRIORITY_SOC_MARGIN_PCT`` for the incident this closes. Deliberately
+        narrower than ``battery_priority``'s live-discharge correction above: that one
+        reacts to the battery actively giving up charge; this one covers the case that
+        correction can't see at all — the battery sitting idle at its floor, neither
+        charging nor discharging, while a device still claims to be running on "surplus".
+
+        Only touches the live export-surplus term, never ``plan_w`` — the LP already
+        sees the whole horizon (including any forecast afternoon glut) and may have a
+        real reason to schedule grid-funded deferrable charging now (e.g. a charge-target
+        deadline); this guard only stops Greedy's own, forecast-blind opportunism from
+        piling more grid import on top of that while the battery goes unrefilled.
+
+        Fails open like ``_soc_cutoff_active``: no battery SOC sensor configured, or an
+        unreadable sensor, returns False rather than ever blocking a device on a guess.
+        """
+        if not self._battery_soc_sensor:
+            return False
+        soc = self._read_percent(self._battery_soc_sensor)
+        if soc is None:
+            return False
+        if soc > self._battery_min_soc_percent + _BATTERY_PRIORITY_SOC_MARGIN_PCT:
+            return False
+        charge_w = self._read_battery_net_power_w()
+        if charge_w is not None and charge_w >= _BATTERY_PRIORITY_CHARGE_THRESHOLD_W:
+            return False
+        return True
 
     def _ac_output_headroom_w(self) -> Optional[float]:
         """Headroom (W) below the configured inverter/plant AC output ceiling, or None if

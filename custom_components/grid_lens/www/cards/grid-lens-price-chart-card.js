@@ -17,7 +17,7 @@
  *   entity: sensor.roof_grid_lens_nsw_planned_dispatch   (required)
  *   show_cash_bars: true     (optional, default true — false = rates only, as before)
  */
-import { GridLensChartCardBase, multiLineChart, fmtHour, fmtC, RIGHT_AXIS_MR } from './grid-lens-chart-common.js?v=20261101a';
+import { GridLensChartCardBase, multiLineChart, fmtHour, fmtC, RIGHT_AXIS_MR } from './grid-lens-chart-common.js?v=20261105a';
 
 class GridLensPriceChartCard extends GridLensChartCardBase {
   get title() { return this._cashBars() ? 'Price ($/kWh) & today\'s cost / credit' : 'Price ($/kWh)'; }

@@ -1337,6 +1337,34 @@ async def _run_manager_target_surplus_below_floor():
     assert await m3._modulation_target_w(0, _T0) == (1000.0, "plan")
 
 
+async def _run_manager_target_surplus_blocked_by_battery_priority():
+    """2026-11-05 fix: the home battery sitting idle at its own floor must suppress the
+    live export-surplus term here too, not just the on/off path — this is the loop that
+    actually sized the Wattpilot's setpoint during the incident this closes. Same grid
+    reading as _run_manager_target_surplus's surplus case (would otherwise size to 2850 W
+    and win the max() over the 1000 W plan); the battery being empty and idle must clamp
+    the result back down to plan_w."""
+    m, hass = _mod_mgr(
+        grid_power_sensor="sensor.grid",
+        battery_soc_sensor="sensor.battery_soc",
+        battery_charge_power_sensor="sensor.battery_charge_w",
+        battery_min_soc=10.0,
+    )
+    m.set_plan(_plan(export_rate=0.0, dev_w=1000.0), updated_at=_T0)
+    await m.set_greedy(0, True)
+    hass.states.set("sensor.grid", "-2000")           # looks like 2 kW of spare export
+    hass.states.set("sensor.evse_power", "1000")
+    hass.states.set("sensor.battery_soc", "12")        # at/near the 10% floor
+    hass.states.set("sensor.battery_charge_w", "0")     # idle — not actually charging
+    target, source = await m._modulation_target_w(0, _T0)
+    assert target == 1000.0 and source == "plan"
+
+    # Once the battery is genuinely soaking solar, the same grid reading is trusted again.
+    hass.states.set("sensor.battery_charge_w", "3000")
+    target2, source2 = await m._modulation_target_w(0, _T0)
+    assert target2 == 2850.0 and source2 == "surplus"
+
+
 async def _run_manager_target_ac_output_cap():
     """Live inverter AC output ceiling clamp (found 2026-09-12 against the household's
     own Sigenergy + Wattpilot — GRIDLENS_CHECKLIST.md): applied LAST, after plan/surplus/
@@ -2177,6 +2205,7 @@ if __name__ == "__main__":
         ("manager_target_plan_only", lambda: _run_async(_run_manager_target_plan_only)),
         ("manager_target_surplus", lambda: _run_async(_run_manager_target_surplus)),
         ("manager_target_surplus_below_floor", lambda: _run_async(_run_manager_target_surplus_below_floor)),
+        ("manager_target_surplus_blocked_by_battery_priority", lambda: _run_async(_run_manager_target_surplus_blocked_by_battery_priority)),
         ("manager_target_free_import", lambda: _run_async(_run_manager_target_free_import_takes_cap)),
         ("surplus_masked_by_battery_discharge", lambda: _run_async(_run_manager_target_surplus_masked_by_battery_discharge)),
         ("battery_priority_below_plan", lambda: _run_async(_run_manager_target_battery_priority_below_plan)),

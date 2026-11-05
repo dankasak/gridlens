@@ -733,6 +733,66 @@ async def _run_manager_end_to_end_below_floor_export_tick():
     assert len(_turn_ons(hass2)) == 0
 
 
+async def _run_manager_battery_priority_blocks_export_surplus():
+    """2026-11-05 fix: the home battery sitting idle at its floor (0 W, neither charging
+    nor discharging) must block the export-surplus condition exactly like a missing grid
+    reading does — this is the state the household's Wattpilot incident was found in
+    (battery pinned at 10-15% SOC for two hours while the live grid reading, read alone,
+    still looked like it had surplus to give away)."""
+    m, hass = _mgr(grid_power_sensor="sensor.grid_power", extra_data={
+        "min_export_price": 5.0,
+        "battery_soc_sensor": "sensor.battery_soc",
+        "battery_charge_power_sensor": "sensor.battery_charge_w",
+        "battery_min_soc": 10.0,
+    })
+    _NOW[0] = _T0
+    hass.states.set("sensor.grid_power", "-4000")  # looks like 4 kW of spare export
+    hass.states.set("sensor.battery_soc", "12")     # at/near the 10% floor
+    hass.states.set("sensor.battery_charge_w", "0")  # idle — not actually using any of it
+    plan = [DispatchInterval(start=_T0 - timedelta(minutes=1), action=BatteryAction.SELF_USE,
+                              deferrable_w=[0.0], import_rate=0.35, export_rate=0.03)]
+    m.set_plan(plan, updated_at=_T0)
+    await m.set_entitled(True)
+    await m.enable(0)
+    await m.set_greedy(0, True)
+    later = _T0 + timedelta(minutes=16)
+    await m._tick_device(0, later)
+    assert len(_turn_ons(hass)) == 0
+    assert m.controllers[0].status()["greedy_blocked"] == "battery_priority"
+
+    # Same scene, but the battery is actually charging well above the floor -> no longer
+    # "needs priority", export-surplus fires exactly as it did before this fix.
+    m2, hass2 = _mgr(grid_power_sensor="sensor.grid_power", extra_data={
+        "min_export_price": 5.0,
+        "battery_soc_sensor": "sensor.battery_soc",
+        "battery_charge_power_sensor": "sensor.battery_charge_w",
+        "battery_min_soc": 10.0,
+    })
+    _NOW[0] = _T0
+    hass2.states.set("sensor.grid_power", "-4000")
+    hass2.states.set("sensor.battery_soc", "12")
+    hass2.states.set("sensor.battery_charge_w", "2000")  # genuinely soaking solar
+    m2.set_plan(plan, updated_at=_T0)
+    await m2.set_entitled(True)
+    await m2.enable(0)
+    await m2.set_greedy(0, True)
+    await m2._tick_device(0, later)
+    assert len(_turn_ons(hass2)) == 1
+    assert m2.controllers[0].status()["greedy_reason"] == "export_surplus"
+
+    # And with no battery sensors configured at all (the common no-battery install),
+    # behaviour is unchanged — fails open, exactly like before this fix.
+    m3, hass3 = _mgr(grid_power_sensor="sensor.grid_power", extra_data={"min_export_price": 5.0})
+    _NOW[0] = _T0
+    hass3.states.set("sensor.grid_power", "-4000")
+    m3.set_plan(plan, updated_at=_T0)
+    await m3.set_entitled(True)
+    await m3.enable(0)
+    await m3.set_greedy(0, True)
+    await m3._tick_device(0, later)
+    assert len(_turn_ons(hass3)) == 1
+
+
 if __name__ == "__main__":
     tests = [
         ("greedy_import_free_turns_on", lambda: _run_async(_run_greedy_import_free_turns_on)),
@@ -767,6 +827,7 @@ if __name__ == "__main__":
         ("manager_notify_on_every_tick", test_manager_notify_on_every_tick),
         ("manager_end_to_end_greedy_tick", lambda: _run_async(_run_manager_end_to_end_greedy_tick)),
         ("manager_end_to_end_below_floor_export_tick", lambda: _run_async(_run_manager_end_to_end_below_floor_export_tick)),
+        ("manager_battery_priority_blocks_export_surplus", lambda: _run_async(_run_manager_battery_priority_blocks_export_surplus)),
     ]
     passed = 0
     for name, fn in tests:

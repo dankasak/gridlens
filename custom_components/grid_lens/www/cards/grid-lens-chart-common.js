@@ -1383,6 +1383,8 @@ export function greedyLine(a, opts = {}) {
   if (a.greedy_blocked) {
     const why = a.greedy_blocked === 'override'
       ? 'suppressed by a manual override'
+      : a.greedy_blocked === 'battery_priority'
+      ? 'home battery is empty and not charging — it gets any solar first'
       : 'outside this load\'s availability window';
     return `<div class="${p('greedy-line')}">Greedy: armed, ${why}</div>`;
   }
