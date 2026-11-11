@@ -62,6 +62,14 @@ class AdvisoryDispatchSensor(CoordinatorEntity, SensorEntity):
                 # priced against the plan — see advisory/today_cash.py), which is what the
                 # chart's cost/credit bars draw for the elapsed half of the day.
                 attrs["past_rates"] = data["past_rates"]
+            if data.get("plan_rates"):
+                # The whole rate structure of the plan in force today — every
+                # import/export tier with its time range and a per-half-hour
+                # mask of when it is the tier being charged, plus supply charge,
+                # controlled load, demand charge and bonus credits. Rendered by
+                # the advisory card's rate-card popup (the header buy/sell
+                # readout opens it). See retailer_plans.build_rate_card.
+                attrs["plan_rates"] = data["plan_rates"]
             attrs.update(data.get("attributes", {}))  # generated_at, trajectory, soc, cost…
         return attrs
 

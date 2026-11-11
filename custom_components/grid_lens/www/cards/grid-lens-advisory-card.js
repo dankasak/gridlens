@@ -162,12 +162,19 @@ class GridLensAdvisoryCard extends HTMLElement {
     this._battMins = null;
     this._battPowerW = null;
     this._battOutsideClickHandler = (ev) => this._onBattOutsideClick(ev);
+    // Rate card popup (2026-11-11) — opened by the buy/sell readout in the second
+    // header row. _planRates is the dispatch sensor's `plan_rates` attribute, re-read
+    // on every hass tick like everything else about that sensor.
+    this._ratesPopOpen = false;
+    this._planRates = null;
+    this._ratesOutsideClickHandler = (ev) => this._onRatesOutsideClick(ev);
   }
 
   connectedCallback() {
     window.addEventListener('pointerup', this._dtPointerUpHandler);
     window.addEventListener('pointercancel', this._dtPointerUpHandler);
     window.addEventListener('click', this._battOutsideClickHandler, true);
+    window.addEventListener('click', this._ratesOutsideClickHandler, true);
     if (!this._clTimer) this._clTimer = setInterval(() => this._clTick(), CL_ROTATE_MS / 2);
   }
 
@@ -175,6 +182,7 @@ class GridLensAdvisoryCard extends HTMLElement {
     window.removeEventListener('pointerup', this._dtPointerUpHandler);
     window.removeEventListener('pointercancel', this._dtPointerUpHandler);
     window.removeEventListener('click', this._battOutsideClickHandler, true);
+    window.removeEventListener('click', this._ratesOutsideClickHandler, true);
     if (this._clTimer) { clearInterval(this._clTimer); this._clTimer = null; }
   }
 
@@ -292,6 +300,7 @@ class GridLensAdvisoryCard extends HTMLElement {
 
     const a = st.attributes || {};
     this._traj = Array.isArray(a.trajectory) ? a.trajectory : null;
+    this._planRates = (a.plan_rates && typeof a.plan_rates === 'object') ? a.plan_rates : null;
     this._deferNames = Array.isArray(a.deferrable_names) ? a.deferrable_names : [];
     this._deferMaxKw = Array.isArray(a.deferrable_max_kw) ? a.deferrable_max_kw : [];
 
@@ -352,6 +361,10 @@ class GridLensAdvisoryCard extends HTMLElement {
     if (html === this._statusSig) return;
     const st = this.shadowRoot && this.shadowRoot.querySelector('.hd2 .st');
     if (st) { st.innerHTML = html; this._statusSig = html; } else this._paint();
+    // The buy/sell button is inside .st, so an in-place refresh rebuilds it — re-anchor
+    // the rate-card popup (and refresh its contents) against the new element rather
+    // than leaving it pointing at a node that no longer exists.
+    this._syncRatesPop();
   }
 
   // The header badge — the one at-a-glance "is Grid Lens actually working" signal on
@@ -490,27 +503,314 @@ class GridLensAdvisoryCard extends HTMLElement {
     return new Date(t[1].start).getTime() - new Date(t[0].start).getTime();
   }
 
-  // One-line buy/sell readout for the slot covering now — the rate the plan is pricing
-  // against this instant. Lives in the second header row (_hd2Html), alongside the
-  // battery pill and the changelog tickers (moved there 2026-10-28, user request — it
-  // used to sit under the plan-status line, gated behind a now-removed
-  // `show_current_rates` option). Empty string unless a plan is actually available, so
-  // it drops cleanly out of both the compact and full layouts.
-  _currentRatesHtml() {
+  // The trajectory slot covering now — the rate the plan is pricing against this
+  // instant (the LP's own planned rate schedule, not a raw retailer feed; see
+  // CLAUDE.md "Canonical live/planned price data"). Trajectory rows are chronological,
+  // so this is the last row that has already started.
+  _currentSlot() {
     const t = this._traj;
-    if (!t || !t.length || (this._summary && this._summary.status !== 'ok')) return '';
+    if (!t || !t.length) return null;
     const nowMs = Date.now();
     let cur = null;
     for (const row of t) {
       if (new Date(row.start).getTime() <= nowMs) cur = row; else break;
     }
-    cur = cur || t[0];
+    return cur || t[0];
+  }
+
+  // When the buy (or sell) rate next changes, as an ISO start, or null if it holds
+  // for the whole remaining trajectory. Drives the "until HH:MM" hint in the popup's
+  // now-strip — the one thing the rate card itself cannot say, since a tier's mask
+  // describes today's structure and the trajectory is what the optimiser is pricing.
+  _nextRateChange(key) {
+    const t = this._traj;
+    const cur = this._currentSlot();
+    if (!t || !cur) return null;
+    const nowMs = Date.now();
+    for (const row of t) {
+      if (new Date(row.start).getTime() <= nowMs) continue;
+      if (row[key] !== cur[key]) return row.start;
+    }
+    return null;
+  }
+
+  // One-line buy/sell readout for the slot covering now. Lives in the second header
+  // row (_hd2Html), alongside the battery pill and the changelog tickers (moved there
+  // 2026-10-28, user request — it used to sit under the plan-status line, gated behind
+  // a now-removed `show_current_rates` option). Empty string unless a plan is actually
+  // available, so it drops cleanly out of both the compact and full layouts.
+  //
+  // A button since 2026-11-11 (user request): it opens the rate-card popup below —
+  // the plan's full published rate structure with the tier in force highlighted. The
+  // two numbers answer "what am I paying right now"; the popup answers "and what are
+  // the other rates, and when do they apply", which otherwise took a trip to the
+  // retailer's own fact sheet.
+  _currentRatesHtml() {
+    const cur = this._currentSlot();
+    if (!cur || (this._summary && this._summary.status !== 'ok')) return '';
     const buy = cur.import_rate != null ? `${fmtC(cur.import_rate)}/kWh` : '–';
     const sell = cur.export_rate != null ? `${fmtC(cur.export_rate)}/kWh` : '–';
-    return `<div class="rates-now">` +
+    return `<button type="button" class="rates-now" data-rates-toggle
+        aria-expanded="${this._ratesPopOpen}"
+        data-tip="Current buy/sell rate — click for this plan's full rate card">` +
       `<span><span class="rk" style="color:var(--buy)">Buy</span> <b>${buy}</b></span>` +
       `<span><span class="rk" style="color:var(--sell)">Sell</span> <b>${sell}</b></span>` +
-      `</div>`;
+      `<ha-icon icon="mdi:chevron-down"></ha-icon>` +
+      `</button>`;
+  }
+
+  // --------------------------------------------------------- Rate card popup
+  //
+  // What the header's buy/sell button opens (2026-11-11, user request): the published
+  // rate structure of the plan the household is actually on, with the tier in force
+  // right now highlighted. Everything here comes from the dispatch sensor's
+  // `plan_rates` attribute (retailer_plans.build_rate_card) — the same plan data the
+  // bill breakdown prices against, so the two can't disagree about what a plan charges.
+  //
+  // Section order is rates-first (usage, then feed-in, then the fixed charges), unlike
+  // the bill-breakdown card's deliberately bill-shaped fixed-charges-first order: this
+  // popup is opened BY clicking a rate, so burying the rates under a supply charge
+  // would answer a question nobody asked first. The per-tier lines still follow the
+  // bill's own rule of one line per rate tier (never a blended average), including each
+  // capped tier's free and after-cap tranches.
+  //
+  // The highlight comes from each tier's `mask` — one character per half-hour of the
+  // published day — indexed at the current slot, NOT from a server-side "active" flag:
+  // the sensor refreshes every couple of minutes, so a flag would name the wrong window
+  // for up to that long after every boundary. `mask_date` guards the one case a mask
+  // can be stale (just past midnight, before the next refresh) by dropping the
+  // highlight rather than showing yesterday's.
+
+  // c/kWh at the precision a bill prints (2dp) — deliberately finer than the header
+  // button's whole-cent fmtC(), which has a narrow row to live in.
+  _rcRate(v) {
+    const n = parseFloat(v);
+    return isNaN(n) ? '–' : `${(n * 100).toFixed(2)}c`;
+  }
+
+  _rcMoney(v) {
+    const n = parseFloat(v);
+    return isNaN(n) ? '–' : `$${n.toFixed(2)}`;
+  }
+
+  // Index into a tier's mask for "now", or -1 when the masks can't be trusted for the
+  // current moment (no card, or they describe a different local day).
+  _rcSlotIdx(card) {
+    if (!card || !card.mask_date) return -1;
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+      + `-${String(now.getDate()).padStart(2, '0')}`;
+    if (card.mask_date !== today) return -1;
+    const step = +card.slot_minutes || 30;
+    return Math.floor((now.getHours() * 60 + now.getMinutes()) / step);
+  }
+
+  _rcIsActive(tier, idx) {
+    return idx >= 0 && typeof tier.mask === 'string' && tier.mask.charAt(idx) === '1';
+  }
+
+  _rcRowHtml(label, meta, value, active, cls = '', tip = '') {
+    return `<div class="rc-row${active ? ' active' : ''} ${cls}"${tip ? ` title="${esc(tip)}"` : ''}>
+      <span class="rc-lbl">${esc(label)}${active ? '<span class="rc-nowtag">now</span>' : ''}</span>
+      <span class="rc-meta">${meta ? esc(meta) : ''}</span>
+      <span class="rc-val">${esc(value)}</span>
+    </div>`;
+  }
+
+  // Cap wording mirrors build_rate_caps'/_split_capped_kwh's own labels ("first 10
+  // kWh/day", "after 10 kWh/day avg" for a pooled allowance) so a line here reads the
+  // same as the matching line on the bill breakdown.
+  _rcCapSuffix(tier) {
+    const unit = { day: 'kWh/day', week: 'kWh/week', month: 'kWh/month', quarter: 'kWh/quarter',
+      year: 'kWh/year', billing_period: 'kWh/bill' }[tier.cap_period] || 'kWh/day';
+    const avg = tier.cap_application === 'pooled' ? ' avg' : '';
+    return `${+tier.daily_cap_kwh} ${unit}${avg}`;
+  }
+
+  _rcTierRowsHtml(tiers, idx, fallbackLabel) {
+    if (!Array.isArray(tiers) || !tiers.length) {
+      return `<div class="rc-none">Not published for this plan</div>`;
+    }
+    return tiers.map((t) => {
+      const active = this._rcIsActive(t, idx);
+      const base = t.label || fallbackLabel;
+      const when = t.range || 'All day';
+      const capped = t.daily_cap_kwh && t.rate_after_cap != null;
+      if (!capped) return this._rcRowHtml(base, when, `${this._rcRate(t.rate)}/kWh`, active);
+      const cap = this._rcCapSuffix(t);
+      return this._rcRowHtml(`${base} — first ${cap}`, when, `${this._rcRate(t.rate)}/kWh`, active)
+        + this._rcRowHtml(`${base} — after ${cap}`, when,
+          `${this._rcRate(t.rate_after_cap)}/kWh`, active);
+    }).join('');
+  }
+
+  _ratesPopHtml() {
+    const cur = this._currentSlot();
+    const card = this._planRates;
+    const idx = this._rcSlotIdx(card);
+    const name = (this._summary && this._summary.plan_name)
+      || (card ? `${card.retailer} - ${card.plan_name}` : 'Current plan');
+
+    // Now-strip: the two live numbers the button itself shows, each with the tier
+    // currently charging them and when it next changes.
+    const cell = (kind, key, label, colorVar) => {
+      const tiers = card ? (card[kind] || []) : [];
+      const activeLabels = tiers.filter((t) => this._rcIsActive(t, idx))
+        .map((t) => t.label).filter(Boolean);
+      const change = this._nextRateChange(key);
+      const rate = cur && cur[key] != null ? `${this._rcRate(cur[key])}/kWh` : '–';
+      const sub = [activeLabels.join(' · '), change ? `until ${fmtTime(change)}` : '']
+        .filter(Boolean).join(' · ');
+      return `<div class="rc-now-cell">
+        <span class="rc-now-k" style="color:var(${colorVar})">${label}</span>
+        <span class="rc-now-v">${esc(rate)}</span>
+        ${sub ? `<span class="rc-now-sub">${esc(sub)}</span>` : ''}
+      </div>`;
+    };
+
+    const head = `<div class="rc-hd">
+        <span class="rc-plan">${esc(name)}</span>
+        ${card && card.network ? `<span class="rc-net">${esc(card.network)} network</span>` : ''}
+      </div>
+      <div class="rc-now">
+        ${cell('import', 'import_rate', 'Buying', '--buy')}
+        ${cell('export', 'export_rate', 'Selling', '--sell')}
+      </div>`;
+
+    if (!card) {
+      return `${head}<div class="rc-none">This plan's full rate card isn't available
+        yet — it appears once the optimiser has run with plan data loaded.</div>`;
+    }
+
+    // Market-linked plans: the bands below are the plan's published structure, but the
+    // price actually charged follows the wholesale market. Say so rather than letting
+    // the tier list read as "this is your rate" (see CLAUDE.md's price-sensor note).
+    const spot = card.spot || {};
+    const spotNote = card.market_linked || card.spot_export
+      ? `<div class="rc-note rc-warn">
+          ${card.market_linked ? 'Import price follows the wholesale market'
+            + (spot.import_adder_c != null ? ` (spot + ${(+spot.import_adder_c).toFixed(2)}c/kWh)` : '')
+            + (spot.import_cap_c != null ? `, capped at ${(+spot.import_cap_c).toFixed(0)}c/kWh` : '')
+            + '. ' : ''}
+          ${card.spot_export ? 'Export credit follows the wholesale market'
+            + (spot.export_floor_c != null ? ` (floor ${(+spot.export_floor_c).toFixed(2)}c/kWh)` : '')
+            + '. ' : ''}
+          The bands below are the plan's published structure; the live rate above is what
+          Grid Lens is pricing against.
+        </div>`
+      : '';
+
+    const sections = [
+      `<div class="rc-sec">Usage charges</div>`,
+      spotNote,
+      this._rcTierRowsHtml(card.import, idx, 'Usage'),
+      `<div class="rc-sec">Feed-in credits</div>`,
+      this._rcTierRowsHtml(card.export, idx, 'Solar export'),
+    ];
+
+    // Controlled load is never "active" here: it is a separately metered circuit
+    // (switched by the distributor, invisible to this install's CT) — see
+    // feedback_cl_circuits_unmonitored. Listed because it is on the bill, not because
+    // anything can say whether it is drawing right now.
+    if (Array.isArray(card.controlled_load) && card.controlled_load.length) {
+      sections.push(`<div class="rc-sec">Controlled load</div>`);
+      sections.push(card.controlled_load.map((c) => {
+        const rows = [this._rcRowHtml(c.label, 'Separately metered circuit',
+          `${this._rcRate(c.rate)}/kWh`, false, '', c.note || '')];
+        if (c.daily_supply_charge) {
+          rows.push(this._rcRowHtml(`${c.label} supply charge`, 'Every day',
+            `${this._rcMoney(c.daily_supply_charge)}/day`, false));
+        }
+        return rows.join('');
+      }).join(''));
+    }
+
+    // Fixed charges last — see this section's header comment on ordering.
+    const fixed = [];
+    if (card.daily_supply_charge) {
+      fixed.push(this._rcRowHtml('Supply charge', 'Every day',
+        `${this._rcMoney(card.daily_supply_charge)}/day`, false));
+    }
+    for (const d of (card.demand || [])) {
+      fixed.push(this._rcRowHtml(d.label, d.range || 'All day',
+        `${this._rcMoney(d.rate_per_kw_per_day)}/kW/day`, d.active === true));
+    }
+    if (card.monthly_subscription) {
+      fixed.push(this._rcRowHtml('Membership / subscription', 'Monthly',
+        `${this._rcMoney(card.monthly_subscription)}/mth`, false));
+    }
+    if (card.fixed_daily_credit) {
+      fixed.push(this._rcRowHtml('Fixed credit', 'Every day',
+        `+${this._rcMoney(card.fixed_daily_credit)}/day`, false, 'credit'));
+    }
+    if (fixed.length) {
+      sections.push(`<div class="rc-sec">Daily &amp; fixed charges</div>`);
+      sections.push(fixed.join(''));
+    }
+
+    if (Array.isArray(card.credits) && card.credits.length) {
+      sections.push(`<div class="rc-sec">Bonus credits</div>`);
+      sections.push(card.credits.map((c) => this._rcRowHtml(
+        c.label,
+        [c.range, c.threshold_kwh != null ? `under ${+c.threshold_kwh} kWh` : '']
+          .filter(Boolean).join(' · '),
+        `+${this._rcMoney(c.amount_per_day)}/day`, c.active === true, 'credit')).join(''));
+    }
+
+    if (idx < 0) {
+      sections.push(`<div class="rc-note">Rates for ${esc(card.mask_date)} — the
+        "now" highlight resumes once the optimiser next runs.</div>`);
+    }
+    if (card.strategy) sections.push(`<div class="rc-note">${esc(card.strategy)}</div>`);
+
+    return head + sections.join('');
+  }
+
+  // Anchored under the buy/sell button, same math as _syncClPop()/_syncBattPop(). Called
+  // after every repaint (full _paint() and the in-place _refreshStatus()) so it tracks the
+  // button if the header reflows and its content stays live while open.
+  _syncRatesPop() {
+    const root = this.shadowRoot;
+    const pop = root && root.querySelector('.rates-pop');
+    if (!pop) return;
+    const btn = root.querySelector('[data-rates-toggle]');
+    if (!this._ratesPopOpen || !btn) {
+      pop.classList.remove('show');
+      return;
+    }
+    pop.innerHTML = this._ratesPopHtml();
+    const cardEl = root.querySelector('.card');
+    const cardW = cardEl ? cardEl.clientWidth : 600;
+    const w = Math.min(400, cardW - 32);
+    pop.style.width = `${w}px`;
+    pop.style.left = `${Math.max(16, Math.min(btn.offsetLeft, cardW - 16 - w))}px`;
+    pop.style.top = `${btn.offsetTop + btn.offsetHeight + 4}px`;
+    pop.classList.add('show');
+  }
+
+  _onRatesToggleClick(ev) {
+    const btn = ev.target && ev.target.closest && ev.target.closest('[data-rates-toggle]');
+    if (!btn) return;
+    ev.stopPropagation();
+    this._ratesPopOpen = !this._ratesPopOpen;
+    this._syncRatesPop();
+    btn.setAttribute('aria-expanded', String(this._ratesPopOpen));
+  }
+
+  // Dismiss on a click anywhere else. The contents are inert (unlike .batt-pop's
+  // buttons), but this one is tall enough to sit over the rest of the card, so leaving
+  // it open after the user has moved on is in the way.
+  _onRatesOutsideClick(ev) {
+    if (!this._ratesPopOpen) return;
+    const root = this.shadowRoot;
+    if (!root) return;
+    const path = ev.composedPath ? ev.composedPath() : [];
+    const pop = root.querySelector('.rates-pop');
+    const btn = root.querySelector('[data-rates-toggle]');
+    if ((pop && path.includes(pop)) || (btn && path.includes(btn))) return;
+    this._ratesPopOpen = false;
+    this._syncRatesPop();
+    if (btn) btn.setAttribute('aria-expanded', 'false');
   }
 
   // ------------------------------------------------- Second header row (status + news)
@@ -1317,11 +1617,67 @@ class GridLensAdvisoryCard extends HTMLElement {
         .hd2 .st { display:flex; align-items:center; gap:10px; flex-wrap:wrap; flex:1 1 260px; min-width:0; }
         /* Buy/sell readout — a plain text pair, not a pill, so it reads as "the number"
            rather than another status chip (moved into this row 2026-10-28, see
-           _currentRatesHtml). */
-        .rates-now { display:flex; gap:10px; font-size:11.5px;
-                     color:var(--ink2); font-variant-numeric:tabular-nums; }
+           _currentRatesHtml). A button since 2026-11-11 (it opens the rate card), so
+           button chrome is reset back to reading as plain text; only the chevron and a
+           hover tint say it is clickable. */
+        .rates-now { display:flex; align-items:center; gap:10px; font:inherit; font-size:11.5px;
+                     color:var(--ink2); font-variant-numeric:tabular-nums; cursor:pointer;
+                     background:transparent; border:1px solid transparent; border-radius:8px;
+                     padding:3px 5px; margin:-3px -5px; -webkit-appearance:none; text-align:left; }
+        .rates-now:hover { background:color-mix(in srgb,var(--ink) 6%,transparent);
+                           border-color:var(--border); }
+        .rates-now:focus-visible { outline:2px solid var(--good); outline-offset:1px; }
+        .rates-now[aria-expanded="true"] { background:color-mix(in srgb,var(--ink) 8%,transparent);
+                                           border-color:var(--border); }
+        .rates-now[aria-expanded="true"] ha-icon { transform:rotate(180deg); }
+        .rates-now ha-icon { --mdc-icon-size:14px; color:var(--ink2); flex:0 0 auto;
+                             transition:transform .15s ease; }
         .rates-now .rk { font-weight:650; }
         .rates-now b { color:var(--ink); font-weight:650; }
+
+        /* Rate card popup — the plan's full published rate structure, opened by the
+           readout above. Same floating shape as .cl-pop/.batt-pop (see .cl-pop for the
+           positioning rationale); contents are inert, so no listener of its own. */
+        .rates-pop { position:absolute; z-index:20; max-height:min(460px, 70vh); overflow-y:auto;
+                     padding:10px 12px 12px; border-radius:12px; background:var(--surface);
+                     border:1px solid var(--border); box-shadow:0 10px 30px rgba(0,0,0,.25);
+                     display:none; }
+        .rates-pop.show { display:block; animation:cl-pop-in .18s ease-out; }
+        .rc-hd { display:flex; flex-wrap:wrap; align-items:baseline; gap:6px; }
+        .rc-plan { font-size:12.5px; font-weight:700; color:var(--ink); }
+        .rc-net { font-size:10.5px; color:var(--ink2); }
+        /* The two live numbers, repeated big: the popup is opened from a 11.5px readout,
+           so this is where the figure actually becomes legible. */
+        .rc-now { display:flex; gap:8px; margin:9px 0 4px; }
+        .rc-now-cell { flex:1 1 0; min-width:0; display:flex; flex-direction:column; gap:1px;
+                       padding:7px 9px; border-radius:9px; border:1px solid var(--border);
+                       background:color-mix(in srgb,var(--ink) 4%,transparent); }
+        .rc-now-k { font-size:9.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+        .rc-now-v { font-size:17px; font-weight:700; color:var(--ink);
+                    font-variant-numeric:tabular-nums; }
+        .rc-now-sub { font-size:10px; color:var(--ink2); }
+        .rc-sec { font-size:10px; font-weight:700; color:var(--ink2); text-transform:uppercase;
+                  letter-spacing:.03em; margin:11px 0 3px; }
+        .rc-row { display:grid; grid-template-columns:minmax(0,1fr) auto; column-gap:8px;
+                  align-items:baseline; padding:4px 7px; border-radius:7px;
+                  border-left:2px solid transparent; font-size:11.5px; color:var(--ink); }
+        /* The tier in force right now. Tinted, bolder and flagged with a "now" chip —
+           three cues, because this is the single thing the popup exists to answer. */
+        .rc-row.active { background:color-mix(in srgb,var(--good) 13%,transparent);
+                         border-left-color:var(--good); font-weight:650; }
+        .rc-lbl { min-width:0; }
+        .rc-meta { grid-column:1; font-size:10px; color:var(--ink2); font-weight:400; }
+        .rc-val { grid-row:1; grid-column:2; font-variant-numeric:tabular-nums;
+                  white-space:nowrap; font-weight:650; }
+        .rc-row.credit .rc-val { color:var(--sell); }
+        .rc-nowtag { margin-left:6px; font-size:8.5px; font-weight:700; text-transform:uppercase;
+                     letter-spacing:.04em; color:#fff; background:var(--good);
+                     border-radius:4px; padding:1px 4px; vertical-align:1px; }
+        .rc-none { font-size:11px; color:var(--ink2); padding:4px 7px; }
+        .rc-note { font-size:10px; line-height:1.45; color:var(--ink2); margin-top:9px;
+                   padding-top:7px; border-top:1px solid var(--border); }
+        .rc-note.rc-warn { color:var(--ink); background:color-mix(in srgb,var(--gridflow) 10%,transparent);
+                           border:none; border-radius:7px; padding:6px 8px; margin:3px 0 5px; }
         .sp { display:inline-flex; align-items:center; gap:5px; font-size:11.5px; font-weight:600;
               line-height:1; padding:4px 9px 4px 7px; border-radius:20px; white-space:nowrap;
               color:var(--ink); background:color-mix(in srgb,var(--ink) 6%,transparent);
@@ -1613,7 +1969,7 @@ class GridLensAdvisoryCard extends HTMLElement {
                box-shadow: 0 4px 14px rgba(0,0,0,.28); z-index: 30; transition: opacity .08s ease; }
         .dt-tt-pop.show { opacity: 1; visibility: visible; }
       </style>
-      <div class="card"><div class="body"></div><div class="cl-pop"></div><div class="batt-pop"></div><div class="dt-tt-pop"></div></div>
+      <div class="card"><div class="body"></div><div class="cl-pop"></div><div class="batt-pop"></div><div class="rates-pop"></div><div class="dt-tt-pop"></div></div>
     `;
     // Delegated: _paint() replaces .body's innerHTML on every repaint, so per-element
     // listeners would be torn off. The listeners live on .body, which survives.
@@ -1622,6 +1978,7 @@ class GridLensAdvisoryCard extends HTMLElement {
       body.addEventListener('click', (ev) => this._onChipClick(ev));
       body.addEventListener('click', (ev) => this._onClToggleClick(ev));
       body.addEventListener('click', (ev) => this._onBattToggleClick(ev));
+      body.addEventListener('click', (ev) => this._onRatesToggleClick(ev));
       body.addEventListener('click', (ev) => this._onDtExpandClick(ev));
       body.addEventListener('click', (ev) => this._onDtResetClick(ev));
       body.addEventListener('pointerdown', (ev) => this._onDtSliderPointerDown(ev));
@@ -1681,6 +2038,7 @@ class GridLensAdvisoryCard extends HTMLElement {
       body.innerHTML = header;
       this._syncClPop();
       this._syncBattPop();
+      this._syncRatesPop();
       return;
     }
 
@@ -1689,6 +2047,7 @@ class GridLensAdvisoryCard extends HTMLElement {
         `<div class="waiting">Advisory plan not available yet${s.reason ? '<br><span class="sub">' + esc(s.reason) + '</span>' : ''}</div>`;
       this._syncClPop();
       this._syncBattPop();
+      this._syncRatesPop();
       return;
     }
 
@@ -1723,6 +2082,7 @@ class GridLensAdvisoryCard extends HTMLElement {
       <div class="note">See the SOC/Power chart cards for the solar/load/price forecast validation. All series are the forecast for the current plan (${s.plan_name ? esc(s.plan_name) : '—'}).</div>`;
     this._syncClPop();
     this._syncBattPop();
+    this._syncRatesPop();
   }
 
   _modeTransitions() {

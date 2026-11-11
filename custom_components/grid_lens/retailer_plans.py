@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import re
 from abc import ABC, abstractmethod
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict
 
 _LOGGER = logging.getLogger(__name__)
@@ -319,6 +319,21 @@ class RetailerPlan(ABC):
             'daily_supply_charge': self.daily_supply_charge,
             'feed_in_tariff': self.feed_in_tariff,
         }
+
+    def plan_version_at(self, dt: datetime) -> "RetailerPlan":
+        """The single plan version in force at ``dt``. A plain plan is its own
+        only version; :class:`VersionedPlan` overrides this to resolve its
+        segment.
+
+        For a caller that wants to DESCRIBE the tariff a customer is on right
+        now — ``build_rate_card`` below — rather than price a period that may
+        span a retailer price change. Going through the versioned wrapper for
+        that would be wrong twice over: ``get_import_rate_defs()`` returns every
+        version's tiers (superseded ones tagged "(until 12 Aug 2026)"), and the
+        fixed per-day charges are period-weighted averages, not the rate any
+        single day is actually billed at.
+        """
+        return self
 
 
 class PlanFromData(RetailerPlan):
@@ -804,6 +819,11 @@ class VersionedPlan(RetailerPlan):
         return self._segments[0][2] if (self._segments[0][0]
                                         and d < self._segments[0][0]) else self._latest
 
+    def plan_version_at(self, dt: datetime) -> "PlanFromData":
+        """See RetailerPlan.plan_version_at — the one version in force at ``dt``,
+        with its own un-averaged fixed charges and only its own rate tiers."""
+        return self._plan_at(dt)
+
     def get_import_rate(self, dt: datetime) -> float:
         return self._plan_at(dt).get_import_rate(dt)
 
@@ -1061,6 +1081,223 @@ def build_conditional_credits(
                 "day_index": day_index,
             })
     return out
+
+
+# Resolution of a rate card's per-tier "is this tier in force?" mask (minutes).
+# 30 is the finest granularity any real AU retail window in this product's data
+# splits to (see blended_hour_rate's note), so a 48-slot day is lossless here.
+RATE_CARD_SLOT_MINUTES = 30
+
+
+def _rate_card_tiers(
+    rate_defs: list, get_info, day_start: datetime, slot_minutes: int,
+) -> list[Dict]:
+    """One display row per declared rate tier, each carrying a bitmask of the
+    slots of ``day_start``'s local day in which that tier is the one being
+    charged.
+
+    The mask is sampled through the plan's OWN matcher (``get_info`` is
+    ``get_import_rate_info``/``get_export_rate_info``) rather than re-derived
+    from each tier's window dicts, for two reasons:
+
+    * ``_match_rate_def`` returns the FIRST window that matches, so when two
+      tiers' windows overlap only one of them is actually billed. Highlighting
+      every tier whose window contains "now" would show a rate the customer is
+      not being charged.
+    * Seasons, day-type specs and sub-hour window boundaries are then handled in
+      exactly one place — the pricing path — so a display highlight can never
+      drift from what the bill does.
+
+    ⚠ Consequence of sampling through the matcher: ``_in_window`` checks season
+    and time of day but NOT a window's ``days`` spec, so a weekday-only Peak is
+    charged — and therefore highlighted here — on weekends too. That is a
+    pricing bug (found 2026-11-11, logged in OPEN_ITEMS.md; ~180 of the cached
+    import windows carry weekdays/weekends), not a display one, and this stays
+    faithful to it on purpose: a highlight that disagreed with the bill would
+    hide the bug instead of showing it. The ``days`` spec IS visible in each
+    tier's ``range`` string.
+
+    Tiers are keyed by identity ``(label, round(rate, 4))``, never by rate value
+    alone: AGL Battery Rewards declares a 3c "Morning peak" FiT and a 3c
+    "Off-peak" FiT, and rate-value keying collapses the two (the same collision
+    that lost a whole FiT window from the bill breakdown, found 2026-11-11 — see
+    ``tier_time_ranges``). Two tiers sharing BOTH label and rate are genuinely
+    indistinguishable here and merge into the first, which is also what the
+    matcher does.
+    """
+    n_slots = (24 * 60) // slot_minutes
+    tiers: list[Dict] = []
+    by_tier: Dict = {}
+    for rate_def in rate_defs or []:
+        if rate_def.get("rate") is None:
+            continue
+        rate = float(rate_def["rate"])
+        tier = {
+            "label": rate_def.get("label") or None,
+            "rate": round(rate, 6),
+            # None = no time restriction, i.e. "applies all day" (flat rate).
+            "range": _format_rate_time_range(rate_def),
+            "daily_cap_kwh": rate_def.get("daily_cap_kwh"),
+            "rate_after_cap": rate_def.get("rate_after_cap"),
+            "cap_period": rate_def.get("cap_period") or "day",
+            "cap_application": rate_def.get("cap_application") or "strict",
+            "mask": ["0"] * n_slots,
+        }
+        tiers.append(tier)
+        by_tier.setdefault((tier["label"], round(rate, 4)), tier)
+
+    # Slots are stepped in UTC and converted per instant, not added to an
+    # already-localized midnight — same reason build_rate_caps does it that way:
+    # wall-clock arithmetic on an aware datetime does not re-resolve the UTC
+    # offset, so every slot after a DST transition would carry the wrong hour.
+    tz = day_start.tzinfo or local_tz()
+    base = day_start.astimezone(timezone.utc)
+    for t in range(n_slots):
+        dt = (base + timedelta(minutes=t * slot_minutes)).astimezone(tz)
+        try:
+            info = get_info(dt)
+        except Exception:  # noqa: BLE001 — one odd slot must not lose the card
+            continue
+        if not info or info.get("rate") is None:
+            continue
+        tier = by_tier.get((info.get("label") or None,
+                            round(float(info["rate"]), 4)))
+        if tier is not None:
+            tier["mask"][t] = "1"
+
+    for tier in tiers:
+        tier["mask"] = "".join(tier["mask"])
+    return tiers
+
+
+def build_rate_card(plan: RetailerPlan, now: datetime) -> Dict:
+    """A display-ready description of the tariff a household is on TODAY —
+    every import/export tier with its time range and the slots it is in force,
+    plus the fixed charges, controlled-load rates, demand charge and bonus
+    credits that make up the rest of the bill.
+
+    Published on the advisory dispatch sensor as ``plan_rates`` and rendered by
+    the advisory card's rate-card popup (the thing the header's buy/sell readout
+    opens). The card highlights the tier in force by indexing each tier's
+    ``mask`` at the current slot, which is why the mask is published rather than
+    a bare "active" flag: the sensor only refreshes every couple of minutes, and
+    a flag computed at publish time would mislabel the active window for up to
+    that long after every boundary. ``mask_date`` lets a consumer notice it is
+    holding yesterday's masks (across midnight, before the next refresh) and
+    skip the highlight instead of showing the wrong one.
+
+    Rate STRUCTURE only. For a market-linked plan the import tiers are the
+    plan's published bands, not the wholesale-driven price actually charged —
+    ``market_linked``/``spot`` say so, and the live rate is the dispatch
+    sensor's own trajectory.
+    """
+    local_now = now.astimezone(local_tz()) if now.tzinfo else now
+    day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    slot_minutes = RATE_CARD_SLOT_MINUTES
+    # The one version in force today — not the versioned wrapper, whose rate-def
+    # list spans every version and whose fixed charges are period averages.
+    v = plan.plan_version_at(local_now)
+
+    card: Dict = {
+        "retailer": v.retailer,
+        "plan_name": v.plan_name,
+        "network": getattr(v, "network", "") or "",
+        "mask_date": day_start.date().isoformat(),
+        "slot_minutes": slot_minutes,
+        "daily_supply_charge": round(float(v.daily_supply_charge or 0.0), 5),
+        "monthly_subscription": round(float(v.monthly_subscription_fee or 0.0), 2),
+        "fixed_daily_credit": round(float(v.fixed_daily_credit or 0.0), 4),
+        "market_linked": bool(v.is_market_linked),
+        "spot_export": bool(v.spot_export_pricing),
+        "strategy": v.describe_strategy() or "",
+        "import": _rate_card_tiers(v.get_import_rate_defs(),
+                                   v.get_import_rate_info, day_start, slot_minutes),
+        "export": _rate_card_tiers(v.get_export_rate_defs(),
+                                   v.get_export_rate_info, day_start, slot_minutes),
+    }
+
+    # Wholesale->retail transform, for the "your import price follows the market"
+    # note. Cents, as the plan data states them.
+    spot = getattr(v, "spot_pricing", None) or {}
+    if spot:
+        imp = spot.get("import") or {}
+        exp = spot.get("export") or {}
+        card["spot"] = {
+            "region": spot.get("region"),
+            "import_adder_c": imp.get("adder_c_per_kwh"),
+            "import_multiplier": imp.get("multiplier"),
+            "import_cap_c": imp.get("cap_c_per_kwh"),
+            "export_adder_c": exp.get("adder_c_per_kwh"),
+            "export_multiplier": exp.get("multiplier"),
+            "export_floor_c": exp.get("floor_c_per_kwh"),
+        }
+
+    # Controlled load: asked for by register through the public getter rather
+    # than read off _controlled_load_rates, so a plan type that resolves them
+    # some other way still answers correctly.
+    controlled: list[Dict] = []
+    for register in ("controlled_load_1", "controlled_load_2"):
+        entry = v.get_controlled_load_rate(register)
+        if not entry or entry.get("rate") is None:
+            continue
+        controlled.append({
+            "register": register,
+            "label": entry.get("label") or register.replace("_", " ").title(),
+            "rate": round(float(entry["rate"]), 6),
+            # A CL register usually carries its own daily supply charge on top of
+            # the plan's (AGL Ausgrid CL1: 17.369c/kWh + 4.114c/day), and a real
+            # bill prints it as its own line.
+            "daily_supply_charge": (
+                round(float(entry["daily_supply_charge"]), 5)
+                if entry.get("daily_supply_charge") else None
+            ),
+            # Provenance prose for whoever verifies the plan data, not customer
+            # copy — the card hangs it off a tooltip rather than printing it.
+            "note": entry.get("note") or None,
+        })
+    if controlled:
+        card["controlled_load"] = controlled
+
+    # Demand charge — per-season periods when the plan declares them, else the
+    # legacy single network-level charge (see PlanFromData.demand_periods).
+    demand: list[Dict] = []
+    for period in (getattr(v, "demand_periods", None) or []):
+        rate = period.get("rate_per_kw_per_day")
+        if not rate:
+            continue
+        demand.append({
+            "label": period.get("season_label") or "Demand charge",
+            "rate_per_kw_per_day": round(float(rate), 5),
+            "range": format_window_range(period),
+            "active": bool(v.demand_period_covers(period, local_now)),
+        })
+    if not demand and getattr(v, "demand_charge_active", False) \
+            and (v.demand_charge_per_kw_per_day or 0.0):
+        window = getattr(v, "demand_window", None) or {}
+        demand.append({
+            "label": window.get("label") or "Demand charge",
+            "rate_per_kw_per_day": round(float(v.demand_charge_per_kw_per_day), 5),
+            "range": format_window_range(window),
+            "active": bool(v.demand_period_covers(window, local_now)),
+        })
+    if demand:
+        card["demand"] = demand
+
+    credits: list[Dict] = []
+    for credit in (v.get_conditional_credits() or []):
+        window = credit.get("window") or {}
+        credits.append({
+            "label": credit.get("label") or "Bonus credit",
+            "amount_per_day": float(credit.get("amount_per_day") or 0.0),
+            "condition": credit.get("condition") or None,
+            "threshold_kwh": credit.get("threshold_kwh"),
+            "range": format_window_range(window),
+            "active": bool(PlanFromData._in_window(window, local_now)) if window else None,
+        })
+    if credits:
+        card["credits"] = credits
+
+    return card
 
 
 class VppProgramFromData:

@@ -971,6 +971,14 @@ The `planned_dispatch` sensor also carries a `demand` attribute on a demand tari
 `{planned_peak_kw, prior_peak_kw, rate_per_kw_per_day, days_remaining, window_slots}` —
 `null` for plans without a demand charge.
 
+It also carries **`plan_rates`** (2026-11-11): the whole published rate *structure* of the
+plan in force today — every import/export tier with its time range, cap tranches and a
+per-half-hour mask of when that tier is the one being charged, plus supply charge,
+controlled load, demand charge and bonus credits. Built by
+`retailer_plans.build_rate_card()`; rendered by the rate card popup (§6d). Rate structure
+only — for the rate actually in force *now*, use `trajectory` (see the canonical price
+source note below).
+
 **`solver` and `solver_note` — how to tell a real optimisation from a fallback.** `solver`
 is `lp/scipy`, `lp/scipy-milp` or `milp/cbc` for a genuine solve, and `greedy` or `none`
 otherwise. `solver_note` (added 2026-10-23) is set **only on a degraded solve** — the greedy
@@ -1943,7 +1951,7 @@ exists elsewhere:
   card` table entry above for where this number has lived over time): plain text, not a
   pill, for the slot covering now ("Buy 22c/kWh · Sell 3c/kWh"), from the same `trajectory`
   attribute the dispatch sensor carries. Always shown whenever a plan is loaded — no config
-  flag.
+  flag. **Since 2026-11-11 it is a button that opens the plan's rate card** — see §6d.
 - **Battery pill**: the executor's current command from the battery control switch
   (`current_action`/`current_power_w`, e.g. "Charge 3.2 kW"), or a warning pill when that
   switch is off ("Battery control off") or `consecutive_apply_failures`/`degraded` is set.
@@ -1987,6 +1995,87 @@ the card re-asks hourly via `hass.callApi`. An empty feed hides its bar.
 - `gridlens` entries only refresh when `gridlens-api` deploys (it clones the public repo at
   that point) — usually same evening, since a `gridlens` push normally comes with a
   checklist commit in `gridlens-api`.
+
+---
+
+## 6d. Rate card popup (2026-11-11)
+
+Clicking the header's buy/sell readout (§6c) opens the **rate card**: the published rate
+structure of the plan the household is actually on, with the tier in force right now
+highlighted. User request — the two live numbers said what the rate *is* but not what the
+other rates are or when they apply, which otherwise meant a trip to the retailer's fact
+sheet.
+
+**Data path.** `retailer_plans.build_rate_card(plan, now)` →
+`AdvisoryCoordinator._plan_rate_card()` → the dispatch sensor's **`plan_rates`** attribute
+→ `_ratesPopHtml()` in `grid-lens-advisory-card.js`. Same plan data the bill breakdown
+prices against, so the two cannot disagree about what a plan charges. ~1.5 KB on the
+sensor; built from ~96 in-memory rate lookups per advisory tick.
+
+**What it shows**, in this order:
+1. **Now strip** — the live buy and sell rate (the trajectory slot covering now, i.e. the
+   canonical price source of §3), each with the tier charging it and when that rate next
+   changes ("Peak · until 21:00", from the trajectory, not the rate structure).
+2. **Usage charges** — one line per declared import tier: label, time range, c/kWh at 2dp.
+3. **Feed-in credits** — same, per export tier.
+4. **Controlled load** — rate plus that register's own daily supply charge, when the plan
+   publishes one. Never highlighted: it is a separately metered, distributor-switched
+   circuit, so nothing can say whether it is drawing (see §5's CL note).
+5. **Daily & fixed charges** — supply charge $/day, demand charge $/kW/day (highlighted
+   when its window covers now), subscription $/mth, fixed daily credit.
+6. **Bonus credits** — conditional day-credits with their window and threshold.
+7. Notes: the plan's own strategy line, and the wholesale caveat below.
+
+**Section order is rates-first, deliberately unlike the bill-breakdown card's
+fixed-charges-first order** (§1): this popup is opened *by clicking a rate*, so leading
+with a supply charge would answer a question nobody asked. The per-tier lines still follow
+the bill's rule of **one line per rate tier, never a blended average** — a capped tier
+renders both tranches ("first 10 kWh/day" / "after 10 kWh/day", "avg" appended for a
+pooled allowance, matching `build_rate_caps`' own labels).
+
+**How the highlight works, and why it is a mask.** Each tier carries a `mask`: one
+character per half-hour of the published day, `1` where that tier is the one being
+charged. It is sampled through the plan's **own rate matcher**
+(`get_import_rate_info`/`get_export_rate_info`), not re-derived from the window dicts, so
+overlapping windows resolve the way pricing resolves them — `_match_rate_def` returns the
+*first* match, so only one tier is ever charged, and highlighting every tier whose window
+contains "now" would show a rate the customer is not paying. The card indexes the mask at
+the current slot rather than reading a server-side "active" flag, because the sensor only
+refreshes every couple of minutes and a flag would name the wrong window for up to that
+long after every boundary. `mask_date` guards the one stale case (just past midnight):
+mismatch → no highlight and a "Rates for <date>" note, rather than yesterday's answer.
+
+**Tiers are keyed by identity `(label, rate)`, never by rate value** — AGL Battery Rewards
+declares a 3c "Morning Export" (7am–5pm) and a 3c "Off-Peak Export" (9pm–7am), and
+rate-value keying collapses the two (the same collision that lost a whole FiT window from
+the bill breakdown, 2026-11-11). Two tiers sharing both label and rate are genuinely
+indistinguishable and merge into the first, as the matcher does.
+
+**Versioned plans** (§1's temporal versioning) are described by the version in force
+today, via the new `RetailerPlan.plan_version_at(dt)` — not through the `VersionedPlan`
+wrapper, whose rate-def list spans every version (superseded tiers tagged "(until 12 Aug
+2026)") and whose fixed charges are period-weighted averages rather than what any single
+day is billed.
+
+**Market-linked plans** (`is_market_linked`/`spot_export_pricing`) get a caveat band above
+the tier list: the bands are the plan's published structure, the live number above them is
+what Grid Lens is actually pricing against, and the `spot` block's adder/cap/floor are
+printed so the transform is visible.
+
+**⚠ Known limitation, inherited from pricing.** `PlanFromData._in_window` checks season
+and time of day but **not** a window's `days` spec, so a weekday-only Peak is charged —
+and therefore highlighted here — on weekends too. ~180 of this install's cached import
+windows carry `weekdays`/`weekends` (e.g. `alinta_solarbalance_choice_demand_time_of_use`).
+That is a pricing bug, found 2026-11-11 while building this and logged in
+`OPEN_ITEMS.md`; the rate card stays faithful to it on purpose, because a highlight that
+disagreed with the bill would hide the bug instead of showing it. The `days` spec *is*
+printed in each tier's time range ("3pm–9pm (weekdays)").
+
+**Tests.** `tests/test_rate_card.py` (the payload: masks follow the matcher, tier identity
+survives a shared rate, versioned plans, caps, spot, demand, credits) and
+`tests/test_rate_card_popup.mjs` (the markup: exactly one tier marked per direction, stale
+masks drop the highlight, capped tiers render two lines, fixed charges/credits/CL
+formatting, next-change hint).
 
 ---
 
@@ -3036,7 +3125,7 @@ the legend. `show_cash_bars: false` returns the card to rates-only.
   dollars) nor `opts.rightAxis` (whose job is scaling a second labelled *line*).
 
 | `grid-lens-dispatch-chart-card` | Planned EMS mode timeline. |
-| `grid-lens-advisory-card` | Plan status header (plan name/solver/last-run time, status badge), control-mode timeline, deferrable-load recommendations, **plus Daily Target (§9b, relocated 2026-09-22): today/tomorrow solar forecast + master slider in the header, per-device sliders behind a chevron expander** — same header content in both compact and full layouts. **The expanded per-device panel also carries the full load-control row (§6b, merged 2026-09-24): sparkline, Today Boost, Greedy toggles, Off now/On now/Auto, live status, the estimator debug panel — alongside that row's slider.** `compact: true` config renders just the header (incl. the Daily Target/load-control block) — used as a slim "optimiser & plan" status bar at the top of the Power Flow view; `title` config overrides the header text in that mode. **Second header row (§6c, 2026-10-04): a live battery-status pill + a one-line buy/sell readout ("Buy 22c/kWh · Sell 3c/kWh") on the left, two rotating tickers ("What's new" for code changes, "Plan updates" for plan-data changes) on the right.** The rate readout is always on now (moved into this row 2026-10-28, user request — it used to sit under the plan-status line in the main header behind an opt-in `show_current_rates` flag, which is gone; before that it briefly lived on the `grid-lens-powerflow-card`'s Grid node, 2026-09-11 to 2026-10-28). Just the numbers; the rate *graph* is `grid-lens-price-chart-card`. **Per-device status pills (running/greedy, SOC-limit, unplugged, overrides) were removed from this row the same day** (user request: too cluttered) — that same information is still shown per row in the per-device expander / Load Control card's own live status line, just not duplicated here. |
+| `grid-lens-advisory-card` | Plan status header (plan name/solver/last-run time, status badge), control-mode timeline, deferrable-load recommendations, **plus Daily Target (§9b, relocated 2026-09-22): today/tomorrow solar forecast + master slider in the header, per-device sliders behind a chevron expander** — same header content in both compact and full layouts. **The expanded per-device panel also carries the full load-control row (§6b, merged 2026-09-24): sparkline, Today Boost, Greedy toggles, Off now/On now/Auto, live status, the estimator debug panel — alongside that row's slider.** `compact: true` config renders just the header (incl. the Daily Target/load-control block) — used as a slim "optimiser & plan" status bar at the top of the Power Flow view; `title` config overrides the header text in that mode. **Second header row (§6c, 2026-10-04): a live battery-status pill + a one-line buy/sell readout ("Buy 22c/kWh · Sell 3c/kWh") on the left, two rotating tickers ("What's new" for code changes, "Plan updates" for plan-data changes) on the right.** **The rate readout is a button (2026-11-11): it opens the plan's full rate card — every import/export tier with its time range, the fixed charges, controlled load, demand charge and bonus credits, with the tier in force right now highlighted. See §6d.** The rate readout is always on now (moved into this row 2026-10-28, user request — it used to sit under the plan-status line in the main header behind an opt-in `show_current_rates` flag, which is gone; before that it briefly lived on the `grid-lens-powerflow-card`'s Grid node, 2026-09-11 to 2026-10-28). Just the numbers; the rate *graph* is `grid-lens-price-chart-card`. **Per-device status pills (running/greedy, SOC-limit, unplugged, overrides) were removed from this row the same day** (user request: too cluttered) — that same information is still shown per row in the per-device expander / Load Control card's own live status line, just not duplicated here. |
 | `grid-lens-load-control-card` | One row per deferrable load: Today Boost, greedy toggles, Off now / On now / Auto, and live greedy status. **No longer seeded onto the default Settings view (2026-09-24)** — its default-visible home is now `grid-lens-advisory-card`'s per-device expander on the Power Flow view (§6b), same relocation Daily Target got in §9b. Still installed/registered for a dashboard that wants it as its own card. |
 | `grid-lens-daily-target-card` | Standalone Daily Target card (§9b) — same content as `grid-lens-advisory-card`'s header block, always expanded, no chevron. No longer seeded onto the default Settings view (2026-09-22) since the advisory-card header is now the default home; still installed/registered for a dashboard that wants it as its own card. |
 | `grid-lens-charge-target-card` | One row per SOC-tracked deferrable load: ad-hoc "charge to X% by a datetime" target (§9a) — a percent tile + a datetime tile, auto-paired via the `charge_target_role`/`deferrable_sensor_id` state attributes, plus a plain-text "Target: 95% by Sat, 2:22 am" / "No target set" status line, plus a third "Timing" tile (§9c's Prefer early/No preference/Prefer just-in-time select, matched via `charge_timing_preference_role: 'select'`) shown whenever the entity exists, independent of whether a target is currently active. Empty state when no device has SOC tracking configured. |
@@ -3741,7 +3830,9 @@ custom_components/grid_lens/
 ├── cap_periods.py           capped-tier bucketing / pooled-allowance sizing / period start —
 │                            shared by plan_calculator.py (the bill) and advisory/today_cash.py
 │                            (the price chart's bars), which must not disagree
-├── retailer_plans.py        plan fetch/cache from the API
+├── retailer_plans.py        plan fetch/cache from the API; plan_version_at() (the version
+│                            in force at an instant) and build_rate_card() (the rate-card
+│                            popup's payload — §6d)
 ├── bill_model.py            paper-bill energy reconstruction — §1h. Pure stdlib, no HA
 │                            imports: schema + arithmetic self-check, load archetypes,
 │                            solar geometry, calibration, CL-placement scenarios

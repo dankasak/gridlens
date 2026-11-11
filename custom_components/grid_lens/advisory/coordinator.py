@@ -43,7 +43,7 @@ from .load_history import build_hour_of_day_load
 from .planner import AdvisoryPlanner, _BONUS_VALUE_PER_KWH
 from .rates import PlanRateForecaster
 from .today_cash import async_attach_actual_cash
-from ..retailer_plans import build_rate_caps, build_conditional_credits
+from ..retailer_plans import build_rate_caps, build_conditional_credits, build_rate_card
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1127,7 +1127,23 @@ class AdvisoryCoordinator(DataUpdateCoordinator):
             "past_rates": await self._elapsed_today_cash(bundle.start),
             "sources": bundle.sources,
             "plan_name": f"{self._plan.retailer} - {self._plan.plan_name}",
+            "plan_rates": self._plan_rate_card(bundle.start),
         }
+
+    def _plan_rate_card(self, plan_start: datetime) -> dict | None:
+        """The plan's whole rate structure, for the advisory card's rate-card
+        popup (``plan_rates`` on the dispatch sensor — see
+        retailer_plans.build_rate_card). Cheap: ~96 rate lookups against
+        in-memory plan data.
+
+        Swallows its own failures for the same reason _elapsed_today_rates does
+        — a quirk in one retailer's rate structure must cost the popup its
+        detail, not sink the whole plan."""
+        try:
+            return build_rate_card(self._plan, dt_util.as_local(plan_start))
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("rate card build failed", exc_info=True)
+            return None
 
     def _elapsed_today_rates(self, plan_start: datetime) -> list[dict]:
         """Buy/sell rate for each slot from local midnight up to ``plan_start`` (exclusive).
