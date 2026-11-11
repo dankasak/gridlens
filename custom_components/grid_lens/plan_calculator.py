@@ -18,7 +18,8 @@ from .subhourly_energy_archive import SLOT_MINUTES as _ARCHIVE_SLOT_MINUTES
 from .retailer_plans import (
     plans_from_api_data, versioned_plans_from_history, build_rate_caps,
     build_conditional_credits, slot_calendar_day_index, RetailerPlan, PlanFromData,
-    rate_time_ranges, format_window_range, cap_label_base, local_tz, blended_hour_rate,
+    rate_time_ranges, tier_time_ranges, declared_tier_keys,
+    format_window_range, cap_label_base, local_tz, blended_hour_rate,
 )
 from .const import (
     DOMAIN,
@@ -158,6 +159,82 @@ def power_unit_divisor(hass, entity_id: str) -> float:
         entity_id,
     )
     return 1.0
+
+
+# --- Bill-line tier keying -------------------------------------------------
+#
+# A bill line is one TARIFF TIER, not one rate value. Those are not the same
+# thing: nothing stops a plan declaring two tiers at the same c/kWh, and real
+# plans do. AGL Battery Rewards publishes three feed-in tiers — 28c evening
+# peak (5-9pm), 3c morning peak (7-8am) and 3c off-peak (8am-5pm, 9pm-7am) —
+# and AGL's own bill prints all three as separate lines.
+#
+# `_compute_bill_items` used to bucket by `round(rate, 4)` alone, so the two
+# 3c tiers collapsed into one bucket and one rendered line, labelled with
+# whichever tier the label dict happened to see last (export sort_order put
+# off-peak last, so the morning window silently disappeared from the
+# breakdown — found 2026-11-11 against the owner's real AGL bill). The money
+# was never wrong: both windows price at the same rate, so the summed credit
+# matched. The LINE was wrong, which is worse than it sounds — the bill
+# breakdown's whole job is to be held up against the retailer's own PDF, and
+# a line that under-describes its own window can't be ticked off against
+# anything (CLAUDE.md, "Bill breakdown must match a real bill's layout").
+#
+# So buckets are keyed by `(tier_label, rounded_rate)`. A bucket with no tier
+# identity — a blended rate straddling a window boundary in an LP schedule,
+# a spot-priced period — keys as `(None, rate)` and resolves its label and
+# window through the old rate-only maps, exactly as before.
+
+def tier_key(rate, label: str | None = None) -> tuple:
+    """The bucket key for one bill line: ``(tier_label, round(rate, 4))``.
+
+    `label` None means "no tier identity available"; such a bucket falls back
+    to rate-keyed label/window lookup via `tier_label_and_range`."""
+    return (label or None, round(float(rate), 4))
+
+
+def tier_label_and_range(
+    key: tuple,
+    tier_ranges: dict,
+    rate_ranges: dict,
+    rate_labels: dict,
+    default_label: str,
+) -> tuple:
+    """Resolve one tier key to its ``(label, time_range)`` for display.
+
+    The key's own label wins when it has one — it came from the matched rate
+    definition, so it is the tier's real identity. Only an unlabelled bucket
+    consults `rate_labels` (the rate-value-keyed maps: the display-breakdown
+    probe, cap labels). `time_range` prefers the tier-keyed window string and
+    falls back to the rate-keyed one, which is what a cap-split tranche
+    ("… (after 10 kWh/day)") needs, since its label is minted at pricing time
+    and is not a declared tier label."""
+    label, rk = key
+    rng = tier_ranges.get(key)
+    if rng is None:
+        rng = rate_ranges.get(rk)
+    return (label or rate_labels.get(rk, default_label), rng)
+
+
+def _unlabelled_leftover_keys(rate_labels: dict, bucketed: dict,
+                              declared: set) -> set:
+    """Rate-only keys from a rate-value-keyed label map that no tier key
+    already covers, as ``(None, rate)``.
+
+    Keeps the pre-tier-keying behaviour of rendering a line for a tier the
+    `get_display_breakdown` probe (or a cap label) found but that this
+    period's usage never touched — without double-rendering a tier that the
+    plan's own rate definitions already declare, or that a bucket already
+    holds energy for."""
+    covered = {k[1] for k in bucketed} | {k[1] for k in declared}
+    return {(None, rk) for rk in rate_labels if rk not in covered}
+
+
+def sorted_tier_keys(keys) -> list:
+    """Tier keys highest rate first, then by label, so bill lines land in a
+    stable order that doesn't depend on dict insertion (two tiers sharing a
+    rate would otherwise swap places between runs)."""
+    return sorted(keys, key=lambda k: (-k[1], k[0] or ""))
 
 
 class PlanCalculator:
@@ -1875,8 +1952,13 @@ class PlanCalculator:
         encountered, keyed by rounded rate, for callers that build energy
         line items from rate value alone.
 
-        Returns ``[(rate, kwh_at_rate), ...]`` — a single-element list when
-        the matched rate has no cap (the common case).
+        Returns ``[(rate, kwh_at_rate, tier_label), ...]`` — a single-element
+        list when the matched rate has no cap (the common case).
+        ``tier_label`` is the matched rate definition's own label (or the
+        cap-split "… (first/after N kWh/day)" wording for a capped tier), and
+        is what callers key their bill-line buckets by. It can be None for a
+        plan whose rate lookup declares no label; keying on rate value alone
+        is wrong whenever two tiers share a rate (see `tier_time_ranges`).
         """
         get_info = plan.get_import_rate_info if direction == "import" else plan.get_export_rate_info
         info = get_info(local_dt)
@@ -1884,7 +1966,7 @@ class PlanCalculator:
         cap = info.get("daily_cap_kwh")
         after_rate = info.get("rate_after_cap")
         if kwh <= 0 or not cap or after_rate is None:
-            return [(rate, kwh)]
+            return [(rate, kwh, info.get("label") or None)]
 
         label = info.get("label") or "Energy"
         cap_period = info.get("cap_period") or "day"
@@ -1911,14 +1993,64 @@ class PlanCalculator:
         base = cap_label_base(label)
         parts = []
         if free_kwh > 1e-9:
-            parts.append((rate, free_kwh))
-            cap_labels.setdefault(round(rate, 4),
-                                  f"{base} (first {cap:g} {unit}{pooled_note})")
+            free_label = f"{base} (first {cap:g} {unit}{pooled_note})"
+            parts.append((rate, free_kwh, free_label))
+            cap_labels.setdefault(round(rate, 4), free_label)
         if over_kwh > 1e-9:
-            parts.append((after_rate, over_kwh))
-            cap_labels.setdefault(round(after_rate, 4),
-                                  f"{base} (after {cap:g} {unit}{pooled_note})")
+            over_label = f"{base} (after {cap:g} {unit}{pooled_note})"
+            parts.append((after_rate, over_kwh, over_label))
+            cap_labels.setdefault(round(after_rate, 4), over_label)
         return parts
+
+    def _lp_step_tier_resolver(self, plan, direction: str):
+        """Return ``resolve(step, rate_field) -> tier_label | None`` for an LP
+        schedule's steps.
+
+        An LP step carries numbers, not tier identity: ``import_rate`` is the
+        rate the solver priced that hour at, and two tiers of the same plan can
+        share a rate (AGL Battery Rewards' 3c morning-peak and 3c off-peak FiT
+        windows). Bucketing bill lines by rate value alone therefore merges
+        them. This asks the plan itself which rate definition was in force at
+        the step's own local datetime — stamped as ``local_dt`` when the
+        schedule was built, because a seasonal window needs the date and a bare
+        elapsed-hour index drifts across DST.
+
+        Returns None (bucket stays unlabelled, old rate-keyed behaviour) when
+        the step has no ``local_dt``, when the plan declares no label, or when
+        the tier's own rate disagrees with the step's — the latter being the
+        real "blended rate" case, where ``blended_hour_rate`` averaged two
+        half-hour rates across a window boundary and the hour genuinely belongs
+        to no single tier.
+        """
+        get_info = (plan.get_import_rate_info if direction == "import"
+                    else plan.get_export_rate_info)
+
+        def resolve(step: dict, rate_field: str) -> str | None:
+            iso = step.get('local_dt')
+            if not iso:
+                return None
+            try:
+                local_dt = datetime.fromisoformat(iso)
+            except (TypeError, ValueError):
+                return None
+            try:
+                info = get_info(local_dt)
+            except Exception:  # a plan's own lookup must never break the bill
+                return None
+            label = info.get('label') or None
+            if label is None:
+                return None
+            step_rate = step.get(rate_field)
+            if step_rate is None:
+                return None
+            # A cap-split tranche is priced at the tier's post-cap rate, which
+            # is still that tier — accept either side of the cap.
+            tier_rates = {round(float(info['rate']), 4)}
+            if info.get('rate_after_cap') is not None:
+                tier_rates.add(round(float(info['rate_after_cap']), 4))
+            return label if round(float(step_rate), 4) in tier_rates else None
+
+        return resolve
 
     def _archived_fine_records(
         self, day_iso: str, direction: str, subhourly_archive: dict | None, tz,
@@ -2323,13 +2455,24 @@ class PlanCalculator:
         from collections import defaultdict
         tz = local_tz()
 
-        # Human time-range per declared rate value (e.g. "2pm–8pm (weekdays)"),
-        # keyed the same way as rate_to_label below (round(rate, 4)) so every
-        # energy_lines/fit_lines branch can attach one with a single dict
-        # lookup. Flat all-hours rates are simply absent — see
-        # retailer_plans.rate_time_ranges.
-        import_time_ranges = rate_time_ranges(plan.get_import_rate_defs())
-        export_time_ranges = rate_time_ranges(plan.get_export_rate_defs())
+        # Human time-range per tier (e.g. "2pm–8pm (weekdays)"), keyed by
+        # (label, round(rate, 4)) — the same tier key every energy_lines/
+        # fit_lines bucket uses, so two tiers sharing a rate keep their own
+        # window string. The *_time_ranges pair below is the rate-only
+        # fallback for buckets with no tier identity (see tier_key /
+        # tier_label_and_range above). Flat all-hours rates are simply absent
+        # from both — see retailer_plans.rate_time_ranges.
+        import_def_list = plan.get_import_rate_defs()
+        export_def_list = plan.get_export_rate_defs()
+        import_tier_ranges = tier_time_ranges(import_def_list)
+        export_tier_ranges = tier_time_ranges(export_def_list)
+        import_time_ranges = rate_time_ranges(import_def_list)
+        export_time_ranges = rate_time_ranges(export_def_list)
+        # Import tiers the plan declares, so a tier this period's usage never
+        # touched still renders a zero line — which the rate-value-keyed
+        # `rate_to_label` probe already did before tier keying, so this keeps
+        # that. Export deliberately has no equivalent; see fit_all_keys below.
+        import_declared_keys = declared_tier_keys(import_def_list)
         credit_time_ranges = {
             c.get('label', 'Conditional Credit'): format_window_range(c.get('window') or {})
             for c in plan.get_conditional_credits()
@@ -2382,12 +2525,12 @@ class PlanCalculator:
                         covered_hours.add(hour_key)
                         kwh = d['value']
                         total_import_kwh += kwh
-                        for rate, part_kwh in self._split_capped_kwh(
+                        for rate, part_kwh, tier_label in self._split_capped_kwh(
                                 plan, "import", local_dt, kwh, daily_used, cap_labels,
                                 actual_days):
-                            rk = round(rate, 4)
-                            tier_data[rk]['kwh'] += part_kwh
-                            tier_data[rk]['cost'] += part_kwh * rk
+                            key = tier_key(rate, tier_label)
+                            tier_data[key]['kwh'] += part_kwh
+                            tier_data[key]['cost'] += part_kwh * key[1]
 
             for d in (usage_data or []):
                 local_dt = d['timestamp'].astimezone(tz)
@@ -2397,12 +2540,12 @@ class PlanCalculator:
                 total_import_kwh += kwh
                 if kwh <= 1e-6:
                     continue
-                for rate, part_kwh in self._split_capped_kwh(
+                for rate, part_kwh, tier_label in self._split_capped_kwh(
                         plan, "import", local_dt, kwh, daily_used, cap_labels,
                         actual_days):
-                    rk = round(rate, 4)
-                    tier_data[rk]['kwh'] += part_kwh
-                    tier_data[rk]['cost'] += part_kwh * rk
+                    key = tier_key(rate, tier_label)
+                    tier_data[key]['kwh'] += part_kwh
+                    tier_data[key]['cost'] += part_kwh * key[1]
             dummy_slots = [{'hour': h, 'import_kwh': 0.0, 'import_cost': 0.0,
                             'export_kwh': 0.0, 'export_credit': 0.0} for h in range(48)]
             dummy_sections = plan.get_display_breakdown({'schedule': dummy_slots}).get('sections', [])
@@ -2414,14 +2557,21 @@ class PlanCalculator:
             rate_to_label: dict = {**{round(s['rate'], 4): s['title']
                                    for s in dummy_sections if s.get('rate', 0) >= 0},
                                    **cap_labels}
-            all_rates = sorted(set(tier_data.keys()) | set(rate_to_label.keys()), reverse=True)
-            if all_rates:
-                energy_lines = [{'label': rate_to_label.get(rk, 'Energy'),
-                                 'rate_c': round(rk * 100, 2),
-                                 'kwh': round(tier_data[rk]['kwh'], 2),
-                                 'amount': round(tier_data[rk]['cost'], 2),
-                                 'time_range': import_time_ranges.get(rk)}
-                                for rk in all_rates]
+            all_keys = sorted_tier_keys(
+                set(tier_data.keys()) | import_declared_keys
+                | _unlabelled_leftover_keys(rate_to_label, tier_data,
+                                            import_declared_keys))
+            if all_keys:
+                energy_lines = []
+                for key in all_keys:
+                    lbl, rng = tier_label_and_range(
+                        key, import_tier_ranges, import_time_ranges,
+                        rate_to_label, 'Energy')
+                    energy_lines.append({'label': lbl,
+                                         'rate_c': round(key[1] * 100, 2),
+                                         'kwh': round(tier_data[key]['kwh'], 2),
+                                         'amount': round(tier_data[key]['cost'], 2),
+                                         'time_range': rng})
                 # Deliberately NO reconciliation plug here. This used to force
                 # energy_lines[0] to absorb any gap between the summed rate×kWh and
                 # import_cost_actual, which silently made one line's amount stop
@@ -2474,24 +2624,34 @@ class PlanCalculator:
             total_import_kwh = 0.0
             total_export_kwh = opt_result.get('total_export_kwh', 0.0)
             tier_data: dict = defaultdict(lambda: {'kwh': 0.0, 'cost': 0.0})
+            # Tier identity for an LP step comes from the plan's own rate
+            # definitions at the step's real local clock time (stamped as
+            # 'local_hour'/'local_dow' when the schedule was built — a step's
+            # bare 'hour' is an elapsed index that drifts across DST). A
+            # blended rate straddling a window boundary matches no tier and
+            # keys unlabelled, exactly as every step did before.
+            step_tier = self._lp_step_tier_resolver(plan, "import")
             for step in lp_schedule:
                 imp = step.get('import_kwh', 0.0)
                 total_import_kwh += imp
                 free = step.get('import_cap_free_kwh', 0.0)
                 over = step.get('import_cap_over_kwh', 0.0)
                 if free > 1e-9:
-                    rk = round(step.get('import_cap_free_rate', 0.0), 4)
-                    tier_data[rk]['kwh']  += free
-                    tier_data[rk]['cost'] += free * rk
+                    key = tier_key(step.get('import_cap_free_rate', 0.0),
+                                   step_tier(step, 'import_cap_free_rate'))
+                    tier_data[key]['kwh']  += free
+                    tier_data[key]['cost'] += free * key[1]
                 if over > 1e-9:
-                    rk = round(step.get('import_cap_over_rate', 0.0), 4)
-                    tier_data[rk]['kwh']  += over
-                    tier_data[rk]['cost'] += over * rk
+                    key = tier_key(step.get('import_cap_over_rate', 0.0),
+                                   step_tier(step, 'import_cap_over_rate'))
+                    tier_data[key]['kwh']  += over
+                    tier_data[key]['cost'] += over * key[1]
                 uncapped = imp - free - over
                 if uncapped > 1e-6:
-                    rk = round(step.get('import_rate', 0.0), 4)
-                    tier_data[rk]['kwh']  += uncapped
-                    tier_data[rk]['cost'] += uncapped * rk
+                    key = tier_key(step.get('import_rate', 0.0),
+                                   step_tier(step, 'import_rate'))
+                    tier_data[key]['kwh']  += uncapped
+                    tier_data[key]['cost'] += uncapped * key[1]
 
             # Discover plan-defined rate tiers and their labels via a dummy schedule
             # (all-zero kWh, 48 h so days=2 avoids division-by-zero in some plans).
@@ -2515,18 +2675,23 @@ class PlanCalculator:
                 **(opt_result.get('import_cap_labels', {}) if opt_result else {}),
             }
 
-            all_rates = sorted(set(tier_data.keys()) | set(rate_to_label.keys()), reverse=True)
-            if all_rates:
-                energy_lines = [
-                    {
-                        'label': rate_to_label.get(rk, 'Energy'),
-                        'rate_c': round(rk * 100, 2),
-                        'kwh': round(tier_data[rk]['kwh'], 2),
-                        'amount': round(tier_data[rk]['cost'], 2),
-                        'time_range': import_time_ranges.get(rk),
-                    }
-                    for rk in all_rates
-                ]
+            all_keys = sorted_tier_keys(
+                set(tier_data.keys()) | import_declared_keys
+                | _unlabelled_leftover_keys(rate_to_label, tier_data,
+                                            import_declared_keys))
+            if all_keys:
+                energy_lines = []
+                for key in all_keys:
+                    lbl, rng = tier_label_and_range(
+                        key, import_tier_ranges, import_time_ranges,
+                        rate_to_label, 'Energy')
+                    energy_lines.append({
+                        'label': lbl,
+                        'rate_c': round(key[1] * 100, 2),
+                        'kwh': round(tier_data[key]['kwh'], 2),
+                        'amount': round(tier_data[key]['cost'], 2),
+                        'time_range': rng,
+                    })
             else:
                 energy_lines = [{'label': 'Energy (grid)', 'rate_c': 0, 'kwh': 0.0, 'amount': 0.0,
                                  'time_range': None}]
@@ -2538,14 +2703,19 @@ class PlanCalculator:
             tier_data = defaultdict(lambda: {'kwh': 0.0, 'cost': 0.0})
             for d in usage_data:
                 local_dt = d['timestamp'].astimezone(tz)
-                for rate, part_kwh in self._split_capped_kwh(
+                for rate, part_kwh, tier_label in self._split_capped_kwh(
                         plan, "import", local_dt, d['value'], daily_used, cap_labels,
                         actual_days):
-                    rk = round(rate, 4)
-                    tier_data[rk]['kwh'] += part_kwh
-                    tier_data[rk]['cost'] += part_kwh * rate
+                    key = tier_key(rate, tier_label)
+                    tier_data[key]['kwh'] += part_kwh
+                    tier_data[key]['cost'] += part_kwh * rate
 
-            sorted_rates = sorted(tier_data.keys())
+            # Positional off-peak/peak/shoulder naming, for a plan whose rate
+            # lookup gave no labels at all. Keyed by rate value deliberately:
+            # it's a heuristic over the DISTINCT RATES observed, and a tier
+            # that already knows its own name never consults it (see
+            # tier_label_and_range).
+            sorted_rates = sorted({k[1] for k in tier_data})
             n = len(sorted_rates)
             label_map = {}
             if n == 0:
@@ -2563,19 +2733,22 @@ class PlanCalculator:
                     label_map[r] = 'Shoulder energy'
             # Prefer the real "(over cap)" label discovered while splitting,
             # over the generic off-peak/peak/shoulder positional heuristic.
-            label_map.update({rk: lbl for rk, lbl in cap_labels.items() if rk in tier_data})
+            label_map.update({rk: lbl for rk, lbl in cap_labels.items()
+                              if rk in sorted_rates})
 
             if n > 0:
-                energy_lines = sorted([
-                    {
-                        'label': label_map.get(rk, 'Energy'),
-                        'rate_c': round(rk * 100, 2),
-                        'kwh': round(data['kwh'], 2),
-                        'amount': round(data['cost'], 2),
-                        'time_range': import_time_ranges.get(rk),
-                    }
-                    for rk, data in tier_data.items()
-                ], key=lambda x: x['rate_c'], reverse=True)
+                energy_lines = []
+                for key in sorted_tier_keys(tier_data.keys()):
+                    lbl, rng = tier_label_and_range(
+                        key, import_tier_ranges, import_time_ranges,
+                        label_map, 'Energy')
+                    energy_lines.append({
+                        'label': lbl,
+                        'rate_c': round(key[1] * 100, 2),
+                        'kwh': round(tier_data[key]['kwh'], 2),
+                        'amount': round(tier_data[key]['cost'], 2),
+                        'time_range': rng,
+                    })
 
         # Controlled Load: move any CL-wired device's energy out of general consumption
         # and price it separately at this plan's flat CL rate. CL rates have no
@@ -2637,29 +2810,33 @@ class PlanCalculator:
         #   1. Current plan with spot export (Amber-as-current): use actual sensor credit
         #   2. LP-optimised non-current plan: use solver's per-step export credit
         #   3. Current plan with fixed FiT: apply plan's own export tariff to actual export_data
-        # Bucketed by rate (fit_tier_data), same as energy_lines above, so the bill
-        # shows one line per FiT tier/window (e.g. GloBird's "Super Export top up"
-        # separate from its base "Solar/Generation Feed in" line) instead of one
-        # blended average-rate line that doesn't correspond to anything printed on
-        # a real bill — the whole point being to let a customer tick this off
-        # against their actual retailer bill line by line.
+        # Bucketed by TIER (fit_tier_data, keyed (label, rate) — see tier_key),
+        # same as energy_lines above, so the bill shows one line per FiT
+        # tier/window (e.g. GloBird's "Super Export top up" separate from its
+        # base "Solar/Generation Feed in" line, or AGL Battery Rewards' three
+        # evening-peak/morning-peak/off-peak FiT lines, two of which share a
+        # rate) instead of one blended average-rate line that doesn't
+        # correspond to anything printed on a real bill — the whole point
+        # being to let a customer tick this off against their actual retailer
+        # bill line by line.
         fit_tier_data: dict = defaultdict(lambda: {'kwh': 0.0, 'cost': 0.0})
+        _SPOT_FIT_KEY = (None, -1.0)   # sentinel tier: a continuously-variable spot price
         _spot_fit_avg_c = None  # set on the LP spot path, for a labelled average line
         if export_credit_actual is not None and getattr(plan, 'spot_export_pricing', False):
             # Spot-priced export for the current plan (e.g. Amber): use sensor's
             # actual credit as a single line — there's no fixed rate/window to
             # itemise a continuously-variable spot price against.
             if total_export_kwh > 1e-9:
-                fit_tier_data[-1.0]['kwh'] = total_export_kwh
-                fit_tier_data[-1.0]['cost'] = export_credit_actual
+                fit_tier_data[_SPOT_FIT_KEY]['kwh'] = total_export_kwh
+                fit_tier_data[_SPOT_FIT_KEY]['cost'] = export_credit_actual
         elif lp_schedule and export_credit_actual is None and is_spot_priced:
             # LP-optimised market-linked plan: one spot feed-in line at the
             # period-average c/kWh (same reasoning as the import branch above).
             tot_kwh = sum(s.get('export_kwh', 0.0) for s in lp_schedule)
             tot_cost = sum(s.get('export_credit', 0.0) for s in lp_schedule)
             if tot_kwh > 1e-9:
-                fit_tier_data[-1.0]['kwh'] = tot_kwh
-                fit_tier_data[-1.0]['cost'] = tot_cost
+                fit_tier_data[_SPOT_FIT_KEY]['kwh'] = tot_kwh
+                fit_tier_data[_SPOT_FIT_KEY]['cost'] = tot_cost
                 _spot_fit_avg_c = round(tot_cost / tot_kwh * 100, 2)
         elif lp_schedule and export_credit_actual is None:
             # LP-optimised non-current plan: bucket each step's export by its
@@ -2674,27 +2851,30 @@ class PlanCalculator:
             # rates that match nothing on the retailer's bill. The solver's own
             # per-step credit is exp_free*free_rate + exp_over*over_rate, so
             # bucketing the tranches reconciles to the same total.
+            step_tier = self._lp_step_tier_resolver(plan, "export")
             for step in lp_schedule:
                 exp = step.get('export_kwh', 0.0)
                 free = step.get('export_cap_free_kwh', 0.0)
                 over = step.get('export_cap_over_kwh', 0.0)
                 if free > 1e-9:
-                    rk = round(step.get('export_cap_free_rate', 0.0), 4)
-                    if rk > 0:
-                        fit_tier_data[rk]['kwh']  += free
-                        fit_tier_data[rk]['cost'] += free * rk
+                    key = tier_key(step.get('export_cap_free_rate', 0.0),
+                                   step_tier(step, 'export_cap_free_rate'))
+                    if key[1] > 0:
+                        fit_tier_data[key]['kwh']  += free
+                        fit_tier_data[key]['cost'] += free * key[1]
                 if over > 1e-9:
-                    rk = round(step.get('export_cap_over_rate', 0.0), 4)
-                    if rk > 0:
-                        fit_tier_data[rk]['kwh']  += over
-                        fit_tier_data[rk]['cost'] += over * rk
+                    key = tier_key(step.get('export_cap_over_rate', 0.0),
+                                   step_tier(step, 'export_cap_over_rate'))
+                    if key[1] > 0:
+                        fit_tier_data[key]['kwh']  += over
+                        fit_tier_data[key]['cost'] += over * key[1]
                 uncapped = exp - free - over
                 if uncapped > 1e-6:
-                    rate = step.get('export_rate', 0.0)
-                    if rate > 0:
-                        rk = round(rate, 4)
-                        fit_tier_data[rk]['kwh']  += uncapped
-                        fit_tier_data[rk]['cost'] += uncapped * rk
+                    key = tier_key(step.get('export_rate', 0.0),
+                                   step_tier(step, 'export_rate'))
+                    if key[1] > 0:
+                        fit_tier_data[key]['kwh']  += uncapped
+                        fit_tier_data[key]['cost'] += uncapped * key[1]
         else:
             # Current plan with fixed FiT (e.g. Flow Power): apply plan rate to actual export_data.
             #
@@ -2709,13 +2889,13 @@ class PlanCalculator:
             for d in fine:
                 local_dt = d['timestamp'].astimezone(tz)
                 covered_hours.add(local_dt.replace(minute=0, second=0, microsecond=0))
-                for rate, part_kwh in self._split_capped_kwh(
+                for rate, part_kwh, tier_label in self._split_capped_kwh(
                         plan, "export", local_dt, d['value'], daily_used,
                         export_cap_labels, actual_days):
                     if rate > 0:
-                        rk = round(rate, 4)
-                        fit_tier_data[rk]['kwh']  += part_kwh
-                        fit_tier_data[rk]['cost'] += part_kwh * rate
+                        key = tier_key(rate, tier_label)
+                        fit_tier_data[key]['kwh']  += part_kwh
+                        fit_tier_data[key]['cost'] += part_kwh * rate
             # GridLens's own sub-hourly archive (subhourly_energy_archive.py): for a
             # day whose hours aren't (fully) covered by 5-minute data above, splice
             # in its archived reconstruction — real per-30-minute-slot energy, not
@@ -2735,13 +2915,13 @@ class PlanCalculator:
                         if hour_key in covered_hours:
                             continue
                         covered_hours.add(hour_key)
-                        for rate, part_kwh in self._split_capped_kwh(
+                        for rate, part_kwh, tier_label in self._split_capped_kwh(
                                 plan, "export", local_dt, d['value'], daily_used,
                                 export_cap_labels, actual_days):
                             if rate > 0:
-                                rk = round(rate, 4)
-                                fit_tier_data[rk]['kwh']  += part_kwh
-                                fit_tier_data[rk]['cost'] += part_kwh * rate
+                                key = tier_key(rate, tier_label)
+                                fit_tier_data[key]['kwh']  += part_kwh
+                                fit_tier_data[key]['cost'] += part_kwh * rate
 
             # Hourly fallback for hours covered by neither 5-minute data nor the
             # archive above: split each bucket across its two half-hours (windows
@@ -2753,13 +2933,16 @@ class PlanCalculator:
                 local_dt = d['timestamp'].astimezone(tz)
                 if local_dt.replace(minute=0, second=0, microsecond=0) in covered_hours:
                     continue
-                r0 = plan.get_export_rate(local_dt)
-                r30 = plan.get_export_rate(local_dt + timedelta(minutes=30))
-                for r in (r0, r30):
+                # get_export_rate_info, not get_export_rate: the half-hours of
+                # one bucket can fall in different tiers, and each half needs
+                # its own tier identity or two tiers sharing a rate merge.
+                for half_dt in (local_dt, local_dt + timedelta(minutes=30)):
+                    info = plan.get_export_rate_info(half_dt)
+                    r = info.get('rate') or 0.0
                     if r > 0:
-                        rk = round(r, 4)
-                        fit_tier_data[rk]['kwh']  += d['value'] / 2
-                        fit_tier_data[rk]['cost'] += d['value'] / 2 * r
+                        key = tier_key(r, info.get('label'))
+                        fit_tier_data[key]['kwh']  += d['value'] / 2
+                        fit_tier_data[key]['cost'] += d['value'] / 2 * r
 
         # Label every FiT tier the plan declares (even ones with zero export so
         # far), same precedence as energy_lines: the plan's own flat label first,
@@ -2779,20 +2962,33 @@ class PlanCalculator:
         fit_rate_to_label.update(export_cap_labels)
         fit_rate_to_label[-1.0] = 'Feed-in (spot price)'
 
-        fit_all_rates = sorted(fit_tier_data.keys(), reverse=True)
-        fit_lines = [
-            {
-                'label': ('Spot feed-in (period average)'
-                          if (rk == -1.0 and _spot_fit_avg_c is not None)
-                          else fit_rate_to_label.get(rk, 'Solar Export')),
-                'rate_c': (_spot_fit_avg_c if (rk == -1.0 and _spot_fit_avg_c is not None)
+        # FiT lines come from the buckets that actually hold export, same as
+        # before tier keying — deliberately NOT seeded with every declared
+        # tier the way energy_lines is. A real bill doesn't print a feed-in
+        # window you never exported into, and seeding would manufacture a
+        # "0.00 c/kWh × 0.0 kWh" row for every plan carrying an explicit 0c
+        # "no feed-in" tier (the export bucketing all guards on rate > 0, so
+        # such a tier never gets a bucket of its own).
+        #
+        # AGL Battery Rewards needs no seeding to render its three lines: the
+        # morning-peak window carried 0.292 kWh on the bill that exposed this,
+        # and tier keying is what stops it merging into the off-peak line.
+        fit_all_keys = sorted_tier_keys(fit_tier_data.keys())
+        fit_lines = []
+        for key in fit_all_keys:
+            rk = key[1]
+            is_spot_avg = (rk == -1.0 and _spot_fit_avg_c is not None)
+            lbl, rng = tier_label_and_range(
+                key, export_tier_ranges, export_time_ranges,
+                fit_rate_to_label, 'Solar Export')
+            fit_lines.append({
+                'label': 'Spot feed-in (period average)' if is_spot_avg else lbl,
+                'rate_c': (_spot_fit_avg_c if is_spot_avg
                            else (round(rk * 100, 2) if rk >= 0 else None)),
-                'kwh': round(fit_tier_data[rk]['kwh'], 2),
-                'amount': round(fit_tier_data[rk]['cost'], 2),
-                'time_range': export_time_ranges.get(rk) if rk >= 0 else None,
-            }
-            for rk in fit_all_rates
-        ]
+                'kwh': round(fit_tier_data[key]['kwh'], 2),
+                'amount': round(fit_tier_data[key]['cost'], 2),
+                'time_range': rng if rk >= 0 else None,
+            })
         fit_credit = round(sum(l['amount'] for l in fit_lines), 2)
         fit_eligible_kwh = round(sum(l['kwh'] for l in fit_lines), 2)
         fit_rate_c = round(fit_credit / fit_eligible_kwh * 100, 2) if fit_eligible_kwh > 0 else 0.0
@@ -4137,6 +4333,11 @@ class PlanCalculator:
         local_hods = []  # local hour-of-day per LP hour, for availability masks
         demand_window_mask = [] if demand_predicate else None
         local_dows: list[int] = []  # weekday per LP hour (0=Mon), for weekly schedules
+        # Full local datetime per LP hour. local_hods/local_dows alone can't
+        # resolve which TARIFF TIER an hour fell in for a plan with seasonal
+        # rate windows (season_start/season_end are MM-DD), and the bill
+        # breakdown needs that to label a tier whose rate another tier shares.
+        local_dts: list = []
         _dp_rate_sum, _dp_rate_n = 0.0, 0          # for the blended per-season rate
         _dp_inseason_dates: set = set()            # distinct in-season local dates
         _spot_imp, _spot_exp = spot_series if spot_series else (None, None)
@@ -4159,6 +4360,7 @@ class PlanCalculator:
                 hourly_export_rates.append(blended_hour_rate(plan.get_export_rate, local_dt))
             local_hods.append(local_dt.hour)
             local_dows.append(local_dt.weekday())
+            local_dts.append(local_dt)
             if demand_predicate:
                 in_win = demand_predicate(local_dt)
                 demand_window_mask.append(1 if in_win else 0)
@@ -4271,6 +4473,10 @@ class PlanCalculator:
             if 0 <= t < len(local_hods):
                 step['local_hour'] = local_hods[t]
                 step['local_dow'] = local_dows[t]
+                # ISO local datetime, so _compute_bill_items can ask the plan
+                # which tier this hour was priced in (seasonal windows need the
+                # date, not just the clock hour).
+                step['local_dt'] = local_dts[t].isoformat()
         result['total_import_kwh'] = sum(s.get('import_kwh', 0.0) for s in result['schedule'])
         result['total_export_kwh'] = sum(s.get('export_kwh', 0.0) for s in result['schedule'])
         result['total_import_cost'] = sum(s.get('import_cost', 0.0) for s in result['schedule'])
@@ -4476,7 +4682,7 @@ class PlanCalculator:
                     total_cost += kwh * _spot_imp[_hk]
                     continue  # spot-priced: cap tiers don't apply to a market rate
 
-            for rate, part_kwh in self._split_capped_kwh(
+            for rate, part_kwh, _tier_label in self._split_capped_kwh(
                     plan, "import", timestamp, kwh, daily_used, cap_labels):
                 total_cost += part_kwh * rate
 

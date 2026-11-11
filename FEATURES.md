@@ -446,9 +446,11 @@ no hourly profile. `_renderDispatchSummary` in `grid-lens-card.js`.
 **Bill breakdown mirrors a real retailer bill, on purpose.** The "our bill breakdown" card
 (`grid-lens-card.js`) orders and labels its rows to match how an Australian electricity bill
 actually reads — fixed charges (supply/subscription/demand/controlled load) first, usage
-charges next, feed-in/export credits next (one line **per rate tier**, e.g. a capped
-"top-up" rate separate from the base feed-in rate — via `_compute_bill_items`'s `fit.lines`,
-built the same way as `energy_lines`), bonus/conditional credits last, then the total. The
+charges next, feed-in/export credits next (one line **per tariff tier** — a capped
+"top-up" rate separate from the base feed-in rate, and two tiers that merely happen to share
+a c/kWh still rendered separately; via `_compute_bill_items`'s `fit.lines`, built the same
+way as `energy_lines` and keyed by tier, not rate value — see "A bill line is a TARIFF TIER"
+below), bonus/conditional credits last, then the total. The
 point is letting a customer tick GloBird-ZEROHERO-style output off against their actual PDF
 bill line by line to verify the product is pricing them correctly — don't reorder or
 re-blend sections without checking against a real bill sample first (see CLAUDE.md).
@@ -513,6 +515,51 @@ different tiers land on the same numeric rate — including *across* import and 
 GloBird's 0c import Free Window and 0c export No-Feed-in window). `_compute_bill_items` uses
 separate `cap_labels` (import) and `export_cap_labels` (export) dicts for exactly this
 reason — don't merge them back into one shared dict. See the checklist entry.
+
+**A bill line is a TARIFF TIER, not a rate value** (fixed 2026-11-11). The same collision
+class as the gotcha above, but in the *bucketing* rather than the labelling, and it dropped
+whole windows off the bill rather than just mislabelling them. `_compute_bill_items` used to
+bucket `energy_lines`/`fit.lines` by `round(rate, 4)`, so two tiers of one plan declaring the
+same c/kWh collapsed into a single rendered line, labelled with whichever tier the dict saw
+last. Found against the owner's real AGL bill: **AGL Battery Rewards declares three feed-in
+tiers — 28c evening peak (5-9pm), 3c morning peak (7-8am), 3c off-peak (8am-5pm and
+9pm-7am) — and AGL's own bill prints all three.** We rendered two, and the surviving 3c line
+read "9pm–7am", so the daytime export window was simply absent from the breakdown. The same
+defect existed on the import side for any plan whose shoulder rate equals its off-peak rate
+(reproduced: a 22c Shoulder 7am-5pm and 22c Off-peak 9pm-7am rendered as one
+`Shoulder … 9pm–7am` line with both windows' kWh).
+
+**The money was never wrong** — equal-rate tiers price identically, so the summed total
+always matched. The *line* was wrong, which is the thing that matters here: a line that
+under-describes its own window can't be ticked off against the retailer's PDF, which is this
+card's whole job.
+
+Buckets are now keyed `(tier_label, round(rate, 4))` — `tier_key()` /
+`tier_label_and_range()` / `sorted_tier_keys()` in `plan_calculator.py`, plus
+`tier_time_ranges()` / `declared_tier_keys()` in `retailer_plans.py` (`rate_time_ranges()`
+survives as the rate-only fallback). Consequences for anyone touching this area:
+
+- `_split_capped_kwh` returns **triples** `(rate, kwh, tier_label)`, not pairs.
+- Tier identity for an **LP schedule** step comes from `_lp_step_tier_resolver`, which asks
+  the plan which rate definition was in force at the step's own `local_dt` — a new step
+  field, stamped alongside `local_hour`/`local_dow`, because a seasonal window needs the
+  date and a bare elapsed-hour index drifts across DST. A step whose rate matches no tier
+  (`blended_hour_rate` averaging two half-hour rates across a window edge) stays
+  **unlabelled** and falls back to the old rate-keyed lookup rather than borrowing a
+  neighbouring tier's name.
+- `energy_lines` still renders a zero line for an **import** tier the period never used
+  (`declared_tier_keys`, preserving what the rate-keyed `get_display_breakdown()` probe
+  already did). `fit.lines` deliberately has **no** equivalent: it comes only from buckets
+  holding real export, because a bill doesn't print a feed-in window you never exported
+  into, and seeding would manufacture a `0.00 c/kWh × 0.0 kWh` row on every plan carrying
+  an explicit 0c "no feed-in" tier (all export bucketing guards on `rate > 0`, so such a
+  tier never gets a bucket). AGL needs no seeding anyway — its morning window carried
+  0.292 kWh; tier keying is what stops that merging into the off-peak line.
+- ⚠ **Still outstanding, pre-existing and unrelated to the above:** the *hourly fallback*
+  export path (no 5-minute data **and** no sub-hourly archive entry for that hour) is not
+  cap-aware, so a capped FiT prices entirely at its pre-cap rate there. Verified identical
+  before and after this change. Rare on a live install — it only fires for history
+  predating the archive.
 
 ⚠ **Gotcha — a `VersionedPlan` bill spanning a retailer price change** (fixed 2026-09-04).
 When the comparison window straddles a plan's `effective_from` boundary (two `/plans/history`

@@ -124,8 +124,17 @@ def cap_label_base(label: str) -> str:
 def rate_time_ranges(rate_defs: list) -> dict:
     """Map each declared rate value -> human time-range string, for
     period-based (TOU) rates only — flat all-hours rates are simply absent
-    from the returned dict. Keyed by round(rate, 4) to match the rate_to_label
-    keying used throughout _compute_bill_items.
+    from the returned dict. Keyed by round(rate, 4).
+
+    ⚠ Rate VALUE is not a tier identity: two tiers of the same plan can share
+    a rate and then collide here, last-writer-wins. Real case (AGL Battery
+    Rewards, found 2026-11-11 from the owner's own bill): a 3c "Morning peak
+    FiT" 7am-8am and a 3c "Off-peak FiT" 8am-5pm/9pm-7am both round to 0.03,
+    so this returned "9pm–7am" for both and the morning window vanished from
+    the bill breakdown. Use `tier_time_ranges` for anything that renders one
+    line per tier; this function survives only as the fallback for buckets
+    that genuinely have no tier identity (a blended cross-boundary LP rate, a
+    cap-split tranche).
 
     A capped rate's after-cap tier (rate_after_cap) shares its parent's
     windows — the cap only splits pricing by kWh threshold, not by time — so
@@ -139,6 +148,47 @@ def rate_time_ranges(rate_defs: list) -> dict:
             out[round(float(rate_def["rate"]), 4)] = rng
             if rate_def.get("rate_after_cap") is not None:
                 out[round(float(rate_def["rate_after_cap"]), 4)] = rng
+    return out
+
+
+def tier_time_ranges(rate_defs: list) -> dict:
+    """Same as `rate_time_ranges`, but keyed by TIER identity —
+    ``(label, round(rate, 4))`` — so two tiers that happen to share a rate
+    each keep their own window string instead of overwriting each other.
+
+    This is the keying `_compute_bill_items` buckets by; `rate_time_ranges`
+    remains the rate-only fallback for buckets with no tier identity. A
+    capped rate's after-cap tier is mapped under the parent's label (same
+    windows, split only by kWh threshold) AND left to the rate-only fallback,
+    since the cap-split labels the bill renders ("… (after N kWh/day)") are
+    built at pricing time, not declared here."""
+    out = {}
+    for rate_def in rate_defs or []:
+        if rate_def.get("rate") is None:
+            continue
+        rng = _format_rate_time_range(rate_def)
+        if not rng:
+            continue
+        label = rate_def.get("label") or None
+        out[(label, round(float(rate_def["rate"]), 4))] = rng
+        if rate_def.get("rate_after_cap") is not None:
+            out[(label, round(float(rate_def["rate_after_cap"]), 4))] = rng
+    return out
+
+
+def declared_tier_keys(rate_defs: list) -> set:
+    """The ``(label, round(rate, 4))`` tier keys a plan declares, so the bill
+    can render a line for a tier the period's usage never touched (AGL prints
+    its Morning peak FiT line whether or not you exported into it).
+
+    Base rates only: a capped tier's free/after-cap tranches are named at
+    pricing time (`_split_capped_kwh`), so they appear once encountered."""
+    out = set()
+    for rate_def in rate_defs or []:
+        if rate_def.get("rate") is None:
+            continue
+        out.add((rate_def.get("label") or None,
+                 round(float(rate_def["rate"]), 4)))
     return out
 
 
