@@ -19,6 +19,18 @@ tie-break front-loads the charge — an EV reaches 100% hours before it's needed
 and then sits there, which is bad for battery longevity. "Prefer just-in-time"
 breaks that tie the other way; "Prefer early" breaks it the original way, on
 purpose, for anyone who'd rather have headroom sooner than later.
+
+Both are a tie-break WITHIN the slots the forecast sun can actually run the
+device in — solar coverage outranks the clock, so "Prefer early" means the
+earliest slot that can pay for itself out of its own sunlight, not the earliest
+slot on the clock. The ordering itself lives in
+``battery_optimizer._solar_first_slot_order`` (it needs the solar/load forecast,
+which only the optimizer has) and is shared by the LP objective and the
+post-solve consolidation pass, so the two cannot disagree. Added 2026-11-12,
+after a clock-only tie-break planned an EV to drain the house battery
+18.2% -> 10% at dawn on an overcast morning for no cost saving at all — see
+GRIDLENS_CHECKLIST.md 2026-11-12. ``rank()`` below is the clock-only ranking and
+is now only exercised by its own unit tests; the live path does not call it.
 """
 from __future__ import annotations
 

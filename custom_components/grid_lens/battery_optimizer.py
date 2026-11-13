@@ -85,6 +85,82 @@ _NO_PREFERENCE = "no_preference"
 _CHARGE_TIMING_TIE_BREAK_MAGNITUDE = 0.0003
 
 
+def _solar_first_slot_order(
+    prefer_early: bool, slots: List[int], surplus_kwh: Dict[int, float], demand_kwh: float,
+) -> List[int]:
+    """``slots`` reordered most-preferred first, for a charge-timing tie-break.
+
+    Solar coverage is the PRIMARY key and the clock is only the tie-break
+    within it: a slot whose own forecast solar surplus (``solar - load``, i.e.
+    before the battery or the grid contributes anything) can run the device at
+    its full rating is preferred over any slot that cannot, whatever the user's
+    timing preference. Within each of those two groups, ``prefer_early`` decides
+    which end fills first exactly as before — earliest-first when true,
+    latest-first when false.
+
+    ``prefer_early`` is a bool, not a preference string, deliberately: the two
+    callers map the SAME ``charge_timing_preference`` values to a direction by
+    different (both correct) rules, because '' means different things to them.
+    In the LP objective '' cannot occur for a real device (coordinator.py always
+    resolves one) and is treated as the ``prefer_just_in_time`` default, i.e.
+    late; in the consolidation pass '' means "device has no timing-preference
+    concept at all" (a pool pump, or plan_calculator.py's comparison path) and
+    must stay earliest-first. Folding a string test in here would silently pick
+    one of those for both. Each caller keeps its own existing rule.
+
+    Why solar outranks the clock (2026-11-12, third occurrence — see
+    GRIDLENS_CHECKLIST.md, and 2026-11-05/06 for the first two). ``def_i`` has no
+    direct objective cost and a battery discharge offsets grid import regardless
+    of which load consumes it, so "battery → deferrable load now" and "battery →
+    house load, deferrable load waits for solar" are an EXACT cost-tie whenever
+    the plan's forecast says the battery refills and spills later anyway. The
+    clock-only tie-break then resolved that tie toward running a flexible load
+    off stored charge before dawn: on 2026-11-12 the EV was planned to take
+    2.949 kWh in the 08:00 slot with only 1.08 kWh of solar surplus in it,
+    draining the house battery 18.2% → 10% on an overcast morning. Verified live
+    the same morning that the two arrangements price identically (net_cost
+    -11.6229 vs -11.6230, a $0.0001 spread that is the tie-break magnitude
+    itself), so this is a tie-break robustness defect, not mispricing.
+
+    The tie is cost-neutral ONLY while the forecast holds and the battery really
+    delivers. When either fails — cloud, a hardware backup-SOC floor above the
+    modelled one, cold derating, battery control switched off — the household
+    pays for both loads and the next replan re-offers the same headroom, so it
+    never self-corrects. Preferring the slot that can pay for itself out of
+    that slot's own sunlight is strictly the safer side of a tie and costs
+    nothing when the forecast is right.
+
+    Slots that solar cannot cover are ordered by DESCENDING surplus (most
+    sunlight first) rather than by the clock, so a thoroughly overcast day —
+    where no slot clears the device's full rating and the groups would otherwise
+    collapse to one — still shifts flexible load toward whatever sun there is
+    instead of silently reverting to earliest-first.
+
+    This preserves what "Prefer early" means to a user who set it deliberately:
+    the earliest slot the sun can actually run the device in, not the earliest
+    slot on the clock. Caller-supplied magnitude is unchanged
+    (``_CHARGE_TIMING_TIE_BREAK_MAGNITUDE``, spread across the returned order),
+    so this can still only ever resolve a genuine tie — never outweigh a real
+    price difference between slots, which is what keeps a genuinely cheaper dark
+    hour (a free/negative import window, or an expensive-import evening where
+    the battery really is the right source) winning on its own merits.
+
+    ``demand_kwh`` is the device's rated draw for one slot (``max_kw * dt``) —
+    the "can this slot's sun run it flat out" bar. ``surplus_kwh`` need only
+    carry the slots passed in.
+    """
+    ordered = sorted(slots, reverse=not prefer_early)
+    covered, uncovered = [], []
+    for t in ordered:
+        if demand_kwh > 0.0 and surplus_kwh.get(t, 0.0) + 1e-9 >= demand_kwh:
+            covered.append(t)
+        else:
+            uncovered.append(t)
+    # Stable sort: equal-surplus slots keep the clock order applied above.
+    uncovered.sort(key=lambda t: -surplus_kwh.get(t, 0.0))
+    return covered + uncovered
+
+
 def _import_bound(load, solar, deferrable_loads, dt, max_charge_kw, max_discharge_kw):
     """Safe per-slot upper bound on grid import, in kWh.
 
@@ -239,17 +315,21 @@ def _consolidate_device_day(
     so '' covers both "no preference set" and "this device has no timing-
     preference concept at all", e.g. a pool pump, or any device on
     plan_calculator.py's plan-comparison path, which never populates the
-    field) decides WHICH end of a cost-tied stretch that block lands at:
-    '' (unset), "prefer_early", and "no_preference" ALL fill the earliest
-    eligible slots first — the original, byte-identical-to-before-this-
-    feature behaviour, and the safe default for anything this feature
-    doesn't apply to. Only an explicit "prefer_just_in_time" (or any other
-    non-empty, unrecognised value — matching charge_timing_preference.DEFAULT)
-    fills the LATEST eligible slots first instead. Unlike the empty-string
-    case, a real SOC-tracked device's preference field is never actually
-    empty in practice — advisory/coordinator.py always resolves it to a
-    real value, defaulting to "prefer_just_in_time" — so '' here only ever
-    means "not applicable", never "applicable but unset".
+    field) decides WHICH end of a cost-tied stretch that block lands at,
+    but only AFTER solar coverage has had first say — see
+    ``_solar_first_slot_order``, which this pass shares with the LP
+    objective's own tie-break so the two cannot disagree. '' (unset) and
+    "prefer_early" fill the earliest eligible slot *the slot's own forecast
+    solar surplus can actually run the device in*; an explicit
+    "prefer_just_in_time" (or any other non-empty, unrecognised value —
+    matching charge_timing_preference.DEFAULT) fills the latest such slot
+    instead. Only "no_preference" keeps the original, byte-identical
+    earliest-first fill, because that value means "add no tie-break at all"
+    rather than "pick a different end". Unlike the empty-string case, a real
+    SOC-tracked device's preference field is never actually empty in
+    practice — advisory/coordinator.py always resolves it to a real value,
+    defaulting to "prefer_just_in_time" — so '' here only ever means "not
+    applicable", never "applicable but unset".
 
     This function is the reason the LP-objective tie-break above is not
     sufficient on its own: `optimize_hourly_schedule` calls
@@ -268,9 +348,34 @@ def _consolidate_device_day(
     if total <= 1e-9:
         return
 
-    prefer_late = bool(preference) and preference not in ('prefer_early', 'no_preference')
     tiers = _slot_marginal_tiers(schedule, dev_idx, slots, cap_kwh)
-    tiers.sort(key=lambda tup: (tup[0], -tup[1] if prefer_late else tup[1]))
+    if preference == _NO_PREFERENCE:
+        # "No preference" means add no tie-break at all — keep the original
+        # earliest-first fill rather than substituting a different opinion.
+        rank_of = {t: idx for idx, t in enumerate(sorted(slots))}
+    else:
+        # Same solar-coverage-over-clock ordering the LP objective now uses, for
+        # the reason this function's docstring already gives for carrying the
+        # preference through at all: this pass runs AFTER the solve and would
+        # otherwise re-flatten a correctly tie-broken raw solve back to its own
+        # hardcoded earliest-first (found live 2026-09-28). A clock-only
+        # ordering here would silently undo the solar-first objective nudge the
+        # same way. Unit cost stays the PRIMARY key, so the pass's "never
+        # increases cost" guarantee is untouched — this only re-breaks ties.
+        surplus = {
+            t: max(0.0, schedule[t].get('solar_kwh', 0.0) - schedule[t].get('load_kwh', 0.0))
+            for t in slots
+        }
+        # Unchanged direction rule: '' (no preference concept) and
+        # "prefer_early" fill earliest-first; an explicit "prefer_just_in_time"
+        # (or any other non-empty, unrecognised value) fills latest-first.
+        prefer_late = bool(preference) and preference not in (_PREFER_EARLY, _NO_PREFERENCE)
+        rank_of = {
+            t: idx for idx, t in enumerate(
+                _solar_first_slot_order(not prefer_late, sorted(slots), surplus, cap_kwh)
+            )
+        }
+    tiers.sort(key=lambda tup: (tup[0], rank_of[tup[1]]))
 
     target = {t: 0.0 for t in slots}
     remaining = total
@@ -1343,10 +1448,13 @@ class BatteryOptimizer:
         # above (whether it's the everyday day-0 ceiling or an active ad-hoc
         # charge target) only bounds the CUMULATIVE energy charged by the
         # deadline — nothing above prices WHICH pre-deadline slot is used, so
-        # when several are cost-tied (a flat overnight tariff, most commonly)
-        # the solver's own degenerate-vertex choice decides, and in practice
-        # that front-loads the charge — an EV reaches its target hours before
-        # the deadline and then sits there, which is bad for battery longevity.
+        # when several are cost-tied (a flat overnight tariff, most commonly;
+        # also any slot the battery can cover on a day the plan expects it to
+        # refill and spill anyway — see _solar_first_slot_order) the solver's
+        # own degenerate-vertex choice decides, and in practice that
+        # front-loads the charge — an EV reaches its target hours before the
+        # deadline and then sits there, which is bad for battery longevity and,
+        # at dawn, drains the house battery into it.
         # This adds a tiny per-slot nudge, spread evenly across each device's
         # own pre-floor window so a long window gets no bigger a total nudge
         # than a short one, scaled to the SAME proven-safe magnitude as the
@@ -1383,9 +1491,18 @@ class BatteryOptimizer:
             if len(reachable) <= 1:
                 continue
             def_col0 = (5 + i) * T
-            step = _CHARGE_TIMING_TIE_BREAK_MAGNITUDE / (len(reachable) - 1)
-            for rank, t in enumerate(reachable):
-                r = rank if preference == _PREFER_EARLY else (len(reachable) - 1 - rank)
+            # Solar coverage outranks the clock within this same fixed budget —
+            # see _solar_first_slot_order. `load` here is the house's own load,
+            # deferrable draw excluded (see this module's docstring), so
+            # solar - load is the surplus genuinely available to this device
+            # before the battery or the grid contributes anything.
+            surplus = {t: max(0.0, solar[t] - load[t]) for t in reachable}
+            order = _solar_first_slot_order(
+                preference == _PREFER_EARLY, reachable, surplus,
+                float(deferrable_loads[i].get('max_kw') or 0.0) * dt,
+            )
+            step = _CHARGE_TIMING_TIE_BREAK_MAGNITUDE / (len(order) - 1)
+            for r, t in enumerate(order):
                 c_obj[def_col0 + t] += step * r
         for i, idx in bonus_idx.items():
             c_obj[idx:idx + bonus_slots[i]] = -float(deferrable_loads[i]['bonus_value'])

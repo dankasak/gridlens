@@ -36,11 +36,16 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 def _row(import_kwh=0.0, export_kwh=0.0, import_rate=0.0, export_rate=0.0, defer=None,
-         bonus=None):
+         bonus=None, solar_kwh=0.0, load_kwh=0.0):
     defer = defer or [0.0]
     return {
         'import_kwh': import_kwh, 'export_kwh': export_kwh,
         'import_rate': import_rate, 'export_rate': export_rate,
+        # Forecast solar/load for the slot (the real schedule rows always carry
+        # these). solar - load is the surplus the solar-first tie-break ranks on;
+        # defaulting both to 0 leaves every pre-existing fixture undifferentiated,
+        # so those keep their original pure clock ordering.
+        'solar_kwh': solar_kwh, 'load_kwh': load_kwh,
         'import_cost': import_kwh * import_rate, 'export_credit': export_kwh * export_rate,
         'deferrable_per_device': list(defer),
         'deferrable_kwh': sum(defer),
@@ -315,6 +320,119 @@ def test_prefer_early_fills_earliest_tied_slots_first():
           on_pattern == [True, True, True, True, False], f"pattern={on_pattern}")
 
 
+def test_prefer_early_still_waits_for_a_slot_solar_can_actually_cover():
+    """The 2026-11-12 live case (third occurrence; 2026-11-05/06 were the first
+    two — GRIDLENS_CHECKLIST.md).
+
+    Dawn slot 0 has a little sun (0.5 kWh of surplus) and the rest of the
+    device's draw came from the house battery, so `_slot_marginal_tiers` sees
+    its whole 0.9 kWh as "free" at the export rate — EXACTLY the same unit cost
+    as the midday slots, where 0.9 kWh of real surplus is being exported. That
+    tie is what clock-only `prefer_early` resolved toward slot 0, draining the
+    battery at dawn (live: EV planned 2.949 kWh into an 08:00 slot holding
+    1.08 kWh of surplus, battery 18.2% -> 10%, for a $0.0001 cost difference).
+
+    `prefer_early` must still mean early — just the earliest slot whose OWN
+    sunlight can run the device, which here is slot 2, not slot 0.
+    """
+    dev = [{'max_kw': 1.8, 'daily_kwh': 1.8, 'hour_mask': None,
+            'charge_timing_preference': 'prefer_early'}]
+    schedule = [
+        # Dawn: 0.5 kWh surplus, device drawing 0.9 — the other 0.4 is battery.
+        _row(export_rate=0.03, import_rate=0.25, defer=[0.9], solar_kwh=0.6, load_kwh=0.1),
+        _row(export_rate=0.03, import_rate=0.25, defer=[0.0], solar_kwh=0.9, load_kwh=0.1),
+        # Midday: 1.4 kWh of surplus, 0.9 of it being exported at the same 3c.
+        _row(export_kwh=0.9, export_rate=0.03, import_rate=0.25, defer=[0.0],
+             solar_kwh=1.5, load_kwh=0.1),
+        _row(export_kwh=0.9, export_rate=0.03, import_rate=0.25, defer=[0.9],
+             solar_kwh=1.5, load_kwh=0.1),
+    ]
+    before_cost = _total_cost(schedule)
+    before_total = sum(r['deferrable_per_device'][0] for r in schedule)
+
+    consolidate_deferrable_schedule(schedule, dev, dt=0.5, slots_per_day=48)
+
+    after = [round(r['deferrable_per_device'][0], 6) for r in schedule]
+    check("the dawn slot solar cannot cover is emptied", after[0] == 0.0, f"got {after}")
+    check("energy lands in the earliest SOLAR-COVERED slot (slot 2), not slot 0",
+          after == [0.0, 0.0, 0.9, 0.9], f"got {after}")
+    check("total energy is preserved",
+          abs(sum(after) - before_total) < 1e-6, f"{sum(after)} vs {before_total}")
+    check("cost did not increase (it was an exact tie)",
+          _total_cost(schedule) <= before_cost + 1e-9,
+          f"{_total_cost(schedule)} vs {before_cost}")
+
+
+def test_overcast_day_with_no_covered_slot_still_prefers_the_sunniest():
+    """Graceful degradation: when NOTHING clears the device's full rating the
+    two groups collapse to one, and a naive implementation would silently fall
+    back to pure earliest-first — the exact behaviour being fixed. Ordering the
+    uncovered group by descending surplus keeps flexible load pointed at
+    whatever sun there is.
+
+    Note the fill necessarily fragments here: a slot that cannot cover the
+    device's full draw can only absorb its own surplus at the export rate, so
+    the sunniest slot fills to 0.7 and the remaining 0.2 stays in the earliest.
+    That is correct — the point is only that 0.7 of it moved off the clock's
+    first slot and onto the sun.
+    """
+    dev = [{'max_kw': 1.8, 'daily_kwh': 0.9, 'hour_mask': None,
+            'charge_timing_preference': 'prefer_early'}]
+    schedule = [
+        # 0.5 kWh surplus, all of it going into the device (so nothing exported).
+        _row(export_rate=0.03, import_rate=0.25, defer=[0.9], solar_kwh=0.6, load_kwh=0.1),
+        # 0.7 kWh surplus, currently exported at 3c — the sunniest slot.
+        _row(export_kwh=0.7, export_rate=0.03, import_rate=0.25, defer=[0.0],
+             solar_kwh=0.8, load_kwh=0.1),
+        # 0.3 kWh surplus, also exported at the same 3c.
+        _row(export_kwh=0.3, export_rate=0.03, import_rate=0.25, defer=[0.0],
+             solar_kwh=0.4, load_kwh=0.1),
+    ]
+    before_cost = _total_cost(schedule)
+    consolidate_deferrable_schedule(schedule, dev, dt=0.5, slots_per_day=48)
+    after = [round(r['deferrable_per_device'][0], 6) for r in schedule]
+    check("no slot covers 0.9 kWh, so the sunniest (slot 1) fills before the earliest",
+          after == [0.2, 0.7, 0.0], f"got {after}")
+    check("overcast reshuffle still did not increase cost",
+          _total_cost(schedule) <= before_cost + 1e-9,
+          f"{_total_cost(schedule)} vs {before_cost}")
+
+
+def test_no_preference_is_untouched_by_the_solar_ordering():
+    """"No preference" means add no tie-break at all, so it keeps the original
+    earliest-first fill even when the solar forecast would point elsewhere —
+    it is an explicit opt-out, not a request for a different opinion."""
+    dev = [{'max_kw': 1.8, 'daily_kwh': 0.9, 'hour_mask': None,
+            'charge_timing_preference': 'no_preference'}]
+    schedule = [
+        _row(export_rate=0.03, import_rate=0.25, defer=[0.9], solar_kwh=0.2, load_kwh=0.1),
+        _row(export_rate=0.03, import_rate=0.25, defer=[0.0], solar_kwh=1.5, load_kwh=0.1),
+    ]
+    consolidate_deferrable_schedule(schedule, dev, dt=0.5, slots_per_day=48)
+    after = [round(r['deferrable_per_device'][0], 6) for r in schedule]
+    check("no_preference stays earliest-first despite slot 1 having the sun",
+          after == [0.9, 0.0], f"got {after}")
+
+
+def test_solar_first_never_overrides_a_real_price_difference():
+    """The whole safety argument: solar coverage re-breaks TIES only. A dark
+    slot that is genuinely cheaper (a free import window) must still win,
+    because unit cost stays the primary sort key."""
+    dev = [{'max_kw': 1.8, 'daily_kwh': 0.9, 'hour_mask': None,
+            'charge_timing_preference': 'prefer_early'}]
+    schedule = [
+        # Dark, but importing is FREE here — genuinely the cheapest slot.
+        _row(export_rate=0.0, import_rate=0.0, defer=[0.0], solar_kwh=0.0, load_kwh=0.1),
+        # Sunny, but its surplus is worth 3c/kWh in foregone export.
+        _row(export_kwh=0.9, export_rate=0.03, import_rate=0.25, defer=[0.9],
+             solar_kwh=1.5, load_kwh=0.1),
+    ]
+    consolidate_deferrable_schedule(schedule, dev, dt=0.5, slots_per_day=48)
+    after = [round(r['deferrable_per_device'][0], 6) for r in schedule]
+    check("the genuinely free dark slot still wins over the sunny one",
+          after == [0.9, 0.0], f"got {after}")
+
+
 def test_prefer_just_in_time_fills_latest_tied_slots_first():
     """The live 2026-09-28 bug this was found from: with charge_timing_preference
     set to prefer_just_in_time, a fragmented cost-tied allocation must
@@ -468,6 +586,10 @@ if __name__ == "__main__":
     test_floor_slot_does_not_restrict_days_outside_the_deadline()
     test_slot_day_index_confines_consolidation_to_real_calendar_days()
     test_prefer_early_fills_earliest_tied_slots_first()
+    test_prefer_early_still_waits_for_a_slot_solar_can_actually_cover()
+    test_overcast_day_with_no_covered_slot_still_prefers_the_sunniest()
+    test_no_preference_is_untouched_by_the_solar_ordering()
+    test_solar_first_never_overrides_a_real_price_difference()
     test_prefer_just_in_time_fills_latest_tied_slots_first()
     test_no_preference_behaves_like_the_original_earliest_first_default()
     test_missing_preference_field_is_scoped_to_early_not_late()

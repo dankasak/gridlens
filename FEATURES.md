@@ -2749,6 +2749,36 @@ way (nudges the charge toward the *last* feasible slots before the deadline); "P
 breaks it the original way, on purpose, for anyone who'd rather have headroom sooner.
 "No preference" adds nothing — solver behaviour identical to before this feature existed.
 
+**Solar coverage outranks the clock (2026-11-12).** Both "early" and "just-in-time" are a
+tie-break *within the slots the forecast sun can actually run the device in*: a slot whose
+own forecast surplus (`solar - load`, i.e. before the battery or the grid contributes
+anything) covers the device's full rating is preferred over any slot that cannot, whatever
+the timing preference. So "Prefer early" means **the earliest slot the sun can run the
+device in**, not the earliest slot on the clock. Slots that nothing can cover (a thoroughly
+overcast day) are ordered by *descending* surplus rather than by the clock, so flexible load
+still follows whatever sun there is instead of silently reverting to earliest-first. Only
+"No preference" is exempt — it means "add no tie-break at all", an explicit opt-out, so it
+keeps the original earliest-first fill.
+
+Why: the tie this feature breaks is wider than a flat overnight tariff. `def_i` has no direct
+objective cost and a battery discharge offsets grid import *regardless of which load consumes
+it*, so on any day the plan expects the battery to refill and spill anyway, "battery →
+deferrable load now" and "battery → house load, deferrable load waits for solar" price
+**exactly** the same. Clock-only "Prefer early" resolved that toward running a flexible load
+off stored charge at dawn: on 2026-11-12 the EV was planned to take 2.949 kWh in an 08:00 slot
+holding only 1.08 kWh of surplus, draining the house battery 18.2% → 10% on an overcast
+morning (third occurrence; 2026-11-05/06 were the same tie in the pre-dawn, grid-import
+shape). That is cost-neutral **only while the forecast holds and the battery really
+delivers** — when either fails, the household pays for both loads and the next replan
+re-offers the same headroom, so it never self-corrects. Preferring the slot that can pay for
+itself out of its own sunlight is strictly the safer side of a tie and costs nothing when the
+forecast is right. Verified against a real scipy solve on that morning's own forecast:
+`prefer_early` slot-0 draw 2.585 kWh → 0.000 kWh, energy relocated to 12:00–14:00 (the
+earliest slots whose surplus clears the charger's 3.84 kWh/slot rating), `net_cost` unchanged
+at -11.7435 in both — i.e. a pure tie-break, no price consequence. The ordering lives in
+`battery_optimizer._solar_first_slot_order` and is shared by both layers below, so the
+objective and the post-solve consolidation cannot disagree.
+
 **How the tie-break works — two layers, both required.** (1) A tiny per-slot cost is added to
 `def_i[t]`'s objective coefficient for `t` in `[0, floor_slot[i])`, spread evenly across that
 device's own window so a long window (a next-morning deadline) gets no bigger a total nudge
@@ -2756,9 +2786,15 @@ than a short one (a same-afternoon one). Total swing across the whole window is 
 SAME proven-safe magnitude as the existing `soc_reward` degeneracy regularizer (0.0003 $/kWh —
 calibrated there: 0.001 measurably distorts real decisions, this doesn't; see §2), so it can
 only ever resolve a genuine tie between equally-priced slots, never outweigh an actual price
-difference. (2) `consolidate_deferrable_schedule`'s post-LP pass (`_consolidate_device_day`,
-below) ALSO needs to know the preference — see the 2026-09-28 bug note below for why (1) alone
-isn't sufficient.
+difference. The nudge is spread across the slots in `_solar_first_slot_order`'s order, so the
+solar-coverage grouping above is encoded *inside* that same fixed 0.0003 budget rather than
+competing with it for magnitude — nothing about the calibration changed in 2026-11-12's fix.
+(2) `consolidate_deferrable_schedule`'s post-LP pass (`_consolidate_device_day`, below) ALSO
+needs to know the preference, and uses the same `_solar_first_slot_order` ordering — see the
+2026-09-28 bug note below for why (1) alone isn't sufficient, and note that a clock-only
+ordering left in layer (2) would silently undo layer (1)'s solar grouping in exactly the same
+way. In that pass, unit cost remains the PRIMARY sort key, so its hard "can only ever keep
+cost the same or improve" guarantee is untouched — solar coverage only re-breaks ties.
 
 **Live bug found and fixed 2026-09-28, same day as the feature's initial ship: the objective
 tie-break alone did nothing.** First live check showed the owner's real "100% by 6am" EV
@@ -2783,12 +2819,19 @@ fills latest-first instead. Re-verified live after the fix: the same EV target n
 02:30–05:30, ending exactly at the 06:00 deadline instead of finishing at 03:30 and sitting
 full for 2.5 hours. See `docs/GRIDLENS_CHECKLIST.md` 2026-09-28 for the full investigation.
 
-**Scope.** Applies to any device with SOC tracking configured (same
-`CONF_DEFERRABLE_LOAD_SOC_SENSORS`/`_CAPACITY_KWH` gating as §9a) — both while an ad-hoc
-charge target is active AND on the everyday day-0 ceiling floor when one isn't, since both
-share the exact same `floor_slot`/`ev_soc_idx` mechanism in `battery_optimizer.py`. Devices
-without SOC tracking (a pool pump, a dishwasher) get no entity — there's no "sitting fully
-charged" concept for them to tie-break.
+**Scope.** The `select` entity and the *objective-level* nudge apply to any device with SOC
+tracking configured (same `CONF_DEFERRABLE_LOAD_SOC_SENSORS`/`_CAPACITY_KWH` gating as §9a) —
+both while an ad-hoc charge target is active AND on the everyday day-0 ceiling floor when one
+isn't, since both share the exact same `floor_slot`/`ev_soc_idx` mechanism in
+`battery_optimizer.py`. Devices without SOC tracking (a pool pump, a dishwasher) get no
+entity — there's no "sitting fully charged" concept for them to tie-break.
+
+The *consolidation* pass runs for every deferrable device regardless, so since 2026-11-12 a
+non-SOC device's cost-tied energy is also packed solar-covered-slots-first (its preference
+field is `''`, which keeps the earliest-first direction it always had — only the grouping is
+new). Plan comparison (`plan_calculator.py`) goes through the same pass and never populates
+the field either, so it gets the same treatment; the pass's "never increases cost" guarantee
+bounds the blast radius, and the nudge is ~$0.0002/day of objective weight in total.
 
 **Files:** `charge_timing_preference.py` (pure enum + rank maths, no HA imports —
 `tests/test_charge_timing_preference.py`), `charge_timing_preference_store.py` (shared
@@ -2804,7 +2847,13 @@ magnitude as local constants rather than importing `charge_timing_preference.py`
 this file's existing "no local-package imports, stay importable standalone" design — see
 `tests/test_day_groups.py`'s header for why — `_consolidate_device_day`, the post-LP
 consolidation pass, DOES need the preference and gets it via a plain string parameter from
-its caller rather than an import, same reasoning), `www/cards/grid-lens-charge-target-card.js`
+its caller rather than an import, same reasoning; `_solar_first_slot_order` is the shared
+ordering both layers call, and takes a `prefer_early` **bool** rather than a preference
+string on purpose — the two callers map `''` to a direction by different, both-correct rules
+(the objective never sees a real `''` and treats it as the just-in-time default; the
+consolidation pass must keep `''` meaning earliest-first for devices with no preference
+concept), so folding a string test into the shared helper would silently pick one of those
+for both), `www/cards/grid-lens-charge-target-card.js`
 (third, optional "Timing" tile per device row — unlike the percent/time pair, not gated on
 an active target, since the preference also governs the everyday day-0 ceiling).
 
