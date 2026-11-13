@@ -10,7 +10,6 @@ import logging
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
@@ -19,6 +18,7 @@ from .const import (
     CONF_HAS_BATTERY,
     CONF_MIN_EXPORT_PRICE,
     CONF_DEFERRABLE_LOAD_SENSORS,
+    CONF_DEFERRABLE_LOAD_SWITCHES,
     CONF_DEFERRABLE_LOAD_MAX_KW,
     CONF_DEFERRABLE_LOAD_SETPOINT,
     CONF_DEFERRABLE_LOAD_MIN_CURRENT,
@@ -27,29 +27,38 @@ from .const import (
     DEFAULT_SUPPLY_VOLTAGE,
     DEFAULT_MIN_CHARGE_CURRENT_A,
 )
+from .entity_lookup import async_get_energy_dashboard_names, resolve_device_name
 from .reoptimize import request_reoptimize
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def _device_display_name(hass: HomeAssistant, sensor_id: str) -> str:
-    """Best-effort human name for a deferrable device's source sensor.
+def _device_display_name(
+    hass: HomeAssistant,
+    sensor_id: str,
+    control: str | None = None,
+    dashboard_names: dict[str, str] | None = None,
+) -> str:
+    """Human name for a deferrable device, via the one shared resolver.
 
-    Tries the entity registry first (populated from disk at startup, so it's
-    available even before the owning integration — sigen/evconduit/etc. — has
-    finished setup and published a live state with friendly_name). Falls back to
-    the live state's friendly_name, then to a humanized object_id rather than the
-    raw entity_id, so a not-yet-loaded sensor still gets a readable label instead
-    of "sensor.ev_charger_energy Today Boost".
+    This used to be its own resolver — `entry.name or entry.original_name`, then live
+    `friendly_name`, then a humanized object_id — which is the shortcut switch.py's own
+    comment calls out as "exactly the kind of name-mismatch-between-places drift" that
+    `resolve_device_name` exists to prevent. It drifted exactly as predicted (2026-11-13):
+    with the energy sensor as the only anchor and no Energy Dashboard label, every load on
+    this rig's ECHONET aircons got its meter's name, so one load read "Dan's Aircon" on its
+    control switch and "Dan's Aircon Measured cumulative power consumption" on its Today
+    Boost, Daily Target and charge-target entities.
+
+    Pass the load's **control** entity as well as its meter whenever the caller has one:
+    the control entity names the appliance, and resolution is source-major across all
+    anchors. `dashboard_names` should come from one `async_get_energy_dashboard_names`
+    call per platform setup — see switch.py for why it must be awaited rather than read
+    from a cache that isn't populated yet at this point in startup.
     """
-    entry = er.async_get(hass).async_get(sensor_id)
-    if entry and (entry.name or entry.original_name):
-        return entry.name or entry.original_name
-    state_obj = hass.states.get(sensor_id)
-    if state_obj and state_obj.attributes.get("friendly_name"):
-        return state_obj.attributes["friendly_name"]
-    object_id = sensor_id.split(".", 1)[-1]
-    return object_id.replace("_", " ").title()
+    return resolve_device_name(
+        hass, control or None, sensor_id, dashboard_names=dashboard_names
+    ) or sensor_id.split(".", 1)[-1].replace("_", " ").title()
 
 
 def _resolve_max_current_a(hass: HomeAssistant, controller, setpoint_id: str, max_kw: float) -> float:
@@ -96,6 +105,16 @@ async def async_setup_entry(
 ) -> None:
     entities: list[NumberEntity] = []
 
+    # One Energy Dashboard read for the whole platform; every per-device name below goes
+    # through resolve_device_name with the load's control entity as well as its meter, so
+    # a load is called the same thing here as on its control switch and in the cards.
+    dashboard_names = await async_get_energy_dashboard_names(hass)
+    switches_cfg = entry.data.get(CONF_DEFERRABLE_LOAD_SWITCHES, []) or []
+
+    def _load_name(i: int, sensor_id: str) -> str:
+        sw = switches_cfg[i] if i < len(switches_cfg) else ""
+        return _device_display_name(hass, sensor_id, sw, dashboard_names)
+
     # min_export_price feeds two things: the battery LP's export pricing (needs a
     # battery — without one optimize_hourly_schedule never runs) and Greedy Consumption's
     # "export is being wasted" bar (needs a deferrable load). Offer the entity if either
@@ -128,7 +147,7 @@ async def async_setup_entry(
         store = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_deferrable_overrides")
         max_kws = entry.data.get(CONF_DEFERRABLE_LOAD_MAX_KW, [])
         for i, sensor_id in enumerate(sensors):
-            name = _device_display_name(hass, sensor_id)
+            name = _load_name(i, sensor_id)
             max_kw = max_kws[i] if i < len(max_kws) else 3.5
             entities.append(
                 GridLensDeferrableOverrideNumber(entry, store, sensor_id, name, max_kw)
@@ -139,7 +158,7 @@ async def async_setup_entry(
         daily_target_store = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_daily_targets")
         entities.append(GridLensMasterTargetPercentNumber(entry, daily_target_store))
         for i, sensor_id in enumerate(sensors):
-            name = _device_display_name(hass, sensor_id)
+            name = _load_name(i, sensor_id)
             entities.append(
                 GridLensDeferrableTargetPercentNumber(entry, daily_target_store, sensor_id, name)
             )
@@ -160,7 +179,7 @@ async def async_setup_entry(
                 continue
             if i >= len(sensors) or not sensors[i]:
                 continue
-            name = _device_display_name(hass, sensors[i])
+            name = _load_name(i, sensors[i])
             entities.append(
                 GridLensChargeTargetPercentNumber(entry, target_store, sensors[i], name)
             )
@@ -185,7 +204,7 @@ async def async_setup_entry(
             if not setpoint_id:
                 continue
             controller = load_mgr.controllers.get(i) if load_mgr is not None else None
-            name = _device_display_name(hass, sensors[i]) if i < len(sensors) else setpoint_id
+            name = _load_name(i, sensors[i]) if i < len(sensors) else setpoint_id
             min_a = min_currents[i] if i < len(min_currents) and min_currents[i] else DEFAULT_MIN_CHARGE_CURRENT_A
             max_kw = max_kws[i] if i < len(max_kws) else 0.0
             max_a = _resolve_max_current_a(hass, controller, setpoint_id, float(max_kw))

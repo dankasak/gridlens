@@ -188,8 +188,32 @@ def read_loads(data: Mapping[str, Any]) -> list[dict[str, Any]]:
     Each dict carries `kind`, an identity (`sensor` for monitored, `name` for the
     other two) and only the fields that kind uses. Blank spine entries are skipped —
     the fixed-slot forms wrote `""` for unused slots, and those are not loads.
+
+    **`shadow`** marks a monitored row that is not a load in its own right: it is an
+    *estimated* load's synthetic consumption sensor, which `_ensure_load_estimators`
+    splices into `CONF_DEFERRABLE_LOAD_SENSORS` at startup and persists with
+    `async_update_entry`. Every such load therefore appears twice here — once off the
+    sensor spine, once off `CONF_DEFERRABLE_LOAD_EST_NAMES` — and on this rig that
+    meant the wizard listing ten loads for eight, with Grid Lens's own sensors
+    presented as appliances ("Grid Lens - NSW Daikin AC Estimated Consumption —
+    metered, on/off, 1.8 kW") next to the real rows they shadow.
+
+    They are flagged rather than dropped, because the shadow rows sit in the MIDDLE of
+    the sensor spine (slots 3 and 4 of 8 here) and every per-load entity's unique_id is
+    keyed by position — `{entry_id}_deferrable_visible_{index}`, the estimator's
+    `_pwr_{i}`, the greedy trackers. Removing them would renumber every later load and
+    re-point its entities, the 2026-10-11 incident `_migrate_load_estimator_positional_
+    keys` exists to clean up. `write_loads` ignores unknown fields, so a flagged row
+    round-trips byte-for-byte; the config flow just doesn't show it.
     """
     loads: list[dict[str, Any]] = []
+    # An estimated load's spliced twin is identifiable without the entity registry:
+    # the splice copies the estimated load's control entity into the switch slot.
+    est_controls = {
+        str(c)
+        for c in (data.get(CONF_DEFERRABLE_LOAD_EST_CONTROL, []) or [])
+        if str(c or "").strip()
+    }
 
     for i, sensor in enumerate(data.get(CONF_DEFERRABLE_LOAD_SENSORS, []) or []):
         if not sensor:
@@ -197,6 +221,8 @@ def read_loads(data: Mapping[str, Any]) -> list[dict[str, Any]]:
         load: dict[str, Any] = {"kind": MONITORED, "sensor": str(sensor)}
         for field, key, default in _MONITORED_MAP:
             load[field] = _coerce(_at(data.get(key, []) or [], i, default), default)
+        if load.get("switch") and load["switch"] in est_controls:
+            load["shadow"] = True
         loads.append(load)
 
     for i, name in enumerate(data.get(CONF_DEFERRABLE_LOAD_DUMMY_NAMES, []) or []):

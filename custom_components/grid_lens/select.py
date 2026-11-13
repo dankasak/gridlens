@@ -29,10 +29,11 @@ from . import charge_timing_preference as ctp
 from .const import (
     DOMAIN,
     CONF_DEFERRABLE_LOAD_SENSORS,
+    CONF_DEFERRABLE_LOAD_SWITCHES,
     CONF_DEFERRABLE_LOAD_SOC_SENSORS,
     CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH,
 )
-from .entity_lookup import resolve_device_name
+from .entity_lookup import async_get_energy_dashboard_names, resolve_device_name
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -66,6 +67,13 @@ async def async_setup_entry(
     soc_sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, [])
     soc_capacities = entry.data.get(CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH, [])
     if soc_sensors:
+        # Control anchor + Energy Dashboard label, the same two the switch and number
+        # platforms resolve with. Without them a load whose meter name carries no device
+        # prefix reads differently here than on its own control switch — this install's
+        # Wattpilot was "Totally Charged" on this select and "Wattpilot / Xpeng"
+        # everywhere else (2026-11-13).
+        dashboard_names = await async_get_energy_dashboard_names(hass)
+        switches_cfg = entry.data.get(CONF_DEFERRABLE_LOAD_SWITCHES, []) or []
         timing_store = hass.data.get(DOMAIN, {}).get(
             f"{entry.entry_id}_charge_timing_preferences"
         )
@@ -75,7 +83,10 @@ async def async_setup_entry(
                 continue
             if i >= len(sensors) or not sensors[i]:
                 continue
-            name = resolve_device_name(hass, sensors[i])
+            sw = switches_cfg[i] if i < len(switches_cfg) else ""
+            name = resolve_device_name(
+                hass, sw or None, sensors[i], dashboard_names=dashboard_names
+            )
             entities.append(
                 GridLensChargeTimingPreferenceSelect(entry, timing_store, sensors[i], name)
             )

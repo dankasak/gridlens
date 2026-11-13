@@ -19,9 +19,11 @@ from .const import (
     DOMAIN,
     CONF_HAS_BATTERY,
     CONF_DEFERRABLE_LOAD_SENSORS,
+    CONF_DEFERRABLE_LOAD_SWITCHES,
     CONF_DEFERRABLE_LOAD_SOC_SENSORS,
     CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH,
 )
+from .entity_lookup import async_get_energy_dashboard_names
 from .number import _device_display_name
 
 _LOGGER = logging.getLogger(__name__)
@@ -36,6 +38,10 @@ async def async_setup_entry(
     soc_sensors = entry.data.get(CONF_DEFERRABLE_LOAD_SOC_SENSORS, [])
     soc_capacities = entry.data.get(CONF_DEFERRABLE_LOAD_SOC_CAPACITY_KWH, [])
     if soc_sensors:
+        # Same anchors and the same single Energy Dashboard read as number.py, so the
+        # percent half and the deadline half of a charge target never disagree on a name.
+        dashboard_names = await async_get_energy_dashboard_names(hass)
+        switches_cfg = entry.data.get(CONF_DEFERRABLE_LOAD_SWITCHES, []) or []
         store = hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_charge_targets")
         for i, soc_sensor_id in enumerate(soc_sensors):
             capacity = soc_capacities[i] if i < len(soc_capacities) else 0.0
@@ -43,7 +49,8 @@ async def async_setup_entry(
                 continue
             if i >= len(sensors) or not sensors[i]:
                 continue
-            name = _device_display_name(hass, sensors[i])
+            sw = switches_cfg[i] if i < len(switches_cfg) else ""
+            name = _device_display_name(hass, sensors[i], sw, dashboard_names)
             entities.append(GridLensChargeTargetTimeDateTime(entry, store, sensors[i], name))
 
     # Deadline half of the one-off export/discharge floor on the main battery —

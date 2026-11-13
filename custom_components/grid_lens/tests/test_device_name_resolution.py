@@ -47,12 +47,13 @@ def check(name, cond, detail=""):
 
 
 class Ent:
-    def __init__(self, entity_id, *, name=None, original_name=None, device_id=None):
+    def __init__(self, entity_id, *, name=None, original_name=None, device_id=None,
+                 device_class=None):
         self.entity_id = entity_id
         self.name = name
         self.original_name = original_name
         self.device_id = device_id
-        self.device_class = None
+        self.device_class = device_class
         self.original_device_class = None
 
 
@@ -191,6 +192,119 @@ def test_entity_rename_beats_dashboard_label():
         dashboard_names={"sensor.pool_pool_energy": "Pool Pump"},
     )
     check("explicit entity rename is top priority", got == "Filter Pump", got)
+
+
+def _echonet_heat_pump():
+    """This rig's ECHONET aircon, the 2026-11-13 shape.
+
+    The climate entity carries an EMPTY name override (`""`, which HA writes when a
+    rename is cleared) and the energy counter is renamed to describe the *reading*.
+    Under the old priority order the renamed meter became the load's whole identity
+    the moment its control entity stopped carrying a name — which is what happened
+    when the load was moved off a (mislabelled) plug switch onto the climate entity.
+    """
+    return Hass(
+        entities={
+            "climate.julian_s_aircon": Ent(
+                "climate.julian_s_aircon", name="",
+                original_name="Julian's Aircon", device_id="d9",
+            ),
+            "sensor.julian_cumulative": Ent(
+                "sensor.julian_cumulative",
+                name="Measured cumulative power consumption",
+                original_name="Julian's Aircon Measured cumulative power consumption",
+                device_id="d9", device_class="energy",
+            ),
+        },
+        devices={"d9": Dev(name="Mitsubishi MAC-578IF-E", name_by_user="Julian's Aircon")},
+        live={"climate.julian_s_aircon": "Julian's Aircon"},
+    )
+
+
+def test_renamed_meter_does_not_become_the_appliance_name():
+    _use(_echonet_heat_pump())
+    got = _rdn("climate.julian_s_aircon", "sensor.julian_cumulative",
+        dashboard_names={"sensor.julian_cumulative": "Julian's Aircon"},
+    )
+    check("renamed meter loses to the Energy Dashboard label",
+          got == "Julian's Aircon", got)
+
+
+def test_renamed_meter_loses_with_no_dashboard_at_all():
+    """The case the first attempt at this fix got wrong.
+
+    Demoting the sensor override below the dashboard label only helps an install that
+    HAS a dashboard label for that sensor. Most of Grid Lens's own call sites pass no
+    `dashboard_names` at all, and plenty of installs track nothing on the Energy
+    Dashboard — so the override has to lose on its own shape, not on what outranks it.
+    """
+    _use(_echonet_heat_pump())
+    for anchors in (
+        ("climate.julian_s_aircon", "sensor.julian_cumulative"),  # switch.py, __init__.py
+        ("sensor.julian_cumulative",),                            # select.py, daily_targets.py
+    ):
+        got = _rdn(*anchors)
+        check(f"no-op override ignored for {anchors}", got == "Julian's Aircon", got)
+
+
+def test_meter_named_after_its_own_device_resolves_to_the_device():
+    """No word list: the device-name prefix plus an energy/power device_class is enough.
+
+    These are the three wordings this install actually has. Dan's and Christel's loads
+    carry no rename at all, so before this rule their override select, Today Boost and
+    Daily Target entities read "Dan's Aircon Measured cumulative power consumption" while
+    the same load's control switch read "Dan's Aircon".
+    """
+    for orig, dc, want in (
+        ("Dan's Aircon Measured cumulative power consumption", "energy", "Dan's Aircon"),
+        ("Pool Pool Energy", "energy", "Pool"),
+        ("Dryer Instantaneous electric power", "power", "Dryer"),
+    ):
+        _use(Hass(
+            entities={"sensor.x": Ent("sensor.x", original_name=orig,
+                                      device_id="d0", device_class=dc)},
+            devices={"d0": Dev(name=want)},
+            live={},
+        ))
+        got = _rdn("sensor.x")
+        check(f"{orig!r} -> {want!r}", got == want, got)
+
+
+def test_non_meter_keeps_its_own_name_under_a_device_prefix():
+    """The rule is scoped to meters. A *control* entity named after its device still
+    carries whatever distinguishes it — a second switch on one device must not collapse
+    onto the device name (the power-strip case _INDEX_RE exists for)."""
+    _use(Hass(
+        entities={"switch.pool_pool_boost": Ent(
+            "switch.pool_pool_boost", original_name="Pool Boost", device_id="d0")},
+        devices={"d0": Dev(name="Pool")},
+        live={},
+    ))
+    got = _rdn("switch.pool_pool_boost")
+    check("switch keeps 'Pool Boost'", got == "Pool Boost", got)
+
+
+def test_a_real_rename_on_a_meter_is_still_used():
+    """Only a *tail of original_name* is discarded, not any sensor rename.
+
+    "Dishwasher" on a plug whose own name is "Smart Plug 4 Energy" is the user telling
+    us what the appliance is, and it is the only place that information exists.
+    """
+    _use(Hass(
+        entities={"sensor.smartplug4_energy": Ent(
+            "sensor.smartplug4_energy", name="Dishwasher",
+            original_name="Smart Plug 4 Energy", device_id="d7")},
+        devices={"d7": Dev(name="Smart Plug 4")},
+        live={},
+    ))
+    got = _rdn("sensor.smartplug4_energy")
+    check("informative meter rename still wins", got == "Dishwasher", got)
+
+
+def test_empty_name_override_is_not_a_name():
+    _use(_echonet_heat_pump())
+    got = _rdn("climate.julian_s_aircon")
+    check("empty override falls through to device name", got == "Julian's Aircon", got)
 
 
 def test_device_rename_by_user_wins_over_device_name():

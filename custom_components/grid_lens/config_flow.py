@@ -16,6 +16,12 @@ from homeassistant.helpers import instance_id, selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import homeassistant.helpers.config_validation as cv
 
+from .load_discovery import (
+    async_dashboard_stats,
+    async_seed_max_kw,
+    discover_appliances,
+    discover_wiring,
+)
 from .deferrable_loads import (
     CONTROL_MODULATING,
     CONTROL_NONE,
@@ -1048,6 +1054,14 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         # fights Grid Lens's own on/off control) isn't buried in a code comment only a
         # developer ever reads. Cleared whenever "Other"/no note applies.
         self._load_vendor_note: str = ""
+        # Device-first discovery state (load_discovery.py). `_appliances` caches the
+        # picker rows for one pass through the add flow; `_pending_wiring` is what
+        # discovery found for the appliance being added, kept so the review screen can
+        # explain itself and so an unresolved slot can be re-asked without re-running
+        # discovery.
+        self._appliances: list = []
+        self._dashboard_names: dict = {}
+        self._pending_wiring: dict = {}
         # True when the wizard was entered straight from the menu, so "save and
         # continue" saves and exits instead of walking on to the plan/API steps.
         self._loads_only: bool = False
@@ -1306,9 +1320,16 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
                 return self.async_create_entry(title="", data={})
             return await self.async_step_current_plan()
 
+        # `shadow` rows are an estimated load's own synthetic sensor, spliced into the
+        # monitored spine at startup (see read_loads) — the same load as the estimated
+        # row further down the list, so showing both listed ten "loads" for eight and
+        # invited the user to edit Grid Lens's own sensor as though it were an
+        # appliance. Hidden here, never dropped: their position in the stored arrays is
+        # what every per-load entity's unique_id is keyed on.
         options = [
             {"value": f"edit:{i}", "label": self._load_label(load)}
             for i, load in enumerate(self._loads)
+            if not load.get("shadow")
         ]
         options.append({"value": "add", "label": "➕ Add a deferrable load"})
         if any(load.get("kind") == ESTIMATED for load in self._loads):
@@ -1317,9 +1338,10 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
             )
         options.append({"value": "done", "label": "✓ Save and continue"})
 
+        shown = [load for load in self._loads if not load.get("shadow")]
         summary = (
-            "\n".join(f"• {self._load_label(load)}" for load in self._loads)
-            if self._loads
+            "\n".join(f"• {self._load_label(load)}" for load in shown)
+            if shown
             else "No deferrable loads configured yet."
         )
         return self.async_show_form(
@@ -1374,14 +1396,192 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
         return f"{name} — {', '.join(bits)}"
 
     async def async_step_load_kind(self, user_input=None):
-        """Which kind of load is being added. The distinction that decides every
-        following question is what Home Assistant can already see and do: an energy
-        sensor, a controllable entity, or neither."""
-        menu_options = []
-        if self._device_options:
-            menu_options.append("load_add_monitored")
-        menu_options += ["load_add_estimated", "load_add_declared"]
-        return self.async_show_menu(step_id="load_kind", menu_options=menu_options)
+        """How the appliance is identified — by picking it, or by describing it.
+
+        This used to ask which *kind* of load was being added ("it has an energy
+        sensor" / "no sensor but I can switch it" / "neither"), then ask for each
+        entity in turn from a global picker. Nobody can answer that reliably, including
+        the person who wrote it: an entity whose display name had been edited to
+        "Julian's Aircon switch" was picked for an air conditioner and turned out to be
+        the kitchen dishwasher's plug (2026-11-12). The kind is derivable from what the
+        appliance actually exposes, so it is no longer a question — pick the appliance
+        and `load_discovery` reads the rest off its device.
+
+        The second option stays because it is a genuinely different answer: the
+        appliance isn't in Home Assistant at all, so there is nothing to discover and
+        Grid Lens can only plan around a declared daily figure.
+        """
+        return self.async_show_menu(
+            step_id="load_kind",
+            menu_options=["load_add_appliance", "load_add_declared"],
+        )
+
+    async def async_step_load_add_appliance(self, user_input=None):
+        """Pick the appliance. One choice; every entity is discovered from it."""
+        if not self._dashboard_names:
+            self._dashboard_names = await async_dashboard_stats(self.hass)
+        # Appliances already configured, by the entities that identify them, so one
+        # appliance can't be added twice under two different names.
+        taken = {
+            str(load.get("sensor") or "") for load in (self._loads or [])
+        } | {
+            str(load.get("switch") or load.get("control") or "")
+            for load in (self._loads or [])
+        }
+        self._appliances = discover_appliances(
+            self.hass,
+            exclude_entry_id=self._config_entry.entry_id,
+            taken={t for t in taken if t},
+            dashboard=self._dashboard_names,
+        )
+        if not self._appliances:
+            # Nothing discoverable — don't show an empty picker, fall through to the
+            # declared path, which needs no entities at all.
+            return await self.async_step_load_add_declared()
+
+        if user_input is not None:
+            choice = str(user_input["appliance"])
+            kind, ref = choice.split(":", 1)
+            wiring = discover_wiring(
+                self.hass,
+                device_id=ref if kind == "device" else None,
+                control_entity=ref if kind == "entity" else None,
+                dashboard=self._dashboard_names,
+            )
+            seeded = await async_seed_max_kw(self.hass, wiring.get("power"))
+            if seeded:
+                wiring["max_kw"] = seeded
+            self._pending_wiring = wiring
+            return await self.async_step_load_review()
+
+        return self.async_show_form(
+            step_id="load_add_appliance",
+            data_schema=vol.Schema({
+                vol.Required("appliance"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=self._appliances,
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                ),
+            }),
+        )
+
+    def _wiring_summary(self, w: dict) -> str:
+        """What discovery found, as the review screen's body text.
+
+        Entity ids are shown, not just friendly names: a friendly name is exactly what
+        misled the old flow, and the id plus the device name is what lets a reviewer
+        catch a load pointing at the wrong appliance before committing it.
+        """
+        rows = [
+            ("Appliance", w.get("device_name") or w.get("name")),
+            ("Meter", w.get("energy")),
+            ("Live power", w.get("power")),
+            ("Control", w.get("control")),
+            ("Setpoint", w.get("setpoint")),
+            ("Battery level", w.get("soc")),
+        ]
+        lines = [f"**{label}:** `{value}`" for label, value in rows if value]
+        if not w.get("energy"):
+            lines.append(
+                "**Meter:** none found — Grid Lens will learn this appliance's draw by "
+                "watching the house total when it switches on."
+            )
+        if not w.get("control") and w.get("kind") != DECLARED:
+            lines.append("**Control:** none — planned around, never switched.")
+        for note in w.get("notes", []):
+            lines.append(f"\n⚠ {note}")
+        return "\n".join(lines)
+
+    async def async_step_load_review(self, user_input=None):
+        """Confirm what discovery found, answer anything it refused to guess, and save.
+
+        Everything here is already filled in. The only required input is confirmation —
+        plus, for a slot discovery deliberately would not guess (a multi-circuit device's
+        control entity, say), one targeted question with the real candidates rather than
+        every entity in the house.
+        """
+        w = self._pending_wiring
+        if not w:
+            return await self.async_step_loads()
+
+        if user_input is not None:
+            for slot in ("energy", "control"):
+                chosen = str(user_input.get(f"pick_{slot}") or "")
+                if chosen:
+                    w[slot] = chosen
+                    if slot == "control":
+                        w["control_domain"] = chosen.split(".", 1)[0]
+            w["max_kw"] = float(user_input.get("max_kw") or w.get("max_kw") or 3.5)
+            # Kind is re-derived, because answering an unresolved meter question can
+            # turn an estimated load into a monitored one.
+            kind = MONITORED if w.get("energy") else (
+                ESTIMATED if (w.get("control") or w.get("setpoint")) else DECLARED
+            )
+            load = new_load(
+                kind,
+                sensor=w.get("energy") or "",
+                name="" if kind == MONITORED else (w.get("name") or ""),
+            )
+            load["max_kw"] = w["max_kw"]
+            if kind == MONITORED:
+                load["switch"] = w.get("control") or ""
+                # Only meaningful for a climate.* control, and offering it for a switch
+                # is how a plug ended up configured with an "on" mode of "cool".
+                load["climate_on_mode"] = ""
+                load["setpoint"] = w.get("setpoint") or ""
+                load["setpoint_unit"] = w.get("setpoint_unit") or ""
+                load["soc_sensor"] = w.get("soc") or ""
+            elif kind == ESTIMATED:
+                load["control"] = w.get("control") or w.get("setpoint") or ""
+                load["est_kw"] = w["max_kw"]
+            self._loads.append(load)
+            self._editing = len(self._loads) - 1
+            self._pending_wiring = {}
+            if user_input.get("change"):
+                # The escape hatch: walk the per-entity steps for this load, which are
+                # unchanged and remain the way to express something discovery can't
+                # (the Wattpilot's setpoint-only wiring with start/stop buttons).
+                return await self._open_load_detail()
+            return await self.async_step_loads()
+
+        schema: dict = {
+            vol.Optional("max_kw", default=float(w.get("max_kw") or 3.5)):
+                selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0.1, max=100.0, step=0.1,
+                        unit_of_measurement="kW",
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                ),
+        }
+        for slot, label in (("energy", "pick_energy"), ("control", "pick_control")):
+            cands = w.get("unresolved", {}).get(slot) or []
+            if not cands:
+                continue
+            options = [{"value": c, "label": c} for c in cands]
+            if slot == "control":
+                options.insert(0, {"value": "", "label": "Nothing — plan around it only"})
+            schema[vol.Optional(label, default="")] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=options, mode=selector.SelectSelectorMode.LIST
+                )
+            )
+        schema[vol.Optional("change", default=False)] = selector.BooleanSelector()
+
+        return self.async_show_form(
+            step_id="load_review",
+            data_schema=vol.Schema(schema),
+            description_placeholders={
+                "name": w.get("name") or "This appliance",
+                "kind": {
+                    MONITORED: "metered — Grid Lens can see what it uses",
+                    ESTIMATED: "controllable, not metered — its draw will be learned",
+                    DECLARED: "forecast only — nothing to measure or switch",
+                }.get(w.get("kind"), ""),
+                "summary": self._wiring_summary(w),
+            },
+        )
 
     async def async_step_load_add_monitored(self, user_input=None):
         """Pick the Energy Dashboard device this load is measured by."""
@@ -1702,7 +1902,14 @@ class GridLensOptionsFlow(config_entries.OptionsFlow):
 
         if user_input is not None:
             load["switch"] = str(user_input.get("switch", "") or "")
-            load["climate_on_mode"] = str(user_input.get("climate_on_mode", "") or "")
+            on_mode = str(user_input.get("climate_on_mode", "") or "")
+            # The "on" mode is only ever consulted for a climate.* entity. Storing it
+            # against a switch is how a TP-Link plug came to be configured with an on
+            # mode of "cool" (2026-11-12) — which read, to the person who set it up, as
+            # confirmation that they had wired up an air conditioner. The field is left
+            # in the form (HA can't re-render a schema on a selection) but a value that
+            # cannot apply is dropped rather than stored.
+            load["climate_on_mode"] = on_mode if load["switch"].startswith("climate.") else ""
             return await self._next_load_step()
 
         prev = load.get("switch", "")

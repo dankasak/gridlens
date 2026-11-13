@@ -223,11 +223,10 @@
       },
       "load_kind": {
         "title": "Add a Deferrable Load",
-        "description": "What Grid Lens can already see and do for this appliance decides everything else it needs to ask.",
+        "description": "Pick the appliance and Grid Lens works out the rest — which sensor measures it, which entity switches it, whether its power can be ramped.\n\nYou only need the second option if the appliance isn't in Home Assistant at all.",
         "menu_options": {
-          "load_add_monitored": "It has an energy sensor — pick it from my Energy Dashboard",
-          "load_add_estimated": "No energy sensor, but I can switch it on and off from HA",
-          "load_add_declared": "No energy sensor and no way to control it — forecast only"
+          "load_add_appliance": "Pick it from my devices",
+          "load_add_declared": "It isn't in Home Assistant — plan around it anyway"
         }
       },
       "load_add_monitored": {
@@ -280,7 +279,7 @@
       },
       "load_control": {
         "title": "{name} — Control Entity",
-        "description": "The `switch.*` or `climate.*` entity Grid Lens turns on and off to run **{name}** at the best times.\n\nFor a **modulating charger** (an adjustable current/power setpoint) this is **optional** — leave it blank if the charger stops when its current is set to zero, which almost all do. Set it only if your charger needs a separate switch flipped on before it will draw.\n\nControl starts disabled: each load gets its own master switch, off by default, that you turn on when you're ready to let Grid Lens actuate it.\n\nThe **\"on\" mode** below is only consulted for a `climate.*` entity that doesn't support turn on/off — most do, so leave it on Auto unless yours misbehaves.",
+        "description": "The `switch.*` or `climate.*` entity Grid Lens turns on and off to run **{name}** at the best times.\n\nFor a **modulating charger** (an adjustable current/power setpoint) this is **optional** — leave it blank if the charger stops when its current is set to zero, which almost all do. Set it only if your charger needs a separate switch flipped on before it will draw.\n\nControl starts disabled: each load gets its own master switch, off by default, that you turn on when you're ready to let Grid Lens actuate it.\n\nThe **\"on\" mode** below applies only to a `climate.*` entity that doesn't support turn on/off — most do, so leave it on Auto unless yours misbehaves. Pick a plain `switch.*` and it is ignored, not saved.",
         "data": {
           "switch": "Control entity",
           "climate_on_mode": "Climate \"on\" mode"
@@ -365,6 +364,23 @@
         "data_description": {
           "gridlens_api_key": "Leave blank or unchanged to keep using your existing key.",
           "gridlens_api_url": "Leave as the default unless you're self-hosting the Grid Lens API."
+        }
+      },
+      "load_add_appliance": {
+        "title": "Which Appliance?",
+        "description": "Devices Home Assistant can measure or switch. Appliances already set up as deferrable loads aren't listed.\n\nThings on your Energy Dashboard come first — those are the ones you've already told Home Assistant are appliances. A device is listed by its **device** name, not by an entity name, so what you pick is the physical thing.",
+        "data": {
+          "appliance": "Appliance"
+        }
+      },
+      "load_review": {
+        "title": "{name}",
+        "description": "**{name}** — {kind}.\n\n{summary}\n\nMaximum power caps what the optimiser may assign it in any half-hour; it's been filled in from the highest draw actually recorded for this appliance, so adjust it only if that looks wrong.\n\nControl starts disabled either way — each load gets its own master switch, off until you turn it on.\n\nRun times aren't set here: paint them on the Deferrable Loads card's weekly schedule. Every load is unrestricted until you do.",
+        "data": {
+          "max_kw": "Maximum power draw",
+          "pick_energy": "Which meter measures this appliance?",
+          "pick_control": "What switches this appliance?",
+          "change": "Let me change what was found"
         }
       }
     },

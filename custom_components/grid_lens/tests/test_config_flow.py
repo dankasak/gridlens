@@ -136,10 +136,23 @@ def _install_stubs() -> None:
     helpers.instance_id = iid
 
     sel = _mod("homeassistant.helpers.selector")
+
+    class _Sel:
+        """Records what it was constructed with, so a test can assert on the options a
+        step actually renders rather than only on which step came back."""
+
+        def __init__(self, *args, **kwargs):
+            self.config = args[0] if args and isinstance(args[0], dict) else kwargs
+            if args and isinstance(args[0], _Sel):
+                self.config = args[0].config
+
+        def __getitem__(self, key):
+            return self.config[key]
+
     for name in ("EntitySelector", "EntitySelectorConfig", "SelectSelector",
                  "SelectSelectorConfig", "TextSelector", "TextSelectorConfig",
                  "NumberSelector", "NumberSelectorConfig", "BooleanSelector"):
-        setattr(sel, name, lambda *a, **k: None)
+        setattr(sel, name, _Sel)
     sel.SelectSelectorMode = types.SimpleNamespace(DROPDOWN="dropdown", LIST="list")
     sel.NumberSelectorMode = types.SimpleNamespace(BOX="box")
     sel.TextSelectorType = types.SimpleNamespace(EMAIL="email")
@@ -180,6 +193,31 @@ def _bootstrap():
     _load(
         os.path.join(_COMPONENT, "ev_charger_vendors.py"), "gl.ev_charger_vendors", package="gl"
     )
+    # Device-first discovery. Stubbed rather than loaded: it needs the entity/device
+    # registries, which test_load_discovery.py covers directly against its own
+    # fixtures. Here the only thing under test is that the flow *calls* it and puts
+    # what it returns in the right config slots, so the stub returns a fixed appliance.
+    disc = types.ModuleType("gl.load_discovery")
+
+    async def _async_dashboard_stats(hass):
+        return {}
+
+    async def _async_seed_max_kw(hass, power_entity):
+        return None
+
+    disc.async_dashboard_stats = _async_dashboard_stats
+    disc.async_seed_max_kw = _async_seed_max_kw
+    disc.discover_appliances = lambda hass, **kw: [
+        {"value": "device:d1", "label": "Pool — metered, switchable"}
+    ]
+    disc.discover_wiring = lambda hass, **kw: {
+        "device_id": "d1", "device_name": "Pool", "name": "Pool",
+        "energy": "sensor.pool_energy", "power": "sensor.pool_power",
+        "control": "switch.pool_outlet", "control_domain": "switch",
+        "setpoint": None, "setpoint_unit": "", "soc": None,
+        "kind": "monitored", "unresolved": {}, "notes": [],
+    }
+    sys.modules["gl.load_discovery"] = disc
     inv = types.ModuleType("gl.inverters")
     inv.__path__ = []
     inv.INVERTER_BRANDS = {"sigenergy": {"mqtt": "Sigenergy (MQTT)"}}
@@ -743,6 +781,72 @@ def test_reconfigure_never_overrides_a_stored_grid_power_sensor():
     marker = next(k for k in seeded if str(k) == const.CONF_GRID_POWER_SENSOR)
     assert marker.description.get("suggested_value") == "sensor.grid_power"
     print("  ✓ discovery fills a blank grid power sensor, never overrides a stored one")
+
+
+def test_adding_a_load_is_one_pick_then_a_review():
+    """The device-first add path: pick an appliance, confirm, done.
+
+    No step may ask for an entity. Before 2026-11-13 this walked load_kind →
+    load_add_monitored → load_detail_monitored → load_control, each with its own
+    global entity picker, which is how a deferrable load ended up pointed at the
+    kitchen dishwasher's plug.
+    """
+    f = _options_flow(dict(_BASE_ENTRY))
+    f._loads = []
+
+    kind = run(f.async_step_load_kind())
+    assert kind["menu_options"] == ["load_add_appliance", "load_add_declared"], kind
+    picker = run(f.async_step_load_add_appliance())
+    assert picker["step_id"] == "load_add_appliance", picker
+    options = next(iter(picker["data_schema"].schema.values())).config["options"]
+    assert options == [{"value": "device:d1", "label": "Pool — metered, switchable"}], options
+
+    review = run(f.async_step_load_add_appliance({"appliance": "device:d1"}))
+    assert review["step_id"] == "load_review", review
+    body = review["description_placeholders"]["summary"]
+    for expected in ("sensor.pool_energy", "switch.pool_outlet", "Pool"):
+        assert expected in body, (expected, body)
+
+    run(f.async_step_load_review({"max_kw": 1.2, "change": False}))
+    assert len(f._loads) == 1, f._loads
+    load = f._loads[0]
+    assert load["kind"] == "monitored", load
+    assert load["sensor"] == "sensor.pool_energy", load
+    assert load["switch"] == "switch.pool_outlet", load
+    assert load["max_kw"] == 1.2, load
+    # A switch control must never carry a climate "on" mode — offering that field
+    # alongside a switch is why a TP-Link plug was stored with on_mode "cool".
+    assert load["climate_on_mode"] == "", load
+    print("  ✓ adding a load is one appliance pick plus a review, no entity pickers")
+
+
+def test_estimated_loads_shadow_rows_are_hidden_from_the_hub():
+    """Ten rows for eight loads: an estimated load's spliced synthetic sensor was
+    listed as an appliance of its own, next to the real row it shadows."""
+    entry = dict(_BASE_ENTRY)
+    entry.update({
+        const.CONF_DEFERRABLE_LOAD_SENSORS: [
+            "sensor.pool_energy", "sensor.daikin_ac_estimated_consumption",
+        ],
+        const.CONF_DEFERRABLE_LOAD_SWITCHES: ["switch.pool_outlet", "climate.daikin_ac"],
+        const.CONF_DEFERRABLE_LOAD_EST_NAMES: ["Daikin AC"],
+        const.CONF_DEFERRABLE_LOAD_EST_CONTROL: ["climate.daikin_ac"],
+        const.CONF_DEFERRABLE_LOAD_EST_KW: [1.8],
+        const.CONF_DEFERRABLE_LOAD_EST_AUTO: [True],
+    })
+    f = _options_flow(entry)
+    res = run(f.async_step_loads())
+    labels = [
+        o["label"]
+        for o in next(iter(res["data_schema"].schema.values())).config["options"]
+    ]
+    assert not any("Estimated Consumption" in l for l in labels), labels
+    assert sum(1 for l in labels if "Daikin" in l) == 1, labels
+    # Hidden, not dropped: the shadow row still round-trips so positional unique_ids
+    # for every later load stay put.
+    assert len(f._loads) == 3, f._loads
+    assert sum(1 for l in f._loads if l.get("shadow")) == 1, f._loads
+    print("  ✓ an estimated load's shadow row is hidden from the hub but still stored")
 
 
 if __name__ == "__main__":

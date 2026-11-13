@@ -1342,7 +1342,8 @@ loads, never sensor wiring.
 **Naming.** Display names resolve via `resolve_device_name()`, which is handed the load's
 identifying entities ("anchors" — the control switch first, then the energy sensor) and tries
 each naming source across **every** anchor before dropping to the next source: entity-registry
-`name` override → Energy Dashboard per-device label → registry `original_name`, falling back to
+`name` override (on a control anchor; a *sensor* rename is demoted one rank, see below) →
+Energy Dashboard per-device label → sensor `name` override → registry `original_name`, falling back to
 the **device** name when `original_name` is only a role noun ("Outlet", "Switch", "Plug",
 "Relay", "Energy", "Power" — `_GENERIC_ENTITY_NAMES`) → live `friendly_name` → humanized entity
 id. Trailing metering words (" Energy", " Power", " Consumption", " Total Consumption") are
@@ -1369,6 +1370,60 @@ them from a longer name ("Dishwasher Energy" → "Dishwasher"); a `has_entity_na
 *whole* name is often the bare word ("Energy"), which no suffix match touches, so those words
 are in `_GENERIC_ENTITY_NAMES` too. That is the case a load configured with an energy sensor
 and **no control switch** hits — the ordinary "added the plug to the Energy Dashboard" shape.
+
+**Two rules added 2026-11-13, both structural rather than word lists.**
+
+*A `name` override that is only the tail of the entity's own `original_name` is not a rename.*
+HA's rename dialog prefills the entity's half of the displayed name, so opening it on a
+`has_entity_name` entity and saving stores an override byte-identical to `original_name` minus
+the device prefix. Nobody named anything — the dialog was opened. Dropping a prefix can only
+remove appliance identity, so `_override` ignores it and falls through. A rename that is *not*
+that tail ("Filter Pump" over "Outlet", "Dishwasher" over "Smart Plug 4 Energy") is the user
+genuinely naming the appliance and still wins outright.
+
+*A meter whose `original_name` starts with its own device's name resolves to the device name.*
+Scoped to an `energy`/`power` `device_class`: the remainder describes the reading, whatever
+words the integration chose, so there is no need to know them. ECHONET writes "Julian's Aircon
+Measured cumulative power consumption"; `_NAME_SUFFIXES` can only strip phrases it has been
+told about, and this product is not going to accumulate a dictionary of every integration's
+wording. A meter name that does *not* start with the device name ("Smart Load 01 Total
+Consumption" on a "Sigenergy Plant") is distinguishing one appliance among several on that
+device and is left alone, as are non-meter entities ("Pool Boost" stays "Pool Boost").
+
+Why both, and why the second one matters most: the first attempt at this fix only demoted a
+*sensor* rename below the Energy Dashboard label, which worked on the dev rig purely because
+it happens to track that sensor on the dashboard under the right label. Most of Grid Lens's
+own call sites pass no `dashboard_names` at all (`select.py`, `daily_targets.py`,
+`deferrable_overrides.py`, `__init__.py`), and many installs track nothing on the Energy
+Dashboard, so three of the four anchor shapes still resolved to the meter's name. A naming
+rule has to hold with no dashboard present. Measured over this install's eight loads × three
+anchor shapes: 5 of 24 cells wrong before, 0 after, nothing else moved.
+
+The second rule also fixed a live inconsistency that predates all of this: a load whose meter
+is named "<device> <measurement>" and which carries no rename at all was reading "Dan's Aircon"
+on its control switch and "Dan's Aircon Measured cumulative power consumption" on its override
+select, Today Boost and Daily Target — the same load, two names, depending on whether the call
+site passed the control anchor.
+
+**Every entity platform now resolves with the same anchors** (2026-11-13). `number.py` and
+`datetime.py` had their own private resolver, `_device_display_name`, which read
+`entry.name or entry.original_name` straight off the registry and never consulted
+`resolve_device_name` at all — the shortcut `switch.py`'s own comment calls out as "exactly the
+kind of name-mismatch-between-places drift" the shared resolver exists to prevent. It is now a
+thin delegation, and `number.py`, `datetime.py` and `select.py` each await
+`async_get_energy_dashboard_names` once per platform setup and pass the load's **control**
+entity alongside its meter, as `switch.py` and `sensor.py` already did. That also fixed the
+last holdout, whose meter name carries no device prefix for the rule above to match: this
+install's Wattpilot read "Totally Charged" on its charge-timing select, charge-target percent
+and charge-target time, and "Wattpilot / Xpeng" on its other nine entities. Verified live —
+all eight loads now resolve to exactly one name across every entity they own.
+
+Entity *ids* are keyed on unique_id, so they do **not** move when a name is fixed (see below).
+A load whose entities were first created while its name resolved wrongly keeps those slugs
+permanently unless the registry rows are deleted and allowed to regenerate — which costs the
+recorder history keyed on the old id. This install carries three such ids
+(`number.roof_grid_lens_nsw_measured_cumulative_power_consumption_{today_boost,daily_target}`,
+`sensor.measured_cumulative_power_consumption_estimated_power`), all displaying correctly.
 
 Names are resolved **at setup time**, so a rename (on the entity, the device, or the Energy
 Dashboard) reaches the control-panel entities only after an integration reload or HA restart.
@@ -3766,8 +3821,10 @@ A forecast-only pool pump now answers **three** questions.
 | Step | Asks | Shown when |
 |---|---|---|
 | `loads` | Hub — pick a load to edit, add one, or save | Always |
-| `load_kind` | Metered / controllable-but-unmetered / neither | Adding a load |
-| `load_add_monitored` | Which Energy-dashboard appliance | Adding a metered load |
+| `load_kind` | Pick it from my devices / it isn't in HA at all | Adding a load |
+| `load_add_appliance` | **Which appliance** — one pick, a list of *devices* | Adding a load |
+| `load_review` | Confirm what was discovered; max kW (pre-seeded); any slot discovery refused to guess | Adding a load |
+| `load_add_monitored` / `load_add_estimated` | Which Energy-dashboard appliance / blank estimated load | **No longer routed to** — superseded by `load_add_appliance`; the step handlers still exist but nothing reaches them |
 | `load_detail_monitored` | Max kW, control style, has-own-battery, [on CL] | Editing a metered load |
 | `load_detail_declared` | Name, daily kWh, max kW, hours, [on CL] | Editing a declared load |
 | `load_detail_estimated` | Name, control entity, est. kW, auto-refine | Editing an estimated load |
@@ -3778,12 +3835,54 @@ A forecast-only pool pump now answers **three** questions.
 | `load_cl` | CL register, already-in-aggregate | "On a Controlled Load circuit" ticked |
 | `load_power` | Whole-house load power sensor | Offered when an estimated load exists |
 
+**Adding a load is device-first (2026-11-13).** `load_discovery.py` takes **one** pick — an
+HA *device* — and reads every entity the load needs off it: the energy counter
+(`device_class: energy` + a cumulative `state_class`), the live power sensor
+(`power` + `measurement`), the control entity (`climate.*` preferred over `switch.*`, both
+filtered to `entity_category is None`), a `number.*` A/W/kW setpoint, and a
+`device_class: battery` sensor. `max_kw` is seeded from the power sensor's own recorder
+`max` statistic rather than typed. Nothing is name-matched.
+
+*Why.* The old path asked for each entity in turn from pickers listing every entity in the
+house, and those pickers show **friendly names** — so an entity renamed "Julian's Aircon
+switch" is indistinguishable from the real thing. On 2026-11-12 that entity turned out to be
+the kitchen dishwasher's TP-Link plug: a deferrable load was metering the dishwasher's power
+and would have switched the dishwasher on and off to chase cheap solar, while its energy
+counter pointed at an air conditioner on the other side of the house. Control had not been
+enabled yet, so nothing was actuated. Picking a *device* makes that unrepresentable, and
+`load_review` prints the device name and every resolved entity id so a mismatch is visible
+before it is committed.
+
+*What discovery refuses to do.* It never guesses on a **multi-circuit device** (≥4 energy
+counters — an inverter, a plant, a whole-house meter): the Sigenergy plant's 14 circuits
+would otherwise have handed a hot-water load `switch.…_plant_remote_ems`,
+`number.…_plant_max_charging_limit` and `sensor.…_plant_battery_soc` — the battery's EMS
+switch, its charge-power limit and its state of charge. There, control/setpoint/SOC are left
+for the user, with "nothing — plan around it only" a first-class answer. **Wrapper entities**
+(anything whose state carries a list of other entity ids — HA groups, `climate_scheduler`'s
+schedule switches) are excluded outright, since actuating one means fighting whatever it is
+itself actuating. Measured on this rig, the picker went from 35 rows (price feeds, PV
+strings, a Garmin account) to 17 real appliances.
+
 **Three load kinds, one namespace.** `monitored` (has an energy sensor), `estimated`
 (controllable but unmetered — `LoadEstimator` infers its draw), `declared` (neither; an
-estimated daily kWh the optimiser plans around but never actuates). The kind is chosen once,
-up front, from what HA can already see and do — which is the question that decides every
-field afterwards. Declared and estimated loads share a name namespace and a duplicate is now
-rejected **at the point of entry** rather than by a cross-step check several screens later.
+estimated daily kWh the optimiser plans around but never actuates). **The kind is no longer
+asked** — it is derived from what the appliance exposes (counter → monitored, controllable
+without a counter → estimated, neither → declared), and re-derived if answering an
+unresolved meter question turns one into another. Declared and estimated loads share a name
+namespace and a duplicate is rejected **at the point of entry** rather than by a cross-step
+check several screens later.
+
+**Estimated loads no longer appear twice in the hub.** `_ensure_load_estimators` splices each
+estimated load's synthetic consumption sensor into `CONF_DEFERRABLE_LOAD_SENSORS` and
+persists it, so `read_loads()` saw every estimated load twice — once off the sensor spine,
+once off `CONF_DEFERRABLE_LOAD_EST_NAMES`. The hub listed **ten loads for eight**, with Grid
+Lens's own sensors presented as appliances ("Grid Lens - NSW Daikin AC Estimated
+Consumption — metered, on/off, 1.8 kW") next to the real rows they shadow. Those rows are now
+flagged `shadow` and hidden from the hub, **not dropped**: they sit in the middle of the
+sensor spine and every per-load entity's unique_id is keyed by position, so removing them
+would renumber later loads and re-point their entities. `write_loads()` ignores the flag, so
+a saved entry is byte-identical to what was read.
 
 **Storage is unchanged.** `deferrable_loads.py` is the seam: `read_loads()` turns the 22
 parallel arrays into one dict per load, `write_loads()` turns them back index-aligned and
@@ -3911,6 +4010,9 @@ custom_components/grid_lens/
 │                            unmonitored controllable load (aircon w/ no feedback), §5
 ├── load_estimate_math.py    pure sample-accept/EMA/integration logic behind LoadEstimator
 ├── entity_lookup.py         device name / power sensor auto-discovery
+├── load_discovery.py        device-first discovery of a deferrable load's entities:
+│                            one appliance pick -> meter, power, control, setpoint,
+│                            SOC + a recorder-seeded max kW — §12b
 ├── advisory/                forecast → LP → dispatch plan + sensors
 ├── control/                 executor, battery + load control managers, controllers
 │   └── modulating_controller.py  type-2 EV-charger current setpoint control, §6a
