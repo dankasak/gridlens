@@ -3308,6 +3308,53 @@ even on one install, let alone across installs:
 | Whether a temperature can be set at all | `supported_features` — `TARGET_TEMPERATURE` (1) vs `TARGET_TEMPERATURE_RANGE` (2) vs neither | A range thermostat has no single `temperature` attribute: its low/high pair is shown **read-only** with more-info as the way to edit it, rather than faking a stepper. A fan-only unit gets no temperature UI at all |
 | What "on" means | `last_on_operation`, else the first non-`off` entry in `hvac_modes` | `climate.turn_on` leaves "on as what?" to the integration, so the overlay always names the mode via `set_hvac_mode` instead (`climate.turn_off` is a fallback only for an entity that doesn't list `off`) |
 
+**The Grid Lens control-interlock row** (added 2026-11-13 as P2, the overlay's second half).
+Under each unit's hardware controls sits one line saying *who is in charge of that unit right
+now*, and the buttons to change it. This is the only thing the overlay offers that HA's own
+more-info dialog cannot, and it's what justifies a custom panel rather than embedding HA's
+thermostat card:
+
+| Pill | When | Line underneath |
+|---|---|---|
+| **Scheduled** | the plan has it running this half-hour (`commanded: on`, or `plan_w > 0`) | "The plan is running it in this half-hour" |
+| **Greedy** | Greedy Consumption is what's holding it on | the specific reason — free import, surplus export, or forecast surplus (with its `forecast_target_w` when it has one) |
+| **Forced on** / **Forced off** | a manual override is set | "Grid Lens will not turn it off / on while this is set" |
+| **Auto** | Grid Lens is scheduling it, nothing running now | the greedy-armed-but-blocked reason when there is one (outside the availability window, battery priority, no grid power sensor), else the controller's own `note` |
+| **Control off** | the per-device control switch is off | "pick Auto to hand it the plan" |
+| **Stopped** / **Paused** | SOC cutoff reached / subscription inactive | the actionable reason |
+| **No control** | a Grid Lens load with no control entity (measured only) | how to assign one; the buttons render disabled rather than missing |
+| *(no pill)* | a `climate.*` unit that isn't a Grid Lens load at all | one muted "Not scheduled by Grid Lens" line, **no** control group — a full disabled group per unit would cost an install with five unmanaged units 5×34px of dead chrome for a fact one line states |
+
+**The buttons are the Deferrable Loads card's own control, not a second control path.**
+`Off now` / `On now` / `Auto` write the three real `GridLensLoadOverrideSelect` options
+(`Force Off` / `Force On` / `Auto`) via `select.select_option`, and `Auto` *also* turns the
+per-device control switch back on — identical semantics to
+`grid-lens-load-control-card.js`'s `.ovr` handler, deliberately mirrored (`AC_OVERRIDE_OPTIONS`
+in the card names the strings once). For the same reason **Auto only highlights when the
+control switch is actually on**: an override cleared while control is off is *not* Grid Lens
+driving the unit, and showing it as Auto would claim it is. Priority order when several things
+are true at once is SOC cutoff → entitlement → override → control-off → greedy → plan, which
+matches what `load_control_manager.py` actually enforces (the SOC cutoff is a hard interlock
+that beats an override, so it is reported ahead of one).
+
+**It also carries the revert warning, on exactly the units where it's true.** While Grid Lens
+is free to command a unit (controllable, control on, Auto, entitled — the `drivable` flag), the
+row is marked and its tooltip adds that a power change in the controls *above* can be reverted
+within a few minutes, with the fix one button away in the same row. Before this, that caveat
+existed only in `docs.html`. A forced or control-off unit gets no warning, because there is
+nothing to revert it.
+
+**Resolution is one shared index.** `_loadControlIndex()` builds `join key → {control switch,
+override select}` in a single pass over `hass.states` (cached per `hass` object plus a
+state-count guard), joined on the `switch` attribute every Grid Lens control entity publishes
+(`control/load_controller.py`'s `join_key`) — never on entity naming. `_controlSwitchFor()` now
+reads that same index, so the interlock row and the node's greedy badge cannot disagree about
+which switch belongs to a load, and the per-load scans that ran once per load per `hass` tick
+are gone. The row's fields live in that switch's **attributes**, on a switch whose own state
+string means "control enabled" and so barely moves, so the watch signature needed a second
+aircon term (`acCtlSig`) on top of the first — without it an `Off now` tap would leave a stale
+reason and a stale selected chip on screen.
+
 **Optimistic, because half these units have no feedback loop.** A command shows its new value
 immediately with a slow pulse on the control that was tapped, held for 6s
 (`AC_PENDING_TTL_MS`) or until the entity catches up — whichever comes first. A pending value
@@ -3338,8 +3385,9 @@ CSS (`_airconPanelCss()`) are shared verbatim by the classic and scene layouts, 
 nobody would notice had drifted. Open/closed state lives on the component instance
 (`_airconOpen`), not in the DOM, and the overlay closes itself if the node disappears
 (`show_aircon: false`, or the last `climate.*` entity removed). Covered by
-`gridlens-api/tests/test_powerflow_aircon_panel.mjs` (36 assertions over the four capability
-shapes plus the command semantics).
+`gridlens-api/tests/test_powerflow_aircon_panel.mjs` (69 assertions: the four capability
+shapes, the command semantics, and the interlock row's pill/priority/write semantics over a
+real-shaped deferrable-load + control-switch + override-select fixture set).
 
 The read-only panel this replaced is still worth understanding, because its central design
 constraint still applies: it was deliberately **not** a native SVG `<title>` (tried first,
