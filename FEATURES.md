@@ -3286,21 +3286,69 @@ phases B–D of `DEFER_ICON_RESOLUTION_PLAN.md` (private repo) and not built.
 *absence* of a `member_entities` attribute — not by name or integration, so any HA climate
 group is excluded the same way) is folded into one "dragon" node instead of drawing its own —
 heat/cool/neutral/idle art picked from the busiest state across all units, with a corner badge
-showing the active count and a tooltip breakdown ("1 heating · 2 off"). **Per-unit detail panel**
-(added 2026-08-05, tap-to-toggle 2026-08-05): tapping/clicking the dragon icon itself (not just
-the corner badge) opens a panel below the diagram with the same summary line plus one line per
-`climate.*` unit — its resolved state (Heating/Cooling/Off/etc) and, wherever the entity reports
-`current_temperature`/`temperature` (or `target_temp_low`/`target_temp_high` for range-mode
-units), its current and target temperature. Units that report neither temperature attribute just
-show their state with no temp suffix. Deliberately **not** a native SVG `<title>` (tried first,
-reverted same day): the card fully rebuilds `shadowRoot.innerHTML` on every re-render — which
-fires on any watched solar/grid/battery/load power change, i.e. every few seconds — so a native
-title's DOM node kept getting torn down before the browser's hover-and-wait timer could fire, and
-it doesn't work on touch at all. The panel's open/closed state instead lives on the component
-instance (`_openTooltipId`), survives the `innerHTML` rebuild, and its content re-reads live each
-render so it stays open and up to date rather than vanishing; tap the panel's close button or
-anywhere else on the card to dismiss it. Built generically off `_pnode`'s `nodeTooltip` field, so
-any other node could opt into the same panel just by setting it. A `climate.*` entity
+showing the active count and a tooltip breakdown ("1 heating · 2 off").
+
+**Aircon control overlay** (added 2026-11-13, replacing the read-only per-unit detail panel that
+had been there since 2026-08-05). Tapping/clicking the dragon icon itself (not just the corner
+badge) opens a modal sheet over the card — centred on desktop, a bottom sheet under 520px — with
+one row per `climate.*` unit: a **power button**, a **mode chip row**, and a **target-temperature
+stepper**, plus a **"⋯"** that hands off to HA's own more-info dialog for fan, swing, presets and
+history. The header carries the same summary line the old panel led with ("1 cooling · 4 off ·
+~0.00 kW"), and an **All off** button, shown only while something is running. There is
+deliberately no "all on" counterpart: turning five compressors off is safe and reversible,
+turning five on by mistake is neither.
+
+*Every capability is read from the entity's own attributes, never assumed* — the spread is wide
+even on one install, let alone across installs:
+
+| What | Read from | Why it can't be assumed |
+|---|---|---|
+| Which modes to offer | `hvac_modes` (minus `off`, which the power button owns) | This rig: an ECHONET split lists `heat_cool` but a SmartIR Fujitsu lists `fan_only` instead. An unrecognised mode still renders, title-cased, rather than being dropped |
+| Stepper bounds + increment | `min_temp` / `max_temp` / `target_temp_step` | 18–30@1 on the IR units, 16–30@1 on the ECHONET ones (and they *move* with hvac_mode); half-degree thermostats exist |
+| Whether a temperature can be set at all | `supported_features` — `TARGET_TEMPERATURE` (1) vs `TARGET_TEMPERATURE_RANGE` (2) vs neither | A range thermostat has no single `temperature` attribute: its low/high pair is shown **read-only** with more-info as the way to edit it, rather than faking a stepper. A fan-only unit gets no temperature UI at all |
+| What "on" means | `last_on_operation`, else the first non-`off` entry in `hvac_modes` | `climate.turn_on` leaves "on as what?" to the integration, so the overlay always names the mode via `set_hvac_mode` instead (`climate.turn_off` is a fallback only for an entity that doesn't list `off`) |
+
+**Optimistic, because half these units have no feedback loop.** A command shows its new value
+immediately with a slow pulse on the control that was tapped, held for 6s
+(`AC_PENDING_TTL_MS`) or until the entity catches up — whichever comes first. A pending value
+that now matches the entity stops being pending *by definition*, so confirmation clears the
+pulse with nothing watching for it, and the TTL is the backstop for the SmartIR/Broadlink
+blasters, which are open-loop IR. Without it the panel would snap back to the old value on its
+next re-render and read as a broken control. For the same reason the stepper is **disabled while
+a unit is off** (on an IR unit a `set_temperature` is a physical transmission that can wake the
+unit up, not the harmless no-op it is on a polled thermostat) and a burst of taps is
+**coalesced into one `set_temperature`** at the final value, quantised onto the entity's own
+step grid and clamped to its own min/max.
+
+**The card's `hass` watch signature needed its own aircon term for any of this to work.** That
+signature compares *state strings* for a hand-picked entity list, and most `climate.*` entities
+aren't in it at all (only those that happen to be a deferrable load's `switch_entity`), while
+everything the overlay displays or writes — `temperature`, `hvac_action`, `fan_mode`,
+`current_temperature` — lives in **attributes**. Before the term was added, setting 22→23 left
+the card showing 22 until some unrelated power sensor happened to tick, i.e. the control looked
+broken for up to several seconds every single time.
+
+**Mechanics worth knowing before changing it.** The overlay mounts in a persistent slot that is a
+**sibling of `ha-card`, not a child** (`position: fixed`, so it stays clear of the card's own box
+and the square-aspect sizing the diagram lives under), and it gets **one delegated click
+listener** bound once to that slot — its HTML is rewritten whenever the content changes, so
+per-element listeners would either be lost or stack up. Both the overlay's markup builder and its
+CSS (`_airconPanelCss()`) are shared verbatim by the classic and scene layouts, like
+`_paletteCss()`, because those two style blocks are duplicated and the scene copy is the one
+nobody would notice had drifted. Open/closed state lives on the component instance
+(`_airconOpen`), not in the DOM, and the overlay closes itself if the node disappears
+(`show_aircon: false`, or the last `climate.*` entity removed). Covered by
+`gridlens-api/tests/test_powerflow_aircon_panel.mjs` (36 assertions over the four capability
+shapes plus the command semantics).
+
+The read-only panel this replaced is still worth understanding, because its central design
+constraint still applies: it was deliberately **not** a native SVG `<title>` (tried first,
+reverted same day), since the card fully rebuilds `shadowRoot.innerHTML` on every re-render —
+which fires on any watched power change, i.e. every few seconds — so a native title's DOM node
+kept getting torn down before the browser's hover-and-wait timer could fire, and it doesn't work
+on touch at all. The generic `nodeTooltip` machinery that drove it is still in `_pnode()` and
+still works, so any *other* node can opt into a read-only text panel just by setting that field;
+the aircon node now sets `airconPanel: true` instead. A `climate.*` entity
 that's ALSO a deferrable load's `switch_entity` (e.g. an ECHONET Lite aircon under load control)
 is represented here instead of getting its own individual node — full aggregation, no per-unit
 carve-out. **Wattage**: summed across whichever units resolve a `power_entity` via that same

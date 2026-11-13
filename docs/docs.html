@@ -36,6 +36,7 @@
         <ul>
           <li><a href="#battery-control">Battery control</a></li>
           <li><a href="#load-control">Load control</a></li>
+          <li><a href="#aircon-controls">Air conditioners</a></li>
           <li><a href="#ev-chargers">EV chargers</a></li>
           <li><a href="#greedy">Greedy Consumption</a></li>
           <li><a href="#observability">Seeing why it acted</a></li>
@@ -166,7 +167,7 @@
         <p>Battery control is brand-agnostic by design. <strong>Sigenergy</strong> is supported today; more inverter drivers are being added.</p>
 
         <h2 id="load-control">Load control</h2>
-        <p>Grid Lens can also switch simple on/off appliances — anything exposed to Home Assistant as a <code>switch</code> entity that draws roughly a fixed power when running (a pool pump, a smart-plug-fed charger, a resistive heater) — <strong>or as a <code>climate</code> entity</strong>, so an air conditioner works the same way. Grid Lens only ever decides when it runs, never its mode or target temperature — those stay under your own control.</p>
+        <p>Grid Lens can also switch simple on/off appliances — anything exposed to Home Assistant as a <code>switch</code> entity that draws roughly a fixed power when running (a pool pump, a smart-plug-fed charger, a resistive heater) — <strong>or as a <code>climate</code> entity</strong>, so an air conditioner works the same way. <em>Automatically</em>, Grid Lens only ever decides when it runs, never its mode or target temperature — nothing it does on its own will change how you have your air conditioner set. You can still change those yourself from the Power Flow card, which is often quicker than hunting for the right entity: see <a href="#aircon-controls">Air conditioner controls</a>.</p>
         <p>An EV charger that accepts a charging-current limit is handled differently, and better — see <a href="#ev-chargers">EV chargers</a> below.</p>
         <p>Assign a control switch (or climate entity) to a deferrable load via <strong>Grid Lens → Configure</strong>. Each controllable load then gets its own controls — on the Power Flow page's expandable device panel and on the Deferrable Loads card:</p>
         <table class="compare-table">
@@ -179,6 +180,13 @@
         </table>
         <div class="note">
           <strong>Everything is off by default.</strong> A fresh install never touches an appliance until you explicitly enable control for it. And Grid Lens will never force a running appliance off because <em>it</em> had a problem — if it loses its plan or Home Assistant restarts, it stops driving the load and leaves it exactly as it is.
+        </div>
+
+        <h3 id="aircon-controls">Air conditioner controls</h3>
+        <p>Every air conditioner in your house shows up as a single node on the <strong>Power Flow card</strong> — one icon, however many units you have. <strong>Tap it to control all of them from one place:</strong> power, mode and target temperature per unit, with <strong>All off</strong> at the top for when you're walking out the door. No setup — any <code>climate</code> entity Home Assistant can see is picked up automatically, and nothing needs to be assigned as a deferrable load first.</p>
+        <p>Each unit is offered exactly the controls it actually supports, read from the unit itself: only the modes it has, its own temperature range and step size, and the fan, swing or preset settings behind the <strong>⋯</strong> button. A thermostat that works to a temperature <em>range</em> rather than a single target shows both ends, and sends you to its own full controls to change them. An infrared-controlled unit that can't report back what it did will still show your change immediately — it just can't confirm it, so the change fades in a few seconds rather than being confirmed.</p>
+        <div class="note">
+          <strong>If Grid Lens is set to control that unit</strong> (above), note that turning it on or off here is a change to the appliance, not to the plan — so Grid Lens may switch it back within a few minutes, the same as it would if you'd used the unit's own remote. To hold it where you put it, use <strong>On now</strong> / <strong>Off now</strong> instead. Mode and target temperature are never touched by Grid Lens, so those always stay as you set them.
         </div>
 
         <h3 id="ev-chargers">EV chargers — variable charging current</h3>
