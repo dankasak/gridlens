@@ -3291,9 +3291,10 @@ showing the active count and a tooltip breakdown ("1 heating · 2 off").
 **Aircon control overlay** (added 2026-11-13, replacing the read-only per-unit detail panel that
 had been there since 2026-08-05). Tapping/clicking the dragon icon itself (not just the corner
 badge) opens a modal sheet over the card — centred on desktop, a bottom sheet under 520px — with
-one row per `climate.*` unit: a **power button**, a **mode chip row**, and a **target-temperature
-stepper**, plus a **"⋯"** that hands off to HA's own more-info dialog for fan, swing, presets and
-history. The header carries the same summary line the old panel led with ("1 cooling · 4 off ·
+one row per `climate.*` unit: a **power button**, a **mode chip row**, a **target-temperature
+stepper** (or a **stepper per bound** on a low/high range thermostat), an **expander for fan
+speed, swing and preset** (added 2026-11-15 as P3), plus a **"⋯"** that hands off to HA's own
+more-info dialog for history and anything else that integration exposes. The header carries the same summary line the old panel led with ("1 cooling · 4 off ·
 ~0.00 kW"), and an **All off** button, shown only while something is running. There is
 deliberately no "all on" counterpart: turning five compressors off is safe and reversible,
 turning five on by mistake is neither.
@@ -3305,8 +3306,78 @@ even on one install, let alone across installs:
 |---|---|---|
 | Which modes to offer | `hvac_modes` (minus `off`, which the power button owns) | This rig: an ECHONET split lists `heat_cool` but a SmartIR Fujitsu lists `fan_only` instead. An unrecognised mode still renders, title-cased, rather than being dropped |
 | Stepper bounds + increment | `min_temp` / `max_temp` / `target_temp_step` | 18–30@1 on the IR units, 16–30@1 on the ECHONET ones (and they *move* with hvac_mode); half-degree thermostats exist |
-| Whether a temperature can be set at all | `supported_features` — `TARGET_TEMPERATURE` (1) vs `TARGET_TEMPERATURE_RANGE` (2) vs neither | A range thermostat has no single `temperature` attribute: its low/high pair is shown **read-only** with more-info as the way to edit it, rather than faking a stepper. A fan-only unit gets no temperature UI at all |
+| Whether a temperature can be set at all | `supported_features` — `TARGET_TEMPERATURE` (1) vs `TARGET_TEMPERATURE_RANGE` (2) vs neither | A range thermostat has no single `temperature` attribute: since P3 it gets **one labelled stepper per bound** on its own line (before that, read-only text and a trip to more-info). A fan-only unit gets no temperature UI at all |
+| Which secondary axes to offer | `supported_features` bits `FAN_MODE` (8) / `PRESET_MODE` (16) / `SWING_MODE` (32) / `SWING_HORIZONTAL_MODE` (512), **and** a non-empty `fan_modes` / `preset_modes` / `swing_modes` / `swing_horizontal_modes` list | Both, because an integration can advertise the bit and publish no list (this install's fan-only shape) — drawing an empty picker for it would be a dead control. The bit values are grounded in live data here, not memory: 937 = {1,8,32,128,256,512} on an ECHONET split with exactly those attributes, 393 = {1,8,128,256} on a SmartIR blaster with no swing at all, and 401 = {1,16,128,256} on the `climate_scheduler` wrappers with `preset_modes: ['Default']`, which is what pins `PRESET_MODE` at 16 |
 | What "on" means | `last_on_operation`, else the first non-`off` entry in `hvac_modes` | `climate.turn_on` leaves "on as what?" to the integration, so the overlay always names the mode via `set_hvac_mode` instead (`climate.turn_off` is a fallback only for an entity that doesn't list `off`) |
+
+**Inline fan, swing and preset** (added 2026-11-15 as P3). Each unit's row carries a chevron
+next to the `⋯` that expands a panel of its **secondary axes** — fan speed, vertical swing,
+horizontal swing, preset — drawn inline instead of handing the user to more-info and out of the
+Grid Lens context the interlock row below supplies. Only axes the entity actually offers appear
+(see the capability table above), in that fixed order, and a unit with none gets no chevron at
+all. The four are one table in the card (`AC_AXES`: feature bit, list attribute, value
+attribute, service, field) rather than four near-identical code paths, because they differ only
+in those five things and crossing any one of them — sending `swing_mode` to
+`set_swing_horizontal_mode`, say — is a control that silently moves the wrong vane.
+
+**Short option lists are chips; long ones are a native `<select>`** (`AC_CHIP_MAX = 5`). Not a
+style preference: the ECHONET splits on this rig publish **26** horizontal swing positions and 9
+fan speeds, which is several hundred pixels of wrapped buttons inside a 420px sheet, while the
+SmartIR blasters publish exactly 5 fan speeds (`auto`/`high`/`med`/`low`/`quiet`) — so both
+sides of the threshold are exercised by real hardware here, not only by fixtures. The `<select>`
+is deliberately the *platform's* own and not one of HA's internal picker primitives, for the
+same reason the whole overlay has its own chrome: those elements are only defined once a
+frontend chunk that registers them has loaded, which on a dashboard where the user hasn't opened
+a more-info dialog this session means empty boxes. A native select is also keyboard- and
+screen-reader-correct for free. Because a `<select>` reports through `change` rather than
+`click`, the overlay slot carries a **second delegated listener** for it, under the same
+once-only bind guard; the click listener's blanket `stopPropagation()` doesn't interfere, since
+it never calls `preventDefault()`.
+
+Two details that are easy to get wrong and are tested:
+
+- **A value the entity reports but doesn't list** (set outside HA, or a lagging list) is
+  *prepended* to the options rather than dropped. A `<select>` whose value matches no `<option>`
+  renders its **first** option as selected, which would silently misreport what the hardware is
+  doing.
+- **Option labels are faithful, not prettified** — underscores to spaces, first letter
+  capitalised, and nothing else. These are the integration's own tokens (`lc-center-rc`,
+  `medium-low`), and inventing friendlier names for 26 vane geometries we can't verify would
+  mislabel them. An ugly correct label beats a pretty wrong one on a control that moves hardware.
+
+**Dual setpoints for a range thermostat** (added 2026-11-15 as P3). A `TARGET_TEMPERATURE_RANGE`
+entity has no single `temperature` attribute, and until P3 its low/high pair was read-only text
+with more-info as the only way to change it — meaning a Nest/Ecobee-class install had no
+editable target in the overlay at all. It now gets one labelled stepper per bound, on its own
+line in the same gutter as the mode chips (two steppers plus labels don't fit beside a name and a
+power button in a 420px sheet). Semantics are the single stepper's, deliberately: step from the
+*effective* value, quantise to the entity's own grid, clamp to its own `min_temp`/`max_temp`,
+coalesce a burst into one call, disabled while the unit is off. Two rules are specific to a pair:
+
+- **Both bounds go in every call.** HA's `set_temperature` takes `target_temp_low` and
+  `target_temp_high` as two independent fields, and an integration handed only one sees the other
+  as unset — some reject the call, some apply a default. Sending the pair being displayed is the
+  only version that means what the UI says.
+- **The bounds can't cross**, and stop a full step apart rather than meeting. Most range
+  thermostats have a dead band and refuse `low == high` outright; one step is the smallest
+  separation the entity's own grid can express, and where its real dead band is wider the
+  integration clamps further and the next state tick shows it.
+
+⚠ **Neither of these two P3 halves has met the hardware they're for.** No unit on this install
+is a range thermostat, and none of the five controllable ones advertises a preset — both shapes
+are covered by fixtures and by mutating a copy of the live states dump, which is strictly weaker
+than the fan/swing half (verified against five real units). A real range thermostat or a
+willing tester is still the outstanding check.
+
+**Secondary controls, like the setpoint steppers, are read-only while a unit is off** — the
+panel still *opens*, so the current fan speed and vane positions are legible without turning the
+compressor on to look, but the controls are disabled and carry a tooltip saying why. Same reason
+as the stepper's: on an IR blaster a `set_fan_mode` is a physical transmission that can wake the
+unit, not the harmless no-op it is on a polled thermostat. Consistency across all units was
+chosen over a per-integration carve-out that can't be verified brand by brand. Expander state is
+card state, not entity state (`_acExpanded`), so toggling re-renders directly rather than waiting
+for a signature change — and **closing the sheet collapses every unit**, so a modal always
+reopens in its compact shape instead of five units tall because of taps in a previous session.
 
 **The Grid Lens control-interlock row** (added 2026-11-13 as P2, the overlay's second half).
 Under each unit's hardware controls sits one line saying *who is in charge of that unit right
@@ -3370,8 +3441,11 @@ step grid and clamped to its own min/max.
 **The card's `hass` watch signature needed its own aircon term for any of this to work.** That
 signature compares *state strings* for a hand-picked entity list, and most `climate.*` entities
 aren't in it at all (only those that happen to be a deferrable load's `switch_entity`), while
-everything the overlay displays or writes — `temperature`, `hvac_action`, `fan_mode`,
-`current_temperature` — lives in **attributes**. Before the term was added, setting 22→23 left
+everything the overlay displays or writes — `temperature`, the `target_temp_low`/`_high` pair,
+`hvac_action`, `fan_mode`, `swing_mode`, `swing_horizontal_mode`, `preset_mode`,
+`current_temperature` — lives in **attributes**. P3 added the swing and preset terms for exactly
+this reason: an entity's state string doesn't change when a vane moves, so without them tapping
+a swing position would leave the old one selected on screen until some unrelated sensor ticked. Before the term was added, setting 22→23 left
 the card showing 22 until some unrelated power sensor happened to tick, i.e. the control looked
 broken for up to several seconds every single time.
 
@@ -3385,9 +3459,13 @@ CSS (`_airconPanelCss()`) are shared verbatim by the classic and scene layouts, 
 nobody would notice had drifted. Open/closed state lives on the component instance
 (`_airconOpen`), not in the DOM, and the overlay closes itself if the node disappears
 (`show_aircon: false`, or the last `climate.*` entity removed). Covered by
-`gridlens-api/tests/test_powerflow_aircon_panel.mjs` (69 assertions: the four capability
-shapes, the command semantics, and the interlock row's pill/priority/write semantics over a
-real-shaped deferrable-load + control-switch + override-select fixture set).
+`gridlens-api/tests/test_powerflow_aircon_panel.mjs` (**123** assertions: the capability
+shapes, the command semantics, the interlock row's pill/priority/write semantics over a
+real-shaped deferrable-load + control-switch + override-select fixture set, and P3's axis
+resolution / chip-vs-select threshold / per-axis service+field / dual-setpoint crossing and
+clamping). The fixtures' fan, swing and horizontal-swing option lists are this install's real
+ones verbatim, including all 26 horizontal positions — tidying them up would delete the case
+`AC_CHIP_MAX` exists for.
 
 The read-only panel this replaced is still worth understanding, because its central design
 constraint still applies: it was deliberately **not** a native SVG `<title>` (tried first,
